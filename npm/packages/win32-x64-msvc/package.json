@@ -1,0 +1,21 @@
+{
+  "name": "@astrolabe/win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "The Windows x86_64 MSVC binary for astrolabe (x86_64-pc-windows-msvc)",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wojiushirencai/Astrolabe.git",
+    "directory": "npm/packages/win32-x64-msvc"
+  },
+  "homepage": "https://github.com/wojiushirencai/Astrolabe",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "engines": { "node": ">=18" },
+  "preferUnplugged": true,
+  "files": ["astrolabe.exe", "README.md"],
+  "bin": {
+    "astrolabe-win32-x64-msvc": "astrolabe.exe"
+  },
+  "publishConfig": { "access": "public" }
+}

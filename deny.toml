@@ -1,0 +1,70 @@
+# cargo-deny 0.20.x config.
+# Astrolabe is published as MIT OR Apache-2.0. The license allow-list is
+# permissive OSI licenses only. Copyleft (GPL/AGPL/LGPL) and any
+# noncommercial / source-available-but-restricted licenses are denied by
+# omission: cargo-deny 0.18+ denies anything not explicitly allowed.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# RUSTSEC vulnerabilities, unmaintained, unsound, yanked: fail the check.
+# Do not ignore advisories here just to go green — record them in CI notes
+# and bump or replace the crate instead.
+ignore = []
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+    "MIT-0",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+]
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+# Duplicate versions are reported. They are a lint, not a license failure;
+# syn 2+3 and winnow 0.7+1.0 currently coexist via rmcp/toml, so this stays
+# at warn until those graphs unify.
+multiple-versions = "warn"
+# astrolabe-mcp -> astrolabe-core now carries both `path` and `version`, which
+# is required for publishing anyway, so it no longer reads as a wildcard. Deny
+# is therefore enforceable: a real registry '*' would fail the build.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

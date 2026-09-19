@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+
+# Acceptance corpora are vendored copies of upstream repositories; they are
+# fetched separately rather than committed. See README for the expected paths.
+/corpus
+
+# Index artefacts written by the server into whatever repo it indexes.
+.astrolabe/
+/dist/

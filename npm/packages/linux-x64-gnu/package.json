@@ -1,0 +1,22 @@
+{
+  "name": "@astrolabe/linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "The Linux x86_64 glibc binary for astrolabe (x86_64-unknown-linux-gnu)",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wojiushirencai/Astrolabe.git",
+    "directory": "npm/packages/linux-x64-gnu"
+  },
+  "homepage": "https://github.com/wojiushirencai/Astrolabe",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "engines": { "node": ">=18" },
+  "preferUnplugged": true,
+  "files": ["astrolabe", "README.md"],
+  "bin": {
+    "astrolabe-linux-x64-gnu": "astrolabe"
+  },
+  "publishConfig": { "access": "public" }
+}

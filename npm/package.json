@@ -1,0 +1,24 @@
+{
+  "name": "astrolabe-npm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private workspace for packing and publishing the astrolabe npm distribution",
+  "workspaces": [
+    "packages/astrolabe",
+    "packages/darwin-arm64",
+    "packages/darwin-x64",
+    "packages/linux-x64-gnu",
+    "packages/linux-x64-musl",
+    "packages/linux-arm64-gnu",
+    "packages/win32-x64-msvc"
+  ],
+  "scripts": {
+    "fill": "node scripts/fill-binaries.js",
+    "pack:all": "node scripts/pack-all.js",
+    "publish:all": "node scripts/publish.js",
+    "verify:install": "node scripts/verify-install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,329 @@
+# Cross-platform binary release for the `astrolabe` CLI.
+#
+# Trigger: annotated or lightweight tags matching `v*` (e.g. v0.1.0).
+# Design: native GitHub-hosted runners for five of six targets so tree-sitter
+# grammar C (compiled via cc-rs) uses a real host compiler. The only true
+# cross-compile is x86_64-unknown-linux-musl, which gets a musl gcc/g++ via
+# taiki-e/setup-cross-toolchain-action — not Docker `cross` (that cannot
+# produce macOS or Windows MSVC binaries, and we already have ubuntu-24.04-arm).
+#
+# Action versions verified 2026-09-11:
+#   actions/checkout                         v7.0.1
+#   dtolnay/rust-toolchain                    @stable (toolchain selector)
+#   Swatinem/rust-cache                       v2.9.2
+#   taiki-e/setup-cross-toolchain-action       v1.42.0
+#   actions/upload-artifact                  v7.0.1
+#   actions/download-artifact                 v8.0.1
+#   softprops/action-gh-release               v3.0.3
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Keep Apple Silicon and Intel binaries loadable on macOS 11+ even when
+  # the runner image is newer than the user's OS.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: write
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
+            musl: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check tag matches workspace version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          "$PYTHON" - <<'PY'
+          import os, re, sys
+          from pathlib import Path
+
+          tag = os.environ["TAG_NAME"]
+          if not tag.startswith("v"):
+              sys.exit(f"tag {tag!r} does not start with v")
+          version = tag[1:]
+          if not re.match(r"^\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?$", version):
+              sys.exit(f"tag {tag!r} is not vMAJOR.MINOR.PATCH")
+
+          toml = Path("Cargo.toml").read_text(encoding="utf-8")
+          match = re.search(
+              r'\[workspace\.package\][^\[]*?version\s*=\s*"([^"]+)"',
+              toml,
+          )
+          if match is None:
+              sys.exit("could not find [workspace.package] version in Cargo.toml")
+          cargo_version = match.group(1)
+          if cargo_version != version:
+              sys.exit(
+                  f"tag {tag} does not match Cargo.toml workspace version {cargo_version}"
+              )
+          print(f"version {version} matches Cargo.toml")
+          PY
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # musl is the only target that is not native on its runner. tree-sitter
+      # grammar crates compile parser.c (and possibly a scanner) through cc-rs,
+      # which looks up CC_<triple> / CXX_<triple>. This action installs a musl 1.2
+      # gcc/g++ sysroot and exports those variables. runner=none skips qemu;
+      # we only need to compile, not execute the musl binary here.
+      # Install before rust-cache so CC_*/CXX_* enter the cache key.
+      - name: Install musl C/C++ toolchain
+        if: matrix.musl
+        uses: taiki-e/setup-cross-toolchain-action@v1.42.0
+        with:
+          target: ${{ matrix.target }}
+          runner: none
+
+      - name: Cache cargo registry and dependency builds
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: release-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Show compilers
+        run: |
+          set -euo pipefail
+          rustc -vV
+          rustup target list --installed
+          echo "CC=${CC:-}"
+          echo "CXX=${CXX:-}"
+          echo "TARGET=${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            *-apple-darwin)
+              cc --version
+              xcrun --show-sdk-path
+              ;;
+            *-windows-msvc)
+              command -v cl || echo "cl.exe is resolved by the MSVC linker via rustc"
+              ;;
+            *-linux-musl)
+              echo "CC_x86_64_unknown_linux_musl=${CC_x86_64_unknown_linux_musl:-}"
+              echo "CXX_x86_64_unknown_linux_musl=${CXX_x86_64_unknown_linux_musl:-}"
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-}"
+              ;;
+            *)
+              cc --version || true
+              gcc --version || true
+              ;;
+          esac
+
+      - name: Build release binary
+        run: cargo build --locked --release --bin astrolabe --target ${{ matrix.target }}
+
+      - name: Package archive
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_EXT: ${{ matrix.archive }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG_NAME#v}"
+          STAGING="${RUNNER_TEMP}/astrolabe-dist"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING" dist
+
+          if [[ ! -f LICENSE-MIT || ! -f LICENSE-APACHE ]]; then
+            echo "LICENSE-MIT and LICENSE-APACHE must exist at the repo root" >&2
+            exit 1
+          fi
+          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+
+          BIN="target/${TARGET}/release/astrolabe"
+          if [[ -f "${BIN}.exe" ]]; then
+            cp "${BIN}.exe" "$STAGING/astrolabe.exe"
+          elif [[ -f "$BIN" ]]; then
+            cp "$BIN" "$STAGING/astrolabe"
+            chmod +x "$STAGING/astrolabe"
+          else
+            echo "built binary not found under target/${TARGET}/release/" >&2
+            ls -la "target/${TARGET}/release/" >&2 || true
+            exit 1
+          fi
+
+          ARCHIVE_STEM="astrolabe-${VERSION}-${TARGET}"
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          ARCHIVE_STEM="$ARCHIVE_STEM" ARCHIVE_EXT="$ARCHIVE_EXT" STAGING="$STAGING" "$PYTHON" - <<'PY'
+          import os, tarfile, zipfile
+          from pathlib import Path
+
+          staging = Path(os.environ["STAGING"])
+          stem = Path("dist") / os.environ["ARCHIVE_STEM"]
+          members = sorted(p for p in staging.iterdir() if p.is_file())
+          if os.environ["ARCHIVE_EXT"] == "zip":
+              produced = stem.with_name(stem.name + ".zip")
+              with zipfile.ZipFile(produced, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  for path in members:
+                      zf.write(path, arcname=path.name)
+          else:
+              produced = stem.with_name(stem.name + ".tar.gz")
+              with tarfile.open(produced, "w:gz") as tar:
+                  for path in members:
+                      tar.add(path, arcname=path.name)
+          print(f"wrote {produced} ({produced.stat().st_size} bytes)")
+          print("contents:", ", ".join(p.name for p in members))
+          PY
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/astrolabe-*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: github-release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download archives
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums and release notes
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          archives=(astrolabe-*.tar.gz astrolabe-*.zip)
+          if [[ ${#archives[@]} -ne 6 ]]; then
+            echo "expected 6 archives, found ${#archives[@]}:" >&2
+            ls -la >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" | tee SHA256SUMS
+          while read -r hash name; do
+            printf '%s  %s\n' "$hash" "$name" > "${name}.sha256"
+          done < SHA256SUMS
+          echo "checksums:"
+          cat SHA256SUMS
+          cd ..
+
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          version = os.environ["TAG_NAME"][1:]
+          changelog = Path("CHANGELOG.md")
+          out = Path("release-notes.md")
+          if not changelog.is_file():
+              out.write_text("", encoding="utf-8")
+              print("CHANGELOG.md missing; GitHub-generated notes only")
+              raise SystemExit(0)
+
+          lines = changelog.read_text(encoding="utf-8").splitlines()
+          heading = re.compile(
+              rf"^##\s+\[?v?{re.escape(version)}\]?(?:\s|$)",
+              re.IGNORECASE,
+          )
+          start = next((i for i, line in enumerate(lines) if heading.match(line)), None)
+          if start is None:
+              out.write_text("", encoding="utf-8")
+              print(f"no CHANGELOG heading for {version}; GitHub-generated notes only")
+              raise SystemExit(0)
+
+          end = len(lines)
+          for index in range(start + 1, len(lines)):
+              if lines[index].startswith("## ") and not lines[index].startswith("###"):
+                  end = index
+                  break
+          section = "\n".join(lines[start:end]).strip() + "\n"
+          out.write_text(section, encoding="utf-8")
+          print(f"extracted {end - start} changelog lines")
+          PY
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Astrolabe ${{ github.ref_name }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            dist/astrolabe-*.tar.gz
+            dist/astrolabe-*.zip
+            dist/*.sha256
+            dist/SHA256SUMS

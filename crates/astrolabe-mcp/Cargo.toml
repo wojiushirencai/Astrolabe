@@ -1,0 +1,33 @@
+[package]
+name = "astrolabe-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "MCP server for Astrolabe, a deterministic code-graph engine that answers file-level repository questions for coding agents and surfaces parse gaps instead of empty results."
+documentation = "https://docs.rs/astrolabe-mcp"
+keywords = ["mcp-server", "code-graph", "tree-sitter", "code-intelligence", "coding-agents"]
+categories = ["development-tools", "command-line-utilities", "parsing"]
+
+[[bin]]
+name = "astrolabe"
+path = "src/main.rs"
+
+[dependencies]
+# `version` is required alongside `path` for `cargo publish`: crates.io cannot
+# resolve a path dependency, so it needs a registry version to fall back on.
+# Publish order is therefore astrolabe-core first, then this crate.
+astrolabe-core = { path = "../astrolabe-core", version = "0.1.0" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rmcp = { workspace = true, features = ["server", "transport-io", "schemars"] }
+schemars.workspace = true
+regex.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "signal"] }

@@ -1,0 +1,12 @@
+# Compiler used for local builds and CI. This is *not* the MSRV.
+# Workspace Cargo.toml still declares rust-version = "1.90" as the floor.
+#
+# Pin a specific version rather than channel = "stable":
+# rustfmt/clippy diagnostics drift every six-week release; a floating
+# stable channel would make `cargo fmt --check` and
+# `cargo clippy -- -D warnings` non-reproducible across machines and weeks.
+# 1.96.1 is the toolchain that currently builds the workspace (186 tests green).
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

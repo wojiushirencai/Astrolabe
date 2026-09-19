@@ -1,0 +1,43 @@
+{
+  "name": "astrolabe",
+  "version": "0.1.0",
+  "description": "Deterministic code-graph MCP server. Zero-dependency Node shim that runs a native binary.",
+  "keywords": [
+    "mcp",
+    "astrolabe",
+    "code-graph",
+    "stdio"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wojiushirencai/Astrolabe.git",
+    "directory": "npm/packages/astrolabe"
+  },
+  "homepage": "https://github.com/wojiushirencai/Astrolabe",
+  "bugs": {
+    "url": "https://github.com/wojiushirencai/Astrolabe/issues"
+  },
+  "bin": {
+    "astrolabe": "bin/astrolabe.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@astrolabe/darwin-arm64": "0.1.0",
+    "@astrolabe/darwin-x64": "0.1.0",
+    "@astrolabe/linux-x64-gnu": "0.1.0",
+    "@astrolabe/linux-x64-musl": "0.1.0",
+    "@astrolabe/linux-arm64-gnu": "0.1.0",
+    "@astrolabe/win32-x64-msvc": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

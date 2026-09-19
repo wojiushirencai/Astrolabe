@@ -1,0 +1,12 @@
+# Read-only deployment: hide apply_rename from tools/list.
+# Use for read-only agents / audited environments — plan_rename stays (it
+# only renders a plan, never writes). Structured off, same reasoning as
+# claude-code/default: content[0] text must always carry the hits.
+#
+# IMPORTANT: excluded_tools only hides names from tools/list. It does NOT
+# block tools/call — a client that knows the name can still invoke it.
+name: readonly
+notes: "Read-only mode. excluded_tools only hides apply_rename from tools/list (does not block tools/call); plan_rename kept (plan only, no write)."
+structured_tool_output: false
+excluded_tools:
+  - apply_rename

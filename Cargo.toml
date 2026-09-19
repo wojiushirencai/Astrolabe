@@ -1,0 +1,60 @@
+[workspace]
+members = ["crates/astrolabe-core", "crates/astrolabe-mcp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+authors = ["Astrolabe Contributors"]
+repository = "https://github.com/wojiushirencai/Astrolabe"
+homepage = "https://github.com/wojiushirencai/Astrolabe"
+
+# Pinned once here so 15 parallel tasks never fight over dependency versions.
+# Do not add dependencies in member crates without adding them here first.
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+globset = "0.4"
+ignore = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+memchr = "2.7"
+notify = "8"
+rayon = "1.10"
+moka = { version = "0.12", features = ["sync"] }
+redb = "2.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Phase 2 (language-server routing) and Phase 3 (safe rewriting).
+lsp-types = "0.97"
+ast-grep-core = "0.45"
+oxc_allocator = "0.149"
+oxc_parser = "0.149"
+oxc_semantic = "0.149"
+oxc_span = "0.149"
+
+# Verified to share one ABI: all seven grammars load under tree-sitter 0.27.0.
+tree-sitter = "0.27"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+# astrolabe-mcp. Caret (not `=`) so patch releases still apply.
+# rmcp 3.3.0 is the floor because it implements MCP spec 2026-07-28
+# (initialize is optional; per-request `_meta` is the new lifecycle).
+rmcp = { version = "3.3.0", features = ["server", "transport-io", "schemars"] }
+schemars = "1.2"
+regex = "1.13"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

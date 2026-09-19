@@ -1,0 +1,96 @@
+---
+name: CI
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --workspace
+        run: cargo build --workspace
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Five-language import-resolution gate (scripts/verify.sh).
+  #
+  # Runs on every push and pull_request, not only workflow_dispatch:
+  # this is the project's primary quality gate, and corpus paths are now
+  # parameterized (env → corpus/<name> → workspace sibling). Cache is keyed
+  # on fetch-corpora.sh, so a pin bump invalidates the clone cache; we do
+  # not use restore-keys, which would resurrect a stale corpus and skip
+  # the fetch because the directories already exist.
+  corpus:
+    name: five-language corpus gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore pinned corpora
+        uses: actions/cache@v4
+        with:
+          path: corpus
+          # yamllint disable-line rule:line-length
+          key: corpora-${{ runner.os }}-${{ hashFiles('scripts/fetch-corpora.sh') }}
+      - name: Fetch pinned corpora
+        run: bash scripts/fetch-corpora.sh
+      - name: Five-language import-resolution gate
+        run: bash scripts/verify.sh
