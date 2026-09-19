@@ -138,7 +138,8 @@ pub fn write_memory(root: &Path, name: &str, content: &str) -> Result<(), String
     }
     if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
         // Best-effort Windows-safe overwrite: remove destination then rename.
-        match std::fs::remove_file(&final_path).and_then(|_| std::fs::rename(&tmp_path, &final_path))
+        match std::fs::remove_file(&final_path)
+            .and_then(|_| std::fs::rename(&tmp_path, &final_path))
         {
             Ok(()) => {}
             Err(_) => {

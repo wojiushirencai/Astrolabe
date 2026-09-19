@@ -213,7 +213,10 @@ mod tests {
 
     #[test]
     fn version_flag() {
-        assert!(matches!(parse(&["astrolabe", "--version"]), Launch::Version));
+        assert!(matches!(
+            parse(&["astrolabe", "--version"]),
+            Launch::Version
+        ));
         assert!(matches!(parse(&["astrolabe", "-V"]), Launch::Version));
     }
 
@@ -348,12 +351,7 @@ mod tests {
 
     #[test]
     fn empty_env_root_falls_back_to_dot() {
-        let launch = parse_launch_from(
-            ["astrolabe"],
-            None,
-            Some(OsString::from("")),
-        )
-        .unwrap();
+        let launch = parse_launch_from(["astrolabe"], None, Some(OsString::from(""))).unwrap();
         match launch {
             Launch::Run { requested_root, .. } => {
                 assert_eq!(requested_root, PathBuf::from("."));
@@ -365,7 +363,9 @@ mod tests {
     #[test]
     fn empty_client_flag_errors() {
         let err = parse_launch_from(
-            ["astrolabe", "hooks", "remind", "--client="].iter().copied(),
+            ["astrolabe", "hooks", "remind", "--client="]
+                .iter()
+                .copied(),
             None,
             None,
         )
@@ -373,7 +373,9 @@ mod tests {
         .to_string();
         assert!(err.contains("--client requires a name"), "{err}");
         let err = parse_launch_from(
-            ["astrolabe", "hooks", "remind", "--client=  "].iter().copied(),
+            ["astrolabe", "hooks", "remind", "--client=  "]
+                .iter()
+                .copied(),
             None,
             None,
         )
@@ -384,10 +386,7 @@ mod tests {
 
     #[test]
     fn hooks_help_flags() {
-        assert!(matches!(
-            parse(&["astrolabe", "hooks", "-h"]),
-            Launch::Help
-        ));
+        assert!(matches!(parse(&["astrolabe", "hooks", "-h"]), Launch::Help));
         assert!(matches!(
             parse(&["astrolabe", "hooks", "remind", "--help"]),
             Launch::Help

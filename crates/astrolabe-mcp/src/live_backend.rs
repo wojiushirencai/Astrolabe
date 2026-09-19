@@ -90,7 +90,6 @@ fn needs_path(what: &str) -> String {
     )
 }
 
-
 /// Note when a path was given but its extension is not mapped to a language.
 fn unknown_language(what: &str, path: &str) -> String {
     format!(
@@ -106,7 +105,6 @@ fn language_from_opt_path(path: Option<&str>, what: &str) -> Result<Language, St
     };
     Language::from_path(&RelPath::new(path)).ok_or_else(|| unknown_language(what, path))
 }
-
 
 impl PreciseCapability for LiveBackend {
     fn references(&self, symbol: &str, path: Option<&str>) -> Precise<Vec<Location>> {

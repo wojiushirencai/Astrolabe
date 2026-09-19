@@ -1093,7 +1093,10 @@ mod tests {
             assert_eq!(cs1.removed, vec![RelPath::new("test.rs")]);
 
             let cs2 = w.check();
-            assert!(cs2.is_empty(), "must not keep emitting while unreadable: {cs2:?}");
+            assert!(
+                cs2.is_empty(),
+                "must not keep emitting while unreadable: {cs2:?}"
+            );
 
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 

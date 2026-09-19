@@ -921,7 +921,7 @@ mod rss {
     pub fn method() -> String {
         #[cfg(target_os = "linux")]
         {
-            return "proc_self_status.VmHWM".into();
+            "proc_self_status.VmHWM".into()
         }
         #[cfg(target_os = "macos")]
         {
@@ -936,7 +936,7 @@ mod rss {
     pub fn current_bytes() -> Option<u64> {
         #[cfg(target_os = "linux")]
         {
-            return proc_kb("VmRSS")?.checked_mul(1024);
+            proc_kb("VmRSS")?.checked_mul(1024)
         }
         #[cfg(target_os = "macos")]
         {
@@ -951,7 +951,7 @@ mod rss {
     pub fn peak_bytes() -> Option<u64> {
         #[cfg(target_os = "linux")]
         {
-            return proc_kb("VmHWM")?.checked_mul(1024);
+            proc_kb("VmHWM")?.checked_mul(1024)
         }
         #[cfg(target_os = "macos")]
         {

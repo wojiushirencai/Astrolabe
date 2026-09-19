@@ -293,14 +293,14 @@ impl Discovery {
     }
 
     fn existing_command(&self, path: &Path) -> Option<PathBuf> {
-        if is_runnable(path) {
-            return Some(path.to_path_buf());
+        if let Some(found) = self.runnable_path(path) {
+            return Some(found);
         }
         if self.windows && path.extension().is_none() {
             for ext in self.pathext() {
                 let with_ext = path.with_extension(ext.trim_start_matches('.'));
-                if is_runnable(&with_ext) {
-                    return Some(with_ext);
+                if let Some(found) = self.runnable_path(&with_ext) {
+                    return Some(found);
                 }
             }
         }
@@ -312,9 +312,43 @@ impl Discovery {
         for dir in &self.path_dirs {
             for name in &names {
                 let candidate = dir.join(name);
-                if is_runnable(&candidate) {
-                    return Some(candidate);
+                if let Some(found) = self.runnable_path(&candidate) {
+                    return Some(found);
                 }
+            }
+        }
+        None
+    }
+
+    /// Like [`is_runnable`], but when `windows` is set also accepts a
+    /// case-insensitive filename match in the same directory.
+    ///
+    /// Real Windows PATH search is case-insensitive. Tests force
+    /// `Discovery.windows = true` on Linux CI, where the filesystem is
+    /// case-sensitive and `PATHEXT` defaults to uppercase (`.CMD`) while
+    /// shims are often written as `.cmd`. Without this fallback the
+    /// `windows_cmd_suffix_is_accepted` unit test fails on Linux runners.
+    fn runnable_path(&self, path: &Path) -> Option<PathBuf> {
+        if is_runnable(path) {
+            return Some(path.to_path_buf());
+        }
+        if !self.windows {
+            return None;
+        }
+        let name = path.file_name()?.to_string_lossy();
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+        let entries = std::fs::read_dir(parent).ok()?;
+        for entry in entries.flatten() {
+            let entry_name = entry.file_name();
+            if !entry_name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(name.as_ref())
+            {
+                continue;
+            }
+            let candidate = entry.path();
+            if is_runnable(&candidate) {
+                return Some(candidate);
             }
         }
         None

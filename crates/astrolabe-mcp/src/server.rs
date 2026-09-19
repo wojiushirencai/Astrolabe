@@ -174,9 +174,7 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
         "module" => K::Module,
         "field" => K::Field,
         other => {
-            return Err(format!(
-                "未知 kind `{other}`；有效值：{VALID_KIND_NAMES}"
-            ));
+            return Err(format!("未知 kind `{other}`；有效值：{VALID_KIND_NAMES}"));
         }
     })
 }
@@ -1208,8 +1206,7 @@ impl AstrolabeServer {
         let remaining = params
             .budget_tokens
             .saturating_sub(estimate_tokens(&header));
-        let (kept, omitted) =
-            truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
+        let (kept, omitted) = truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
         let mut body = header;
         for line in kept {
             body.push_str(line);
@@ -1363,10 +1360,7 @@ impl AstrolabeServer {
                 failed += 1;
                 continue;
             };
-            match astrolabe_core::body::symbol_body(
-                &self.root.join(file.path.as_str()),
-                symbol,
-            ) {
+            match astrolabe_core::body::symbol_body(&self.root.join(file.path.as_str()), symbol) {
                 Ok(text) if !text.is_empty() => {
                     let section = format!("\n----- body @ {line} -----\n{text}");
                     let section_tokens = estimate_tokens(&section);
@@ -1379,9 +1373,7 @@ impl AstrolabeServer {
                         }
                         if available_tokens < 150 {
                             // 前面的符号已展示过、剩余空间过小：省略收尾。
-                            body.push_str(
-                                "\n(include_body: 剩余符号体因 budget_tokens 被省略)\n",
-                            );
+                            body.push_str("\n(include_body: 剩余符号体因 budget_tokens 被省略)\n");
                             break;
                         }
                         let header = format!("\n----- body @ {line} -----\n");
@@ -1403,10 +1395,7 @@ impl AstrolabeServer {
                             shown_lines += 1;
                         }
                         if shown_lines > 0 {
-                            let total_lines = symbol
-                                .end_line
-                                .saturating_sub(symbol.start_line)
-                                + 1;
+                            let total_lines = symbol.end_line.saturating_sub(symbol.start_line) + 1;
                             let note = format!(
                                 "\n... [符号共 {total_lines} 行，受 budget_tokens 限制截断展示前 {shown_lines} 行；查看内部局部代码请使用 Read(offset, limit)] ...\n"
                             );
@@ -1415,9 +1404,7 @@ impl AstrolabeServer {
                             spent += estimate_tokens(&truncated);
                             attached += 1;
                         }
-                        body.push_str(
-                            "\n(include_body: 剩余符号体因 budget_tokens 被省略)\n",
-                        );
+                        body.push_str("\n(include_body: 剩余符号体因 budget_tokens 被省略)\n");
                         break;
                     }
                     spent += section_tokens;
@@ -1501,13 +1488,7 @@ impl AstrolabeServer {
             body.push_str("(未找到匹配的符号)\n");
         }
         if params.include_body && !hits.is_empty() {
-            self.attach_include_bodies(
-                index,
-                &mut body,
-                &hits,
-                kept_count,
-                params.budget_tokens,
-            );
+            self.attach_include_bodies(index, &mut body, &hits, kept_count, params.budget_tokens);
         }
         self.result(
             "find_symbol",

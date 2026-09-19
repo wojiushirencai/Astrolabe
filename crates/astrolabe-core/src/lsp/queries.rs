@@ -285,7 +285,10 @@ fn hover_locate_failed(reason: impl AsRef<str>) -> Precise<Option<String>> {
 /// Strip any references-oriented trails that may have leaked into a site note.
 fn sanitize_hover_site_reason(reason: &str) -> String {
     let mut r = reason.replace(TEXT_SEARCH_HINT, "");
-    r = r.replace("cannot provide precise references", "cannot provide precise hover information");
+    r = r.replace(
+        "cannot provide precise references",
+        "cannot provide precise hover information",
+    );
     // Collapse leftover punctuation/whitespace from stripping the hint.
     while r.contains("  ") {
         r = r.replace("  ", " ");
@@ -1827,11 +1830,7 @@ mod tests {
 
     #[test]
     fn cold_guard_merges_external_note_instead_of_replacing() {
-        let mut server = FakeServer::refs(vec![loc(
-            "file:///usr/lib/go/src/fmt/print.go",
-            1,
-            0,
-        )]);
+        let mut server = FakeServer::refs(vec![loc("file:///usr/lib/go/src/fmt/print.go", 1, 0)]);
         server.busy = true;
         let result = find_references(
             Some(&server),
@@ -1854,10 +1853,7 @@ mod tests {
 
     #[test]
     fn named_hover_skips_unique_definition_anchor_while_server_busy() {
-        let repo = TempRepo::new(&[(
-            "src/main.go",
-            "package p\n\nfunc Run() { helper() }\n",
-        )]);
+        let repo = TempRepo::new(&[("src/main.go", "package p\n\nfunc Run() { helper() }\n")]);
         // Unique def points at another file; while busy that anchor is untrusted.
         let mut server = FakeServer::refs(Vec::new());
         server.busy = true;
