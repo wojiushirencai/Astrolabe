@@ -239,8 +239,7 @@ pub(crate) fn save_counter(path: &Path, counter: &CounterState) {
     let write_ok = (|| -> std::io::Result<()> {
         let file = std::fs::File::create(&tmp_path)?;
         let writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(writer, counter)
-            .map_err(std::io::Error::other)?;
+        serde_json::to_writer(writer, counter).map_err(std::io::Error::other)?;
         Ok(())
     })();
     match write_ok {
