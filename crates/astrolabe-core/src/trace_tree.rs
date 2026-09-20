@@ -122,15 +122,7 @@ fn expand_root(
             cycle: false,
         });
         *budget -= 1;
-        if walk(
-            adj,
-            root,
-            0,
-            max_depth,
-            &mut vec![root],
-            budget,
-            out,
-        ) {
+        if walk(adj, root, 0, max_depth, &mut vec![root], budget, out) {
             cut_short = true;
         }
     }
@@ -209,7 +201,15 @@ pub fn trace_forest(
             continue;
         }
         let mut nodes = Vec::new();
-        if expand_root(direction, &fwd, &rev, root, max_depth, &mut budget, &mut nodes) {
+        if expand_root(
+            direction,
+            &fwd,
+            &rev,
+            root,
+            max_depth,
+            &mut budget,
+            &mut nodes,
+        ) {
             truncated = true;
         }
         entries.push(TraceForestEntry { root, nodes });
@@ -486,9 +486,15 @@ mod tests {
         assert_eq!(f.omitted_roots, 0);
         assert_eq!(f.entries.len(), 2);
         assert_eq!(f.entries[0].root, SymbolId(0));
-        assert_eq!(rows(&f.entries[0].nodes), vec![(0, 0, false), (2, 1, false)]);
+        assert_eq!(
+            rows(&f.entries[0].nodes),
+            vec![(0, 0, false), (2, 1, false)]
+        );
         assert_eq!(f.entries[1].root, SymbolId(1));
-        assert_eq!(rows(&f.entries[1].nodes), vec![(1, 0, false), (2, 1, false)]);
+        assert_eq!(
+            rows(&f.entries[1].nodes),
+            vec![(1, 0, false), (2, 1, false)]
+        );
     }
 
     /// max_nodes=3：第一根收满 3 个节点即截断（剩余子树丢弃），第二根
@@ -566,7 +572,7 @@ mod tests {
             &[SymbolId(9), SymbolId(10)],
             TraceDirection::Callees,
             6,
-            100
+            100,
         );
         assert!(unknown.entries.is_empty());
         assert!(!unknown.truncated && unknown.omitted_roots == 0);
@@ -579,7 +585,10 @@ mod tests {
         );
         assert_eq!(f.entries.len(), 1);
         assert_eq!(f.entries[0].root, SymbolId(0));
-        assert_eq!(rows(&f.entries[0].nodes), vec![(0, 0, false), (1, 1, false)]);
+        assert_eq!(
+            rows(&f.entries[0].nodes),
+            vec![(0, 0, false), (1, 1, false)]
+        );
     }
 
     /// 环语义继承：森林里 A→B→A 仍按"根 → 当前栈"路径截断；根 2 经

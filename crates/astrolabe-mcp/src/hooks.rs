@@ -239,8 +239,7 @@ pub(crate) fn save_counter(path: &Path, counter: &CounterState) {
     let write_ok = (|| -> std::io::Result<()> {
         let file = std::fs::File::create(&tmp_path)?;
         let writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(writer, counter)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        serde_json::to_writer(writer, counter).map_err(std::io::Error::other)?;
         Ok(())
     })();
     match write_ok {
@@ -1428,16 +1427,14 @@ mod tests {
         assert_eq!(code, 2);
         let err_str = String::from_utf8_lossy(&err);
         assert!(
-            err_str.contains("invalid") || err_str.contains("Invalid") || err_str.contains("characters"),
+            err_str.contains("invalid")
+                || err_str.contains("Invalid")
+                || err_str.contains("characters"),
             "stderr={err_str}"
         );
 
         let mut clean_err = Vec::new();
-        let clean_code = run_cleanup_impl(
-            &br#"{"session_id":"a/b"}"#[..],
-            &mut clean_err,
-            None,
-        );
+        let clean_code = run_cleanup_impl(&br#"{"session_id":"a/b"}"#[..], &mut clean_err, None);
         assert_eq!(clean_code, 2);
     }
 
@@ -2286,7 +2283,9 @@ mod tests {
         }
 
         // 计数不增加：NeutralAllow 不写盘，counter.json 保持缺省（全 0、无 deny）
-        let counter_path = get_hook_data_dir(&temp_home, sess_id).unwrap().join("counter.json");
+        let counter_path = get_hook_data_dir(&temp_home, sess_id)
+            .unwrap()
+            .join("counter.json");
         let counter = load_counter(&counter_path);
         assert_eq!(counter, CounterState::default());
 

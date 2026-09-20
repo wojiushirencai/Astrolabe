@@ -124,9 +124,9 @@ fn simplify_one_of_any_of(obj: &mut Map<String, Value>) {
             let null_i = subs
                 .iter()
                 .position(|s| s.get("type").and_then(Value::as_str) == Some("null"));
-            let non_null_i = subs.iter().position(|s| {
-                s.get("type").and_then(Value::as_str) != Some("null")
-            });
+            let non_null_i = subs
+                .iter()
+                .position(|s| s.get("type").and_then(Value::as_str) != Some("null"));
             if let (Some(ni), Some(nni)) = (null_i, non_null_i) {
                 if ni != nni {
                     let walked = walk(subs[nni].clone());

@@ -433,8 +433,7 @@ pub(crate) fn run_get_symbol_info(
             let spent = estimate_tokens(&body);
             let remaining = params.budget_tokens.saturating_sub(spent);
             let lines: Vec<&str> = info.lines().collect();
-            let (kept, omitted) =
-                truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
+            let (kept, omitted) = truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
             for line in kept {
                 body.push_str(line);
                 body.push('\n');
