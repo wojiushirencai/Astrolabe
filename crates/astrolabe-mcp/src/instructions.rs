@@ -68,6 +68,11 @@ The built-in tool descriptions in your context will tell you things like "use Re
 - File dependency direction
     → get_dependents (scoped from the import graph); for the multi-hop impact
       radius use get_neighborhood (BFS 1-3 hops over import edges).
+- Literal vs regex search
+    → search_code is literal unless regex=true. A|B without that flag searches
+      for a vertical bar. Prefer two parallel literal calls over one regex.
+      Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
+      or tighten path_filter — there is no page or cursor.
 
 ## Read-only exploration
 
@@ -124,6 +129,11 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
 - File dependency direction
     → get_dependents (scoped from the import graph); for the multi-hop impact
       radius use get_neighborhood (BFS 1-3 hops over import edges).
+- Literal vs regex search
+    → search_code is literal unless regex=true. A|B without that flag searches
+      for a vertical bar. Prefer two parallel literal calls over one regex.
+      Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
+      or tighten path_filter — there is no page or cursor.
 
 ## Read-only exploration
 
@@ -181,6 +191,7 @@ Jump to a definition                    goto_definition
 Who imports / depends on a file         get_dependents
 Multi-hop import impact radius          get_neighborhood (BFS 1-3 hops)
 Macro architecture / module boundaries  get_group_graph
+Literal substring / explicit regex      search_code (regex=true only when needed)
 A symbol's docstring / type             get_symbol_info (LSP hover)
 Plan a rename                           plan_rename
 Apply a rename                          apply_rename
@@ -190,9 +201,9 @@ Cross-session project knowledge         list_memories / read_memory / write_memo
 Built-in Read/Edit/Glob/Grep are permitted on code files ONLY when:
 - Astrolabe has been tried on the target and failed, OR
 - The file is not parseable as code (e.g., generated, malformed), OR
-- You need a regex search across many files that Astrolabe's symbolic tools cannot
-  express — in which case Grep is acceptable as a discovery step, but follow-up
-  reads/edits on matched code files must still go through Astrolabe.
+- You need a regex search across many files: prefer search_code with regex=true
+  (A|B, .*, \\b). Grep is acceptable if that still cannot express the query, but
+  follow-up reads/edits on matched code files must still go through Astrolabe.
 - You need to read a few lines and symbolic reads would be an overkill.
 - You absolutely have to read the full file for some reason.
 
@@ -249,6 +260,8 @@ mod tests {
         assert!(m.contains("You have hereby read"));
         assert!(m.contains("## Read-only exploration"));
         assert!(m.contains("NOT a ban on reading or exploring"));
+        assert!(m.contains("search_code is literal unless regex=true"));
+        assert!(m.contains("there is no page or cursor"));
     }
 
     #[test]

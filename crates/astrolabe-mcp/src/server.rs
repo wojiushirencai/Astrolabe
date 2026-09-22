@@ -48,6 +48,55 @@ fn default_budget() -> usize {
     DEFAULT_BUDGET
 }
 
+/// Heuristic: query looks like a regex but `regex` was left false.
+/// `|` / `.*` / `\b` 是上一会话假阴性的主因；单独的 `.` 不警告（`foo.bar` 常为字面搜索）。
+fn looks_like_regex_query(query: &str) -> bool {
+    query.contains('|')
+        || query.contains(".*")
+        || query.contains(".+")
+        || query.contains("\\b")
+        || query.contains("\\s")
+        || query.contains("\\d")
+        || query.contains("\\w")
+        || query.contains("(?")
+        || (query.starts_with('^') && query.len() > 1)
+        || (query.ends_with('$') && query.len() > 1 && !query.ends_with("\\$"))
+}
+
+fn quote_query_for_note(query: &str) -> String {
+    const MAX: usize = 80;
+    let count = query.chars().count();
+    if count <= MAX {
+        return query.to_string();
+    }
+    let clipped: String = query.chars().take(MAX).collect();
+    format!("{clipped}…")
+}
+
+fn render_search_mode_header(regex: bool, query: &str) -> String {
+    let mode = if regex { "regex" } else { "literal" };
+    let mut header = format!("mode: {mode}\n");
+    if !regex && looks_like_regex_query(query) {
+        header.push_str(&format!(
+            "注意：query 含正则元字符，但 regex=false，已按字面搜索「{}」。要按正则请传 regex=true；多符号请拆成多次字面搜索。\n",
+            quote_query_for_note(query)
+        ));
+    }
+    header
+}
+
+/// Claude Code 默认丢弃 structuredContent，截断声明必须出现在正文。
+fn render_budget_status(shown: usize, omitted: usize, budget_tokens: usize) -> String {
+    let truncated = omitted > 0;
+    let mut status = format!("shown={shown} omitted={omitted} truncated={truncated}\n");
+    if truncated {
+        status.push_str(&format!(
+            "这不是全集：{omitted} 条因 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查；本工具没有翻页。\n"
+        ));
+    }
+    status
+}
+
 /// Parse `ASTROLABE_CACHE_MB` (whole megabytes). Invalid values fall back to
 /// the core default so a typo cannot silently disable the ceiling.
 fn parse_cache_budget_mb(raw: Option<&str>) -> u64 {
@@ -181,13 +230,24 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
-    #[schemars(description = "Source text or regular expression to search for")]
+    #[schemars(
+        description = "Search string. Literal case-insensitive substring unless regex=true. Do not put A|B here without regex=true — that searches for a vertical bar."
+    )]
     pub query: String,
     #[serde(default)]
+    #[schemars(
+        description = "Default false: treat query as literal text. Set true to compile query as a regular expression. Required for A|B, .*, \\b, and other regex syntax."
+    )]
     pub regex: bool,
     #[serde(default)]
+    #[schemars(
+        description = "Optional case-sensitive substring of the repo-relative path (e.g. relay/channel). Not a glob. Do not pass an absolute path or a ./ prefix."
+    )]
     pub path_filter: Option<String>,
     #[serde(default = "default_budget")]
+    #[schemars(
+        description = "Maximum approximate tokens in the rendered result (default 2500). Overflow drops later hits and sets truncated=true; raise this or tighten path_filter — there is no page or cursor."
+    )]
     pub budget_tokens: usize,
 }
 
@@ -887,13 +947,16 @@ impl AstrolabeServer {
             let (kept, omitted) =
                 truncate_ranked(&lines, params.budget_tokens, |line| format!("{line}\n"));
             let kept_count = kept.len();
+            let truncated = omitted > 0;
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
+            body.push_str(&render_budget_status(
+                kept_count,
+                omitted,
+                params.budget_tokens,
+            ));
             for line in kept {
                 body.push_str(line);
                 body.push('\n');
-            }
-            if omitted > 0 {
-                body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
             }
             // 零命中时显式声明（对齐 find_references 空结果约定），并跳过
             // include_body 附加，避免误导性的"无可提取的符号体"。
@@ -912,13 +975,20 @@ impl AstrolabeServer {
             self.result(
                 "find_symbol",
                 body,
-                json!({"confidence":"syntactic","matches":lines.len(),"budget_tokens":params.budget_tokens}),
+                json!({
+                    "confidence": "syntactic",
+                    "matches": lines.len(),
+                    "shown": kept_count,
+                    "omitted": omitted,
+                    "truncated": truncated,
+                    "budget_tokens": params.budget_tokens
+                }),
             )
         })
     }
 
     #[tool(
-        description = "在已索引源码中搜索字面文本，返回匹配行和 path:line 锚点。Discovery only; edits and renames must be driven by find_references."
+        description = "Search indexed source for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references."
     )]
     pub(crate) fn search_code(
         &self,
@@ -963,12 +1033,7 @@ impl AstrolabeServer {
                         line.to_lowercase().contains(&needle)
                     };
                     if matched {
-                        matches.push(format!(
-                            "@{}:{} {}",
-                            file.path,
-                            line_no + 1,
-                            line.trim()
-                        ));
+                        matches.push(format!("@{}:{} {}", file.path, line_no + 1, line.trim()));
                     }
                 }
             }
@@ -983,7 +1048,14 @@ impl AstrolabeServer {
             );
             let (kept, omitted) =
                 truncate_ranked(&matches, params.budget_tokens, |line| format!("{line}\n"));
-            let mut body = "confidence: exact (磁盘源码字面匹配)\n".to_string();
+            let shown = kept.len();
+            let truncated = omitted > 0;
+            let mode = if params.regex { "regex" } else { "literal" };
+            let mut body = format!(
+                "confidence: exact (磁盘源码字面匹配)\n{}",
+                render_search_mode_header(params.regex, &params.query)
+            );
+            body.push_str(&render_budget_status(shown, omitted, params.budget_tokens));
             for line in kept {
                 body.push_str(line);
                 body.push('\n');
@@ -993,13 +1065,18 @@ impl AstrolabeServer {
             if matches.is_empty() {
                 body.push_str("(未找到匹配的代码行)\n");
             }
-            if omitted > 0 {
-                body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
-            }
             self.result(
                 "search_code",
                 body,
-                json!({"confidence":"exact","matches":matches.len(),"budget_tokens":params.budget_tokens}),
+                json!({
+                    "confidence": "exact",
+                    "mode": mode,
+                    "matches": matches.len(),
+                    "shown": shown,
+                    "omitted": omitted,
+                    "truncated": truncated,
+                    "budget_tokens": params.budget_tokens
+                }),
             )
         })
     }
@@ -1473,15 +1550,18 @@ impl AstrolabeServer {
         let (kept, omitted) =
             truncate_ranked(&lines, params.budget_tokens, |line| format!("{line}\n"));
         let kept_count = kept.len();
+        let truncated = omitted > 0;
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
                 .to_string();
+        body.push_str(&render_budget_status(
+            kept_count,
+            omitted,
+            params.budget_tokens,
+        ));
         for line in kept {
             body.push_str(line);
             body.push('\n');
-        }
-        if omitted > 0 {
-            body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
         }
         // 零命中时显式声明，避免只剩 confidence 元信息的歧义输出。
         if hits.is_empty() {
@@ -1493,7 +1573,15 @@ impl AstrolabeServer {
         self.result(
             "find_symbol",
             body,
-            json!({"confidence":"syntactic","matches":lines.len(),"path_query":true,"budget_tokens":params.budget_tokens}),
+            json!({
+                "confidence": "syntactic",
+                "matches": lines.len(),
+                "shown": kept_count,
+                "omitted": omitted,
+                "truncated": truncated,
+                "path_query": true,
+                "budget_tokens": params.budget_tokens
+            }),
         )
     }
 
@@ -1830,6 +1918,18 @@ mod tests {
         server
     }
 
+    #[test]
+    fn looks_like_regex_query_catches_alternation_and_skips_dotted_names() {
+        assert!(looks_like_regex_query(
+            "scanForBrandHint|RewriteStreamingBody"
+        ));
+        assert!(looks_like_regex_query("foo.*bar"));
+        assert!(looks_like_regex_query("\\bHermes\\b"));
+        assert!(!looks_like_regex_query("foo.bar"));
+        assert!(!looks_like_regex_query("RewriteClaudeBody"));
+        assert!(!looks_like_regex_query("$"));
+    }
+
     fn assert_first_text(result: CallToolResult) {
         let text = result
             .content
@@ -2011,7 +2111,9 @@ mod tests {
             budget_tokens: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
-        assert!(text.contains("因 budget_tokens 被省略"));
+        assert!(text.contains("truncated=true"), "{text}");
+        assert!(text.contains("这不是全集"), "{text}");
+        assert!(text.contains("budget_tokens=0 被省略"), "{text}");
         assert!(
             result.structured_content.is_none(),
             "Claude Code replaces text with structuredContent; default is text-only"
@@ -2221,10 +2323,101 @@ mod tests {
         assert!(text.contains("(未找到匹配的代码行)"), "{text}");
         // confidence 元信息保留，供宿主客户端区分索引根上下文。
         assert!(text.contains("confidence: exact"), "{text}");
+        assert!(text.contains("mode: literal"), "{text}");
+        assert!(text.contains("shown=0 omitted=0 truncated=false"), "{text}");
         // 空结果不应误报截断省略。
         assert!(!text.contains("被省略"), "{text}");
+        assert!(!text.contains("这不是全集"), "{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_warns_when_regex_metacharacters_are_literal() {
+        let (server, dir) = ready_server_with_disk();
+        let result = server.search_code(Parameters(SearchParams {
+            query: "scanForBrandHint|RewriteStreamingBody".into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: 1000,
+        }));
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        assert!(text.contains("mode: literal"), "{text}");
+        assert!(text.contains("regex=false"), "{text}");
+        assert!(
+            text.contains("scanForBrandHint|RewriteStreamingBody"),
+            "{text}"
+        );
+        assert!(text.contains("(未找到匹配的代码行)"), "{text}");
+        assert!(!text.contains("truncated=true"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_truncation_is_declared_in_text() {
+        let dir = unique_temp_dir();
+        let mut source = String::from("needle = 0\n");
+        for i in 1..40 {
+            source.push_str(&format!("needle = {i}\n"));
+        }
+        std::fs::write(dir.join("hits.py"), source).unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = true;
+
+        let result = server.search_code(Parameters(SearchParams {
+            query: "needle".into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: 20,
+        }));
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        assert!(text.contains("mode: literal"), "{text}");
+        assert!(text.contains("truncated=true"), "{text}");
+        assert!(text.contains("这不是全集"), "{text}");
+        assert!(text.contains("本工具没有翻页"), "{text}");
+        assert!(!text.contains("regex=false，已按字面搜索"), "{text}");
+        let structured = result.structured_content.expect("opt-in structured");
+        assert_eq!(structured["truncated"], json!(true));
+        assert_eq!(structured["mode"], json!("literal"));
+        assert!(structured["omitted"].as_u64().unwrap() > 0, "{structured}");
+        assert_eq!(structured["matches"], json!(40));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_schema_describes_literal_default_and_regex_flag() {
+        let server = ready_server();
+        let tools = server.listed_tools();
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == "search_code")
+            .expect("search_code in catalog");
+        let schema = Value::Object((*search.input_schema).clone());
+        let query = schema.pointer("/properties/query/description").unwrap();
+        let regex = schema.pointer("/properties/regex/description").unwrap();
+        let path_filter = schema
+            .pointer("/properties/path_filter/description")
+            .unwrap();
+        let budget = schema
+            .pointer("/properties/budget_tokens/description")
+            .unwrap();
+        let tool_desc = search.description.as_deref().unwrap_or("");
+        assert!(query.as_str().unwrap().contains("regex=true"), "{query}");
+        assert!(regex.as_str().unwrap().contains("Default false"), "{regex}");
+        assert!(
+            path_filter.as_str().unwrap().contains("case-sensitive"),
+            "{path_filter}"
+        );
+        assert!(
+            budget.as_str().unwrap().contains("no page or cursor"),
+            "{budget}"
+        );
+        assert!(tool_desc.contains("regex=true"), "{tool_desc}");
+        assert!(tool_desc.contains("no pagination"), "{tool_desc}");
     }
 
     #[test]

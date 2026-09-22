@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe/win32-x64-msvc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The Windows x86_64 MSVC binary for astrolabe (x86_64-pc-windows-msvc)",
   "license": "MIT OR Apache-2.0",
   "repository": {

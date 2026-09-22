@@ -2,11 +2,17 @@
 
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-仓库尚无 git tag，也未发布到 crates.io / npm。当前 workspace 版本是 `0.1.0`。
+crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当前 workspace 版本见 `[workspace.package]`。
 
 ## [Unreleased]
 
-尚未打 tag。下列条目描述工作区里已经落地、将作为 **0.1.0** 发布的能力。实现范围以源码为准；未接线的契约单独列出。
+### Fixed
+
+- **`search_code` 字面/正则与截断声明。** 默认字面搜索（`regex=false`）；`A|B` 等正则语法必须显式 `regex=true`。`query` / `regex` / `path_filter` / `budget_tokens` 补齐 schema 说明。结果正文回显 `mode: literal|regex`，字面模式下 query 含 `|`、`.*`、`\b` 等元字符时给出警告；`search_code` / `find_symbol` 每条结果声明 `shown` / `omitted` / `truncated`（Claude Code 默认丢弃 structuredContent，故写入正文）。不做翻页：需要更多命中时加大 `budget_tokens` 或收紧 `path_filter`。
+
+## [0.1.1] - 2026-09-22
+
+首个 tag release（`v0.1.1`），内容与上方条目相同。
 
 ### Added
 
@@ -36,6 +42,6 @@
 - 同类工具四次全库引用搜索让 LSP 子进程 186 MB → 719 MB，94% 的增长在宿主外。本项目不常驻语言服务器。
 - OpenVisio 静默 `catch` 丢掉约 20% 文件（205/1026）；WASM 解析器泄漏到 5 GB RSS。本项目把这两条当成缺陷，而不是「以后再加日志」。
 
-## [0.1.0] - 未发布
+## [0.1.0] - 2026-09-19
 
-尚未打 `v0.1.0`。发布时把本节日期补上，并把 [Unreleased] 里已交付的条目移到此处。tag 与 `Cargo.toml` 版本必须一致，见 `.github/RELEASING.md`。
+开源初始版本（未单独打 tag；tag 与 `Cargo.toml` 版本必须一致，见 `.github/RELEASING.md`）。

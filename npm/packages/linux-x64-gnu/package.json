@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe/linux-x64-gnu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The Linux x86_64 glibc binary for astrolabe (x86_64-unknown-linux-gnu)",
   "license": "MIT OR Apache-2.0",
   "repository": {

@@ -1,6 +1,6 @@
 {
   "name": "astrolabe-npm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Private workspace for packing and publishing the astrolabe npm distribution",
   "workspaces": [
