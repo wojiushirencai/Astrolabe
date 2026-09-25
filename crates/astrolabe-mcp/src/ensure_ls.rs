@@ -4,8 +4,9 @@
 //! plan and **do not** download.
 //! With `confirm_install=true`: call [`LanguageServerInstaller::install`].
 //!
-//! The core artifact installer may still be a stub ([`StubInstaller`]); the
-//! prompt contract ships either way (RFC-P0 §2).
+//! [`StubInstaller`] plans from discovery and, on confirm, calls
+//! [`astrolabe_core::lsp::ensure_installed`] when a catalog spec exists;
+//! otherwise returns TODO/`NotImplemented` (RFC-P0 §2 prompt contract).
 
 use astrolabe_core::lsp::install::{
     parse_language_name, InstallError, InstallPlan, LanguageServerInstaller, LspStatus,

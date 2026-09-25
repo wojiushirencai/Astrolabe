@@ -188,7 +188,7 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `find_symbol` | `query` | **快速定位符号**：按名字或子串秒搜函数、类或类型定义，直接返回 `文件:行号` 锚点。 |
 | `search_code` | `query`, `path_filter` | **确定性代码全文检索**：带正则与路径过滤的精准文本查找。 |
 | `trace_calls` | `symbol` | **调用链分析**：快速追踪函数的上下游调用关系。 |
-| `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数。 |
+| `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。 |
 
 ### 2. 精确层工具（按需拉起语言服务器，精确到编译器级别）
 
@@ -197,6 +197,8 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `find_references` | `symbol`, `path` | **编译器级引用查找**：找到全库中所有调用该符号的准确位置，绝不漏报。 |
 | `goto_definition` | `path`, `symbol` | **精准定义跳转**：利用 LSP 语义绑定直达真实定义处，而非靠名字瞎猜。 |
 | `get_diagnostics` | `path` | **改后即时体检**：获取当前文件的语法报错与类型错误，确认写完的代码是否成立。 |
+| `get_symbol_info` | `path`, `symbol` | **符号语义信息**：LSP hover（文档串 / 类型 / 签名），不必整文件阅读。 |
+| `ensure_language_server` | `language`, `confirm_install` | **会话确认安装语言服务器**：默认只返回 needs_install 计划（latest，不下载）；用户同意后再 `confirm_install=true` 调用安装器。精确工具 Unavailable 时先问用户再调此工具。 |
 | `plan_rename` | `symbol`, `new_name`, `path` | **重命名预演**：在安全修改前先列出改动清单供审查，绝不贸然写盘。 |
 | `apply_rename` | `symbol`, `new_name`, `path` | **安全批量重命名**：真正执行跨文件改名；写后自动重新编译解析，一旦报错立即安全回滚。 |
 
