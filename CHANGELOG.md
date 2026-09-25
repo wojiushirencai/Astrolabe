@@ -8,6 +8,14 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ### Added
 
+- **PHP tree-sitter + LSP discovery (P0).** `.php` maps to `Language::Php` with
+  `tree-sitter-php` (`LANGUAGE_PHP`) and embedded symbols/imports/calls queries.
+  Discovery prefers `intelephense --stdio` (`npm i -g intelephense`; free tier
+  works without a key; premium needs a purchased `INTELEPHENSE_LICENSE_KEY` —
+  no pirated keys), then `phpactor language-server` (MIT, PHP 8.1+; composer
+  global or phar). Override via `ASTROLABE_LSP_PHP`. Include/require paths
+  capture `string_content` for both `string` and `encapsed_string`.
+
 - **Vue SFC indexing + Volar discovery (P0).** `.vue` is a first-class
   `Language::Vue`. Indexing extracts `<script>` / `<script setup>` (JS/TS/TSX)
   into the shared parse pipeline — `tree-sitter-vue` is ABI-incompatible with

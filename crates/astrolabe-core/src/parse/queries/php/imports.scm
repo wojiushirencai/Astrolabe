@@ -1,9 +1,9 @@
 ;; PHP import / include specifiers (tree-sitter-php 0.24).
 ;;
 ;; `@import` — `use` clause path (namespace\Name) or include/require path.
-;; Quotes on string includes are stripped by `extract_imports` via `unquote`.
-;; `namespace_use` is captured for graph display; filesystem resolution of
-;; `use` is not attempted (same narrow policy as OpenVisio).
+;; Double-quoted paths are `encapsed_string` with `string_content`; single-quoted
+;; are `string` with `string_content`. Capturing `string_content` avoids quotes;
+;; whole-string fallbacks still work via `extract_imports` `unquote`.
 
 (namespace_use_clause
   [
@@ -12,13 +12,25 @@
   ])
 
 (include_expression
-  (string) @import)
+  [
+    (string (string_content) @import)
+    (encapsed_string (string_content) @import)
+  ])
 
 (include_once_expression
-  (string) @import)
+  [
+    (string (string_content) @import)
+    (encapsed_string (string_content) @import)
+  ])
 
 (require_expression
-  (string) @import)
+  [
+    (string (string_content) @import)
+    (encapsed_string (string_content) @import)
+  ])
 
 (require_once_expression
-  (string) @import)
+  [
+    (string (string_content) @import)
+    (encapsed_string (string_content) @import)
+  ])
