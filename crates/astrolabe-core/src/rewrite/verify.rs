@@ -24,7 +24,7 @@ use crate::types::{Language, RelPath};
 use super::RewriteError;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
-const LANGUAGES: [Language; 7] = [
+const LANGUAGES: [Language; 10] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -32,6 +32,9 @@ const LANGUAGES: [Language; 7] = [
     Language::TypeScript,
     Language::Tsx,
     Language::JavaScript,
+    Language::Php,
+    Language::C,
+    Language::Cpp,
 ];
 
 /// Parse-health of one file, captured before or after a rewrite.
@@ -133,7 +136,7 @@ impl Verifier {
     }
 
     fn parse_tree(&self, lang: Language, source: &str) -> Option<Tree> {
-        let mut slot = self.parsers[language_index(lang)].lock().ok()?;
+        let mut slot = self.parsers[language_index(lang)?].lock().ok()?;
         let parser = slot.as_mut()?;
 
         let deadline = Instant::now() + self.budget;
@@ -246,8 +249,8 @@ fn count_error_nodes_at(cursor: &mut TreeCursor<'_>) -> u32 {
     total
 }
 
-fn language_index(lang: Language) -> usize {
-    match lang {
+fn language_index(lang: Language) -> Option<usize> {
+    Some(match lang {
         Language::Python => 0,
         Language::Go => 1,
         Language::Java => 2,
@@ -255,11 +258,15 @@ fn language_index(lang: Language) -> usize {
         Language::TypeScript => 4,
         Language::Tsx => 5,
         Language::JavaScript => 6,
-    }
+        Language::Php => 7,
+        Language::C => 8,
+        Language::Cpp => 9,
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+    })
 }
 
-fn grammar(lang: Language) -> tree_sitter::Language {
-    match lang {
+fn grammar(lang: Language) -> Option<tree_sitter::Language> {
+    Some(match lang {
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Java => tree_sitter_java::LANGUAGE.into(),
@@ -267,12 +274,16 @@ fn grammar(lang: Language) -> tree_sitter::Language {
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-    }
+        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Language::C => tree_sitter_c::LANGUAGE.into(),
+        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+    })
 }
 
 fn configured_parser(lang: Language) -> Option<Parser> {
     let mut parser = Parser::new();
-    parser.set_language(&grammar(lang)).ok()?;
+    parser.set_language(&grammar(lang)?).ok()?;
     Some(parser)
 }
 
@@ -377,7 +388,7 @@ mod tests {
 
         // Dropping the pooled parser is the same outcome as parse() returning
         // None (timeout / NoTree): a file that had a tree now has none.
-        *verifier.parsers[language_index(Language::JavaScript)]
+        *verifier.parsers[language_index(Language::JavaScript).expect("js")]
             .lock()
             .unwrap() = None;
         let err = verifier.verify(&before, [(&p, src)]).unwrap_err();
@@ -393,7 +404,7 @@ mod tests {
     fn already_unparseable_stays_unparseable_and_does_not_block() {
         let p = path("forever.js");
         let verifier = Verifier::new();
-        *verifier.parsers[language_index(Language::JavaScript)]
+        *verifier.parsers[language_index(Language::JavaScript).expect("js")]
             .lock()
             .unwrap() = None;
         let snap = verifier.snapshot([(&p, "function f() {}\n")]);

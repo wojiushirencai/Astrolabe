@@ -6,6 +6,34 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Added
+
+- **PHP tree-sitter + LSP discovery (P0).** `.php` maps to `Language::Php` with
+  `tree-sitter-php` (`LANGUAGE_PHP`) and embedded symbols/imports/calls queries.
+  Discovery prefers `intelephense --stdio` (`npm i -g intelephense`; free tier
+  works without a key; premium needs a purchased `INTELEPHENSE_LICENSE_KEY` —
+  no pirated keys), then `phpactor language-server` (MIT, PHP 8.1+; composer
+  global or phar). Override via `ASTROLABE_LSP_PHP`. Include/require paths
+  capture `string_content` for both `string` and `encapsed_string`.
+
+- **Vue SFC indexing + Volar discovery (P0).** `.vue` is a first-class
+  `Language::Vue`. Indexing extracts `<script>` / `<script setup>` (JS/TS/TSX)
+  into the shared parse pipeline — `tree-sitter-vue` is ABI-incompatible with
+  tree-sitter 0.27, so embedding is intentional. LSP discovery probes
+  `vue-language-server` (`npm i -g @vue/language-server`, override
+  `ASTROLABE_LSP_VUE`). P0 is **single-process Volar only**; Serena-style
+  dual-server / `@vue/typescript-plugin` coordination is an explicit follow-up,
+  not a silent fallback.
+
+- **Session-gated language-server install UX (MCP).** Precise tools that hit
+  `Unavailable` now name the server and tell the model to ask the user, then
+  call `ensure_language_server`. Without `confirm_install` the tool returns a
+  `needs_install` plan (name, `version_policy=latest`, size if known) and does
+  not download; with `confirm_install=true` it calls the core installer trait
+  (currently a stub/`TODO` until the artifact installer merges).
+  `get_languages` rows include `Ready` / `needs_install` / `AST-only`. L1/L2
+  instructions and precise-tool descriptions document the gate.
+
 ### Fixed
 
 - **`search_code` 字面/正则与截断声明。** 默认字面搜索（`regex=false`）；`A|B` 等正则语法必须显式 `regex=true`。`query` / `regex` / `path_filter` / `budget_tokens` 补齐 schema 说明。结果正文回显 `mode: literal|regex`，字面模式下 query 含 `|`、`.*`、`\b` 等元字符时给出警告；`search_code` / `find_symbol` 每条结果声明 `shown` / `omitted` / `truncated`（Claude Code 默认丢弃 structuredContent，故写入正文）。不做翻页：需要更多命中时加大 `budget_tokens` 或收紧 `path_filter`。

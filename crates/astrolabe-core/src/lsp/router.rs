@@ -246,6 +246,17 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             "typescript-language-server (`npm i -g typescript-language-server typescript`)"
         }
+        Language::Swift => {
+            "sourcekit-lsp (`xcode-select --install` / Xcode; set ASTROLABE_LSP_SWIFT)"
+        }
+        Language::ObjC | Language::ObjCpp => {
+            "sourcekit-lsp (preferred) or clangd (`xcode-select --install` / `brew install llvm`)"
+        }
+        Language::C | Language::Cpp => "clangd (`brew install llvm` or set ASTROLABE_LSP_C)",
+        Language::Php => "intelephense (`npm i -g intelephense` or set ASTROLABE_LSP_PHP)",
+        Language::Vue => {
+            "vue-language-server (`npm i -g @vue/language-server` or set ASTROLABE_LSP_VUE)"
+        }
     }
 }
 
@@ -258,6 +269,10 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Java => "jdtls",
         Language::Rust => "rust-analyzer",
         Language::TypeScript | Language::Tsx | Language::JavaScript => "typescript-language-server",
+        Language::Swift | Language::ObjC | Language::ObjCpp => "sourcekit-lsp",
+        Language::C | Language::Cpp => "clangd",
+        Language::Php => "intelephense",
+        Language::Vue => "vue-language-server",
     }
 }
 

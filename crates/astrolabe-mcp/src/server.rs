@@ -736,6 +736,20 @@ impl AstrolabeServer {
     }
 
     #[tool(
+        description = "Session-gated language-server install. Without confirm_install (default): return needs_install plan (name, version_policy=latest, size if known) and do NOT download. With confirm_install=true: call core installer after the user agrees. Prefer this over silent downloads when precise tools report Unavailable."
+    )]
+    pub(crate) fn ensure_language_server(
+        &self,
+        Parameters(params): Parameters<crate::ensure_ls::EnsureLanguageServerParams>,
+    ) -> CallToolResult {
+        // Does not need the index; discovery is PATH/env based.
+        self.finish(crate::ensure_ls::run_ensure_language_server(
+            params,
+            &crate::ensure_ls::default_installer(),
+        ))
+    }
+
+    #[tool(
         description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep."
     )]
     pub(crate) fn resolve_context(
@@ -811,7 +825,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。REQUIRED for any rename/rewrite decision — grep matches text, not bindings."
+        description = "精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings."
     )]
     pub(crate) fn find_references(
         &self,
@@ -824,7 +838,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "精确定义跳转：语言服务器绑定解析；不要用 find_symbol 代替（那是句法名字匹配）。The sanctioned way to resolve a definition — not Read/grep."
+        description = "精确定义跳转：语言服务器绑定解析；不要用 find_symbol 代替（那是句法名字匹配）。LSP Unavailable → ask user, then ensure_language_server. The sanctioned way to resolve a definition — not Read/grep."
     )]
     pub(crate) fn goto_definition(
         &self,
@@ -837,7 +851,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "文件诊断：语法与类型错误，用于改写后确认代码仍然成立。MUST run after editing a file to confirm it still holds."
+        description = "文件诊断：语法与类型错误，用于改写后确认代码仍然成立。LSP Unavailable → ensure_language_server (user-gated). MUST run after editing a file to confirm it still holds."
     )]
     pub(crate) fn get_diagnostics(
         &self,
@@ -850,7 +864,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "符号语义信息（LSP hover：docstring/类型/签名，Serena include_info 对应物）。Docstrings without reading the file — pair with find_symbol anchors."
+        description = "符号语义信息（LSP hover：docstring/类型/签名）。LSP Unavailable → ensure_language_server (ask user first). Docstrings without reading the file — pair with find_symbol anchors."
     )]
     pub(crate) fn get_symbol_info(
         &self,
@@ -863,7 +877,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "生成重命名计划，只产出待改位置与置信度，不写盘。Always plan before apply_rename; NEVER hand-edit occurrences for a rename."
+        description = "生成重命名计划，只产出待改位置与置信度，不写盘。Needs LSP; if Unavailable ask user then ensure_language_server. Always plan before apply_rename; NEVER hand-edit occurrences for a rename."
     )]
     pub(crate) fn plan_rename(
         &self,
@@ -1727,7 +1741,9 @@ impl AstrolabeServer {
         })
     }
 
-    #[tool(description = "统计已索引仓库的语言、文件数与代码行数。Index coverage check.")]
+    #[tool(
+        description = "统计已索引仓库的语言、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。Index coverage + session-gated install status."
+    )]
     pub(crate) fn get_languages(
         &self,
         Parameters(params): Parameters<BudgetOnly>,
@@ -1741,9 +1757,23 @@ impl AstrolabeServer {
                     total.1 += u64::from(file.loc);
                 }
             }
+            let installer = crate::ensure_ls::default_installer();
+            let status_by_name: std::collections::BTreeMap<&str, _> = installer
+                .probed_statuses()
+                .into_iter()
+                .map(|(lang, status)| (lang.name(), status))
+                .collect();
             let mut rows: Vec<_> = totals
                 .into_iter()
-                .map(|(language, (files, loc))| format!("{language}: {files} files, {loc} LOC"))
+                .map(|(language, (files, loc))| {
+                    let suffix = status_by_name
+                        .get(language)
+                        .map(|s| s.summary_suffix())
+                        .unwrap_or_else(|| {
+                            " — AST-only (language server probe not wired)".to_string()
+                        });
+                    format!("{language}: {files} files, {loc} LOC{suffix}")
+                })
                 .collect();
             rows.sort_by(|a, b| b.cmp(a));
             let (kept, omitted) =
@@ -1759,8 +1789,12 @@ impl AstrolabeServer {
                 "file cache occupancy"
             );
             let mut body = format!(
-                "confidence: exact (来自已扫描文件元数据)\n\
-                 file_cache: {cache_bytes}/{} bytes, hits={cache_hits}, misses={cache_misses}\n",
+                "confidence: exact (来自已扫描文件元数据 + LSP discovery)\n\
+                 file_cache: {cache_bytes}/{} bytes, hits={cache_hits}, misses={cache_misses}\n\
+                 LSP status: Ready = server on PATH; needs_install = ask user then \
+                 ensure_language_server; AST-only = parse/index only (server not wired).\n\
+                 Install is session-gated: ensure_language_server without confirm returns a \
+                 plan only (latest, no download).\n",
                 self.cache_budget_bytes
             );
             for row in kept {

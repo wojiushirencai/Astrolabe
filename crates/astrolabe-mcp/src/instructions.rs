@@ -18,7 +18,9 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
          当前索引根 index_root: {}。每条工具结果第一行会重复该绝对路径；\
          若与你正在编辑的仓库不符，不要用这些路径读文件。\
          先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
-         scoped 来自 import 图，syntactic 来自名字匹配且需要核验。",
+         scoped 来自 import 图，syntactic 来自名字匹配且需要核验。\
+         语言服务器安装是 session-gated：精确工具 Unavailable 时先问用户，\
+         再 ensure_language_server（默认只出计划；confirm_install=true 才安装）。",
         root.display()
     )
 }
@@ -73,6 +75,27 @@ The built-in tool descriptions in your context will tell you things like "use Re
       for a vertical bar. Prefer two parallel literal calls over one regex.
       Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
       or tighten path_filter — there is no page or cursor.
+
+## Language-server install (session-gated)
+
+Precise tools (`find_references`, `goto_definition`, `get_diagnostics`,
+`get_symbol_info`, `plan_rename` / `apply_rename`) need a language server.
+If one is missing they return `confidence: unknown` with the server name and
+do **not** download anything.
+
+When that happens:
+1. Tell the user which server is missing (see the tool text / `get_languages`
+   Ready / needs_install / AST-only rows).
+2. Ask whether to install it in this session.
+3. Only after they agree, call `ensure_language_server` with
+   `confirm_install=true` (and optional `version` pin). Without confirm the
+   tool returns a needs_install plan (name, version_policy=latest, size if
+   known) and performs no download.
+4. If the user declines or the client is non-interactive, leave the server
+   unavailable — do not invent a silent fallback.
+
+Never treat ordinary discovery, indexing, or a read-only precise query as
+permission to install.
 
 ## Read-only exploration
 
@@ -135,6 +158,27 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
       Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
       or tighten path_filter — there is no page or cursor.
 
+## Language-server install (session-gated)
+
+Precise tools (`find_references`, `goto_definition`, `get_diagnostics`,
+`get_symbol_info`, `plan_rename` / `apply_rename`) need a language server.
+If one is missing they return `confidence: unknown` with the server name and
+do **not** download anything.
+
+When that happens:
+1. Tell the user which server is missing (see the tool text / `get_languages`
+   Ready / needs_install / AST-only rows).
+2. Ask whether to install it in this session.
+3. Only after they agree, call `ensure_language_server` with
+   `confirm_install=true` (and optional `version` pin). Without confirm the
+   tool returns a needs_install plan (name, version_policy=latest, size if
+   known) and performs no download.
+4. If the user declines or the client is non-interactive, leave the server
+   unavailable — do not invent a silent fallback.
+
+Never treat ordinary discovery, indexing, or a read-only precise query as
+permission to install.
+
 ## Read-only exploration
 
 All Astrolabe tools except `apply_rename` are read-only. Read-only tasks (surveys,
@@ -196,6 +240,8 @@ A symbol's docstring / type             get_symbol_info (LSP hover)
 Plan a rename                           plan_rename
 Apply a rename                          apply_rename
 Check a file after edits                get_diagnostics
+Install missing language server         ensure_language_server (ask user; confirm_install)
+Language / LSP readiness                get_languages (Ready / needs_install / AST-only)
 Cross-session project knowledge         list_memories / read_memory / write_memory
 
 Built-in Read/Edit/Glob/Grep are permitted on code files ONLY when:
@@ -243,6 +289,7 @@ mod tests {
         assert!(instructions.contains("initial_instructions"));
         assert!(instructions.contains("/workspace/test_repo"));
         assert!(instructions.contains("resolve_context"));
+        assert!(instructions.contains("ensure_language_server"));
     }
 
     #[test]
@@ -258,10 +305,13 @@ mod tests {
         assert!(m.contains("paramount importance"));
         assert!(m.contains("CRITICAL"));
         assert!(m.contains("You have hereby read"));
+        assert!(m.contains("## Language-server install (session-gated)"));
         assert!(m.contains("## Read-only exploration"));
         assert!(m.contains("NOT a ban on reading or exploring"));
         assert!(m.contains("search_code is literal unless regex=true"));
         assert!(m.contains("there is no page or cursor"));
+        assert!(m.contains("ensure_language_server"));
+        assert!(m.contains("session-gated") || m.contains("confirm_install"));
     }
 
     #[test]
@@ -269,6 +319,7 @@ mod tests {
         let m = manual("default");
         assert!(!m.contains("FORBIDDEN"));
         assert!(m.contains("find_references"));
+        assert!(m.contains("ensure_language_server"));
         assert!(m.contains("You have hereby read"));
     }
 
@@ -295,6 +346,7 @@ mod tests {
         assert!(p.contains("resolve_context"));
         assert!(p.contains("Self-check"));
         assert!(p.contains("All Astrolabe tools except apply_rename are read-only"));
+        assert!(p.contains("ensure_language_server"));
         assert_ne!(p, manual("claude-code"));
     }
 }

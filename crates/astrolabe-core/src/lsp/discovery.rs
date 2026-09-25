@@ -4,13 +4,25 @@
 //! silence and not a guessed fallback. Every [`ServerSpec`] therefore carries
 //! an [`ServerSpec::install_hint`] the agent can show the user.
 //!
+//! ## Discovery ladder
+//!
+//! 1. `ASTROLABE_LSP_*` env override
+//! 2. system `PATH`
+//! 3. local cache under `~/.astrolabe/servers/{name}/{version}/`
+//! 4. if [`crate::lsp::installer::AutoInstallMode::On`], [`ensure_installed`]
+//! 5. else [`LspError::Unavailable`] with a structured [`NeedsInstall`] hint
+//!
+//! [`ensure_installed`] is **never** called unless mode is `On`
+//! (`ASTROLABE_AUTO_INSTALL=on`). Default mode is `prompt`.
+//!
 //! ## Testability
 //!
 //! Lookups take an explicit [`Discovery`] (PATH directories + override map).
 //! Production code calls [`discover`] / [`probe_report`], which snapshot the
 //! process environment once. Tests inject a fake PATH built under
 //! `std::env::temp_dir()` and **must not** call `std::env::set_var`, so they
-//! stay isolated from other parallel tests.
+//! stay isolated from other parallel tests. `Discovery::new` disables cache
+//! probing and auto-install so existing unit tests stay hermetic.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -18,6 +30,10 @@ use std::path::{Path, PathBuf};
 
 use crate::types::Language;
 
+use super::installer::{
+    self, ensure_installed_with, AutoInstallMode, InstallContext, InstallSpec, NeedsInstall,
+    UreqFetcher,
+};
 use super::{LspError, ServerSpec};
 
 /// Languages this module probes, in the order MCP reports should list them.
@@ -29,6 +45,13 @@ pub const PROBED_LANGUAGES: &[Language] = &[
     Language::TypeScript,
     Language::Tsx,
     Language::JavaScript,
+    Language::C,
+    Language::Cpp,
+    Language::ObjC,
+    Language::ObjCpp,
+    Language::Swift,
+    Language::Php,
+    Language::Vue,
 ];
 
 /// Snapshot of PATH and override variables used for one probe.
@@ -39,6 +62,9 @@ pub struct Discovery {
     path_dirs: Vec<PathBuf>,
     env: BTreeMap<String, String>,
     windows: bool,
+    /// `None` skips cache probing (default for [`Discovery::new`] / tests).
+    cache_root: Option<PathBuf>,
+    auto_install: AutoInstallMode,
 }
 
 /// One language's probe outcome. Missing is a row, not an omitted row.
@@ -50,6 +76,8 @@ pub struct ProbeResult {
     /// Always non-empty. When `spec` is `None`, this is how to install; when
     /// `Some`, it repeats the chosen server's hint.
     pub install_hint: String,
+    /// Structured install payload for MCP when the binary is missing.
+    pub needs_install: Option<NeedsInstall>,
 }
 
 impl ProbeResult {
@@ -148,6 +176,76 @@ const TYPESCRIPT: &[Candidate] = &[
     },
 ];
 
+const PHP: &[Candidate] = &[
+    Candidate {
+        bin: "intelephense",
+        args: &["--stdio"],
+        // Free features work without a key. Premium requires a purchased
+        // INTELEPHENSE_LICENSE_KEY (LSP initializationOptions.licenceKey).
+        // Do not pirate or share paid license keys.
+        install: "npm i -g intelephense  # free tier works without a key; set a purchased INTELEPHENSE_LICENSE_KEY for premium (no pirated keys)",
+    },
+    Candidate {
+        bin: "phpactor",
+        args: &["language-server"],
+        install: "composer global require phpactor/phpactor  # MIT; needs PHP 8.1+. Or download phpactor.phar from https://github.com/phpactor/phpactor/releases and run: php phpactor.phar language-server",
+    },
+];
+
+const C_FAMILY: &[Candidate] = &[
+    Candidate {
+        bin: "clangd",
+        // Serena launch: `--background-index` so cross-file refs work.
+        args: &["--background-index"],
+        install: "clangd not found on PATH. Install LLVM clangd, then ensure `clangd` is on PATH:\n  \
+macOS:  brew install llvm  # add $(brew --prefix llvm)/bin to PATH\n  \
+Ubuntu/Debian: sudo apt-get install clangd\n  \
+Fedora/RHEL: sudo dnf install clang-tools-extra\n  \
+Arch: sudo pacman -S clang\n  \
+Or download a release from https://clangd.llvm.org/installation\n\
+Prefer a compile_commands.json at the repo root (CMake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).\n\
+Override with ASTROLABE_LSP_CXX=/path/to/clangd (or ASTROLABE_LSP_C).\n\
+With ASTROLABE_AUTO_INSTALL=on, Astrolabe can download a pinned clangd into ~/.astrolabe/servers/.",
+    },
+    Candidate {
+        bin: "ccls",
+        args: &[],
+        install: "ccls (clangd alternative): brew install ccls  # or see https://github.com/MaskRay/ccls/wiki/Build\n\
+Also accepts compile_commands.json at the repo root.\n\
+Override with ASTROLABE_LSP_CXX=/path/to/ccls.",
+    },
+];
+
+/// Swift — sourcekit-lsp only (RFC primary; ships with Xcode / CLT).
+const APPLE_SWIFT: &[Candidate] = &[Candidate {
+    bin: "sourcekit-lsp",
+    args: &[],
+    install: "xcode-select --install  # Xcode CLT ships sourcekit-lsp; or install full Xcode / Swift toolchain",
+}];
+
+/// ObjC/ObjC++ — sourcekit-lsp first (RFC), clangd second (Serena-shaped fallback).
+const APPLE_OBJC: &[Candidate] = &[
+    Candidate {
+        bin: "sourcekit-lsp",
+        args: &[],
+        install: "xcode-select --install  # Xcode CLT ships sourcekit-lsp; or install full Xcode",
+    },
+    Candidate {
+        bin: "clangd",
+        args: &[],
+        install:
+            "brew install llvm  # clangd fallback for ObjC/ObjC++ when sourcekit-lsp is absent",
+    },
+];
+
+// TODO(p0-followup): dual-server / @vue/typescript-plugin with a companion
+// typescript-language-server (Serena-shaped hybridMode). P0 is single Volar only.
+const VUE: &[Candidate] = &[Candidate {
+    bin: "vue-language-server",
+    args: &["--stdio"],
+    install: "npm i -g @vue/language-server",
+}];
+
 const JAVA_UNAVAILABLE: &str = "\
 jdtls not found on PATH. Eclipse JDT Language Server (eclipse.jdt.ls) is the \
 mainstream Java LSP, but it is not a single static binary.
@@ -188,15 +286,21 @@ impl Discovery {
             path_dirs: parse_path(std::env::var_os("PATH").unwrap_or_default()),
             env,
             windows: cfg!(windows),
+            cache_root: Some(installer::default_servers_dir()),
+            auto_install: AutoInstallMode::from_env(),
         }
     }
 
     /// Probe against an explicit PATH string (same encoding as the `PATH` env var).
+    ///
+    /// Hermetic for tests: no cache root, auto-install [`AutoInstallMode::Off`].
     pub fn new(path: impl AsRef<OsStr>) -> Self {
         Self {
             path_dirs: parse_path(path),
             env: BTreeMap::new(),
             windows: cfg!(windows),
+            cache_root: None,
+            auto_install: AutoInstallMode::Off,
         }
     }
 
@@ -204,6 +308,26 @@ impl Discovery {
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
         self
+    }
+
+    /// Enable / override the servers cache root used by the discovery ladder.
+    pub fn with_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.cache_root = Some(root.into());
+        self
+    }
+
+    /// Override [`AutoInstallMode`] (tests / session policy).
+    pub fn with_auto_install(mut self, mode: AutoInstallMode) -> Self {
+        self.auto_install = mode;
+        self
+    }
+
+    pub fn auto_install_mode(&self) -> AutoInstallMode {
+        self.auto_install
+    }
+
+    pub fn cache_root(&self) -> Option<&Path> {
+        self.cache_root.as_deref()
     }
 
     /// First available [`ServerSpec`] for `language`, or [`LspError::Unavailable`].
@@ -216,6 +340,8 @@ impl Discovery {
     }
 
     /// Probe one language. Absence is `spec: None`, never an error.
+    ///
+    /// Ladder: env override → PATH → cache → (if On) install → Unavailable hint.
     pub fn probe(&self, language: Language) -> ProbeResult {
         if let Some((key, value)) = self.override_value(language) {
             match self.resolve_override(&value) {
@@ -226,6 +352,7 @@ impl Discovery {
                         language,
                         spec: Some(spec),
                         install_hint,
+                        needs_install: None,
                     };
                 }
                 None => {
@@ -233,11 +360,7 @@ impl Discovery {
                         "{key} is set to `{value}` but that executable was not found. {}",
                         self.missing_hint(language)
                     );
-                    return ProbeResult {
-                        language,
-                        spec: None,
-                        install_hint: hint,
-                    };
+                    return self.unavailable(language, hint);
                 }
             }
         }
@@ -250,14 +373,115 @@ impl Discovery {
                     language,
                     spec: Some(spec),
                     install_hint,
+                    needs_install: None,
                 };
             }
         }
 
+        // Cache: ~/.astrolabe/servers/{name}/{version}/…
+        if let Some(cache_root) = &self.cache_root {
+            for candidate in candidates(language) {
+                if let Some(command) = installer::find_cached_binary(
+                    cache_root,
+                    candidate.bin,
+                    Path::new(candidate.bin),
+                ) {
+                    let spec = spec_from_candidate(language, command, candidate);
+                    let install_hint = spec.install_hint.clone();
+                    return ProbeResult {
+                        language,
+                        spec: Some(spec),
+                        install_hint,
+                        needs_install: None,
+                    };
+                }
+                // Also try common bin/ layout used by packaged releases.
+                let rel = PathBuf::from("bin").join(candidate.bin);
+                if let Some(command) =
+                    installer::find_cached_binary(cache_root, candidate.bin, &rel)
+                {
+                    let spec = spec_from_candidate(language, command, candidate);
+                    let install_hint = spec.install_hint.clone();
+                    return ProbeResult {
+                        language,
+                        spec: Some(spec),
+                        install_hint,
+                        needs_install: None,
+                    };
+                }
+            }
+        }
+
+        // Auto-install only when mode is On (never for Prompt/Off).
+        if self.auto_install == AutoInstallMode::On {
+            if let Some(install_spec) = catalog_install_spec(language) {
+                if let Some(cache_root) = &self.cache_root {
+                    let fetcher = UreqFetcher::default();
+                    let ctx = InstallContext {
+                        cache_root: cache_root.clone(),
+                        fetcher: &fetcher,
+                        offline: std::env::var(installer::ENV_OFFLINE)
+                            .map(|v| {
+                                matches!(
+                                    v.trim().to_ascii_lowercase().as_str(),
+                                    "1" | "true" | "yes" | "on"
+                                )
+                            })
+                            .unwrap_or(false),
+                        mirror_github: std::env::var(installer::ENV_MIRROR_GITHUB)
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                        lock_timeout: std::time::Duration::from_secs(120),
+                    };
+                    match ensure_installed_with(&install_spec, &ctx) {
+                        Ok(command) => {
+                            let cands = candidates(language);
+                            let candidate = cands.first().expect("catalog langs have candidates");
+                            let spec = spec_from_candidate(language, command, candidate);
+                            let install_hint = spec.install_hint.clone();
+                            return ProbeResult {
+                                language,
+                                spec: Some(spec),
+                                install_hint,
+                                needs_install: None,
+                            };
+                        }
+                        Err(err) => {
+                            let hint = format!(
+                                "auto-install of {} failed: {err}. {}",
+                                install_spec.name,
+                                self.missing_hint(language)
+                            );
+                            return self.unavailable(language, hint);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.unavailable(language, self.missing_hint(language))
+    }
+
+    fn unavailable(&self, language: Language, hint: String) -> ProbeResult {
+        let server = primary_bin(language);
+        let cache_root = self
+            .cache_root
+            .clone()
+            .unwrap_or_else(installer::default_servers_dir);
+        let needs = installer::needs_install_for(
+            language,
+            hint.clone(),
+            server,
+            catalog_install_spec(language),
+            self.auto_install,
+            &cache_root,
+        );
         ProbeResult {
             language,
             spec: None,
-            install_hint: self.missing_hint(language),
+            install_hint: needs.message(),
+            needs_install: Some(needs),
         }
     }
 
@@ -372,6 +596,13 @@ impl Discovery {
             return JAVA_UNAVAILABLE.to_string();
         }
         let cands = candidates(language);
+        if cands.is_empty() {
+            return format!(
+                "AST-only: no language-server discovery candidates wired for {}.                  Or set {} to an executable when support lands.",
+                language.name(),
+                env_override_keys(language)[0]
+            );
+        }
         let bins: Vec<&str> = cands.iter().map(|c| c.bin).collect();
         let installs: Vec<&str> = cands.iter().map(|c| c.install).collect();
         let extra = match language {
@@ -379,6 +610,18 @@ impl Discovery {
                 " TypeScript 7's native `tsc --lsp --stdio` is not auto-detected \
                   because older `tsc` binaries do not speak LSP; set \
                   ASTROLABE_LSP_TYPESCRIPT to that executable if you want it."
+            }
+            Language::Php => {
+                " Intelephense premium features need a purchased INTELEPHENSE_LICENSE_KEY;                   never use a pirated key. Phpactor is MIT and needs PHP 8.1+."
+            }
+            Language::Vue => {
+                " Volar (`@vue/language-server`) is the P0 Vue server; a dual-server                   TypeScript arrangement is a follow-up, not a silent fallback."
+            }
+            Language::Swift => {
+                " sourcekit-lsp is the RFC-primary Swift server; it ships with                   Xcode / Command Line Tools (`xcode-select --install`)."
+            }
+            Language::ObjC | Language::ObjCpp => {
+                " Prefer sourcekit-lsp (RFC); clangd is a practical fallback for                   .m/.mm (Serena routes ObjC there). Pure .h headers remain                   Language::C unless content-aware ObjC header detection lands."
             }
             _ => "",
         };
@@ -389,6 +632,13 @@ impl Discovery {
             env_override_keys(language)[0],
             extra
         )
+    }
+}
+
+impl Default for Discovery {
+    /// Empty PATH, auto-install off — safe for `StubInstaller::default()` and tests.
+    fn default() -> Self {
+        Self::new("")
     }
 }
 
@@ -414,6 +664,11 @@ fn candidates(language: Language) -> &'static [Candidate] {
         Language::Java => JAVA,
         Language::Rust => RUST,
         Language::TypeScript | Language::Tsx | Language::JavaScript => TYPESCRIPT,
+        Language::Php => PHP,
+        Language::C | Language::Cpp => C_FAMILY,
+        Language::Swift => APPLE_SWIFT,
+        Language::ObjC | Language::ObjCpp => APPLE_OBJC,
+        Language::Vue => VUE,
     }
 }
 
@@ -426,6 +681,13 @@ fn env_override_keys(language: Language) -> &'static [&'static str] {
         Language::TypeScript => &["ASTROLABE_LSP_TYPESCRIPT"],
         Language::Tsx => &["ASTROLABE_LSP_TSX", "ASTROLABE_LSP_TYPESCRIPT"],
         Language::JavaScript => &["ASTROLABE_LSP_JAVASCRIPT", "ASTROLABE_LSP_TYPESCRIPT"],
+        Language::Php => &["ASTROLABE_LSP_PHP"],
+        Language::C => &["ASTROLABE_LSP_C", "ASTROLABE_LSP_CXX"],
+        Language::Cpp => &["ASTROLABE_LSP_CXX", "ASTROLABE_LSP_C"],
+        Language::ObjC => &["ASTROLABE_LSP_OBJC", "ASTROLABE_LSP_SWIFT"],
+        Language::ObjCpp => &["ASTROLABE_LSP_OBJCPP", "ASTROLABE_LSP_SWIFT"],
+        Language::Swift => &["ASTROLABE_LSP_SWIFT"],
+        Language::Vue => &["ASTROLABE_LSP_VUE"],
     }
 }
 
@@ -438,7 +700,100 @@ fn override_keys_all() -> &'static [&'static str] {
         "ASTROLABE_LSP_TYPESCRIPT",
         "ASTROLABE_LSP_TSX",
         "ASTROLABE_LSP_JAVASCRIPT",
+        "ASTROLABE_LSP_PHP",
+        "ASTROLABE_LSP_C",
+        "ASTROLABE_LSP_CXX",
+        "ASTROLABE_LSP_OBJC",
+        "ASTROLABE_LSP_OBJCPP",
+        "ASTROLABE_LSP_SWIFT",
+        "ASTROLABE_LSP_VUE",
     ]
+}
+
+fn primary_bin(language: Language) -> &'static str {
+    candidates(language)
+        .first()
+        .map(|c| c.bin)
+        .unwrap_or(language.name())
+}
+
+/// Optional download catalog entry. Absent means Prompt/On still surface a
+/// manual hint but cannot call [`crate::lsp::ensure_installed`] until a release
+/// matrix fills the URL + official sha256.
+pub fn catalog_install_spec(language: Language) -> Option<InstallSpec> {
+    match language {
+        // Official clangd GitHub release (Serena pins 19.1.2). Only used when
+        // AutoInstallMode::On — Prompt/Off never download.
+        Language::C | Language::Cpp => clangd_install_spec(),
+        _ => None,
+    }
+}
+
+/// Pinned clangd 19.1.2 artifact for the current host (SHA-256 of the archive).
+fn clangd_install_spec() -> Option<InstallSpec> {
+    const VERSION: &str = "19.1.2";
+    // Checksums from Serena's clangd_language_server.py (official release assets).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some(InstallSpec {
+            name: "clangd".into(),
+            version: VERSION.into(),
+            url: format!(
+                "https://github.com/clangd/clangd/releases/download/{VERSION}/clangd-linux-{VERSION}.zip"
+            ),
+            sha256: "7c09614eff857d590e4502ef516f035ff94cfb8b795de14ece5afbc53a206caf".into(),
+            archive: installer::ArchiveFormat::Zip,
+            binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd")),
+        })
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some(InstallSpec {
+            name: "clangd".into(),
+            version: VERSION.into(),
+            url: format!(
+                "https://github.com/clangd/clangd/releases/download/{VERSION}/clangd-mac-{VERSION}.zip"
+            ),
+            sha256: "d3b329b3f58602c57ca6501d255147af1bccad3691b1cb0c12c258fcd2da1be3".into(),
+            archive: installer::ArchiveFormat::Zip,
+            binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd")),
+        })
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some(InstallSpec {
+            name: "clangd".into(),
+            version: VERSION.into(),
+            url: format!(
+                "https://github.com/clangd/clangd/releases/download/{VERSION}/clangd-mac-{VERSION}.zip"
+            ),
+            sha256: "d3b329b3f58602c57ca6501d255147af1bccad3691b1cb0c12c258fcd2da1be3".into(),
+            archive: installer::ArchiveFormat::Zip,
+            binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd")),
+        })
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Some(InstallSpec {
+            name: "clangd".into(),
+            version: VERSION.into(),
+            url: format!(
+                "https://github.com/clangd/clangd/releases/download/{VERSION}/clangd-windows-{VERSION}.zip"
+            ),
+            sha256: "5b6ceb0f85d63fa0c2c9aab31c29bebd41dc11da1f160ef21bc2fea93270a20d".into(),
+            archive: installer::ArchiveFormat::Zip,
+            binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd.exe")),
+        })
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+    )))]
+    {
+        None
+    }
 }
 
 fn spec_from_candidate(language: Language, command: PathBuf, candidate: &Candidate) -> ServerSpec {
@@ -471,12 +826,18 @@ fn find_candidate_by_bin(bin: &str) -> Option<&'static Candidate> {
         .chain(JAVA)
         .chain(RUST)
         .chain(TYPESCRIPT)
+        .chain(PHP)
+        .chain(C_FAMILY)
+        .chain(APPLE_SWIFT)
+        .chain(APPLE_OBJC)
+        .chain(VUE)
         .find(|c| c.bin == bin)
 }
 
 fn extra_args_for_unknown_stem(stem: &str) -> Vec<String> {
     match stem {
         "tsc" | "tsgo" => vec!["--lsp".into(), "--stdio".into()],
+        "clangd" => vec!["--background-index".into()],
         _ => Vec::new(),
     }
 }
@@ -678,7 +1039,30 @@ mod tests {
                         .install_hint
                         .contains("npm i -g typescript-language-server"))
                 }
+                Language::Php => {
+                    assert!(result.install_hint.contains("npm i -g intelephense"));
+                    assert!(result.install_hint.contains("phpactor"));
+                    assert!(
+                        result.install_hint.contains("INTELEPHENSE_LICENSE_KEY")
+                            || result.install_hint.contains("purchased"),
+                        "license guidance required, got: {}",
+                        result.install_hint
+                    );
+                }
+                Language::C | Language::Cpp => {
+                    assert!(result.install_hint.to_ascii_lowercase().contains("clangd"))
+                }
+                Language::ObjC | Language::ObjCpp | Language::Swift => {
+                    assert!(result.install_hint.contains("sourcekit-lsp"))
+                }
+                Language::Vue => {
+                    assert!(result.install_hint.contains("@vue/language-server"))
+                }
             }
+            assert!(
+                result.needs_install.is_some(),
+                "{language:?} must export NeedsInstall"
+            );
         }
     }
 
@@ -970,6 +1354,41 @@ mod tests {
     }
 
     #[test]
+    fn finds_vue_language_server_as_volar() {
+        let dir = scratch();
+        fake_bin(&dir.0, "vue-language-server");
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Vue)
+            .expect("vue-language-server on PATH");
+        assert!(
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("vue-language-server"),
+            "got {:?}",
+            spec.command
+        );
+        assert_eq!(spec.args, vec!["--stdio"]);
+        assert_eq!(spec.language, Language::Vue);
+        assert!(
+            spec.install_hint.contains("@vue/language-server"),
+            "install hint should point at @vue/language-server, got {}",
+            spec.install_hint
+        );
+        // P0 is single-server Volar; dual-server/TS plugin is follow-up only.
+        assert!(
+            !spec
+                .install_hint
+                .to_ascii_lowercase()
+                .contains("typescript-language-server")
+                || spec.install_hint.contains("follow-up")
+                || spec.install_hint.contains("dual-server"),
+            "P0 must not silently require a companion TS server"
+        );
+    }
+
+    #[test]
     fn env_override_var_names_are_stable() {
         assert_eq!(env_override_var(Language::Python), "ASTROLABE_LSP_PYTHON");
         assert_eq!(env_override_var(Language::Go), "ASTROLABE_LSP_GO");
@@ -984,5 +1403,194 @@ mod tests {
             env_override_var(Language::JavaScript),
             "ASTROLABE_LSP_JAVASCRIPT"
         );
+        assert_eq!(env_override_var(Language::Php), "ASTROLABE_LSP_PHP");
+        assert_eq!(env_override_var(Language::C), "ASTROLABE_LSP_C");
+        assert_eq!(env_override_var(Language::Cpp), "ASTROLABE_LSP_CXX");
+        assert_eq!(env_override_var(Language::Swift), "ASTROLABE_LSP_SWIFT");
+        assert_eq!(env_override_var(Language::ObjC), "ASTROLABE_LSP_OBJC");
+        assert_eq!(env_override_var(Language::ObjCpp), "ASTROLABE_LSP_OBJCPP");
+        assert_eq!(env_override_var(Language::Vue), "ASTROLABE_LSP_VUE");
+    }
+
+    #[test]
+    fn php_prefers_intelephense_then_phpactor() {
+        let dir = scratch();
+        fake_bin(&dir.0, "intelephense");
+        fake_bin(&dir.0, "phpactor");
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Php)
+            .unwrap();
+        assert!(
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("intelephense"),
+            "priority must prefer intelephense, got {:?}",
+            spec.command
+        );
+        assert_eq!(spec.args, vec!["--stdio"]);
+        assert!(spec.install_hint.contains("npm i -g intelephense"));
+    }
+
+    #[test]
+    fn php_falls_back_to_phpactor_language_server() {
+        let dir = scratch();
+        fake_bin(&dir.0, "phpactor");
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Php)
+            .unwrap();
+        assert!(spec
+            .command
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("phpactor"));
+        assert_eq!(spec.args, vec!["language-server"]);
+        assert!(spec.install_hint.contains("phpactor"));
+    }
+
+    #[test]
+    fn cache_root_is_consulted_after_path_miss() {
+        let cache = scratch();
+        let version = cache.0.join("clangd").join("18.1.3");
+        fs::create_dir_all(&version).unwrap();
+        let bin = fake_bin(&version, "clangd");
+        fs::write(version.join(".installed"), "ok").unwrap();
+        let d = Discovery::new("")
+            .with_cache_root(&cache.0)
+            .with_auto_install(AutoInstallMode::Off);
+        let spec = d.discover(Language::Cpp).unwrap();
+        assert_eq!(spec.command, bin);
+        assert!(d.probe(Language::Cpp).needs_install.is_none());
+    }
+
+    #[test]
+    fn prompt_mode_never_auto_installs() {
+        let cache = scratch();
+        let d = Discovery::new("")
+            .with_cache_root(&cache.0)
+            .with_auto_install(AutoInstallMode::Prompt);
+        let result = d.probe(Language::Cpp);
+        assert!(result.spec.is_none());
+        let needs = result.needs_install.expect("structured hint");
+        assert_eq!(needs.hint.mode, AutoInstallMode::Prompt);
+    }
+
+    #[test]
+    fn new_discovery_defaults_are_hermetic() {
+        let d = Discovery::new("");
+        assert!(d.cache_root().is_none());
+        assert_eq!(d.auto_install_mode(), AutoInstallMode::Off);
+    }
+
+    #[test]
+    fn sourcekit_is_primary_for_swift_and_objc_family() {
+        let dir = scratch();
+        fake_bin(&dir.0, "sourcekit-lsp");
+        fake_bin(&dir.0, "clangd");
+        let d = discovery_with_dirs(&[&dir.0]);
+        for language in [Language::Swift, Language::ObjC, Language::ObjCpp] {
+            let spec = d.discover(language).unwrap();
+            assert_eq!(spec.language, language);
+            assert!(
+                spec.command
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("sourcekit-lsp"),
+                "{language:?} must prefer sourcekit-lsp, got {:?}",
+                spec.command
+            );
+        }
+    }
+
+    #[test]
+    fn objc_falls_back_to_clangd_when_sourcekit_missing() {
+        let dir = scratch();
+        fake_bin(&dir.0, "clangd");
+        let d = discovery_with_dirs(&[&dir.0]);
+        for language in [Language::ObjC, Language::ObjCpp] {
+            let spec = d.discover(language).unwrap();
+            assert!(
+                spec.command
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("clangd"),
+                "{language:?} should fall back to clangd, got {:?}",
+                spec.command
+            );
+        }
+        let err = d.discover(Language::Swift).unwrap_err();
+        let (lang, hint) = unavailable_hint(err);
+        assert_eq!(lang, Language::Swift);
+        assert!(hint.contains("sourcekit-lsp") || hint.contains("xcode-select"));
+    }
+
+    #[test]
+    fn from_path_recognizes_apple_extensions() {
+        assert_eq!(
+            Language::from_path(&crate::types::RelPath::new("Foo.m")),
+            Some(Language::ObjC)
+        );
+        assert_eq!(
+            Language::from_path(&crate::types::RelPath::new("Foo.mm")),
+            Some(Language::ObjCpp)
+        );
+        assert_eq!(
+            Language::from_path(&crate::types::RelPath::new("Foo.swift")),
+            Some(Language::Swift)
+        );
+        // .h stays C (foundation); ObjC headers need companion/.m awareness later.
+        assert_eq!(
+            Language::from_path(&crate::types::RelPath::new("Foo.h")),
+            Some(Language::C)
+        );
+    }
+
+    #[test]
+    fn prefers_clangd_over_ccls_for_c_and_cpp() {
+        let dir = scratch();
+        fake_bin(&dir.0, "clangd");
+        fake_bin(&dir.0, "ccls");
+        let d = discovery_with_dirs(&[&dir.0]);
+        for language in [Language::C, Language::Cpp] {
+            let spec = d.discover(language).unwrap();
+            assert!(
+                spec.command
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("clangd"),
+                "{language:?} should prefer clangd, got {:?}",
+                spec.command
+            );
+            assert_eq!(spec.args, vec!["--background-index"]);
+            assert!(
+                spec.install_hint.to_ascii_lowercase().contains("clangd"),
+                "hint should mention clangd, got {}",
+                spec.install_hint
+            );
+        }
+    }
+
+    #[test]
+    fn c_family_falls_back_to_ccls() {
+        let dir = scratch();
+        fake_bin(&dir.0, "ccls");
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Cpp)
+            .unwrap();
+        assert!(
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ccls"),
+            "got {:?}",
+            spec.command
+        );
+        assert!(spec.args.is_empty());
     }
 }

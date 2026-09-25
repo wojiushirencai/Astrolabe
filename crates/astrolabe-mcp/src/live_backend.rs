@@ -70,7 +70,7 @@ impl LiveBackend {
 
     fn resolver_for(language: Language) -> Box<dyn ScopeResolver> {
         match language {
-            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Vue => {
                 Box::new(JsScopeResolver)
             }
             _ => Box::new(TreeSitterScopeResolver::new()),

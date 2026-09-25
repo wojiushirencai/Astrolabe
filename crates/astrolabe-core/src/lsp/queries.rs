@@ -625,6 +625,10 @@ fn server_label(language: Language) -> &'static str {
         Language::Python => "pyright",
         Language::Java => "jdtls",
         Language::TypeScript | Language::Tsx | Language::JavaScript => "typescript-language-server",
+        Language::Swift | Language::ObjC | Language::ObjCpp => "sourcekit-lsp",
+        Language::C | Language::Cpp => "clangd",
+        Language::Php => "intelephense",
+        Language::Vue => "vue-language-server",
     }
 }
 

@@ -69,6 +69,20 @@ pub enum Language {
     TypeScript,
     Tsx,
     JavaScript,
+    /// C source / headers (`.c`, `.h`).
+    C,
+    /// C++ source / headers (`.cpp`, `.cc`, `.cxx`, `.hpp`, …).
+    Cpp,
+    /// Objective-C (`.m`).
+    ObjC,
+    /// Objective-C++ (`.mm`).
+    ObjCpp,
+    /// Swift (`.swift`).
+    Swift,
+    /// PHP (`.php`).
+    Php,
+    /// Vue single-file components (`.vue`).
+    Vue,
 }
 
 impl Language {
@@ -82,8 +96,36 @@ impl Language {
             "ts" | "mts" | "cts" => Language::TypeScript,
             "tsx" => Language::Tsx,
             "js" | "mjs" | "cjs" | "jsx" => Language::JavaScript,
+            "c" | "h" => Language::C,
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "ipp" => Language::Cpp,
+            "m" => Language::ObjC,
+            "mm" => Language::ObjCpp,
+            "swift" => Language::Swift,
+            "php" => Language::Php,
+            "vue" => Language::Vue,
             _ => return None,
         })
+    }
+
+    /// Parse a canonical language name (`"python"`, `"c++"`, `"objc"`, …).
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "python" | "py" => Some(Language::Python),
+            "go" | "golang" => Some(Language::Go),
+            "java" => Some(Language::Java),
+            "rust" | "rs" => Some(Language::Rust),
+            "typescript" | "ts" => Some(Language::TypeScript),
+            "tsx" => Some(Language::Tsx),
+            "javascript" | "js" => Some(Language::JavaScript),
+            "c" => Some(Language::C),
+            "cpp" | "c++" | "cxx" => Some(Language::Cpp),
+            "objc" | "objective-c" | "objectivec" => Some(Language::ObjC),
+            "objcpp" | "objective-c++" | "objectivecpp" => Some(Language::ObjCpp),
+            "swift" => Some(Language::Swift),
+            "php" => Some(Language::Php),
+            "vue" => Some(Language::Vue),
+            _ => None,
+        }
     }
 
     pub fn name(&self) -> &'static str {
@@ -95,6 +137,13 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::Tsx => "tsx",
             Language::JavaScript => "javascript",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::ObjC => "objc",
+            Language::ObjCpp => "objcpp",
+            Language::Swift => "swift",
+            Language::Php => "php",
+            Language::Vue => "vue",
         }
     }
 }
@@ -343,6 +392,39 @@ pub struct CodeEdge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_from_path_and_name_cover_p0_matrix() {
+        assert_eq!(Language::from_path(&RelPath::new("a.c")), Some(Language::C));
+        assert_eq!(Language::from_path(&RelPath::new("a.h")), Some(Language::C));
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.cpp")),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.m")),
+            Some(Language::ObjC)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.mm")),
+            Some(Language::ObjCpp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.swift")),
+            Some(Language::Swift)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.php")),
+            Some(Language::Php)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.vue")),
+            Some(Language::Vue)
+        );
+        assert_eq!(Language::from_name("C++"), Some(Language::Cpp));
+        assert_eq!(Language::from_name("objective-c"), Some(Language::ObjC));
+        assert_eq!(Language::from_name("vue").unwrap().name(), "vue");
+    }
 
     #[test]
     fn relpath_normalizes() {

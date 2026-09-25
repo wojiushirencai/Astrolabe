@@ -9,6 +9,7 @@
 
 mod cli;
 mod context;
+mod ensure_ls;
 // hooks / instructions 对 bin（main.rs 的子命令分发）公开：hook 协议入口
 // 不经 ServerHandler，直接调用模块函数。
 pub mod hooks;
@@ -31,8 +32,8 @@ pub const TOOL_CATALOG_TTL_MS: u64 = 86_400_000;
 /// find_symbol/search_code/trace_calls plus `get_neighborhood` and
 /// `get_group_graph`), the language-server-backed ones (`find_references`/
 /// `goto_definition`/`get_diagnostics`/`get_symbol_info`/`plan_rename`/
-/// `apply_rename`), the `initial_instructions` bootstrap tool, and the four
-/// memory tools.
-pub const TOOL_COUNT: usize = 10 + PRECISE_TOOL_COUNT + 1 + 4;
+/// `apply_rename`), the `initial_instructions` bootstrap tool, the four
+/// memory tools, and `ensure_language_server` (session-gated install UX).
+pub const TOOL_COUNT: usize = 10 + PRECISE_TOOL_COUNT + 1 + 4 + 1;
 /// Language-server-backed tools defined in `precise_tools`, mounted on the server.
 pub const PRECISE_TOOL_COUNT: usize = 6;

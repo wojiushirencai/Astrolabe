@@ -345,23 +345,49 @@ fn ident_start(c: char, lang: Option<Language>) -> bool {
         return false;
     }
     match lang {
-        Some(Language::Java | Language::TypeScript | Language::Tsx | Language::JavaScript) => {
-            c.is_alphabetic() || c == '_' || c == '$'
-        }
-        Some(Language::Python | Language::Go | Language::Rust) | None => {
-            c.is_alphabetic() || c == '_' || (lang.is_none() && c == '$')
-        }
+        Some(
+            Language::Java
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Php
+            | Language::Vue,
+        ) => c.is_alphabetic() || c == '_' || c == '$',
+        Some(
+            Language::Python
+            | Language::Go
+            | Language::Rust
+            | Language::C
+            | Language::Cpp
+            | Language::ObjC
+            | Language::ObjCpp
+            | Language::Swift,
+        )
+        | None => c.is_alphabetic() || c == '_' || (lang.is_none() && c == '$'),
     }
 }
 
 fn ident_continue(c: char, lang: Option<Language>) -> bool {
     match lang {
-        Some(Language::Java | Language::TypeScript | Language::Tsx | Language::JavaScript) => {
-            c.is_alphanumeric() || c == '_' || c == '$'
-        }
-        Some(Language::Python | Language::Go | Language::Rust) | None => {
-            c.is_alphanumeric() || c == '_' || (lang.is_none() && c == '$')
-        }
+        Some(
+            Language::Java
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Php
+            | Language::Vue,
+        ) => c.is_alphanumeric() || c == '_' || c == '$',
+        Some(
+            Language::Python
+            | Language::Go
+            | Language::Rust
+            | Language::C
+            | Language::Cpp
+            | Language::ObjC
+            | Language::ObjCpp
+            | Language::Swift,
+        )
+        | None => c.is_alphanumeric() || c == '_' || (lang.is_none() && c == '$'),
     }
 }
 
@@ -535,6 +561,198 @@ const JS_KEYWORDS: &[&str] = &[
     "yield",
 ];
 
+// Thin keyword lists for P0 languages (rewrite planner). Full sets can land
+// with language-specific agents; empty/small lists only affect is_keyword rejects.
+const PHP_KEYWORDS: &[&str] = &[
+    "abstract",
+    "and",
+    "array",
+    "as",
+    "break",
+    "callable",
+    "case",
+    "catch",
+    "class",
+    "clone",
+    "const",
+    "continue",
+    "declare",
+    "default",
+    "do",
+    "echo",
+    "else",
+    "elseif",
+    "empty",
+    "enddeclare",
+    "endfor",
+    "endforeach",
+    "endif",
+    "endswitch",
+    "endwhile",
+    "enum",
+    "extends",
+    "final",
+    "finally",
+    "fn",
+    "for",
+    "foreach",
+    "function",
+    "global",
+    "goto",
+    "if",
+    "implements",
+    "include",
+    "include_once",
+    "instanceof",
+    "insteadof",
+    "interface",
+    "isset",
+    "list",
+    "match",
+    "namespace",
+    "new",
+    "or",
+    "print",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "require",
+    "require_once",
+    "return",
+    "static",
+    "switch",
+    "throw",
+    "trait",
+    "try",
+    "unset",
+    "use",
+    "var",
+    "while",
+    "xor",
+    "yield",
+];
+
+const C_FAMILY_KEYWORDS: &[&str] = &[
+    "alignas",
+    "alignof",
+    "asm",
+    "auto",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "constexpr",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "explicit",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "nullptr",
+    "operator",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "while",
+];
+
+const SWIFT_KEYWORDS: &[&str] = &[
+    "associatedtype",
+    "class",
+    "deinit",
+    "enum",
+    "extension",
+    "fileprivate",
+    "func",
+    "import",
+    "init",
+    "inout",
+    "internal",
+    "let",
+    "operator",
+    "private",
+    "protocol",
+    "public",
+    "rethrows",
+    "static",
+    "struct",
+    "subscript",
+    "typealias",
+    "var",
+    "break",
+    "case",
+    "continue",
+    "default",
+    "defer",
+    "do",
+    "else",
+    "fallthrough",
+    "for",
+    "guard",
+    "if",
+    "in",
+    "repeat",
+    "return",
+    "switch",
+    "where",
+    "while",
+    "as",
+    "Any",
+    "catch",
+    "false",
+    "is",
+    "nil",
+    "super",
+    "self",
+    "Self",
+    "throw",
+    "throws",
+    "true",
+    "try",
+];
+
 fn keywords(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::Python => PYTHON_KEYWORDS,
@@ -542,6 +760,10 @@ fn keywords(lang: Language) -> &'static [&'static str] {
         Language::Java => JAVA_KEYWORDS,
         Language::Rust => RUST_KEYWORDS,
         Language::TypeScript | Language::Tsx | Language::JavaScript => JS_KEYWORDS,
+        Language::Php => PHP_KEYWORDS,
+        Language::C | Language::Cpp | Language::ObjC | Language::ObjCpp => C_FAMILY_KEYWORDS,
+        Language::Swift => SWIFT_KEYWORDS,
+        Language::Vue => JS_KEYWORDS,
     }
 }
 
@@ -635,11 +857,22 @@ fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
     match lang {
         Some(Language::Python) => classify_python(source.as_bytes(), &mut kind),
         Some(Language::Go) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Go),
-        Some(Language::Java) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Java),
-        Some(Language::Rust) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Rust),
-        Some(Language::TypeScript | Language::Tsx | Language::JavaScript) | None => {
-            classify_c_like(source.as_bytes(), &mut kind, Flavor::Js)
+        Some(Language::Java | Language::Php) => {
+            classify_c_like(source.as_bytes(), &mut kind, Flavor::Java)
         }
+        Some(Language::Rust) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Rust),
+        Some(
+            Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Vue
+            | Language::C
+            | Language::Cpp
+            | Language::ObjC
+            | Language::ObjCpp
+            | Language::Swift,
+        )
+        | None => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
     }
     kind
 }

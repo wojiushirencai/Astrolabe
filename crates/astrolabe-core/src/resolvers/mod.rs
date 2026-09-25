@@ -109,7 +109,7 @@ impl ResolverSet {
         let lang = Language::from_path(from)?;
         // TS and TSX and JS share one resolver.
         let owner = match lang {
-            Language::Tsx | Language::JavaScript => Language::TypeScript,
+            Language::Tsx | Language::JavaScript | Language::Vue => Language::TypeScript,
             other => other,
         };
         let r = self.resolvers.iter().find(|r| r.language() == owner)?;

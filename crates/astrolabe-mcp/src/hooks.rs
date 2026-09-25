@@ -31,6 +31,7 @@ pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] = &[
     "search_code",
     "diagnostics",
     "languages",
+    "ensure_language",
     "instructions",
     "memory",
 ];
@@ -1160,6 +1161,9 @@ mod tests {
             "mcp__astrolabe__get_diagnostics"
         ));
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_languages"));
+        assert!(!is_astrolabe_symbolic_tool(
+            "mcp__astrolabe__ensure_language_server"
+        ));
         assert!(!is_astrolabe_symbolic_tool(
             "mcp__astrolabe__initial_instructions"
         ));

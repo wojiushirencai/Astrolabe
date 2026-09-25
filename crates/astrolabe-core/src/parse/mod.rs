@@ -27,10 +27,11 @@ use crate::types::{CodeSymbol, FileId, Language, RelPath, SymbolId, SymbolKind};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 pub mod queries;
+mod vue;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SIGNATURE_CHARS: usize = 240;
-const LANGUAGES: [Language; 7] = [
+const LANGUAGES: [Language; 10] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -38,6 +39,9 @@ const LANGUAGES: [Language; 7] = [
     Language::TypeScript,
     Language::Tsx,
     Language::JavaScript,
+    Language::Php,
+    Language::C,
+    Language::Cpp,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -86,10 +90,15 @@ impl ParserPool {
     pub fn parse(
         &self,
         lang: Language,
-        _path: &RelPath,
+        path: &RelPath,
         source: &str,
     ) -> Result<ParsedFile, ParseError> {
-        let mut slot = self.parsers[language_index(lang)]
+        // Vue SFCs: embedded <script> extraction (no tree-sitter-vue on ABI 0.27).
+        if lang == Language::Vue {
+            return vue::parse_sfc(self, path, source);
+        }
+        let index = language_index(lang).ok_or(ParseError::NoGrammar(lang))?;
+        let mut slot = self.parsers[index]
             .lock()
             .map_err(|_| ParseError::Query("parser pool mutex poisoned".into()))?;
         let parser = slot.as_mut().ok_or(ParseError::NoGrammar(lang))?;
@@ -155,8 +164,8 @@ impl Default for ParserPool {
     }
 }
 
-fn language_index(lang: Language) -> usize {
-    match lang {
+fn language_index(lang: Language) -> Option<usize> {
+    Some(match lang {
         Language::Python => 0,
         Language::Go => 1,
         Language::Java => 2,
@@ -164,7 +173,11 @@ fn language_index(lang: Language) -> usize {
         Language::TypeScript => 4,
         Language::Tsx => 5,
         Language::JavaScript => 6,
-    }
+        Language::Php => 7,
+        Language::C => 8,
+        Language::Cpp => 9,
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+    })
 }
 
 fn grammar(lang: Language) -> Option<tree_sitter::Language> {
@@ -176,6 +189,10 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Language::C => tree_sitter_c::LANGUAGE.into(),
+        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
 
@@ -307,7 +324,47 @@ fn is_exported(lang: Language, name: &str, node: tree_sitter::Node<'_>, source: 
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             js_exported(name, node, source)
         }
+        Language::Php => php_exported(node, source),
+        // Sibling P0 languages: treat as exported until their agents land visibility rules.
+        Language::C
+        | Language::Cpp
+        | Language::ObjC
+        | Language::ObjCpp
+        | Language::Swift
+        | Language::Vue => true,
     }
+}
+
+fn php_exported(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    // Walk up to a declaration that may carry a visibility modifier.
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        match n.kind() {
+            "method_declaration"
+            | "property_declaration"
+            | "const_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+            | "function_definition" => {
+                if let Ok(text) = n.utf8_text(source.as_bytes()) {
+                    // First keyword tokens: private is never exported; protected
+                    // stays internal to the inheritance hierarchy.
+                    let head = text.split('{').next().unwrap_or(text);
+                    if head
+                        .split_whitespace()
+                        .any(|t| t == "private" || t == "protected")
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => cur = n.parent(),
+        }
+    }
+    true
 }
 
 fn python_exported(name: &str) -> bool {
@@ -592,9 +649,11 @@ fn signature(node: tree_sitter::Node<'_>, source: &str) -> String {
 fn unquote(value: &str) -> &str {
     if value.len() >= 2 {
         let bytes = value.as_bytes();
+        // Quotes for ordinary string literals; angle brackets for C/C++
+        // `#include <…>` (`system_lib_string` nodes include the brackets).
         if matches!(
             (bytes[0], bytes[value.len() - 1]),
-            (b'\'', b'\'') | (b'"', b'"') | (b'`', b'`')
+            (b'\'', b'\'') | (b'"', b'"') | (b'`', b'`') | (b'<', b'>')
         ) {
             return &value[1..value.len() - 1];
         }
@@ -637,7 +696,7 @@ mod tests {
         let pool = ParserPool::new();
         for language in LANGUAGES {
             assert!(
-                pool.parsers[language_index(language)]
+                pool.parsers[language_index(language).expect("wired language")]
                     .lock()
                     .unwrap()
                     .is_some(),
@@ -651,7 +710,9 @@ mod tests {
     fn parser_pool_size_does_not_grow_with_file_count() {
         let pool = ParserPool::new();
         for _ in 0..100 {
-            let mut parser = pool.parsers[language_index(Language::Rust)].lock().unwrap();
+            let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")]
+                .lock()
+                .unwrap();
             assert!(parser.as_mut().unwrap().parse("fn f() {}", None).is_some());
         }
         assert_eq!(pool.parsers.len(), LANGUAGES.len());
@@ -667,7 +728,9 @@ mod tests {
     #[test]
     fn malformed_source_and_empty_source_are_recoverable() {
         let pool = ParserPool::new();
-        let mut parser = pool.parsers[language_index(Language::Rust)].lock().unwrap();
+        let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")]
+            .lock()
+            .unwrap();
         let parser = parser.as_mut().unwrap();
         let malformed = parser.parse("fn broken( {", None).unwrap();
         assert!(malformed.root_node().has_error());
@@ -1121,6 +1184,14 @@ mod tests {
             Language::TypeScript | Language::Tsx | Language::JavaScript => {
                 ts_defs(&mask_c_like(source, CFlavor::Js))
             }
+            // P0 languages without recall baselines yet.
+            Language::Php
+            | Language::C
+            | Language::Cpp
+            | Language::ObjC
+            | Language::ObjCpp
+            | Language::Swift
+            | Language::Vue => Vec::new(),
         }
     }
 

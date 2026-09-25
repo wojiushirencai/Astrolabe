@@ -388,6 +388,13 @@ fn language_to_u8(language: Language) -> u8 {
         Language::TypeScript => 4,
         Language::Tsx => 5,
         Language::JavaScript => 6,
+        Language::C => 7,
+        Language::Cpp => 8,
+        Language::ObjC => 9,
+        Language::ObjCpp => 10,
+        Language::Swift => 11,
+        Language::Php => 12,
+        Language::Vue => 13,
     }
 }
 
@@ -427,6 +434,13 @@ fn language_from_u8(language: u8) -> Option<Language> {
         4 => Language::TypeScript,
         5 => Language::Tsx,
         6 => Language::JavaScript,
+        7 => Language::C,
+        8 => Language::Cpp,
+        9 => Language::ObjC,
+        10 => Language::ObjCpp,
+        11 => Language::Swift,
+        12 => Language::Php,
+        13 => Language::Vue,
         _ => return None,
     })
 }

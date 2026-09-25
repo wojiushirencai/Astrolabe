@@ -806,6 +806,13 @@ fn language_id(language: Language) -> &'static str {
         Language::TypeScript => "typescript",
         Language::Tsx => "typescriptreact",
         Language::JavaScript => "javascript",
+        Language::C => "c",
+        Language::Cpp => "cpp",
+        Language::ObjC => "objective-c",
+        Language::ObjCpp => "objective-cpp",
+        Language::Swift => "swift",
+        Language::Php => "php",
+        Language::Vue => "vue",
     }
 }
 
