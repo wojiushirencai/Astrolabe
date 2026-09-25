@@ -83,6 +83,10 @@ pub fn for_language(lang: Language) -> Option<LanguageQueries> {
         Language::Rust => queries!("rust"),
         Language::TypeScript | Language::Tsx => queries!("typescript"),
         Language::JavaScript => queries!("javascript"),
+        Language::Php => queries!("php"),
+        Language::C => queries!("c"),
+        Language::Cpp => queries!("cpp"),
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
 
@@ -112,7 +116,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
-    const ALL: [Language; 7] = [
+    const ALL: [Language; 10] = [
         Language::Python,
         Language::Go,
         Language::Java,
@@ -120,6 +124,9 @@ mod tests {
         Language::TypeScript,
         Language::Tsx,
         Language::JavaScript,
+        Language::Php,
+        Language::C,
+        Language::Cpp,
     ];
 
     fn grammar(lang: Language) -> tree_sitter::Language {
@@ -133,6 +140,13 @@ mod tests {
             }
             Language::Tsx => tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TSX),
             Language::JavaScript => tree_sitter::Language::new(tree_sitter_javascript::LANGUAGE),
+            Language::Php => tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
+            Language::C => tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
+            Language::Cpp => tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
+            Language::ObjC
+            | Language::ObjCpp
+            | Language::Swift
+            | Language::Vue => panic!("{lang:?} grammar not registered in query tests yet"),
         }
     }
 
@@ -1354,4 +1368,206 @@ exports.plain = 1;
             assert!(parsed > 0, "{label}: parsed no files");
         }
     }
+    // ---------------------------------------------------------------- C / C++
+
+    const C_SRC: &str = r#"
+#include "local.h"
+#include <stdio.h>
+
+struct Point {
+    int x;
+    int y;
+};
+
+enum Color { RED, GREEN };
+
+typedef struct Point Point_t;
+
+int add(int a, int b) {
+    return a + b;
+}
+
+int main(void) {
+    Point_t p;
+    printf("%d", add(1, 2));
+    return 0;
+}
+"#;
+
+    const CPP_SRC: &str = r#"
+#include "util.hpp"
+#include <vector>
+
+namespace geom {
+class Shape {
+public:
+    virtual int area() const;
+};
+
+struct Box {
+    int w;
+    int h;
+    int area() const { return w * h; }
+};
+
+int Shape::area() const { return 0; }
+
+void draw(Shape* s) {
+    s->area();
+    geom::Shape* t = s;
+    t->area();
+}
+}  // namespace geom
+"#;
+
+    #[test]
+    fn c_symbols_cover_functions_structs_enums() {
+        // symbols() yields (kind, name, range)
+        let got = symbols(Language::C, C_SRC);
+        let by_name: BTreeMap<_, _> = got
+            .iter()
+            .map(|(k, n, _)| (n.as_str(), k.as_str()))
+            .collect();
+        for need in ["add", "main", "Point", "Color", "Point_t", "RED", "GREEN"] {
+            assert!(by_name.contains_key(need), "missing {need} in {by_name:?}");
+        }
+        assert_eq!(by_name.get("add"), Some(&"function"));
+        assert_eq!(by_name.get("Point"), Some(&"struct"));
+        assert_eq!(by_name.get("Color"), Some(&"enum"));
+        assert_eq!(by_name.get("Point_t"), Some(&"type"));
+        assert_eq!(by_name.get("RED"), Some(&"const"));
+    }
+
+    #[test]
+    fn c_imports_and_calls() {
+        assert_eq!(
+            imports(Language::C, C_SRC),
+            ["local.h", "stdio.h"]
+        );
+        let got = calls(Language::C, C_SRC);
+        let names: BTreeSet<_> = got.iter().map(|n| n.as_str()).collect();
+        assert!(names.contains("add"), "{names:?}");
+        assert!(names.contains("printf"), "{names:?}");
+    }
+
+    #[test]
+    fn cpp_symbols_cover_class_struct_namespace_methods() {
+        let got = symbols(Language::Cpp, CPP_SRC);
+        let by_name: BTreeMap<_, _> = got
+            .iter()
+            .map(|(k, n, _)| (n.as_str(), k.as_str()))
+            .collect();
+        for need in ["geom", "Shape", "Box", "area", "draw"] {
+            assert!(by_name.contains_key(need), "missing {need} in {by_name:?}");
+        }
+        assert_eq!(by_name.get("geom"), Some(&"module"));
+        assert_eq!(by_name.get("Shape"), Some(&"class"));
+        assert_eq!(by_name.get("Box"), Some(&"struct"));
+        assert_eq!(by_name.get("draw"), Some(&"function"));
+        // `area` appears as method (decl + out-of-line / inline) — at least one method.
+        assert!(
+            got.iter().any(|(k, n, _)| k == "method" && n == "area"),
+            "expected method area, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_imports_and_calls() {
+        assert_eq!(
+            imports(Language::Cpp, CPP_SRC),
+            ["util.hpp", "vector"]
+        );
+        let got = calls(Language::Cpp, CPP_SRC);
+        let names: BTreeSet<_> = got.iter().map(|n| n.as_str()).collect();
+        assert!(names.contains("area"), "{names:?}");
+    }
+
+
+    // ---------------------------------------------------------------- PHP
+
+    const PHP_SRC: &str = r#"
+<?php
+namespace App\Geom;
+
+use App\Support\Helper;
+require_once "bootstrap.php";
+
+interface Drawable {
+    public function draw(): void;
+}
+
+trait HasId {
+    public int $id;
+}
+
+enum Color: string {
+    case Red = "r";
+}
+
+class Shape implements Drawable {
+    public const PI = 3.14;
+    private string $name;
+
+    public function draw(): void {
+        $this->paint();
+    }
+
+    private function paint(): void {}
+}
+
+function area(Shape $s): int {
+    return Helper::boost($s);
+}
+
+$s = new Shape();
+$s->draw();
+area($s);
+"#;
+
+    #[test]
+    fn php_symbols_cover_class_interface_trait_enum_method_const() {
+        let got = symbols(Language::Php, PHP_SRC);
+        let by_name: BTreeMap<_, _> = got
+            .iter()
+            .map(|(k, n, _)| (n.as_str(), k.as_str()))
+            .collect();
+        for need in ["Drawable", "HasId", "Color", "Shape", "draw", "paint", "PI", "area"] {
+            assert!(by_name.contains_key(need), "missing {need} in {by_name:?}");
+        }
+        assert!(
+            by_name.keys().any(|n| n.contains("Geom") || n.contains("App")),
+            "expected namespace module, got {by_name:?}"
+        );
+        assert_eq!(by_name.get("Drawable"), Some(&"interface"));
+        assert_eq!(by_name.get("HasId"), Some(&"trait"));
+        assert_eq!(by_name.get("Color"), Some(&"enum"));
+        assert_eq!(by_name.get("Shape"), Some(&"class"));
+        assert_eq!(by_name.get("draw"), Some(&"method"));
+        assert_eq!(by_name.get("area"), Some(&"function"));
+        assert_eq!(by_name.get("PI"), Some(&"const"));
+    }
+
+    #[test]
+    fn php_imports_and_calls() {
+        let imps = imports(Language::Php, PHP_SRC);
+        assert!(
+            imps.iter().any(|s| s.contains("Helper")),
+            "expected use Helper, got {imps:?}"
+        );
+        assert!(
+            imps.iter().any(|s| s.contains("bootstrap")),
+            "expected require_once, got {imps:?}"
+        );
+        let got = calls(Language::Php, PHP_SRC);
+        let names: BTreeSet<_> = got.iter().map(|n| n.as_str()).collect();
+        assert!(
+            names.contains("draw")
+                || names.contains("area")
+                || names.contains("boost")
+                || names.contains("Shape")
+                || names.contains("paint"),
+            "expected call names, got {names:?}"
+        );
+    }
+
 }

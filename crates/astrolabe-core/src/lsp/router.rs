@@ -235,6 +235,7 @@ pub trait LspProvider: Send + Sync {
 
 /// Fallback install text used when no provider is wired (and as the default
 /// trait method). Names match the binaries discovery is expected to probe.
+
 pub fn install_hint_for(language: Language) -> &'static str {
     match language {
         Language::Python => "pyright (`npm i -g pyright` or set ASTROLABE_LSP_PYTHON)",
@@ -246,11 +247,24 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             "typescript-language-server (`npm i -g typescript-language-server typescript`)"
         }
+        Language::Swift => {
+            "sourcekit-lsp (`xcode-select --install` / Xcode; set ASTROLABE_LSP_SWIFT)"
+        }
+        Language::ObjC | Language::ObjCpp => {
+            "sourcekit-lsp (preferred) or clangd (`xcode-select --install` / `brew install llvm`)"
+        }
+        Language::C | Language::Cpp => "clangd (`brew install llvm` or set ASTROLABE_LSP_C)",
+        Language::Php => "intelephense (`npm i -g intelephense` or set ASTROLABE_LSP_PHP)",
+        Language::Vue => {
+            "vue-language-server (`npm i -g @vue/language-server` or set ASTROLABE_LSP_VUE)"
+        }
     }
 }
 
+
 /// Primary binary name mentioned in degradation notes so an agent can grep
 /// for what to install without parsing a full hint.
+
 pub fn primary_server_name(language: Language) -> &'static str {
     match language {
         Language::Python => "pyright",
@@ -258,8 +272,13 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Java => "jdtls",
         Language::Rust => "rust-analyzer",
         Language::TypeScript | Language::Tsx | Language::JavaScript => "typescript-language-server",
+        Language::Swift | Language::ObjC | Language::ObjCpp => "sourcekit-lsp",
+        Language::C | Language::Cpp => "clangd",
+        Language::Php => "intelephense",
+        Language::Vue => "vue-language-server",
     }
 }
+
 
 /// Confidence is [`Ord`] with Exact < Scoped < Syntactic < Unknown: a larger
 /// value is *less* trusted. Never report a more trusted label than the source.

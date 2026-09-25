@@ -264,7 +264,7 @@ impl PreciseTools {
 #[tool_router]
 impl PreciseTools {
     #[tool(
-        description = "精确引用查询（语言服务器）。LSP 不可用时说明缺什么、怎么装，并建议 search_code（有误报）",
+        description = "精确引用查询（语言服务器）。LSP Unavailable 时说明服务器名与下一步：向用户确认后调用 ensure_language_server（默认只出计划、不下载）；可建议 search_code（有误报）",
         annotations(title = "精确引用", read_only_hint = true)
     )]
     pub(crate) fn find_references(
@@ -275,7 +275,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "精确定义跳转（语言服务器绑定解析）。不要用 find_symbol 代替；LSP 不可用时说明缺什么、怎么装",
+        description = "精确定义跳转（语言服务器绑定解析）。不要用 find_symbol 代替；LSP Unavailable 时请向用户确认并调用 ensure_language_server（session-gated）",
         annotations(title = "精确定义", read_only_hint = true)
     )]
     pub(crate) fn goto_definition(
@@ -286,7 +286,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "文件诊断（语言服务器）。按严重程度过滤；LSP 不可用时返回安装提示而不是空的干净结果",
+        description = "文件诊断（语言服务器）。按严重程度过滤；LSP Unavailable 时返回服务器名与 ensure_language_server 下一步，而不是空的干净结果",
         annotations(title = "文件诊断", read_only_hint = true)
     )]
     pub(crate) fn get_diagnostics(
@@ -297,7 +297,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "符号语义信息（LSP hover：docstring/类型/签名，Serena include_info 对应物）",
+        description = "符号语义信息（LSP hover：docstring/类型/签名）。LSP Unavailable 时提示 ensure_language_server（需用户确认）",
         annotations(title = "符号信息", read_only_hint = true)
     )]
     pub(crate) fn get_symbol_info(
@@ -426,7 +426,11 @@ pub(crate) fn run_get_symbol_info(
     let note = outcome
         .note
         .unwrap_or_else(|| confidence_note(confidence).to_string());
-    let mut body = format!("confidence: {confidence:?} {note}\n");
+    let mut body = if confidence == Confidence::Unknown {
+        unknown_preamble(Some(note.as_str()), Some(params.path.as_str()), false)
+    } else {
+        format!("confidence: {confidence:?} {note}\n")
+    };
     match outcome.value.as_deref() {
         Some(info) if !info.trim().is_empty() => {
             body.push('\n');
@@ -920,6 +924,7 @@ fn unknown_preamble(note: Option<&str>, path: Option<&str>, suggest_search: bool
             body.push('\n');
         }
     }
+    body.push_str(&unavailable_ensure_gate(language_of(path)));
     body.push_str("安装提示：\n");
     body.push_str(&install_hint(language_of(path)));
     if suggest_search {
@@ -938,11 +943,30 @@ fn unknown_preamble_definition(note: Option<&str>, path: Option<&str>) -> String
             body.push('\n');
         }
     }
+    body.push_str(&unavailable_ensure_gate(language_of(path)));
     body.push_str("安装提示：\n");
     body.push_str(&install_hint(language_of(path)));
     body.push_str(DEFINITION_FALLBACK);
     body.push('\n');
     body
+}
+
+/// Prompt contract when a precise tool hits Unavailable: tell the model to ask
+/// the user, then call `ensure_language_server` (session-gated; no silent download).
+fn unavailable_ensure_gate(language: Option<Language>) -> String {
+    let (server, lang_name) = match language {
+        Some(lang) => (
+            astrolabe_core::lsp::router::primary_server_name(lang),
+            lang.name(),
+        ),
+        None => ("the language server", "<language>"),
+    };
+    format!(
+        "语言服务器不可用（{server}）。请先向用户确认是否安装，然后调用 \
+         ensure_language_server(language=\"{lang_name}\", confirm_install=true)。\
+         未确认时该工具只返回 needs_install 计划（version_policy=latest，不下载）。\
+         也可用 get_languages 查看 Ready / needs_install / AST-only。\n"
+    )
 }
 
 fn language_of(path: Option<&str>) -> Option<Language> {
@@ -964,6 +988,7 @@ pub(crate) fn install_hint(language: Option<Language>) -> String {
                 Language::Rust,
                 Language::TypeScript,
                 Language::Java,
+                Language::Php,
             ] {
                 out.push_str("- ");
                 out.push_str(&install_hint_one(language));
@@ -973,6 +998,7 @@ pub(crate) fn install_hint(language: Option<Language>) -> String {
         }
     }
 }
+
 
 fn install_hint_one(language: Language) -> String {
     match language {
@@ -991,8 +1017,24 @@ fn install_hint_one(language: Language) -> String {
         Language::Java => {
             "Java（Eclipse JDT LS / jdtls）：启动参数依赖发行版，Homebrew 可用 `brew install jdtls`。当前默认不自动拉起。".into()
         }
+        Language::Swift => {
+            "Swift（sourcekit-lsp）：`xcode-select --install` 或完整 Xcode；可用 ASTROLABE_LSP_SWIFT 覆盖。".into()
+        }
+        Language::ObjC | Language::ObjCpp => {
+            "ObjC/ObjC++：优先 sourcekit-lsp（`xcode-select --install`），回退 clangd（`brew install llvm`）。".into()
+        }
+        Language::C | Language::Cpp => {
+            "C/C++（clangd）：`brew install llvm`，或设置 ASTROLABE_LSP_C。".into()
+        }
+        Language::Php => {
+            "PHP（intelephense）：`npm i -g intelephense`。".into()
+        }
+        Language::Vue => {
+            "Vue（Volar / vue-language-server）：`npm i -g @vue/language-server`，stdio 启动 `vue-language-server --stdio`。可设 ASTROLABE_LSP_VUE。P0 单进程 Volar；双服务器/@vue/typescript-plugin 为后续（TODO）。".into()
+        }
     }
 }
+
 
 fn parse_severity(raw: &str) -> Option<Severity> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -1363,6 +1405,8 @@ mod tests {
         );
         assert!(text.contains("gopls"), "{text}");
         assert!(text.contains("go install"), "{text}");
+        assert!(text.contains("ensure_language_server"), "{text}");
+        assert!(text.contains("confirm_install"), "{text}");
         assert!(text.contains("search_code"), "{text}");
         assert!(text.contains("误报"), "{text}");
         assert!(
@@ -1378,6 +1422,7 @@ mod tests {
         let text = first_text(&diags);
         assert!(text.contains("confidence: Unknown"), "{text}");
         assert!(text.contains("go install"), "{text}");
+        assert!(text.contains("ensure_language_server"), "{text}");
         assert!(!text.contains("search_code"), "{text}");
 
         let plan = assert_first_text(tools.plan_rename(Parameters(PlanRenameParams {

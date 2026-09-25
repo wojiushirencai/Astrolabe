@@ -30,10 +30,21 @@ use crate::types::{Confidence, Language, RelPath};
 
 pub mod diagnostics;
 pub mod discovery;
+pub mod install;
+pub mod installer;
 pub mod pool;
 pub mod queries;
 pub mod router;
 pub mod transport;
+
+pub use installer::{
+    ensure_installed, ensure_installed_with, AutoInstallMode, InstallContext, InstallError as ArtifactInstallError,
+    InstallHint, InstallSpec, NeedsInstall, ArchiveFormat,
+};
+pub use install::{
+    InstallError as SessionInstallError, InstallPlan, InstallRecord, LanguageServerInstaller,
+    LspStatus, StubInstaller, VersionPolicy, parse_language_name,
+};
 
 /// Zero-based line and UTF-16 column, matching the LSP position encoding.
 ///

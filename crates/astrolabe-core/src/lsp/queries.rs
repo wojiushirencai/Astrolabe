@@ -618,6 +618,7 @@ fn unavailable_definition_without_server(path: &RelPath) -> Precise<Vec<Location
     )
 }
 
+
 fn server_label(language: Language) -> &'static str {
     match language {
         Language::Go => "gopls",
@@ -625,8 +626,13 @@ fn server_label(language: Language) -> &'static str {
         Language::Python => "pyright",
         Language::Java => "jdtls",
         Language::TypeScript | Language::Tsx | Language::JavaScript => "typescript-language-server",
+        Language::Swift | Language::ObjC | Language::ObjCpp => "sourcekit-lsp",
+        Language::C | Language::Cpp => "clangd",
+        Language::Php => "intelephense",
+        Language::Vue => "vue-language-server",
     }
 }
+
 
 /// First identifier-token match, as a zero-based UTF-16 position.
 fn first_identifier_position(source: &str, name: &str) -> Option<Position> {
