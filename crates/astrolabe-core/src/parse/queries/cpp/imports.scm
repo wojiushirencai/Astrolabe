@@ -1,10 +1,12 @@
-;; C++ include specifiers (tree-sitter-cpp 0.23).
+;; CPP include specifiers (tree-sitter-cpp).
 ;;
-;; Same shape as C: quoted and angle includes. Quotes / brackets stripped by
-;; `extract_imports` via `unquote`.
+;; `@import` — path text without surrounding quotes. `string_literal` captures
+;; the content node (same convention as Go/JS). `system_lib_string` includes
+;; angle brackets in the node text; production `unquote` strips them.
 
 (preproc_include
-  path: (string_literal) @import)
+  path: (string_literal
+    (string_content) @import))
 
 (preproc_include
   path: (system_lib_string) @import)

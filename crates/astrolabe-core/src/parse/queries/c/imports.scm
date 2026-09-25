@@ -1,11 +1,12 @@
-;; C include specifiers (tree-sitter-c 0.24).
+;; C include specifiers (tree-sitter-c).
 ;;
-;; `@import` — path text. Quotes / angle brackets are stripped by
-;; `extract_imports` via `unquote`. Angle (system) includes stay in the list
-;; for display; filesystem resolution only attempts quoted includes.
+;; `@import` — path text without surrounding quotes. `string_literal` captures
+;; the content node (same convention as Go/JS). `system_lib_string` includes
+;; angle brackets in the node text; production `unquote` strips them.
 
 (preproc_include
-  path: (string_literal) @import)
+  path: (string_literal
+    (string_content) @import))
 
 (preproc_include
   path: (system_lib_string) @import)

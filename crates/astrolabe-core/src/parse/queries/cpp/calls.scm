@@ -20,10 +20,5 @@
     name: (identifier) @name)) @reference.call
 
 (call_expression
-  function: (template_function
-    name: (qualified_identifier
-      name: (identifier) @name))) @reference.call
-
-(call_expression
   function: (parenthesized_expression
     (identifier) @name)) @reference.call

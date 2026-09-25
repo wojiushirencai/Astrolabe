@@ -1440,10 +1440,21 @@ void draw(Shape* s) {
 
     #[test]
     fn c_imports_and_calls() {
-        assert_eq!(
-            imports(Language::C, C_SRC),
-            ["local.h", "stdio.h"]
-        );
+        // system_lib_string nodes include angle brackets; production
+        // extract_imports runs `unquote` which strips them.
+        let raw = imports(Language::C, C_SRC);
+        let got: Vec<_> = raw
+            .iter()
+            .map(|s| {
+                let b = s.as_bytes();
+                if s.len() >= 2 && matches!((b[0], b[s.len() - 1]), (b'"', b'"') | (b'<', b'>')) {
+                    &s[1..s.len() - 1]
+                } else {
+                    s.as_str()
+                }
+            })
+            .collect();
+        assert_eq!(got, ["local.h", "stdio.h"]);
         let got = calls(Language::C, C_SRC);
         let names: BTreeSet<_> = got.iter().map(|n| n.as_str()).collect();
         assert!(names.contains("add"), "{names:?}");
@@ -1473,10 +1484,19 @@ void draw(Shape* s) {
 
     #[test]
     fn cpp_imports_and_calls() {
-        assert_eq!(
-            imports(Language::Cpp, CPP_SRC),
-            ["util.hpp", "vector"]
-        );
+        let raw = imports(Language::Cpp, CPP_SRC);
+        let got: Vec<_> = raw
+            .iter()
+            .map(|s| {
+                let b = s.as_bytes();
+                if s.len() >= 2 && matches!((b[0], b[s.len() - 1]), (b'"', b'"') | (b'<', b'>')) {
+                    &s[1..s.len() - 1]
+                } else {
+                    s.as_str()
+                }
+            })
+            .collect();
+        assert_eq!(got, ["util.hpp", "vector"]);
         let got = calls(Language::Cpp, CPP_SRC);
         let names: BTreeSet<_> = got.iter().map(|n| n.as_str()).collect();
         assert!(names.contains("area"), "{names:?}");

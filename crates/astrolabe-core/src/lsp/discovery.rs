@@ -237,6 +237,8 @@ const APPLE_OBJC: &[Candidate] = &[
     },
 ];
 
+// TODO(p0-followup): dual-server / @vue/typescript-plugin with a companion
+// typescript-language-server (Serena-shaped hybridMode). P0 is single Volar only.
 const VUE: &[Candidate] = &[
     Candidate {
         bin: "vue-language-server",
@@ -1351,6 +1353,38 @@ mod tests {
     }
 
     #[test]
+    fn finds_vue_language_server_as_volar() {
+        let dir = scratch();
+        fake_bin(&dir.0, "vue-language-server");
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Vue)
+            .expect("vue-language-server on PATH");
+        assert!(
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("vue-language-server"),
+            "got {:?}",
+            spec.command
+        );
+        assert_eq!(spec.args, vec!["--stdio"]);
+        assert_eq!(spec.language, Language::Vue);
+        assert!(
+            spec.install_hint.contains("@vue/language-server"),
+            "install hint should point at @vue/language-server, got {}",
+            spec.install_hint
+        );
+        // P0 is single-server Volar; dual-server/TS plugin is follow-up only.
+        assert!(
+            !spec.install_hint.to_ascii_lowercase().contains("typescript-language-server")
+                || spec.install_hint.contains("follow-up")
+                || spec.install_hint.contains("dual-server"),
+            "P0 must not silently require a companion TS server"
+        );
+    }
+
+    #[test]
     fn env_override_var_names_are_stable() {
         assert_eq!(env_override_var(Language::Python), "ASTROLABE_LSP_PYTHON");
         assert_eq!(env_override_var(Language::Go), "ASTROLABE_LSP_GO");
@@ -1366,12 +1400,13 @@ mod tests {
             "ASTROLABE_LSP_JAVASCRIPT"
         );
         assert_eq!(env_override_var(Language::Php), "ASTROLABE_LSP_PHP");
-    
+        assert_eq!(env_override_var(Language::C), "ASTROLABE_LSP_C");
+        assert_eq!(env_override_var(Language::Cpp), "ASTROLABE_LSP_CXX");
         assert_eq!(env_override_var(Language::Swift), "ASTROLABE_LSP_SWIFT");
         assert_eq!(env_override_var(Language::ObjC), "ASTROLABE_LSP_OBJC");
         assert_eq!(env_override_var(Language::ObjCpp), "ASTROLABE_LSP_OBJCPP");
+        assert_eq!(env_override_var(Language::Vue), "ASTROLABE_LSP_VUE");
     }
-
 
     #[test]
     fn php_prefers_intelephense_then_phpactor() {
@@ -1509,6 +1544,52 @@ mod tests {
             Language::from_path(&crate::types::RelPath::new("Foo.h")),
             Some(Language::C)
         );
+    }
+
+
+    #[test]
+    fn prefers_clangd_over_ccls_for_c_and_cpp() {
+        let dir = scratch();
+        fake_bin(&dir.0, "clangd");
+        fake_bin(&dir.0, "ccls");
+        let d = discovery_with_dirs(&[&dir.0]);
+        for language in [Language::C, Language::Cpp] {
+            let spec = d.discover(language).unwrap();
+            assert!(
+                spec.command
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("clangd"),
+                "{language:?} should prefer clangd, got {:?}",
+                spec.command
+            );
+            assert_eq!(spec.args, vec!["--background-index"]);
+            assert!(
+                spec.install_hint.to_ascii_lowercase().contains("clangd"),
+                "hint should mention clangd, got {}",
+                spec.install_hint
+            );
+        }
+    }
+
+    #[test]
+    fn c_family_falls_back_to_ccls() {
+        let dir = scratch();
+        fake_bin(&dir.0, "ccls");
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Cpp)
+            .unwrap();
+        assert!(
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ccls"),
+            "got {:?}",
+            spec.command
+        );
+        assert!(spec.args.is_empty());
     }
 
 }
