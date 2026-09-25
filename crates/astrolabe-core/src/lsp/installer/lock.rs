@@ -16,7 +16,7 @@ pub struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
