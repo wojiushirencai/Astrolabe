@@ -8,6 +8,15 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ### Added
 
+- **Vue SFC indexing + Volar discovery (P0).** `.vue` is a first-class
+  `Language::Vue`. Indexing extracts `<script>` / `<script setup>` (JS/TS/TSX)
+  into the shared parse pipeline — `tree-sitter-vue` is ABI-incompatible with
+  tree-sitter 0.27, so embedding is intentional. LSP discovery probes
+  `vue-language-server` (`npm i -g @vue/language-server`, override
+  `ASTROLABE_LSP_VUE`). P0 is **single-process Volar only**; Serena-style
+  dual-server / `@vue/typescript-plugin` coordination is an explicit follow-up,
+  not a silent fallback.
+
 - **Session-gated language-server install UX (MCP).** Precise tools that hit
   `Unavailable` now name the server and tell the model to ask the user, then
   call `ensure_language_server`. Without `confirm_install` the tool returns a
