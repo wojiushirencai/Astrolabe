@@ -735,7 +735,7 @@ fn clangd_install_spec() -> Option<InstallSpec> {
     // Checksums from Serena's clangd_language_server.py (official release assets).
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        return Some(InstallSpec {
+        Some(InstallSpec {
             name: "clangd".into(),
             version: VERSION.into(),
             url: format!(
@@ -744,11 +744,11 @@ fn clangd_install_spec() -> Option<InstallSpec> {
             sha256: "7c09614eff857d590e4502ef516f035ff94cfb8b795de14ece5afbc53a206caf".into(),
             archive: installer::ArchiveFormat::Zip,
             binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd")),
-        });
+        })
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        return Some(InstallSpec {
+        Some(InstallSpec {
             name: "clangd".into(),
             version: VERSION.into(),
             url: format!(
@@ -757,11 +757,11 @@ fn clangd_install_spec() -> Option<InstallSpec> {
             sha256: "d3b329b3f58602c57ca6501d255147af1bccad3691b1cb0c12c258fcd2da1be3".into(),
             archive: installer::ArchiveFormat::Zip,
             binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd")),
-        });
+        })
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        return Some(InstallSpec {
+        Some(InstallSpec {
             name: "clangd".into(),
             version: VERSION.into(),
             url: format!(
@@ -770,11 +770,11 @@ fn clangd_install_spec() -> Option<InstallSpec> {
             sha256: "d3b329b3f58602c57ca6501d255147af1bccad3691b1cb0c12c258fcd2da1be3".into(),
             archive: installer::ArchiveFormat::Zip,
             binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd")),
-        });
+        })
     }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        return Some(InstallSpec {
+        Some(InstallSpec {
             name: "clangd".into(),
             version: VERSION.into(),
             url: format!(
@@ -783,7 +783,7 @@ fn clangd_install_spec() -> Option<InstallSpec> {
             sha256: "5b6ceb0f85d63fa0c2c9aab31c29bebd41dc11da1f160ef21bc2fea93270a20d".into(),
             archive: installer::ArchiveFormat::Zip,
             binary_relative: PathBuf::from(format!("clangd_{VERSION}/bin/clangd.exe")),
-        });
+        })
     }
     #[cfg(not(any(
         all(target_os = "linux", target_arch = "x86_64"),

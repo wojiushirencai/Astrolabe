@@ -235,7 +235,6 @@ pub trait LspProvider: Send + Sync {
 
 /// Fallback install text used when no provider is wired (and as the default
 /// trait method). Names match the binaries discovery is expected to probe.
-
 pub fn install_hint_for(language: Language) -> &'static str {
     match language {
         Language::Python => "pyright (`npm i -g pyright` or set ASTROLABE_LSP_PYTHON)",
@@ -263,7 +262,6 @@ pub fn install_hint_for(language: Language) -> &'static str {
 
 /// Primary binary name mentioned in degradation notes so an agent can grep
 /// for what to install without parsing a full hint.
-
 pub fn primary_server_name(language: Language) -> &'static str {
     match language {
         Language::Python => "pyright",

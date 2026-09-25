@@ -27,7 +27,7 @@ pub(crate) fn parse_sfc(
     let mut calls = Vec::new();
 
     let component = component_name(path);
-    let total_lines = line_number(source.lines().count().saturating_sub(1).max(0));
+    let total_lines = line_number(source.lines().count().saturating_sub(1));
     symbols.push(CodeSymbol {
         id: SymbolId(0),
         file: FileId(0),
@@ -141,10 +141,10 @@ fn extract_script_blocks(source: &str) -> Vec<ScriptBlock> {
         let body = &source[body_start..body_end];
         // Drop a single leading newline so line 1 of the script aligns with
         // the first content line after `<script...>`.
-        let (body, body_adj) = if body.starts_with('\n') {
-            (&body[1..], 1usize)
-        } else if body.starts_with("\r\n") {
-            (&body[2..], 1usize)
+        let (body, body_adj) = if let Some(stripped) = body.strip_prefix('\n') {
+            (stripped, 1usize)
+        } else if let Some(stripped) = body.strip_prefix("\r\n") {
+            (stripped, 1usize)
         } else {
             (body, 0usize)
         };
