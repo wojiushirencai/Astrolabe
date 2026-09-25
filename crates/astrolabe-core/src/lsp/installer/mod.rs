@@ -231,17 +231,15 @@ pub fn ensure_installed_with(
     }
 
     let version_dir = spec.version_dir(&ctx.cache_root);
-    fs::create_dir_all(version_dir.parent().unwrap_or(Path::new("."))).map_err(|e| {
-        InstallError::Io(spec.name.clone(), e)
-    })?;
+    fs::create_dir_all(version_dir.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| InstallError::Io(spec.name.clone(), e))?;
 
     let lock_path = version_dir
         .parent()
         .unwrap_or(Path::new("."))
         .join(format!(".{}.install.lock", spec.version));
-    let _guard = lock::acquire(&lock_path, ctx.lock_timeout).map_err(|e| {
-        InstallError::Lock(spec.name.clone(), e.to_string())
-    })?;
+    let _guard = lock::acquire(&lock_path, ctx.lock_timeout)
+        .map_err(|e| InstallError::Lock(spec.name.clone(), e.to_string()))?;
 
     // Re-check after lock: another process may have finished.
     if is_runnable(&dest) && spec.marker_path(&ctx.cache_root).is_file() {
@@ -249,9 +247,10 @@ pub fn ensure_installed_with(
     }
 
     let url = rewrite_mirror(&spec.url, ctx.mirror_github.as_deref());
-    let bytes = ctx.fetcher.fetch(&url).map_err(|e| {
-        InstallError::Download(spec.name.clone(), e)
-    })?;
+    let bytes = ctx
+        .fetcher
+        .fetch(&url)
+        .map_err(|e| InstallError::Download(spec.name.clone(), e))?;
 
     let actual = hex::encode(Sha256::digest(&bytes));
     let expected = spec.sha256.trim().to_ascii_lowercase();
@@ -664,8 +663,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut cursor);
-            let opts = zip::write::SimpleFileOptions::default()
-                .unix_permissions(0o755);
+            let opts = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
             zip.start_file("tool", opts).unwrap();
             zip.write_all(b"#!/bin/sh\n").unwrap();
             zip.finish().unwrap();

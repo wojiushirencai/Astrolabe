@@ -273,7 +273,10 @@ mod tests {
             &installer,
         );
         let text = first_text(&result);
-        assert!(text.contains("TODO") || text.contains("not merged"), "{text}");
+        assert!(
+            text.contains("TODO") || text.contains("not merged"),
+            "{text}"
+        );
         assert!(text.contains("no download"), "{text}");
         assert_eq!(
             result.structured_content.as_ref().unwrap()["status"],

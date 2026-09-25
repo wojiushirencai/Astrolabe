@@ -105,7 +105,10 @@ fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf, String> {
             Component::Normal(s) => out.push(s),
             Component::CurDir => {}
             Component::ParentDir => {
-                return Err(format!("archive path escapes destination: {}", rel.display()));
+                return Err(format!(
+                    "archive path escapes destination: {}",
+                    rel.display()
+                ));
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(format!("archive path is absolute: {}", rel.display()));

@@ -84,9 +84,7 @@ impl LspStatus {
             LspStatus::NeedsInstall {
                 server_name,
                 install_hint: _,
-            } => format!(
-                " — needs_install ({server_name}; ask user then ensure_language_server)"
-            ),
+            } => format!(" — needs_install ({server_name}; ask user then ensure_language_server)"),
             LspStatus::AstOnly { reason } => format!(" — AST-only ({reason})"),
         }
     }

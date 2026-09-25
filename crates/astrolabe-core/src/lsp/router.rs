@@ -261,7 +261,6 @@ pub fn install_hint_for(language: Language) -> &'static str {
     }
 }
 
-
 /// Primary binary name mentioned in degradation notes so an agent can grep
 /// for what to install without parsing a full hint.
 
@@ -278,7 +277,6 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Vue => "vue-language-server",
     }
 }
-
 
 /// Confidence is [`Ord`] with Exact < Scoped < Syntactic < Unknown: a larger
 /// value is *less* trusted. Never report a more trusted label than the source.

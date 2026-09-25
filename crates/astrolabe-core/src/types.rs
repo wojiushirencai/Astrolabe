@@ -397,12 +397,30 @@ mod tests {
     fn language_from_path_and_name_cover_p0_matrix() {
         assert_eq!(Language::from_path(&RelPath::new("a.c")), Some(Language::C));
         assert_eq!(Language::from_path(&RelPath::new("a.h")), Some(Language::C));
-        assert_eq!(Language::from_path(&RelPath::new("a.cpp")), Some(Language::Cpp));
-        assert_eq!(Language::from_path(&RelPath::new("a.m")), Some(Language::ObjC));
-        assert_eq!(Language::from_path(&RelPath::new("a.mm")), Some(Language::ObjCpp));
-        assert_eq!(Language::from_path(&RelPath::new("a.swift")), Some(Language::Swift));
-        assert_eq!(Language::from_path(&RelPath::new("a.php")), Some(Language::Php));
-        assert_eq!(Language::from_path(&RelPath::new("a.vue")), Some(Language::Vue));
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.cpp")),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.m")),
+            Some(Language::ObjC)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.mm")),
+            Some(Language::ObjCpp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.swift")),
+            Some(Language::Swift)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.php")),
+            Some(Language::Php)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.vue")),
+            Some(Language::Vue)
+        );
         assert_eq!(Language::from_name("C++"), Some(Language::Cpp));
         assert_eq!(Language::from_name("objective-c"), Some(Language::ObjC));
         assert_eq!(Language::from_name("vue").unwrap().name(), "vue");

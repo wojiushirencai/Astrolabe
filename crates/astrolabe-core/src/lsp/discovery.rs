@@ -233,19 +233,18 @@ const APPLE_OBJC: &[Candidate] = &[
     Candidate {
         bin: "clangd",
         args: &[],
-        install: "brew install llvm  # clangd fallback for ObjC/ObjC++ when sourcekit-lsp is absent",
+        install:
+            "brew install llvm  # clangd fallback for ObjC/ObjC++ when sourcekit-lsp is absent",
     },
 ];
 
 // TODO(p0-followup): dual-server / @vue/typescript-plugin with a companion
 // typescript-language-server (Serena-shaped hybridMode). P0 is single Volar only.
-const VUE: &[Candidate] = &[
-    Candidate {
-        bin: "vue-language-server",
-        args: &["--stdio"],
-        install: "npm i -g @vue/language-server",
-    },
-];
+const VUE: &[Candidate] = &[Candidate {
+    bin: "vue-language-server",
+    args: &["--stdio"],
+    install: "npm i -g @vue/language-server",
+}];
 
 const JAVA_UNAVAILABLE: &str = "\
 jdtls not found on PATH. Eclipse JDT Language Server (eclipse.jdt.ls) is the \
@@ -382,9 +381,11 @@ impl Discovery {
         // Cache: ~/.astrolabe/servers/{name}/{version}/…
         if let Some(cache_root) = &self.cache_root {
             for candidate in candidates(language) {
-                if let Some(command) =
-                    installer::find_cached_binary(cache_root, candidate.bin, Path::new(candidate.bin))
-                {
+                if let Some(command) = installer::find_cached_binary(
+                    cache_root,
+                    candidate.bin,
+                    Path::new(candidate.bin),
+                ) {
                     let spec = spec_from_candidate(language, command, candidate);
                     let install_hint = spec.install_hint.clone();
                     return ProbeResult {
@@ -1377,7 +1378,10 @@ mod tests {
         );
         // P0 is single-server Volar; dual-server/TS plugin is follow-up only.
         assert!(
-            !spec.install_hint.to_ascii_lowercase().contains("typescript-language-server")
+            !spec
+                .install_hint
+                .to_ascii_lowercase()
+                .contains("typescript-language-server")
                 || spec.install_hint.contains("follow-up")
                 || spec.install_hint.contains("dual-server"),
             "P0 must not silently require a companion TS server"
@@ -1480,7 +1484,6 @@ mod tests {
         assert_eq!(d.auto_install_mode(), AutoInstallMode::Off);
     }
 
-
     #[test]
     fn sourcekit_is_primary_for_swift_and_objc_family() {
         let dir = scratch();
@@ -1546,7 +1549,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn prefers_clangd_over_ccls_for_c_and_cpp() {
         let dir = scratch();
@@ -1591,5 +1593,4 @@ mod tests {
         );
         assert!(spec.args.is_empty());
     }
-
 }

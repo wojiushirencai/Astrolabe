@@ -176,10 +176,7 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Php => 7,
         Language::C => 8,
         Language::Cpp => 9,
-        Language::ObjC
-        | Language::ObjCpp
-        | Language::Swift
-        | Language::Vue => return None,
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
 
@@ -195,10 +192,7 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::ObjC
-        | Language::ObjCpp
-        | Language::Swift
-        | Language::Vue => return None,
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
 
@@ -358,7 +352,10 @@ fn php_exported(node: tree_sitter::Node<'_>, source: &str) -> bool {
                     // First keyword tokens: private is never exported; protected
                     // stays internal to the inheritance hierarchy.
                     let head = text.split('{').next().unwrap_or(text);
-                    if head.split_whitespace().any(|t| t == "private" || t == "protected") {
+                    if head
+                        .split_whitespace()
+                        .any(|t| t == "private" || t == "protected")
+                    {
                         return false;
                     }
                 }
@@ -713,7 +710,9 @@ mod tests {
     fn parser_pool_size_does_not_grow_with_file_count() {
         let pool = ParserPool::new();
         for _ in 0..100 {
-            let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")].lock().unwrap();
+            let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")]
+                .lock()
+                .unwrap();
             assert!(parser.as_mut().unwrap().parse("fn f() {}", None).is_some());
         }
         assert_eq!(pool.parsers.len(), LANGUAGES.len());
@@ -729,7 +728,9 @@ mod tests {
     #[test]
     fn malformed_source_and_empty_source_are_recoverable() {
         let pool = ParserPool::new();
-        let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")].lock().unwrap();
+        let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")]
+            .lock()
+            .unwrap();
         let parser = parser.as_mut().unwrap();
         let malformed = parser.parse("fn broken( {", None).unwrap();
         assert!(malformed.root_node().has_error());

@@ -143,10 +143,9 @@ mod tests {
             Language::Php => tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
             Language::C => tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
             Language::Cpp => tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
-            Language::ObjC
-            | Language::ObjCpp
-            | Language::Swift
-            | Language::Vue => panic!("{lang:?} grammar not registered in query tests yet"),
+            Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => {
+                panic!("{lang:?} grammar not registered in query tests yet")
+            }
         }
     }
 
@@ -1502,7 +1501,6 @@ void draw(Shape* s) {
         assert!(names.contains("area"), "{names:?}");
     }
 
-
     // ---------------------------------------------------------------- PHP
 
     const PHP_SRC: &str = r#"
@@ -1551,11 +1549,15 @@ area($s);
             .iter()
             .map(|(k, n, _)| (n.as_str(), k.as_str()))
             .collect();
-        for need in ["Drawable", "HasId", "Color", "Shape", "draw", "paint", "PI", "area"] {
+        for need in [
+            "Drawable", "HasId", "Color", "Shape", "draw", "paint", "PI", "area",
+        ] {
             assert!(by_name.contains_key(need), "missing {need} in {by_name:?}");
         }
         assert!(
-            by_name.keys().any(|n| n.contains("Geom") || n.contains("App")),
+            by_name
+                .keys()
+                .any(|n| n.contains("Geom") || n.contains("App")),
             "expected namespace module, got {by_name:?}"
         );
         assert_eq!(by_name.get("Drawable"), Some(&"interface"));
@@ -1589,5 +1591,4 @@ area($s);
             "expected call names, got {names:?}"
         );
     }
-
 }

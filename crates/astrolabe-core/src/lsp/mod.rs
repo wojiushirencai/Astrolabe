@@ -37,13 +37,13 @@ pub mod queries;
 pub mod router;
 pub mod transport;
 
-pub use installer::{
-    ensure_installed, ensure_installed_with, AutoInstallMode, InstallContext, InstallError as ArtifactInstallError,
-    InstallHint, InstallSpec, NeedsInstall, ArchiveFormat,
-};
 pub use install::{
-    InstallError as SessionInstallError, InstallPlan, InstallRecord, LanguageServerInstaller,
-    LspStatus, StubInstaller, VersionPolicy, parse_language_name,
+    parse_language_name, InstallError as SessionInstallError, InstallPlan, InstallRecord,
+    LanguageServerInstaller, LspStatus, StubInstaller, VersionPolicy,
+};
+pub use installer::{
+    ensure_installed, ensure_installed_with, ArchiveFormat, AutoInstallMode, InstallContext,
+    InstallError as ArtifactInstallError, InstallHint, InstallSpec, NeedsInstall,
 };
 
 /// Zero-based line and UTF-16 column, matching the LSP position encoding.

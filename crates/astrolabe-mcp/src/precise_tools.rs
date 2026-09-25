@@ -999,7 +999,6 @@ pub(crate) fn install_hint(language: Option<Language>) -> String {
     }
 }
 
-
 fn install_hint_one(language: Language) -> String {
     match language {
         Language::Python => {
@@ -1034,7 +1033,6 @@ fn install_hint_one(language: Language) -> String {
         }
     }
 }
-
 
 fn parse_severity(raw: &str) -> Option<Severity> {
     match raw.trim().to_ascii_lowercase().as_str() {

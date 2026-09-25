@@ -261,10 +261,7 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Php => 7,
         Language::C => 8,
         Language::Cpp => 9,
-        Language::ObjC
-        | Language::ObjCpp
-        | Language::Swift
-        | Language::Vue => return None,
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
 
@@ -280,10 +277,7 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::ObjC
-        | Language::ObjCpp
-        | Language::Swift
-        | Language::Vue => return None,
+        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
 

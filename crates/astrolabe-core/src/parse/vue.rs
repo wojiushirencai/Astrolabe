@@ -217,12 +217,19 @@ export function greet(name: string): string {
 const msg = ref('hi')
 </script>
 "#;
-        let parsed = parse_sfc(&pool(), &RelPath::new("src/HelloWorld.vue"), src)
-            .expect("vue sfc parse");
+        let parsed =
+            parse_sfc(&pool(), &RelPath::new("src/HelloWorld.vue"), src).expect("vue sfc parse");
         assert!(
-            parsed.symbols.iter().any(|s| s.name == "HelloWorld" && s.kind == SymbolKind::Module),
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.name == "HelloWorld" && s.kind == SymbolKind::Module),
             "expected SFC module symbol, got {:?}",
-            parsed.symbols.iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
+            parsed
+                .symbols
+                .iter()
+                .map(|s| (&s.name, s.kind))
+                .collect::<Vec<_>>()
         );
         assert!(
             parsed.symbols.iter().any(|s| s.name == "greet"),
@@ -256,10 +263,7 @@ const msg = ref('hi')
     fn script_lang_ts_selects_typescript() {
         let tag = "<script setup lang=\"ts\">";
         assert_eq!(script_language(tag), Language::TypeScript);
-        assert_eq!(
-            script_language("<script lang='tsx'>"),
-            Language::Tsx
-        );
+        assert_eq!(script_language("<script lang='tsx'>"), Language::Tsx);
         assert_eq!(script_language("<script>"), Language::JavaScript);
     }
 }

@@ -379,7 +379,6 @@ impl From<FileWire> for CodeFile {
     }
 }
 
-
 fn language_to_u8(language: Language) -> u8 {
     match language {
         Language::Python => 0,
@@ -398,7 +397,6 @@ fn language_to_u8(language: Language) -> u8 {
         Language::Vue => 13,
     }
 }
-
 
 #[derive(Serialize, Deserialize)]
 struct ParsedWire {
@@ -427,7 +425,6 @@ impl From<ParsedWire> for crate::parse::ParsedFile {
     }
 }
 
-
 fn language_from_u8(language: u8) -> Option<Language> {
     Some(match language {
         0 => Language::Python,
@@ -447,7 +444,6 @@ fn language_from_u8(language: u8) -> Option<Language> {
         _ => return None,
     })
 }
-
 
 #[derive(Serialize, Deserialize)]
 struct SymbolWire {

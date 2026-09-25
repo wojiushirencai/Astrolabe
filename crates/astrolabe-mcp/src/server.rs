@@ -1741,7 +1741,9 @@ impl AstrolabeServer {
         })
     }
 
-    #[tool(description = "统计已索引仓库的语言、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。Index coverage + session-gated install status.")]
+    #[tool(
+        description = "统计已索引仓库的语言、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。Index coverage + session-gated install status."
+    )]
     pub(crate) fn get_languages(
         &self,
         Parameters(params): Parameters<BudgetOnly>,

@@ -797,7 +797,6 @@ impl LspSession {
     }
 }
 
-
 fn language_id(language: Language) -> &'static str {
     match language {
         Language::Python => "python",
@@ -816,7 +815,6 @@ fn language_id(language: Language) -> &'static str {
         Language::Vue => "vue",
     }
 }
-
 
 fn locations_from_value(value: &Value, root: &Path) -> Vec<Location> {
     match value {
