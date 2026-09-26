@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe/darwin-x64",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "The macOS x86_64 binary for astrolabe (x86_64-apple-darwin)",
   "license": "MIT OR Apache-2.0",
   "repository": {

@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe/linux-x64-musl",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "The Linux x86_64 musl binary for astrolabe (x86_64-unknown-linux-musl)",
   "license": "MIT OR Apache-2.0",
   "repository": {
