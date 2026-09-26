@@ -1,6 +1,6 @@
 # 发布 Astrolabe
 
-本文说明如何把 `astrolabe` 二进制发到 GitHub Releases。流水线文件是 [workflows/release.yml](workflows/release.yml)，在推送 `v*` tag 时构建六个目标三元组并上传归档、SHA256 校验和与双许可证。
+本文说明如何把 `astrolabe` 二进制发到 GitHub Releases。流水线文件是 [workflows/release.yml](workflows/release.yml)，在推送 `v*` tag 时构建六个目标三元组并上传归档、SHA256 校验和与 MIT 许可证。
 
 下游 npm 包装（若接入）会下载这些归档并用校验和做完整性校验。**平台 npm 包必须先于主包发布**，见下文「发布顺序」。
 
@@ -21,8 +21,8 @@
 
 归档根目录内容：
 
-- Unix：`astrolabe`、`LICENSE-MIT`、`LICENSE-APACHE`
-- Windows：`astrolabe.exe`、`LICENSE-MIT`、`LICENSE-APACHE`
+- Unix：`astrolabe`、`LICENSE`
+- Windows：`astrolabe.exe`、`LICENSE`
 
 GNU Linux 归档链接的是构建 runner 上的 glibc（当前为 Ubuntu 24.04 / glibc 2.39）。更老的发行版请用 musl 归档。
 
@@ -44,7 +44,7 @@ GNU Linux 归档链接的是构建 runner 上的 glibc（当前为 Ubuntu 24.04 
    - 仓库根目录 `CHANGELOG.md` 应有对应小节，标题可为 `## [0.1.0]`、`## 0.1.0` 或带 `v` 前缀。
    - 没有 CHANGELOG、或没有该版本小节时，Release 正文会退回 GitHub 根据 commit 自动生成的 notes。有小节时，该小节会写在自动 notes 前面。
 5. **许可证**
-   - 根目录必须有 `LICENSE-MIT` 和 `LICENSE-APACHE`（归档会打进去）。
+   - 根目录必须有 `LICENSE`（归档会打进去）。
 6. **锁文件**
    - `Cargo.lock` 已提交，且与 `Cargo.toml` 同步。发布构建使用 `--locked`。
 7. **npm（若本版本要发 npm）**

@@ -1,5 +1,5 @@
 # cargo-deny 0.20.x config.
-# Astrolabe is published as MIT OR Apache-2.0. The license allow-list is
+# Astrolabe is published under the MIT license. The license allow-list is
 # permissive OSI licenses only. Copyleft (GPL/AGPL/LGPL) and any
 # noncommercial / source-available-but-restricted licenses are denied by
 # omission: cargo-deny 0.18+ denies anything not explicitly allowed.

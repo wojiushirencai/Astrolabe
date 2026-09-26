@@ -172,7 +172,7 @@ xattr -d com.apple.quarantine /usr/local/bin/astrolabe 2>/dev/null || true
 ## 五、开源链接与协议
 
 - **GitHub 仓库**：[https://github.com/wojiushirencai/Astrolabe](https://github.com/wojiushirencai/Astrolabe)
-- **开源协议**：双开源协议 **MIT OR Apache-2.0**，对商业与个人二次开发均完全友好。
+- **开源协议**：**MIT** 开源协议，对商业与个人二次开发均完全友好。
 
 如果 Astrolabe 帮你在日常 Coding 中省下了一大笔 Token 账单，或者治好了你家 AI 的“降智遗忘症”，欢迎去 GitHub 点个 Star ⭐️！
 

@@ -179,11 +179,11 @@ jobs:
           rm -rf "$STAGING"
           mkdir -p "$STAGING" dist
 
-          if [[ ! -f LICENSE-MIT || ! -f LICENSE-APACHE ]]; then
-            echo "LICENSE-MIT and LICENSE-APACHE must exist at the repo root" >&2
+          if [[ ! -f LICENSE ]]; then
+            echo "LICENSE must exist at the repo root" >&2
             exit 1
           fi
-          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cp LICENSE "$STAGING/"
 
           BIN="target/${TARGET}/release/astrolabe"
           if [[ -f "${BIN}.exe" ]]; then
