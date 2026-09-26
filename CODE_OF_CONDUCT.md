@@ -59,10 +59,15 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement.
-All complaints will be reviewed and investigated promptly and fairly.
+reported through the following channels:
 
-All community leaders are obligated to respect the privacy and security of the
+- **Contact the repository owner [@wojiushirencai](https://github.com/wojiushirencai) privately via GitHub** (send a private message or use other private communication means available on GitHub).
+- **Use GitHub's built-in [report](https://docs.github.com/en/communities/maintaining-your-safety-on-github/reporting-abuse-or-spam) and [block](https://docs.github.com/en/communities/maintaining-your-safety-on-github/blocking-a-user-from-your-personal-account) features** for immediate safety concerns.
+
+**Please do NOT file a public issue for Code of Conduct concerns** — this protects both the reporter and the reported party during the investigation.
+
+All complaints will be reviewed and investigated promptly and fairly.
+The repository owner is obligated to respect the privacy and security of the
 reporter of any incident.
 
 ## Enforcement Guidelines
