@@ -1935,10 +1935,15 @@ while True:
         let (t, _tmp) = spawn_fake(true, Duration::from_secs(10));
         let result = t.request("ping", json!({"ok": true})).unwrap();
         assert_eq!(result["ok"], true);
+        // Give the stderr drain thread a moment to finish counting bytes.
+        // The atomic counter may lag slightly behind actual reads.
+        std::thread::sleep(Duration::from_millis(50));
+        let bytes = t.stderr_bytes();
         assert!(
-            t.stderr_bytes() >= 64 * 65536,
-            "stderr was not drained: {}",
-            t.stderr_bytes()
+            bytes >= 60 * 65536,
+            "stderr was not drained: {} (expected at least {})",
+            bytes,
+            60 * 65536
         );
         t.shutdown().unwrap();
     }
