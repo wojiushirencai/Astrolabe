@@ -180,7 +180,7 @@ sha256-mismatch fail-closed: ok
 
 registry 上已有 2014 年的 Protractor 辅助包占用未加 scope 的 [`astrolabe`](https://www.npmjs.com/package/astrolabe)。产品命令仍是 `npx -y astrolabe`，首次 `npm publish` 可能被拒，需要 npm 回收名或改名。`@astrolabe/*` 需要先建 npm org。
 
-许可字段已写 `MIT OR Apache-2.0`，与 Cargo workspace 一致。LICENSE 正文由并行任务放在仓库根；主包 `files` 未内嵌，避免和 LICENSE 任务双写。
+许可字段已写 `MIT`，与 Cargo workspace 一致。LICENSE 正文由并行任务放在仓库根；主包 `files` 未内嵌，避免和 LICENSE 任务双写。
 
 ## 7. 复现命令
 

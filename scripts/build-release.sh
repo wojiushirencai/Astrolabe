@@ -5,7 +5,7 @@
 # 规则约束：
 # 1. 每次发布必须同时构建 macOS 与 Windows 两个平台版本。
 # 2. 产物必须包含版本号标识（例如 astrolabe-v0.1.0-*），同时保留规范 target 三元组与无版本软链接/别名。
-# 3. 归档包内必须包含二进制及 LICENSE-MIT、LICENSE-APACHE。
+# 3. 归档包内必须包含二进制及 LICENSE。
 # 4. 自动生成包含全部归档的 SHA256SUMS 校验文件。
 # ==============================================================================
 set -euo pipefail
@@ -62,8 +62,8 @@ STAGING_DIR="${REPO_ROOT}/target/release-staging"
 rm -rf "${STAGING_DIR}"
 mkdir -p "${DIST_DIR}" "${STAGING_DIR}"
 
-if [[ ! -f LICENSE-MIT || ! -f LICENSE-APACHE ]]; then
-    echo "错误: 仓库根目录下必须存在 LICENSE-MIT 与 LICENSE-APACHE" >&2
+if [[ ! -f LICENSE ]]; then
+    echo "错误: 仓库根目录下必须存在 LICENSE" >&2
     exit 1
 fi
 
@@ -105,7 +105,7 @@ package_unix() {
     mkdir -p "${work_dir}"
     cp "${bin_src}" "${work_dir}/astrolabe"
     chmod +x "${work_dir}/astrolabe"
-    cp LICENSE-MIT LICENSE-APACHE "${work_dir}/"
+    cp LICENSE "${work_dir}/"
 
     # 1. 复制带版本号及常规别名的独立二进制
     cp "${bin_src}" "${DIST_DIR}/astrolabe-v${VERSION}-${label}"
@@ -113,7 +113,7 @@ package_unix() {
     chmod +x "${DIST_DIR}/astrolabe-v${VERSION}-${label}" "${DIST_DIR}/astrolabe-${label}"
 
     # 2. 打包 tar.gz 归档（含版本号）
-    tar -czf "${DIST_DIR}/astrolabe-v${VERSION}-${label}.tar.gz" -C "${work_dir}" astrolabe LICENSE-MIT LICENSE-APACHE
+    tar -czf "${DIST_DIR}/astrolabe-v${VERSION}-${label}.tar.gz" -C "${work_dir}" astrolabe LICENSE
     # 建立兼容别名：
     #   - 无版本号标签名（astrolabe-macos-arm64.tar.gz）
     #   - 带版本号规范三元组名（astrolabe-0.1.0-aarch64-apple-darwin.tar.gz，与 CI release.yml 命名一致）
@@ -136,7 +136,7 @@ package_windows() {
     rm -rf "${work_dir}"
     mkdir -p "${work_dir}"
     cp "${bin_src}" "${work_dir}/astrolabe.exe"
-    cp LICENSE-MIT LICENSE-APACHE "${work_dir}/"
+    cp LICENSE "${work_dir}/"
 
     # 1. 复制带版本号及常规别名的独立可执行文件
     cp "${bin_src}" "${DIST_DIR}/astrolabe-v${VERSION}-${label}.exe"
@@ -145,7 +145,7 @@ package_windows() {
     # 2. 打包 zip 归档（含版本号）
     (
         cd "${work_dir}"
-        zip -q -9 "${DIST_DIR}/astrolabe-v${VERSION}-${label}.zip" astrolabe.exe LICENSE-MIT LICENSE-APACHE
+        zip -q -9 "${DIST_DIR}/astrolabe-v${VERSION}-${label}.zip" astrolabe.exe LICENSE
     )
     # 建立兼容别名（命名规则与 package_unix 相同）
     cp "${DIST_DIR}/astrolabe-v${VERSION}-${label}.zip" "${DIST_DIR}/astrolabe-${label}.zip"

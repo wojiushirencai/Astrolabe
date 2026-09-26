@@ -2,7 +2,7 @@
   "name": "@astrolabe/linux-arm64-gnu",
   "version": "0.2.0",
   "description": "The Linux ARM 64-bit glibc binary for astrolabe (aarch64-unknown-linux-gnu)",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/wojiushirencai/Astrolabe.git",
