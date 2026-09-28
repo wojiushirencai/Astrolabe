@@ -1,15 +1,21 @@
 //! Serena 式防漂移 hooks：PreToolUse 计数连续 grep/read 滥用，超阈值 deny + 提醒。
 //! 入口由 cli 分发；本模块只做协议与计数。
+//!
+//! 可通过环境变量覆盖默认阈值：
+//! - `ASTROLABE_SLICE_READ_MAX`: 切片精读最大行数（默认 200）
+//! - `ASTROLABE_READ_THRESHOLD`: 连续全文件 Read deny 阈值（默认 3）
+//! - `ASTROLABE_DENY_SILENCE_SECS`: deny 后静默窗口秒数（默认 120）
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 /// 阈值常量（照抄 Serena 数值）
 pub(crate) const GREP_THRESHOLD: u32 = 3;
-pub(crate) const READ_THRESHOLD: u32 = 3;
+pub(crate) const DEFAULT_READ_THRESHOLD: u32 = 3;
 pub(crate) const NON_SYMBOLIC_THRESHOLD: u32 = 4;
 
 /// 重置周期（秒）：两次同类调用间隔超过该值才重置计数
@@ -17,13 +23,94 @@ pub(crate) const GREP_RESET_PERIOD_SECONDS: f64 = 1000.0;
 pub(crate) const READ_RESET_PERIOD_SECONDS: f64 = 1000.0;
 pub(crate) const NON_SYMBOLIC_RESET_PERIOD_SECONDS: f64 = 2000.0;
 
-/// deny 后静默窗口（秒）：窗口内整个 hook 变为 no-op（不增计数、不发 deny）
-pub(crate) const MIN_DENY_INTERVAL_SECONDS: f64 = 120.0;
+/// deny 后静默窗口（秒）默认值：窗口内整个 hook 变为 no-op（不增计数、不发 deny）
+pub(crate) const DEFAULT_MIN_DENY_INTERVAL_SECONDS: f64 = 120.0;
 
-/// 切片精读（slice read）最大 limit：显式带 limit 且 limit<=120 的局部阅读视为合法精读，
+/// 切片精读（slice read）最大 limit 默认值：显式带 limit 且 limit<=200 的局部阅读视为合法精读，
 /// 不计 read 滥用（Serena 哲学："read a few lines" 时内置 Read 完全正当）。
 /// 注意：仅有 offset 而无合法 limit 时不算切片精读（Claude Code 默认会读约 2000 行）。
-pub(crate) const SLICE_READ_MAX_LIMIT: u64 = 120;
+pub(crate) const DEFAULT_SLICE_READ_MAX_LIMIT: u64 = 200;
+
+/// 环境变量名称
+pub(crate) const ENV_SLICE_READ_MAX: &str = "ASTROLABE_SLICE_READ_MAX";
+pub(crate) const ENV_READ_THRESHOLD: &str = "ASTROLABE_READ_THRESHOLD";
+pub(crate) const ENV_DENY_SILENCE_SECS: &str = "ASTROLABE_DENY_SILENCE_SECS";
+
+/// 运行时配置（从环境变量解析，进程启动后只读）
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HooksConfig {
+    pub slice_read_max_limit: u64,
+    pub read_threshold: u32,
+    pub min_deny_interval_seconds: f64,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            slice_read_max_limit: DEFAULT_SLICE_READ_MAX_LIMIT,
+            read_threshold: DEFAULT_READ_THRESHOLD,
+            min_deny_interval_seconds: DEFAULT_MIN_DENY_INTERVAL_SECONDS,
+        }
+    }
+}
+
+impl HooksConfig {
+    /// 从环境变量解析配置；无效值回退默认并 tracing::warn
+    pub fn from_env() -> Self {
+        let slice_read_max_limit = std::env::var(ENV_SLICE_READ_MAX)
+            .ok()
+            .and_then(|s| {
+                s.trim().parse::<u64>().ok().or_else(|| {
+                    tracing::warn!(
+                        "invalid {ENV_SLICE_READ_MAX}={s:?}; using default {}",
+                        DEFAULT_SLICE_READ_MAX_LIMIT
+                    );
+                    None
+                })
+            })
+            .unwrap_or(DEFAULT_SLICE_READ_MAX_LIMIT);
+
+        let read_threshold = std::env::var(ENV_READ_THRESHOLD)
+            .ok()
+            .and_then(|s| {
+                s.trim().parse::<u32>().ok().or_else(|| {
+                    tracing::warn!(
+                        "invalid {ENV_READ_THRESHOLD}={s:?}; using default {}",
+                        DEFAULT_READ_THRESHOLD
+                    );
+                    None
+                })
+            })
+            .unwrap_or(DEFAULT_READ_THRESHOLD);
+
+        let min_deny_interval_seconds = std::env::var(ENV_DENY_SILENCE_SECS)
+            .ok()
+            .and_then(|s| {
+                s.trim().parse::<f64>().ok().or_else(|| {
+                    tracing::warn!(
+                        "invalid {ENV_DENY_SILENCE_SECS}={s:?}; using default {}",
+                        DEFAULT_MIN_DENY_INTERVAL_SECONDS
+                    );
+                    None
+                })
+            })
+            .unwrap_or(DEFAULT_MIN_DENY_INTERVAL_SECONDS);
+
+        Self {
+            slice_read_max_limit,
+            read_threshold,
+            min_deny_interval_seconds,
+        }
+    }
+}
+
+/// 全局配置单例（进程生命周期内只初始化一次）
+static CONFIG: OnceLock<HooksConfig> = OnceLock::new();
+
+/// 获取当前配置
+pub(crate) fn config() -> &'static HooksConfig {
+    CONFIG.get_or_init(HooksConfig::from_env)
+}
 
 /// 非符号工具子串：Astrolabe 工具名包含这些子串时不重置 burst 计数
 pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] = &[
@@ -124,7 +211,7 @@ impl CounterState {
     pub(crate) fn is_hook_active(&self, now: f64) -> bool {
         match self.last_deny_ts {
             None => true,
-            Some(ts) => (now - ts) >= MIN_DENY_INTERVAL_SECONDS,
+            Some(ts) => (now - ts) >= config().min_deny_interval_seconds,
         }
     }
 }
@@ -421,7 +508,7 @@ fn parse_head_tail_line_count(args_str: &str) -> Option<u64> {
 /// 判定单个 sed 脚本 token 是否为"纯数字地址 + p 打印"命令（如 300,340p / 50p / 50p;80p）
 ///
 /// 检查 sed 脚本是否为受限的切片打印 token（如 `'300,340p'`、`'50p'` 或 `'50p;80p'`）。
-/// 仅放行纯数字单行或跨度 <= SLICE_READ_MAX_LIMIT 的明确行号区间；
+/// 仅放行纯数字单行或跨度 <= slice_read_max_limit（默认 200）的明确行号区间；
 /// 拒绝 `$p`、`/re/p`、`1,$p` 以及超限大范围倾倒。
 fn is_sed_print_script_token(cleaned: &str) -> bool {
     if cleaned.contains(';') {
@@ -445,7 +532,7 @@ fn is_single_sed_print_script_token(s_raw: &str) -> bool {
     // 区间形式：如 "300,340p"
     if let Some((start_str, end_str)) = s.split_once(',') {
         if let (Some(start), Some(end)) = (parse_digits(start_str), parse_digits(end_str)) {
-            return end >= start && (end - start + 1) <= SLICE_READ_MAX_LIMIT;
+            return end >= start && (end - start + 1) <= config().slice_read_max_limit;
         }
     }
     false
@@ -473,11 +560,11 @@ fn is_sed_slice_print(args_str: &str) -> bool {
 /// 判定调用是否为局部切片阅读（slice read）——合法精读，不应计入 read 滥用
 ///
 /// - 直接 read 类工具（tool_name 为 "read" 或含 "read_file"）：
-///   - 必须显式带 limit 且 limit <= 120 → 切片精读；
+///   - 必须显式带 limit 且 limit <= slice_read_max_limit（默认 200）→ 切片精读；
 ///   - 仅有 offset、无合法 limit 时不算切片精读；
 /// - shell 命令：
 ///   - `sed -n 'Np'` / `sed -n 'A,Bp'`（纯数字地址，不含 -i）→ 切片打印；
-///   - `head -n N` / `tail -n N` 当 N <= 120 → 切片打印。
+///   - `head -n N` / `tail -n N` 当 N <= slice_read_max_limit（默认 200）→ 切片打印。
 pub(crate) fn is_slice_read(
     tool_name: &str,
     command_name: Option<&str>,
@@ -486,13 +573,14 @@ pub(crate) fn is_slice_read(
     _offset: Option<u64>,
 ) -> bool {
     let lower_name = tool_name.to_ascii_lowercase();
+    let max_limit = config().slice_read_max_limit;
 
     // 1. 直接 read 类工具：仅按 limit 判定（offset 忽略）
     if lower_name == "read" || lower_name.contains("read_file") {
-        // 切片阅读放行规则：必须显式带 limit 且 limit <= 120；
+        // 切片阅读放行规则：必须显式带 limit 且 limit <= max_limit；
         // 不带 limit（即使有 offset）在 Claude Code 中默认会读 2000 行，不属于小范围切片。
         if let Some(l) = limit {
-            if l <= SLICE_READ_MAX_LIMIT {
+            if l <= max_limit {
                 return true;
             }
         }
@@ -506,7 +594,7 @@ pub(crate) fn is_slice_read(
             "sed" => return is_sed_slice_print(args),
             "head" | "tail" => {
                 return parse_head_tail_line_count(args)
-                    .map(|n| n <= SLICE_READ_MAX_LIMIT)
+                    .map(|n| n <= max_limit)
                     .unwrap_or(false);
             }
             _ => {}
@@ -554,7 +642,7 @@ pub(crate) fn is_read_code_file_call(
 /// 工具分类函数
 ///
 /// `limit` / `offset` 来自 tool_input 的切片参数（数字或数字字符串）。
-/// 当前切片精读判定只使用 `limit`（须存在且 <= 120）；`offset` 保留传入以兼容调用方。
+/// 当前切片精读判定只使用 `limit`（须存在且 <= slice_read_max_limit，默认 200）；`offset` 保留传入以兼容调用方。
 pub(crate) fn classify_tool(
     tool_name: &str,
     client: Client,
@@ -706,7 +794,7 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
 
     // 阈值判定
     let too_many_greps = counter.n_grep >= GREP_THRESHOLD;
-    let too_many_reads = counter.n_read >= READ_THRESHOLD;
+    let too_many_reads = counter.n_read >= config().read_threshold;
     let too_many_non_symbolic = counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD;
 
     // 依次判定：
@@ -745,7 +833,8 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
 /// 提醒误读为"与我只读任务冲突"而选择绕过——讲清楚 astrolabe 本身只读，
 /// 就不是禁止探索而是给出更省 token 的探索方式）。
 pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
-    const READONLY_NOTE: &str = " Note: all Astrolabe tools except apply_rename are read-only and safe for exploration tasks. Also note: slice reads with limit <= 120 (e.g. Read with offset and limit) are permitted and not counted as abuses.";
+    let max_limit = config().slice_read_max_limit;
+    let readonly_note = format!(" Note: all Astrolabe tools except apply_rename are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} (e.g. Read with offset and limit) are permitted and not counted as abuses.");
     let (reason, ctx) = match deny_kind {
         DenyKind::Grep => (
             "Too many consecutive grep calls without using symbolic tools. You can continue using grep now if needed, the counter was reset.",
@@ -760,7 +849,7 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
             "You were alternating between grep and read file calls recently without using Astrolabe's symbolic mcp tools. Consider using symbolic search and targeted symbol reads instead for more code-centric exploration. You can continue using these tools now if needed, the counter was reset.",
         ),
     };
-    let ctx = format!("{ctx}{READONLY_NOTE}");
+    let ctx = format!("{ctx}{readonly_note}");
 
     match client {
         Client::Grok => serde_json::json!({
@@ -2345,7 +2434,7 @@ mod tests {
         assert!(out_str.contains("\"permissionDecision\":\"deny\""));
         assert!(out_str.contains("Too many consecutive read calls"));
 
-        // Case 2: limit=500 > 120（大块读取）连续 3 次 -> 依然触发 read deny
+        // Case 2: limit=500 > 200（大块读取）连续 3 次 -> 依然触发 read deny
         let payload_big = serde_json::json!({
             "session_id": "cc_read_big_sess",
             "tool_name": "Read",
@@ -2392,7 +2481,7 @@ mod tests {
     fn test_shell_slice_print_and_is_slice_read_unit() {
         let code_read = ToolKind::Read { is_code_file: true };
 
-        // head/tail -n N（N <= 120）切片打印 → Neutral
+        // head/tail -n N（N <= 200）切片打印 → Neutral
         assert_eq!(
             classify_tool(
                 "bash",
@@ -2411,7 +2500,7 @@ mod tests {
                 Client::ClaudeCode,
                 None,
                 Some("tail"),
-                Some("-n 120 src/a.rs"),
+                Some("-n 200 src/a.rs"),
                 None,
                 None
             ),
@@ -2442,7 +2531,7 @@ mod tests {
             ToolKind::Neutral
         );
 
-        // N > 120、无 -n、tail -n +N（打印到 EOF，非有界切片）→ 仍计 Read
+        // N > 200、无 -n、tail -n +N（打印到 EOF，非有界切片）→ 仍计 Read
         assert_eq!(
             classify_tool(
                 "bash",
@@ -2558,10 +2647,10 @@ mod tests {
             code_read
         );
 
-        // is_slice_read 直接工具判定：必须显式带 limit 且 limit <= 120
-        assert!(is_slice_read("Read", None, None, Some(120), None));
+        // is_slice_read 直接工具判定：必须显式带 limit 且 limit <= 200（默认阈值）
+        assert!(is_slice_read("Read", None, None, Some(200), None));
         assert!(is_slice_read("read", None, None, Some(40), Some(300)));
-        assert!(!is_slice_read("read", None, None, Some(121), None));
+        assert!(!is_slice_read("read", None, None, Some(201), None));
         assert!(!is_slice_read("read_file", None, None, None, Some(2))); // 无 limit 不放行
         assert!(is_slice_read("read_file", None, None, Some(40), Some(2)));
         assert!(!is_slice_read("read", None, None, None, Some(1)));
@@ -2575,5 +2664,62 @@ mod tests {
         assert_eq!(json_value_as_u64(&serde_json::json!("abc")), None);
         assert_eq!(json_value_as_u64(&serde_json::json!(true)), None);
         assert_eq!(json_value_as_u64(&serde_json::json!(null)), None);
+    }
+
+    #[test]
+    fn test_hooks_config_defaults() {
+        // 验证默认配置值
+        let default_cfg = HooksConfig::default();
+        assert_eq!(default_cfg.slice_read_max_limit, 200);
+        assert_eq!(default_cfg.read_threshold, 3);
+        assert_eq!(default_cfg.min_deny_interval_seconds, 120.0);
+    }
+
+    #[test]
+    fn test_hooks_config_from_env_parsing() {
+        // 测试 HooksConfig 的环境变量解析逻辑
+        // 注意：这里不能修改全局 CONFIG 单例，只测试 from_env 的解析行为
+
+        // 保存原始环境变量
+        let orig_slice = std::env::var(ENV_SLICE_READ_MAX).ok();
+        let orig_threshold = std::env::var(ENV_READ_THRESHOLD).ok();
+        let orig_silence = std::env::var(ENV_DENY_SILENCE_SECS).ok();
+
+        // 设置自定义值
+        std::env::set_var(ENV_SLICE_READ_MAX, "300");
+        std::env::set_var(ENV_READ_THRESHOLD, "5");
+        std::env::set_var(ENV_DENY_SILENCE_SECS, "60");
+
+        let cfg = HooksConfig::from_env();
+        assert_eq!(cfg.slice_read_max_limit, 300);
+        assert_eq!(cfg.read_threshold, 5);
+        assert_eq!(cfg.min_deny_interval_seconds, 60.0);
+
+        // 测试无效值回退默认
+        std::env::set_var(ENV_SLICE_READ_MAX, "invalid");
+        std::env::set_var(ENV_READ_THRESHOLD, "not_a_number");
+        std::env::set_var(ENV_DENY_SILENCE_SECS, "bad");
+
+        let cfg2 = HooksConfig::from_env();
+        assert_eq!(cfg2.slice_read_max_limit, DEFAULT_SLICE_READ_MAX_LIMIT);
+        assert_eq!(cfg2.read_threshold, DEFAULT_READ_THRESHOLD);
+        assert_eq!(
+            cfg2.min_deny_interval_seconds,
+            DEFAULT_MIN_DENY_INTERVAL_SECONDS
+        );
+
+        // 恢复原始环境变量
+        match orig_slice {
+            Some(v) => std::env::set_var(ENV_SLICE_READ_MAX, v),
+            None => std::env::remove_var(ENV_SLICE_READ_MAX),
+        }
+        match orig_threshold {
+            Some(v) => std::env::set_var(ENV_READ_THRESHOLD, v),
+            None => std::env::remove_var(ENV_READ_THRESHOLD),
+        }
+        match orig_silence {
+            Some(v) => std::env::set_var(ENV_DENY_SILENCE_SECS, v),
+            None => std::env::remove_var(ENV_DENY_SILENCE_SECS),
+        }
     }
 }
