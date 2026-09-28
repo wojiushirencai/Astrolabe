@@ -22,7 +22,7 @@ File: `crates/astrolabe-mcp/src/hooks.rs` (code only; no git commit)
 - On `Err`, writes stderr (`Failed to cleanup session data: …`) and returns **2**; success debug log only on `Ok`.
 
 ### 4. Comments synced with implementation
-- Slice-read docs: require explicit `limit <= 120`; offset alone is not enough (removed stale `offset>1` wording).
+- Slice-read docs: require explicit `limit <= 200` (configurable via `ASTROLABE_SLICE_READ_MAX`); offset alone is not enough (removed stale `offset>1` wording).
 - `is_astrolabe_symbolic_tool` doc now includes `memory` in the non-symbolic substring set.
 - Sed print-token docs: only pure numeric `Np` / `A,Bp`; reject `$p` / `/re/p` (matches code).
 - `classify_tool` / inline slice comments updated accordingly.

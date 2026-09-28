@@ -232,6 +232,9 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `ASTROLABE_LSP_TIMEOUT` | 单次 LSP 语言服务器响应超时时间（秒） | `300` |
 | `ASTROLABE_CACHE_MB` | 文件解析内存缓存大小预算（MB） | `256` |
 | `ASTROLABE_WATCH_SECS` | 文件变更监听：未设置走原生系统事件（空闲 0% CPU）；`0` 关闭；`N` 走轮询兜底 | 未设置（原生事件优先） |
+| `ASTROLABE_SLICE_READ_MAX` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为合法精读，不计入滥用 | `200` |
+| `ASTROLABE_READ_THRESHOLD` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） | `3` |
+| `ASTROLABE_DENY_SILENCE_SECS` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） | `120` |
 | `RUST_LOG` | 日志级别（`error` / `warn` / `info` / `debug`） | `info` |
 
 ### 4. 索引缓存与增量更新
@@ -251,9 +254,10 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 即使有 System Prompt 军规约束，大模型在上下文拉长后依然可能出现注意力衰退（Agent Drift），退化为盲目使用 `grep` / `read`。Astrolabe 提供了硬核的门禁拦截机制：
 
 ### 核心拦截与放行规则
-- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 58 种源码后缀过滤），或连续 4 次混合调用，Hook 将坚决拦截并输出引导警告。
+- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 58 种源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整），或连续 4 次混合调用，Hook 将坚决拦截并输出引导警告。
+- **切片精读放行**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 调用视为合法精读，不计入滥用计数。同样，`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片命令亦放行。
 - **计数重置**：AI 只要调用任意 Astrolabe 工具（如 `resolve_context`、`find_symbol` 等），连续计数立即清零；若连续调用间隔超过设定时间，亦自动重置。
-- **智能放行窗口**：触发 Deny 后进入 120 秒静默宽容窗口。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。
+- **智能放行窗口**：触发 Deny 后进入 120 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。
 - **状态存储与清理**：会话状态持久化于 `~/.astrolabe/hook_data/<session_id>/counter.json`；会话结束时通过 `SessionEnd` 自动清理，不留垃圾。
 
 ---
