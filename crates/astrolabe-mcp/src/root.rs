@@ -16,11 +16,49 @@
 //! as given after canonicalization — that is Serena's `--project` flag.
 //! The cwd sentinel `.` (and "no argument") is Serena's `--project-from-cwd`.
 //!
-//! When no marker is found Serena leaves the project inactive (`None`).
-//! Astrolabe still indexes canonicalize(cwd) and warns: an MCP server that
-//! refuses to start is worse than indexing the spawn directory.
+//! When no ancestor marker exists, [`resolve_root`] classifies the spawn
+//! directory instead of indexing it blindly (that fallback once indexed a
+//! 350k-file parent of many git checkouts):
+//!
+//! 1. Walk **up** first — a nested checkout such as `newapi/web` must still
+//!    resolve to `newapi`. Downward probes must not change that.
+//! 2. Look **down** one level for direct children that contain `.git`
+//!    (hidden names such as `.Trash` are skipped). One hit is `MultiProject`.
+//! 3. Count files (capped) and accept as `Single` or refuse as `TooLarge`.
+//!
+//! The MCP binary starts `MultiProject` in dispatcher mode (lazy per-child
+//! indexing, see `session.rs` / `roots.rs`) and still refuses `TooLarge` on
+//! the cwd sentinel (`exit 2`). An explicit requested root skips the refuse.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+use astrolabe_core::scan::{count_files, ScanOptions};
+
+/// Default file-count cap for an unmarked (non-git) root.
+///
+/// Overridden by `ASTROLABE_MAX_ROOT_FILES` in the binary.
+pub const DEFAULT_MAX_ROOT_FILES: u64 = 20_000;
+
+/// Outcome of [`resolve_root`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedRoot {
+    /// Walked up to a `.git` / `.serena/project.yml` ancestor.
+    Repo(PathBuf),
+    /// No project marker, no child git repos, file count ≤ `limit`.
+    Single(PathBuf),
+    /// Direct children contain `.git` (≥ 1). Hidden names are not listed.
+    MultiProject {
+        root: PathBuf,
+        children: Vec<PathBuf>,
+    },
+    /// No project marker, no child git repos, file count exceeds `limit`.
+    TooLarge {
+        root: PathBuf,
+        files: u64,
+        limit: u64,
+    },
+}
 
 /// Walk `start` and its parents. The nearest directory that contains `.git`
 /// or `.serena/project.yml` wins.
@@ -42,15 +80,112 @@ fn is_project_marker(dir: &Path) -> bool {
     dir.join(".git").exists() || dir.join(".serena").join("project.yml").is_file()
 }
 
-fn is_cwd_sentinel(path: &Path) -> bool {
+/// True when the launch request means "detect from process cwd".
+pub fn is_cwd_sentinel(path: &Path) -> bool {
     path == Path::new(".") || path == Path::new("./")
+}
+
+/// Classify `cwd` for the index-root guardrail.
+///
+/// Upward detection is first and final: a nested repo is never reclassified
+/// because a parent directory happens to contain sibling checkouts.
+pub fn resolve_root(cwd: &Path, limit: u64) -> ResolvedRoot {
+    if let Some(found) = find_project_root(cwd) {
+        return ResolvedRoot::Repo(found);
+    }
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let children = child_git_repos(&root);
+    if !children.is_empty() {
+        return ResolvedRoot::MultiProject { root, children };
+    }
+    let (files, truncated) = count_root_files(&root, limit);
+    if truncated || files > limit {
+        return ResolvedRoot::TooLarge { root, files, limit };
+    }
+    ResolvedRoot::Single(root)
+}
+
+/// `(files, truncated)` for the unmarked-root gate and startup telemetry.
+///
+/// Thin wrapper around [`astrolabe_core::scan::count_files`] so the binary
+/// and [`resolve_root`] share one call site.
+pub fn count_root_files(root: &Path, limit: u64) -> (u64, bool) {
+    let count = count_files(root, &ScanOptions::default(), limit);
+    (count.files, count.truncated)
+}
+
+/// Direct child directories of `root` that contain a `.git` marker.
+///
+/// Names starting with `.` (e.g. `.Trash`) are skipped. Used both by
+/// [`resolve_root`] and by the binary to warn on an explicit root.
+pub fn child_git_repos(root: &Path) -> Vec<PathBuf> {
+    let mut children = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return children;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join(".git").exists() {
+            children.push(path.canonicalize().unwrap_or(path));
+        }
+    }
+    children.sort();
+    children
+}
+
+impl ResolvedRoot {
+    /// Actionable refuse text for `MultiProject` / `TooLarge`. `None` means
+    /// the binary should start.
+    pub fn refuse_guidance(&self) -> Option<String> {
+        match self {
+            Self::MultiProject { root, children } => {
+                Some(format_multi_project_refuse(root, children))
+            }
+            Self::TooLarge { root, files, limit } => Some(format!(
+                "Astrolabe refused to index {}: found {files} files (limit {limit}).\n\
+                 cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root",
+                root.display()
+            )),
+            Self::Repo(_) | Self::Single(_) => None,
+        }
+    }
+}
+
+fn format_multi_project_refuse(root: &Path, children: &[PathBuf]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Astrolabe refused to index {}: found {} nested git repositories:",
+        root.display(),
+        children.len()
+    );
+    let shown = children.len().min(20);
+    for child in &children[..shown] {
+        let _ = writeln!(out, "  {}", child.display());
+    }
+    if children.len() > 20 {
+        let _ = writeln!(out, "  …and {} more", children.len() - 20);
+    }
+    let _ = write!(
+        out,
+        "cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root"
+    );
+    out
 }
 
 /// Turn a user/MCP-supplied path into the directory that will be indexed.
 ///
 /// * `.` / `./` — detect from cwd (walk up for `.git` or `.serena/project.yml`);
-///   if none, canonicalize cwd (unlike Serena, which would stay inactive).
-/// * any other path — canonicalize that directory, do **not** walk up.
+///   if none, canonicalize cwd. Size / multi-project refuse lives in
+///   [`resolve_root`], applied by the binary for this sentinel.
+/// * any other path — canonicalize that directory, do **not** walk up, and
+///   skip the MultiProject / TooLarge refuse (explicit user intent).
 pub fn resolve_index_root(requested: &Path) -> anyhow::Result<PathBuf> {
     let start = if requested.is_absolute() {
         requested.to_path_buf()
@@ -101,6 +236,16 @@ mod tests {
     fn write_serena_marker(dir: &Path) {
         std::fs::create_dir_all(dir.join(".serena")).unwrap();
         std::fs::write(dir.join(".serena").join("project.yml"), "project_name: t\n").unwrap();
+    }
+
+    fn git_marker(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+    }
+
+    fn write_n_files(dir: &Path, n: usize) {
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
     }
 
     #[test]
@@ -300,5 +445,160 @@ mod tests {
             "`.` must walk up from cwd to the nearest .serena/project.yml"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_root_nested_checkout_is_repo_not_multiproject() {
+        // newapi/web must resolve to newapi even when the parent workspace
+        // contains sibling git checkouts.
+        let workspace = unique_temp_dir();
+        let newapi = workspace.join("newapi");
+        git_marker(&newapi);
+        let web = newapi.join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        git_marker(&workspace.join("other"));
+
+        match resolve_root(&web, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => {
+                assert_eq!(found, newapi.canonicalize().unwrap());
+            }
+            other => panic!("expected Repo(newapi), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn resolve_root_git_root_wins_over_child_repos() {
+        let root = unique_temp_dir();
+        git_marker(&root);
+        git_marker(&root.join("vendor"));
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => {
+                assert_eq!(found, root.canonicalize().unwrap());
+            }
+            other => panic!("expected Repo, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_root_multi_project_lists_children() {
+        let root = unique_temp_dir();
+        git_marker(&root.join("alpha"));
+        git_marker(&root.join("beta"));
+        std::fs::create_dir_all(root.join("plain")).unwrap();
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::MultiProject {
+                root: got,
+                children,
+            } => {
+                assert_eq!(got, root.canonicalize().unwrap());
+                let names: Vec<_> = children
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(names, ["alpha", "beta"]);
+            }
+            other => panic!("expected MultiProject, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_root_hidden_dirs_are_not_children() {
+        let root = unique_temp_dir();
+        git_marker(&root.join("visible"));
+        git_marker(&root.join(".Trash"));
+        git_marker(&root.join(".hidden"));
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::MultiProject { children, .. } => {
+                let names: Vec<_> = children
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(names, ["visible"]);
+            }
+            other => panic!("expected MultiProject, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_root_only_hidden_children_is_not_multiproject() {
+        let root = unique_temp_dir();
+        git_marker(&root.join(".Trash"));
+        write_n_files(&root, 2);
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Single(got) => {
+                assert_eq!(got, root.canonicalize().unwrap());
+            }
+            other => panic!("expected Single (hidden .git ignored), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_root_unmarked_small_dir_is_single() {
+        let root = unique_temp_dir();
+        write_n_files(&root, 3);
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Single(got) => {
+                assert_eq!(got, root.canonicalize().unwrap());
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_root_unmarked_over_limit_is_too_large() {
+        let root = unique_temp_dir();
+        write_n_files(&root, 4);
+        match resolve_root(&root, 2) {
+            ResolvedRoot::TooLarge {
+                root: got,
+                files,
+                limit,
+            } => {
+                assert_eq!(got, root.canonicalize().unwrap());
+                assert_eq!(limit, 2);
+                assert!(files >= 2, "count should hit the cap, got files={files}");
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_requested_skips_multi_project_guard() {
+        let root = unique_temp_dir();
+        git_marker(&root.join("a"));
+        git_marker(&root.join("b"));
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::MultiProject { .. } => {}
+            other => panic!("fixture should be MultiProject, got {other:?}"),
+        }
+        let resolved = resolve_index_root(&root).expect("explicit path");
+        assert_eq!(
+            resolved,
+            root.canonicalize().unwrap(),
+            "explicit requested root must not refuse or rewrite a multi-project dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuse_guidance_lists_children_and_caps_at_twenty() {
+        let root = PathBuf::from("/tmp/workspace");
+        let children: Vec<PathBuf> = (0..21)
+            .map(|i| PathBuf::from(format!("/tmp/workspace/r{i}")))
+            .collect();
+        let msg = format_multi_project_refuse(&root, &children);
+        assert!(msg.contains("found 21 nested git repositories"));
+        assert!(msg.contains("/tmp/workspace/r0"));
+        assert!(msg.contains("/tmp/workspace/r19"));
+        assert!(!msg.contains("/tmp/workspace/r20"));
+        assert!(msg.contains("…and 1 more"));
+        assert!(msg.contains("cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root"));
     }
 }

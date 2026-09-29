@@ -2,40 +2,53 @@
 //!
 //! The index is a snapshot. After an editor save the graph is stale until
 //! something rebuilds it. This module is that something: it detects filesystem
-//! changes and diffs `mtime` + size against the previous snapshot via
-//! [`crate::scan::scan`] so the watched set matches the indexer (gitignore,
-//! default excludes, size/binary gates).
+//! changes and diffs `mtime` + size against the previous snapshot so the
+//! watched set matches the indexer (gitignore, default excludes, size/binary
+//! gates).
 //!
-//! ## Architecture: Native Events + Snapshot Diff + Polling Fallback
+//! ## Architecture: Event fast path + conditional safety + freshness log
 //!
-//! 1. **Native OS events as wake-up signal**: We register a [`notify::RecommendedWatcher`]
-//!    recursively on the workspace root (FSEvents on macOS, inotify on Linux,
-//!    ReadDirectoryChangesW on Windows). When files are saved, the OS wakes our
-//!    background thread immediately.
-//! 2. **Debounce & coalesce**: Rapid file saves (e.g. `git checkout` or multi-file
-//!    editor saves) are debounced (default 500 ms quiet period) so bursts of
-//!    event notifications collapse into a single snapshot diff.
-//! 3. **Invariant: watched set == indexed set**: Event notifications only act as
-//!    a wake-up trigger. When debounced, [`Watcher::check`] runs [`crate::scan::scan`]
-//!    to diff against the last snapshot. This guarantees that `.gitignore`,
-//!    excluded directories, and binary/size limits are applied consistently.
-//! 4. **Safety net**: A slow periodic check (every [`WatchConfig::safety_interval`],
-//!    default 10 minutes) runs even during complete event silence to guard
-//!    against any dropped or lost OS events. The first deadline is phase-shifted
-//!    by a random offset in `[0, interval)` so concurrent watchers on the same
-//!    tree do not stampede.
-//! 5. **Automatic polling fallback**: If the OS notification system fails to
-//!    initialize or encounters an error at runtime (e.g. exhausted inotify watches),
-//!    the watcher automatically logs a warning and falls back to polling at
-//!    [`WatchConfig::poll_interval`] (default 10 s).
+//! 1. **Native OS events as a path hint**: We register a
+//!    [`notify::RecommendedWatcher`] recursively on the workspace root
+//!    (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on
+//!    Windows). Events carry paths; they are not themselves the diff.
+//! 2. **Prefix filter before any walk**: Paths under excluded directories
+//!    (`.git`, `node_modules`, `target`, `.astrolabe`, … plus
+//!    [`ScanOptions::extra_excludes`] prefixes) are dropped on arrival. If
+//!    every event in a wake is dropped, the loop does not arm debounce and
+//!    does not call [`Watcher::check`] / [`Watcher::check_paths`] — this
+//!    breaks the self-trigger loop of writing into `.astrolabe`.
+//! 3. **Debounce & pending-path merge**: Surviving paths are merged into a
+//!    deduplicated pending set (paths, not event objects). Rapid editor
+//!    saves collapse into one directed diff after
+//!    [`WatchConfig::debounce`] (default 500 ms).
+//! 4. **Directed diff, storm degrade**: After the quiet period,
+//!    [`Watcher::check_paths`] stats only the suspects (and admits new
+//!    paths via [`crate::scan::path_admission`]). Directory events expand
+//!    that subtree with a bounded walk. If the pending set exceeds
+//!    [`WatchConfig::storm_paths`] (default 5000; e.g. `git checkout` of a
+//!    large branch), the loop degrades to a full [`Watcher::check`].
+//! 5. **Safety net**: A slow periodic full-tree scan (every
+//!    [`WatchConfig::safety_interval`], default 30 minutes) still runs
+//!    during OS-event silence. Overflow or a storm sets
+//!    [`FreshnessLog::distrusted`]; while distrusted the safety scan is
+//!    scheduled within [`DISTRUST_SAFETY_INTERVAL`] (60 s) and a clean
+//!    full check clears the flag. The first deadline is phase-shifted by a
+//!    random offset in `[0, interval)` so concurrent watchers do not
+//!    stampede.
+//! 6. **Automatic polling fallback**: If the OS notification system fails
+//!    to initialize or errors at runtime, the watcher logs a warning and
+//!    polls at [`WatchConfig::poll_interval`] (default 10 s).
 //!
 //! ## Cost model
 //!
 //! In event mode, idle CPU is 0.0% because the background thread sleeps on
-//! channel `recv_timeout`. When changes settle, a single `check` walks the tree.
-//! A file is hashed only when it looks different (`mtime`/size) or is
-//! still inside the mtime-precision window. The safety-interval walk is
-//! phase-jittered so N processes on one tree do not align their full scans.
+//! channel `recv_timeout`. A typical editor save is a handful of `stat`
+//! calls via `check_paths`, not a tree walk. A file is hashed only when it
+//! looks different (`mtime`/size) or is still inside the mtime-precision
+//! window. Full `check` (scan + diff) runs on storm/overflow, on the
+//! safety interval, and in polling mode. The safety walk is phase-jittered
+//! so N processes on one tree do not align their full scans.
 //!
 //! ## mtime precision
 //!
@@ -66,9 +79,9 @@
 //! Or spawn a daemon thread that debounces and pushes on a channel:
 //!
 //! ```ignore
-//! let (rx, handle) = astrolabe_core::watch::Watcher::new(root)
+//! let (rx, handle, log) = astrolabe_core::watch::Watcher::new(root)
 //!     .config(astrolabe_core::watch::WatchConfig::default())
-//!     .spawn();
+//!     .spawn_with_log();
 //! while let Ok(changes) = rx.recv() {
 //!     // one changeset per quiet period
 //! }
@@ -78,13 +91,13 @@
 use crate::scan::{self, ScanOptions};
 use crate::types::RelPath;
 use notify::{RecursiveMode, Watcher as _};
-use std::collections::BTreeMap;
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -95,11 +108,37 @@ use std::time::{Duration, Instant, SystemTime};
 pub const MTIME_UNTRUSTED_WINDOW: Duration = Duration::from_secs(2);
 
 const STOP_SLICE: Duration = Duration::from_millis(50);
-const EVENT_SAFETY_INTERVAL: Duration = Duration::from_secs(600);
+const EVENT_SAFETY_INTERVAL: Duration = Duration::from_secs(1800);
+/// While [`FreshnessLog`] is distrusted, a full safety scan is scheduled
+/// within this cap rather than waiting out [`WatchConfig::safety_interval`].
+const DISTRUST_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_STORM_PATHS: usize = 5000;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01b3;
 
-/// Polling cadence, emit delay, and event-mode safety scan for [`Watcher::spawn`].
+/// Directory names matching [`crate::scan`]'s `EXCLUDED_DIRS` (kept local so
+/// this module does not depend on scan internals). A path is excluded when
+/// any component equals one of these names.
+const EXCLUDED_DIR_NAMES: &[&str] = &[
+    ".astrolabe",
+    ".git",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    ".openvisio",
+    ".serena",
+];
+
+/// Polling cadence, emit delay, event-mode safety scan, and storm threshold
+/// for [`Watcher::spawn`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchConfig {
     /// Cadence for the polling fallback when native OS events are disabled or unavailable.
@@ -108,14 +147,19 @@ pub struct WatchConfig {
     /// saves collapse into one event.
     pub debounce: Duration,
     /// Periodic full-tree scan in event mode even during complete OS-event
-    /// silence. Guards against dropped or lost notifications. Default 10
-    /// minutes. `Duration::ZERO` disables the safety scan.
+    /// silence. Guards against dropped or lost notifications. Default 30
+    /// minutes. `Duration::ZERO` disables the safety scan (unless
+    /// [`FreshnessLog`] is distrusted, in which case a 60 s scan is still
+    /// scheduled).
     pub safety_interval: Duration,
     /// Phase-shift the first safety-scan deadline by a random offset in
     /// `[0, safety_interval)` so concurrent watchers on the same tree do not
     /// stampede. Default true; tests that depend on loop timing should set
     /// this false.
     pub safety_jitter: bool,
+    /// Pending suspect-path count that forces a full-tree [`Watcher::check`].
+    /// Default 5000. Covers `git checkout` of a large branch.
+    pub storm_paths: usize,
 }
 
 impl Default for WatchConfig {
@@ -125,6 +169,7 @@ impl Default for WatchConfig {
             debounce: Duration::from_millis(500),
             safety_interval: EVENT_SAFETY_INTERVAL,
             safety_jitter: true,
+            storm_paths: DEFAULT_STORM_PATHS,
         }
     }
 }
@@ -140,6 +185,133 @@ impl WatchConfig {
     pub fn safety_jitter(mut self, enabled: bool) -> Self {
         self.safety_jitter = enabled;
         self
+    }
+
+    /// Storm threshold. See [`Self::storm_paths`].
+    pub fn storm_paths(mut self, n: usize) -> Self {
+        self.storm_paths = n;
+        self
+    }
+}
+
+/// Query-side freshness barrier: watcher thread writes, readers observe.
+///
+/// Shared via [`Arc`]. A watermark is the last completed verification (a
+/// finished full [`Watcher::check`], or a finished directed
+/// [`Watcher::check_paths`]). Overflow / storm sets `distrusted` until the
+/// next clean full check.
+pub struct FreshnessLog {
+    inner: Mutex<FreshnessInner>,
+    /// Set by the query-time barrier when the watermark is stale but there
+    /// are no suspects (`Repair([])`). The watch loop polls this every
+    /// [`STOP_SLICE`] and runs a full [`Watcher::check`] (which calls
+    /// [`FreshnessLog::note_verified`]).
+    verify_requested: AtomicBool,
+}
+
+struct FreshnessInner {
+    watermark: Instant,
+    distrusted: bool,
+    /// Suspect paths accumulated after the current watermark, in note order.
+    /// When `distrusted`, [`FreshnessLog::suspect_paths`] hides these and
+    /// returns empty (callers look at [`FreshnessLog::distrusted`]).
+    suspects: Vec<(Instant, RelPath)>,
+}
+
+impl FreshnessLog {
+    fn new() -> Self {
+        FreshnessLog {
+            inner: Mutex::new(FreshnessInner {
+                watermark: Instant::now(),
+                distrusted: false,
+                suspects: Vec::new(),
+            }),
+            verify_requested: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask the watch loop to run a full verification on the next `STOP_SLICE`.
+    ///
+    /// Used by the MCP freshness barrier for `Repair([])` (stale watermark,
+    /// no suspects). A clean [`Watcher::check`] pushes the watermark.
+    pub fn request_verification(&self) {
+        self.verify_requested.store(true, Ordering::SeqCst);
+    }
+
+    fn take_verification_request(&self) -> bool {
+        self.verify_requested.swap(false, Ordering::SeqCst)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FreshnessInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Instant of the last completed verification (full check or directed).
+    pub fn watermark(&self) -> Instant {
+        self.lock().watermark
+    }
+
+    /// Suspect paths noted after `since`.
+    ///
+    /// Includes event paths and the pending set as it stood before a storm
+    /// expanded into a full check. When the log is distrusted this returns
+    /// empty; callers should consult [`Self::distrusted`].
+    pub fn suspect_paths(&self, since: Instant) -> Vec<RelPath> {
+        let g = self.lock();
+        if g.distrusted {
+            return Vec::new();
+        }
+        let mut out: Vec<RelPath> = g
+            .suspects
+            .iter()
+            .filter(|(t, _)| *t > since)
+            .map(|(_, p)| p.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Overflow or storm happened, and no clean full check has run since.
+    pub fn distrusted(&self) -> bool {
+        self.lock().distrusted
+    }
+
+    pub(crate) fn note_paths(&self, paths: &[RelPath]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut g = self.lock();
+        let now = Instant::now();
+        for p in paths {
+            g.suspects.push((now, p.clone()));
+        }
+    }
+
+    pub(crate) fn note_distrust(&self) {
+        self.lock().distrusted = true;
+    }
+
+    /// A completed full check: push watermark, clear distrust and suspects.
+    pub(crate) fn note_verified(&self) {
+        let mut g = self.lock();
+        g.watermark = Instant::now();
+        g.distrusted = false;
+        g.suspects.clear();
+    }
+
+    fn bump_watermark(&self) {
+        self.lock().watermark = Instant::now();
+    }
+}
+
+impl std::fmt::Debug for FreshnessLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let g = self.lock();
+        f.debug_struct("FreshnessLog")
+            .field("distrusted", &g.distrusted)
+            .field("suspects", &g.suspects.len())
+            .finish()
     }
 }
 
@@ -262,8 +434,9 @@ struct FileStamp {
 
 /// Hybrid filesystem watcher (native OS events with polling fallback).
 ///
-/// Holds the last snapshot; [`check`] returns the delta. Prefer [`spawn`] for
-/// a background thread that debounces and pushes [`ChangeSet`]s on a channel.
+/// Holds the last snapshot; [`check`] returns the full-tree delta and
+/// [`check_paths`] diffs a suspect set. Prefer [`spawn`] / [`spawn_with_log`]
+/// for a background thread that debounces and pushes [`ChangeSet`]s.
 pub struct Watcher {
     root: PathBuf,
     scan: ScanOptions,
@@ -271,6 +444,9 @@ pub struct Watcher {
     snapshot: BTreeMap<RelPath, FileStamp>,
     seeded: bool,
     events: bool,
+    freshness: Arc<FreshnessLog>,
+    check_calls: Arc<AtomicU64>,
+    check_paths_calls: Arc<AtomicU64>,
 }
 
 impl Watcher {
@@ -284,6 +460,9 @@ impl Watcher {
             snapshot: BTreeMap::new(),
             seeded: false,
             events: true,
+            freshness: Arc::new(FreshnessLog::new()),
+            check_calls: Arc::new(AtomicU64::new(0)),
+            check_paths_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -324,6 +503,11 @@ impl Watcher {
         self
     }
 
+    pub fn storm_paths(mut self, n: usize) -> Self {
+        self.config.storm_paths = n;
+        self
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -341,13 +525,17 @@ impl Watcher {
     ///
     /// The first call only records a baseline and returns empty. Later
     /// calls return added / modified / removed paths, each vec sorted.
+    /// Completing this full scan pushes the freshness watermark and
+    /// clears distrust.
     pub fn check(&mut self) -> ChangeSet {
+        self.check_calls.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now();
         let observed = observe_tree(&self.root, &self.scan);
 
         if !self.seeded {
             self.snapshot = stamps_from_observed(&self.root, &observed, now);
             self.seeded = true;
+            self.freshness.note_verified();
             return ChangeSet::default();
         }
 
@@ -394,19 +582,174 @@ impl Watcher {
                 "watch changeset"
             );
         }
+        self.freshness.note_verified();
+        changes
+    }
+
+    /// Directed diff of `paths` against the snapshot.
+    ///
+    /// Deduplicates `paths`. Directories are expanded with a bounded walk
+    /// (excluded names skipped; snapshot keys under the prefix included so
+    /// deletions are visible). Paths already in the snapshot are `stat`ed
+    /// and run through [`confirm`]; new paths go through
+    /// [`scan::path_admission`]. If the unique / expanded set exceeds
+    /// [`WatchConfig::storm_paths`], this degrades to [`Self::check`].
+    pub fn check_paths(&mut self, paths: &[PathBuf]) -> ChangeSet {
+        self.check_paths_calls.fetch_add(1, Ordering::Relaxed);
+        if !self.seeded {
+            return self.check();
+        }
+        let cap = self.config.storm_paths;
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+        for p in paths {
+            let abs = if p.is_absolute() {
+                p.clone()
+            } else {
+                self.root.join(p)
+            };
+            if seen.insert(abs.clone()) {
+                unique.push(abs);
+            }
+        }
+        if unique.len() > cap {
+            self.freshness.note_distrust();
+            return self.check();
+        }
+
+        let extra = &self.scan.extra_excludes;
+        let mut work: BTreeSet<RelPath> = BTreeSet::new();
+        for abs in &unique {
+            if abs == &self.root
+                || (relativize(&self.root, abs).is_none() && abs.starts_with(&self.root))
+            {
+                // Root-directory event: treat as a bounded walk of the whole
+                // tree. Hitting `cap` degrades to a full check.
+                if expand_dir_bounded(&self.root, abs, extra, cap, &mut work).is_err() {
+                    self.freshness.note_distrust();
+                    return self.check();
+                }
+                if work.len() > cap {
+                    self.freshness.note_distrust();
+                    return self.check();
+                }
+                continue;
+            }
+            let Some(rel) = relativize(&self.root, abs) else {
+                continue;
+            };
+            if is_excluded_rel(&rel, extra) {
+                continue;
+            }
+            if abs.is_dir() {
+                if expand_dir_bounded(&self.root, abs, extra, cap, &mut work).is_err() {
+                    self.freshness.note_distrust();
+                    return self.check();
+                }
+                let prefix = rel.as_str();
+                for k in self.snapshot.keys() {
+                    if rel_is_under(k, prefix) {
+                        work.insert(k.clone());
+                        if work.len() > cap {
+                            self.freshness.note_distrust();
+                            return self.check();
+                        }
+                    }
+                }
+            } else {
+                work.insert(rel.clone());
+                if !abs.exists() {
+                    let prefix = rel.as_str();
+                    for k in self.snapshot.keys() {
+                        if rel_is_under(k, prefix) {
+                            work.insert(k.clone());
+                            if work.len() > cap {
+                                self.freshness.note_distrust();
+                                return self.check();
+                            }
+                        }
+                    }
+                }
+                if work.len() > cap {
+                    self.freshness.note_distrust();
+                    return self.check();
+                }
+            }
+        }
+
+        if work.len() > cap {
+            self.freshness.note_distrust();
+            return self.check();
+        }
+
+        let now = SystemTime::now();
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut removed = Vec::new();
+
+        for rel in work {
+            match self.snapshot.get(&rel).cloned() {
+                Some(old) => match observe_one(&self.root, &rel) {
+                    Some(meta) => {
+                        let (stamp, changed) = confirm(&self.root, &rel, &old, &meta, now);
+                        if changed {
+                            modified.push(rel.clone());
+                        }
+                        self.snapshot.insert(rel, stamp);
+                    }
+                    None => {
+                        self.snapshot.remove(&rel);
+                        removed.push(rel);
+                    }
+                },
+                None => match admit_new(&self.root, &rel, &self.scan) {
+                    Admit::Indexed => {
+                        if let Some(meta) = observe_one(&self.root, &rel) {
+                            let stamp = make_stamp(&self.root, &rel, &meta, now, None);
+                            self.snapshot.insert(rel.clone(), stamp);
+                            added.push(rel);
+                        }
+                    }
+                    Admit::Missing | Admit::Skip => {}
+                },
+            }
+        }
+
+        added.sort();
+        modified.sort();
+        removed.sort();
+        let changes = ChangeSet {
+            added,
+            modified,
+            removed,
+        };
+        if !changes.is_empty() {
+            tracing::debug!(
+                added = changes.added.len(),
+                modified = changes.modified.len(),
+                removed = changes.removed.len(),
+                "watch directed changeset"
+            );
+        }
+        self.freshness.bump_watermark();
         changes
     }
 
     /// Run `check` on a background thread and send debounced changesets.
     ///
-    /// By default, registers native OS filesystem notifications (`notify`) and
-    /// falls back to polling at [`WatchConfig::poll_interval`] if native watching
-    /// fails.
+    /// Delegates to [`Self::spawn_with_log`] and drops the log handle.
+    pub fn spawn(self) -> (Receiver<ChangeSet>, WatchHandle) {
+        let (rx, handle, _log) = self.spawn_with_log();
+        (rx, handle)
+    }
+
+    /// Like [`Self::spawn`], also returning the shared [`FreshnessLog`].
     ///
     /// The thread is daemon-like: dropping the [`WatchHandle`] signals stop
     /// **without joining**, so it cannot hold the process open. Call
     /// [`WatchHandle::stop`] for a graceful join.
-    pub fn spawn(self) -> (Receiver<ChangeSet>, WatchHandle) {
+    pub fn spawn_with_log(self) -> (Receiver<ChangeSet>, WatchHandle, Arc<FreshnessLog>) {
+        let log = Arc::clone(&self.freshness);
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
@@ -451,6 +794,7 @@ impl Watcher {
                 stop,
                 thread: Some(thread),
             },
+            log,
         )
     }
 }
@@ -504,39 +848,65 @@ impl Drop for WatchHandle {
     }
 }
 
-trait EventFeed {
-    fn recv_timeout(&mut self, timeout: Duration) -> Result<Result<(), ()>, RecvTimeoutError>;
+/// One wake from the OS event backend (or a test double).
+#[derive(Debug)]
+enum FeedWake {
+    /// Native event(s). `overflow` is latched when the bounded channel
+    /// dropped at least one event since the last recv.
+    Events { paths: Vec<PathBuf>, overflow: bool },
+    /// Backend error → fall back to polling.
+    Error,
 }
 
-impl EventFeed for Receiver<Result<notify::Event, notify::Error>> {
-    fn recv_timeout(&mut self, timeout: Duration) -> Result<Result<(), ()>, RecvTimeoutError> {
-        match Receiver::recv_timeout(self, timeout) {
-            Ok(Ok(_)) => Ok(Ok(())),
-            Ok(Err(_)) => Ok(Err(())),
-            Err(e) => Err(e),
+trait EventFeed {
+    fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError>;
+}
+
+struct NotifyFeed {
+    rx: Receiver<Result<notify::Event, notify::Error>>,
+    overflow: Arc<AtomicBool>,
+}
+
+impl EventFeed for NotifyFeed {
+    fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(Ok(ev)) => {
+                let overflow = self.overflow.swap(false, Ordering::SeqCst) || ev.need_rescan();
+                Ok(FeedWake::Events {
+                    paths: ev.paths,
+                    overflow,
+                })
+            }
+            Ok(Err(_)) => Ok(FeedWake::Error),
+            Err(e) => {
+                if self.overflow.swap(false, Ordering::SeqCst) {
+                    Ok(FeedWake::Events {
+                        paths: Vec::new(),
+                        overflow: true,
+                    })
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 }
 
 /// Cap queued OS events so a burst cannot grow the channel without bound.
-/// Overflow drops events; debounce coalescing and the safety-interval scan recover.
-const NOTIFY_CHANNEL_CAP: usize = 1024;
+/// Overflow latches a flag; the receiver marks the tree dirty and the
+/// safety / debounce path recovers with a full check.
+const NOTIFY_CHANNEL_CAP: usize = 65536;
 
-fn init_notify(
-    root: &Path,
-) -> Option<(
-    Receiver<Result<notify::Event, notify::Error>>,
-    notify::RecommendedWatcher,
-)> {
+fn init_notify(root: &Path) -> Option<(NotifyFeed, notify::RecommendedWatcher)> {
+    let overflow = Arc::new(AtomicBool::new(false));
+    let overflow_cb = Arc::clone(&overflow);
     let (tx, rx) = mpsc::sync_channel(NOTIFY_CHANNEL_CAP);
-    let mut watcher = match notify::recommended_watcher(move |res| {
-        match tx.try_send(res) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                // Drain-on-overflow at the sender: drop; receiver + safety poll catch up.
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {}
+    let mut watcher = match notify::recommended_watcher(move |res| match tx.try_send(res) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            overflow_cb.store(true, Ordering::SeqCst);
         }
+        Err(mpsc::TrySendError::Disconnected(_)) => {}
     }) {
         Ok(w) => w,
         Err(e) => {
@@ -548,14 +918,14 @@ fn init_notify(
         tracing::warn!(%e, root = %root.display(), "failed to register notify watch on root");
         return None;
     }
-    Some((rx, watcher))
+    Some((NotifyFeed { rx, overflow }, watcher))
 }
 
 /// Mix pid, a high-res clock, and a per-call counter into a u64.
 /// Not cryptographic — only used to desynchronize safety-scan deadlines.
 fn entropy64() -> u64 {
-    use std::sync::atomic::AtomicU64;
-    static SEQ: AtomicU64 = AtomicU64::new(1);
+    use std::sync::atomic::AtomicU64 as Seq;
+    static SEQ: Seq = Seq::new(1);
     let mut h = FNV_OFFSET;
     h ^= u64::from(std::process::id());
     h = h.wrapping_mul(FNV_PRIME);
@@ -592,6 +962,22 @@ fn initial_last_safety(config: &WatchConfig) -> Instant {
         .unwrap_or(now)
 }
 
+/// Effective wait until the next full safety scan.
+///
+/// Distrust caps the wait at [`DISTRUST_SAFETY_INTERVAL`]. A configured
+/// `Duration::ZERO` still disables safety when *not* distrusted.
+fn safety_wait(configured: Duration, distrusted: bool) -> Duration {
+    if distrusted {
+        if configured.is_zero() {
+            DISTRUST_SAFETY_INTERVAL
+        } else {
+            configured.min(DISTRUST_SAFETY_INTERVAL)
+        }
+    } else {
+        configured
+    }
+}
+
 fn event_loop<F: EventFeed, G>(
     mut watcher: Watcher,
     mut feed: F,
@@ -600,9 +986,12 @@ fn event_loop<F: EventFeed, G>(
     stop: Arc<AtomicBool>,
 ) -> (Watcher, bool) {
     let debounce = watcher.config.debounce;
+    let storm_paths = watcher.config.storm_paths;
     let safety_interval = watcher.config.safety_interval;
     let mut last_event: Option<Instant> = None;
     let mut last_safety = initial_last_safety(&watcher.config);
+    let mut pending: HashSet<PathBuf> = HashSet::new();
+    let mut all_dirty = false;
 
     // Seed baseline (!seeded → empty) or emit catch-up delta if already seeded.
     {
@@ -615,21 +1004,59 @@ fn event_loop<F: EventFeed, G>(
 
     while !stop.load(Ordering::Relaxed) {
         match feed.recv_timeout(STOP_SLICE) {
-            Ok(Ok(())) => {
-                last_event = Some(Instant::now());
+            Ok(FeedWake::Events { paths, overflow }) => {
+                let mut kept = 0usize;
+                let mut noted: Vec<RelPath> = Vec::new();
+                if overflow {
+                    all_dirty = true;
+                    watcher.freshness.note_distrust();
+                }
+                for p in paths {
+                    if let Some((abs, rel)) = keep_event_path(&watcher.root, &watcher.scan, &p) {
+                        if pending.insert(abs) {
+                            noted.push(rel);
+                        }
+                        kept += 1;
+                    }
+                }
                 // Drain coalesced events so a bounded channel does not stay full.
                 loop {
                     match feed.recv_timeout(Duration::ZERO) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(())) => {
+                        Ok(FeedWake::Events { paths, overflow }) => {
+                            if overflow {
+                                all_dirty = true;
+                                watcher.freshness.note_distrust();
+                            }
+                            for p in paths {
+                                if let Some((abs, rel)) =
+                                    keep_event_path(&watcher.root, &watcher.scan, &p)
+                                {
+                                    if pending.insert(abs) {
+                                        noted.push(rel);
+                                    }
+                                    kept += 1;
+                                }
+                            }
+                        }
+                        Ok(FeedWake::Error) => {
                             drop(guard);
                             return (watcher, false);
                         }
                         Err(_) => break,
                     }
                 }
+                if pending.len() > storm_paths {
+                    all_dirty = true;
+                    watcher.freshness.note_distrust();
+                }
+                if !noted.is_empty() {
+                    watcher.freshness.note_paths(&noted);
+                }
+                if kept > 0 || overflow || all_dirty {
+                    last_event = Some(Instant::now());
+                }
             }
-            Ok(Err(())) => {
+            Ok(FeedWake::Error) => {
                 drop(guard);
                 return (watcher, false);
             }
@@ -640,11 +1067,11 @@ fn event_loop<F: EventFeed, G>(
             }
         }
 
-        let quiet = last_event.map(|t| t.elapsed() >= debounce).unwrap_or(false);
-        // ZERO disables the safety scan (tests, or callers that only want events).
-        let safety_due = !safety_interval.is_zero() && last_safety.elapsed() >= safety_interval;
-
-        if quiet || safety_due {
+        // Query-time Repair([]) asks for a full check so a stale watermark
+        // can advance without waiting for the safety interval.
+        if watcher.freshness.take_verification_request() {
+            all_dirty = false;
+            pending.clear();
             last_event = None;
             last_safety = Instant::now();
             let batch = watcher.check();
@@ -652,11 +1079,42 @@ fn event_loop<F: EventFeed, G>(
                 break;
             }
         }
+
+        let quiet = last_event.map(|t| t.elapsed() >= debounce).unwrap_or(false);
+        let wait = safety_wait(safety_interval, watcher.freshness.distrusted());
+        let safety_due = !wait.is_zero() && last_safety.elapsed() >= wait;
+
+        if quiet || safety_due {
+            last_event = None;
+            // Safety scans and storm/overflow always take the full-tree path.
+            // Directed `check_paths` does not reset the safety clock, so a
+            // distrusted log still gets a full scan within the 60 s cap.
+            let storm = all_dirty || pending.len() > storm_paths;
+            let batch = if safety_due || storm {
+                all_dirty = false;
+                pending.clear();
+                last_safety = Instant::now();
+                watcher.check()
+            } else {
+                let paths: Vec<PathBuf> = pending.drain().collect();
+                watcher.check_paths(&paths)
+            };
+            if !batch.is_empty() && tx.send(batch).is_err() {
+                break;
+            }
+        }
     }
 
     // Flush pending debounce on stop, matching run_loop's pending flush.
-    if last_event.is_some() {
-        let batch = watcher.check();
+    if last_event.is_some() || !pending.is_empty() || all_dirty {
+        let batch = if all_dirty || pending.len() > storm_paths {
+            watcher.check()
+        } else if pending.is_empty() {
+            ChangeSet::default()
+        } else {
+            let paths: Vec<PathBuf> = pending.drain().collect();
+            watcher.check_paths(&paths)
+        };
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
@@ -690,7 +1148,7 @@ fn run_loop(mut watcher: Watcher, tx: mpsc::Sender<ChangeSet>, stop: Arc<AtomicB
             }
         }
 
-        if wait_or_stop(&stop, poll_interval) {
+        if wait_or_stop_checking(&stop, poll_interval, &mut watcher, &tx) {
             if !pending.is_empty() {
                 let _ = tx.send(std::mem::take(&mut pending));
             }
@@ -710,11 +1168,27 @@ fn clamp_interval(d: Duration) -> Duration {
     }
 }
 
-fn wait_or_stop(stop: &AtomicBool, total: Duration) -> bool {
+/// Sleep up to `total`, waking every [`STOP_SLICE`] to honor stop and
+/// on-demand [`FreshnessLog::request_verification`].
+///
+/// Returns true if stop was requested (or the channel closed during a
+/// verification check).
+fn wait_or_stop_checking(
+    stop: &AtomicBool,
+    total: Duration,
+    watcher: &mut Watcher,
+    tx: &mpsc::Sender<ChangeSet>,
+) -> bool {
     let start = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             return true;
+        }
+        if watcher.freshness.take_verification_request() {
+            let batch = watcher.check();
+            if !batch.is_empty() && tx.send(batch).is_err() {
+                return true;
+            }
         }
         let elapsed = start.elapsed();
         if elapsed >= total {
@@ -752,6 +1226,23 @@ fn observe_tree(root: &Path, opts: &ScanOptions) -> BTreeMap<RelPath, Observed> 
         );
     }
     out
+}
+
+fn observe_one(root: &Path, rel: &RelPath) -> Option<Observed> {
+    let abs = root.join(rel.as_str());
+    let meta = abs.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let (mtime, mtime_ok) = match meta.modified() {
+        Ok(t) => (t, true),
+        Err(_) => (SystemTime::UNIX_EPOCH, false),
+    };
+    Some(Observed {
+        mtime,
+        len: meta.len(),
+        mtime_ok,
+    })
 }
 
 fn stamps_from_observed(
@@ -868,6 +1359,115 @@ fn hash_file(path: &Path) -> Option<u64> {
         }
     }
     Some(h)
+}
+
+fn relativize(root: &Path, path: &Path) -> Option<RelPath> {
+    let stripped = path.strip_prefix(root).ok()?;
+    if stripped.as_os_str().is_empty() {
+        return None;
+    }
+    Some(RelPath::new(stripped.to_string_lossy().as_ref()))
+}
+
+fn is_excluded_rel(rel: &RelPath, extra: &[String]) -> bool {
+    let s = rel.as_str();
+    for comp in s.split('/') {
+        if !comp.is_empty() && EXCLUDED_DIR_NAMES.contains(&comp) {
+            return true;
+        }
+    }
+    for raw in extra {
+        let ex = RelPath::new(raw.as_str());
+        let e = ex.as_str().trim_end_matches('/');
+        if e.is_empty() {
+            continue;
+        }
+        if s == e || (s.len() > e.len() && s.starts_with(e) && s.as_bytes()[e.len()] == b'/') {
+            return true;
+        }
+    }
+    false
+}
+
+fn rel_is_under(path: &RelPath, dir: &str) -> bool {
+    let p = path.as_str();
+    if dir.is_empty() {
+        return true;
+    }
+    p == dir || (p.len() > dir.len() && p.starts_with(dir) && p.as_bytes()[dir.len()] == b'/')
+}
+
+fn keep_event_path(root: &Path, scan: &ScanOptions, path: &Path) -> Option<(PathBuf, RelPath)> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let rel = relativize(root, &abs)?;
+    if is_excluded_rel(&rel, &scan.extra_excludes) {
+        return None;
+    }
+    Some((abs, rel))
+}
+
+struct Storm;
+
+fn expand_dir_bounded(
+    root: &Path,
+    dir: &Path,
+    extra: &[String],
+    cap: usize,
+    out: &mut BTreeSet<RelPath>,
+) -> Result<(), Storm> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let rd = match fs::read_dir(&d) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let Some(rel) = relativize(root, &p) else {
+                continue;
+            };
+            if is_excluded_rel(&rel, extra) {
+                continue;
+            }
+            let ft = match ent.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push(p);
+            } else if ft.is_file() {
+                out.insert(rel);
+                if out.len() > cap {
+                    return Err(Storm);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+enum Admit {
+    Indexed,
+    Missing,
+    Skip,
+}
+
+/// Admission of a newly observed path into the watched set.
+///
+/// Delegates to [`scan::path_admission`] (WP-A2) so gitignore, size, and
+/// binary gates match the indexer.
+fn admit_new(root: &Path, rel: &RelPath, opts: &ScanOptions) -> Admit {
+    match scan::path_admission(root, rel, opts) {
+        scan::PathAdmission::Indexed => Admit::Indexed,
+        scan::PathAdmission::Missing => Admit::Missing,
+        scan::PathAdmission::Ignored
+        | scan::PathAdmission::TooLarge
+        | scan::PathAdmission::Binary => Admit::Skip,
+    }
 }
 
 #[cfg(test)]
@@ -1338,10 +1938,10 @@ mod tests {
     }
 
     impl EventFeed for ErrorFeed {
-        fn recv_timeout(&mut self, _timeout: Duration) -> Result<Result<(), ()>, RecvTimeoutError> {
+        fn recv_timeout(&mut self, _timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
             if !self.yielded {
                 self.yielded = true;
-                Ok(Err(()))
+                Ok(FeedWake::Error)
             } else {
                 Err(RecvTimeoutError::Timeout)
             }
@@ -1371,13 +1971,17 @@ mod tests {
 
     struct OneShotFeed {
         fired: bool,
+        path: PathBuf,
     }
 
     impl EventFeed for OneShotFeed {
-        fn recv_timeout(&mut self, _timeout: Duration) -> Result<Result<(), ()>, RecvTimeoutError> {
+        fn recv_timeout(&mut self, _timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
             if !self.fired {
                 self.fired = true;
-                Ok(Ok(()))
+                Ok(FeedWake::Events {
+                    paths: vec![self.path.clone()],
+                    overflow: false,
+                })
             } else {
                 Err(RecvTimeoutError::Timeout)
             }
@@ -1388,13 +1992,17 @@ mod tests {
     fn event_loop_flushes_pending_debounce_on_stop() {
         let dir = TestDir::new();
         dir.write("seed.rs", "seed");
+        let flushed = dir.abs("flushed.rs");
         let mut w = watcher(&dir).debounce(Duration::from_secs(60));
         let _ = w.check();
 
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let feed = OneShotFeed { fired: false };
+        let feed = OneShotFeed {
+            fired: false,
+            path: flushed,
+        };
 
         let thread = thread::spawn(move || {
             let _ = event_loop(w, feed, (), tx, stop_thread);
@@ -1417,7 +2025,7 @@ mod tests {
     struct TimeoutFeed;
 
     impl EventFeed for TimeoutFeed {
-        fn recv_timeout(&mut self, timeout: Duration) -> Result<Result<(), ()>, RecvTimeoutError> {
+        fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
             // Honor the timeout so the loop does not busy-spin; event_loop
             // passes STOP_SLICE (50 ms) here.
             if !timeout.is_zero() {
@@ -1428,9 +2036,10 @@ mod tests {
     }
 
     #[test]
-    fn watch_config_default_safety_interval_is_ten_minutes() {
+    fn watch_config_default_safety_interval_is_thirty_minutes() {
         let cfg = WatchConfig::default();
-        assert_eq!(cfg.safety_interval, Duration::from_secs(600));
+        assert_eq!(cfg.safety_interval, Duration::from_secs(1800));
+        assert_eq!(cfg.storm_paths, 5000);
         assert!(cfg.safety_jitter);
         assert_eq!(
             WatchConfig::default()
@@ -1440,11 +2049,12 @@ mod tests {
             Duration::from_secs(30)
         );
         assert!(!WatchConfig::default().safety_jitter(false).safety_jitter);
+        assert_eq!(WatchConfig::default().storm_paths(7).storm_paths, 7);
     }
 
     #[test]
     fn safety_phase_offset_stays_inside_interval() {
-        let interval = Duration::from_secs(600);
+        let interval = Duration::from_secs(1800);
         for seed in [0u64, 1, 42, u64::MAX] {
             let offset = safety_phase_offset(interval, seed);
             assert!(offset < interval, "seed={seed} offset={offset:?}");
@@ -1453,6 +2063,24 @@ mod tests {
         assert_eq!(
             safety_phase_offset(Duration::from_nanos(1), 0),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn distrust_caps_safety_wait_at_sixty_seconds() {
+        assert_eq!(
+            safety_wait(Duration::from_secs(1800), true),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            safety_wait(Duration::from_millis(80), true),
+            Duration::from_millis(80)
+        );
+        assert_eq!(safety_wait(Duration::ZERO, false), Duration::ZERO);
+        assert_eq!(safety_wait(Duration::ZERO, true), Duration::from_secs(60));
+        assert_eq!(
+            safety_wait(Duration::from_secs(1800), false),
+            Duration::from_secs(1800)
         );
     }
 
@@ -1519,6 +2147,354 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         thread.join().expect("join");
+    }
+
+    struct BurstFeed {
+        paths: Vec<PathBuf>,
+        overflow: bool,
+        fired: bool,
+    }
+
+    impl EventFeed for BurstFeed {
+        fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
+            if !self.fired {
+                self.fired = true;
+                return Ok(FeedWake::Events {
+                    paths: std::mem::take(&mut self.paths),
+                    overflow: self.overflow,
+                });
+            }
+            if timeout.is_zero() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            thread::sleep(timeout);
+            Err(RecvTimeoutError::Timeout)
+        }
+    }
+
+    #[test]
+    fn excluded_events_do_not_trigger_check() {
+        let dir = TestDir::new();
+        dir.write("seed.rs", "seed");
+        dir.write(".git/HEAD", "ref: refs/heads/main");
+        dir.write("target/out.rs", "x");
+        dir.write("node_modules/pkg/index.js", "x");
+        dir.write(".astrolabe/store", "x");
+        let mut scan = test_scan();
+        scan.extra_excludes = vec!["scratch".into()];
+        dir.write("scratch/tmp.rs", "x");
+
+        let mut w = watcher(&dir)
+            .scan_options(scan)
+            .debounce(Duration::from_millis(30));
+        assert!(w.check().is_empty());
+        let seed_mtime = w
+            .snapshot
+            .get(&RelPath::new("seed.rs"))
+            .expect("seed stamp")
+            .mtime;
+        let checks = Arc::clone(&w.check_calls);
+        let path_checks = Arc::clone(&w.check_paths_calls);
+        let before_full = checks.load(Ordering::Relaxed);
+        let before_paths = path_checks.load(Ordering::Relaxed);
+
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let feed = BurstFeed {
+            paths: vec![
+                dir.abs(".git/HEAD"),
+                dir.abs("target/out.rs"),
+                dir.abs("node_modules/pkg/index.js"),
+                dir.abs(".astrolabe/store"),
+                dir.abs("scratch/tmp.rs"),
+            ],
+            overflow: false,
+            fired: false,
+        };
+
+        let thread = thread::spawn(move || event_loop(w, feed, (), tx, stop_thread));
+
+        // Seed check inside event_loop, then excluded burst, then debounce.
+        thread::sleep(Duration::from_millis(200));
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Err(RecvTimeoutError::Timeout) => {}
+            other => panic!("excluded events leaked a changeset: {other:?}"),
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        let (w, _) = thread.join().expect("join event_loop");
+
+        // event_loop always does one full check at start; excluded events
+        // must not add another full check or a directed check.
+        assert_eq!(
+            w.check_calls.load(Ordering::Relaxed),
+            before_full + 1,
+            "excluded events must not trigger another full check"
+        );
+        assert_eq!(
+            w.check_paths_calls.load(Ordering::Relaxed),
+            before_paths,
+            "excluded events must not trigger check_paths"
+        );
+        assert_eq!(
+            w.snapshot
+                .get(&RelPath::new("seed.rs"))
+                .expect("seed stamp")
+                .mtime,
+            seed_mtime
+        );
+    }
+
+    #[test]
+    fn check_paths_detects_added() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "a");
+        let mut w = watcher(&dir);
+        assert!(w.check().is_empty());
+        dir.write("nested/b.rs", "b");
+        let cs = w.check_paths(&[dir.abs("nested/b.rs")]);
+        assert_eq!(cs.added, vec![RelPath::new("nested/b.rs")]);
+        assert!(cs.modified.is_empty());
+        assert!(cs.removed.is_empty());
+    }
+
+    #[test]
+    fn check_paths_detects_modified() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        assert!(w.check().is_empty());
+        rewrite_and_bump(&dir, "a.rs", "fn a() { 1 }");
+        let cs = w.check_paths(&[dir.abs("a.rs")]);
+        assert_eq!(cs.modified, vec![RelPath::new("a.rs")]);
+        assert!(cs.added.is_empty());
+        assert!(cs.removed.is_empty());
+    }
+
+    #[test]
+    fn check_paths_detects_removed() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "a");
+        dir.write("b.rs", "b");
+        let mut w = watcher(&dir);
+        assert!(w.check().is_empty());
+        fs::remove_file(dir.abs("a.rs")).expect("remove");
+        let cs = w.check_paths(&[dir.abs("a.rs")]);
+        assert_eq!(cs.removed, vec![RelPath::new("a.rs")]);
+        assert!(cs.added.is_empty());
+        assert!(cs.modified.is_empty());
+    }
+
+    #[test]
+    fn check_paths_expands_directory_event() {
+        let dir = TestDir::new();
+        dir.write("sub/a.rs", "a");
+        dir.write("sub/b.rs", "b");
+        let mut w = watcher(&dir);
+        assert!(w.check().is_empty());
+
+        rewrite_and_bump(&dir, "sub/a.rs", "a2");
+        fs::remove_file(dir.abs("sub/b.rs")).expect("remove");
+        dir.write("sub/deep/c.rs", "c");
+
+        let cs = w.check_paths(&[dir.abs("sub")]);
+        assert_eq!(cs.added, vec![RelPath::new("sub/deep/c.rs")], "{cs:?}");
+        assert_eq!(cs.modified, vec![RelPath::new("sub/a.rs")], "{cs:?}");
+        assert_eq!(cs.removed, vec![RelPath::new("sub/b.rs")], "{cs:?}");
+    }
+
+    #[test]
+    fn check_paths_storm_degrades_to_full_check() {
+        let dir = TestDir::new();
+        dir.write("keep.rs", "k");
+        dir.write("seen.rs", "s");
+        let mut w = watcher(&dir).storm_paths(3);
+        assert!(w.check().is_empty());
+        rewrite_and_bump(&dir, "keep.rs", "k2");
+        dir.write("outside.rs", "o");
+
+        let dummies: Vec<PathBuf> = (0..4).map(|i| dir.abs(&format!("nope{i}.rs"))).collect();
+        let before_full = w.check_calls.load(Ordering::Relaxed);
+        let cs = w.check_paths(&dummies);
+        assert!(
+            w.check_calls.load(Ordering::Relaxed) > before_full,
+            "storm must run a full check"
+        );
+        assert!(
+            cs.modified.contains(&RelPath::new("keep.rs")),
+            "full check must see keep.rs, not in the dummy set: {cs:?}"
+        );
+        assert!(
+            cs.added.contains(&RelPath::new("outside.rs")),
+            "full check must see outside.rs: {cs:?}"
+        );
+    }
+
+    #[test]
+    fn overflow_distrust_fast_safety_then_clears() {
+        let dir = TestDir::new();
+        dir.write("seed.rs", "seed");
+        let mut w = watcher(&dir)
+            .safety_interval(Duration::from_millis(80))
+            .debounce(Duration::from_secs(60));
+        let _ = w.check();
+        let log = Arc::clone(&w.freshness);
+        assert!(!log.distrusted());
+
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let feed = BurstFeed {
+            paths: Vec::new(),
+            overflow: true,
+            fired: false,
+        };
+
+        let thread = thread::spawn(move || {
+            let _ = event_loop(w, feed, (), tx, stop_thread);
+        });
+
+        let start = Instant::now();
+        while !log.distrusted() {
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("overflow did not set distrust");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        dir.write("late.rs", "late");
+        let cs = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fast safety after distrust should pick up a silent write");
+        assert_eq!(cs.added, vec![RelPath::new("late.rs")], "{cs:?}");
+        assert!(!log.distrusted(), "clean full check must clear distrust");
+
+        stop.store(true, Ordering::SeqCst);
+        thread.join().expect("join event_loop");
+    }
+
+    #[test]
+    fn freshness_log_watermark_and_suspect_paths() {
+        let log = FreshnessLog::new();
+        let t0 = log.watermark();
+        assert!(!log.distrusted());
+        assert!(log.suspect_paths(t0).is_empty());
+
+        thread::sleep(Duration::from_millis(2));
+        log.note_paths(&[RelPath::new("b.rs"), RelPath::new("a.rs")]);
+        assert_eq!(
+            log.suspect_paths(t0),
+            vec![RelPath::new("a.rs"), RelPath::new("b.rs")]
+        );
+        thread::sleep(Duration::from_millis(2));
+        assert!(log.suspect_paths(Instant::now()).is_empty());
+
+        log.note_distrust();
+        assert!(log.distrusted());
+        assert!(
+            log.suspect_paths(t0).is_empty(),
+            "distrusted log hides suspects"
+        );
+
+        thread::sleep(Duration::from_millis(2));
+        log.note_verified();
+        assert!(!log.distrusted());
+        assert!(log.watermark() > t0);
+        assert!(log.suspect_paths(t0).is_empty());
+    }
+
+    #[test]
+    fn spawn_with_log_shares_freshness() {
+        let dir = TestDir::new();
+        dir.write("seed.rs", "seed");
+        let (rx, handle, log) = watcher(&dir)
+            .events(false)
+            .poll_interval(Duration::from_millis(30))
+            .debounce(Duration::from_millis(20))
+            .spawn_with_log();
+        assert!(!log.distrusted());
+        // Drop any baseline/empty noise, then stop.
+        let _ = rx.recv_timeout(Duration::from_millis(50));
+        handle.stop();
+    }
+
+    #[test]
+    fn request_verification_advances_watermark_poll_loop() {
+        let dir = TestDir::new();
+        dir.write("seed.rs", "seed");
+        let (rx, handle, log) = watcher(&dir)
+            .events(false)
+            .poll_interval(Duration::from_secs(30))
+            .debounce(Duration::ZERO)
+            .safety_interval(Duration::ZERO)
+            .safety_jitter(false)
+            .spawn_with_log();
+
+        // First check seeds baseline immediately; give it a moment.
+        thread::sleep(Duration::from_millis(40));
+        let wm = log.watermark();
+
+        dir.write("late.rs", "fn late() {}");
+        bump_mtime(&dir.abs("late.rs"));
+        log.request_verification();
+
+        let cs = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("on-demand check should emit late.rs without waiting poll_interval");
+        assert!(
+            cs.added.iter().any(|p| p.as_str() == "late.rs"),
+            "expected late.rs added, got {cs:?}"
+        );
+        assert!(
+            log.watermark() > wm,
+            "request_verification must push the watermark"
+        );
+        handle.stop();
+    }
+
+    struct HangFeed;
+
+    impl EventFeed for HangFeed {
+        fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
+            thread::sleep(timeout);
+            Err(RecvTimeoutError::Timeout)
+        }
+    }
+
+    #[test]
+    fn request_verification_event_loop_runs_check() {
+        let dir = TestDir::new();
+        dir.write("seed.rs", "seed");
+        let mut w = watcher(&dir)
+            .safety_interval(Duration::from_secs(3600))
+            .debounce(Duration::from_secs(60))
+            .safety_jitter(false);
+        let _ = w.check();
+        let log = Arc::clone(&w.freshness);
+        let wm = log.watermark();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let _ = event_loop(w, HangFeed, (), tx, stop_thread);
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        dir.write("late.rs", "late");
+        bump_mtime(&dir.abs("late.rs"));
+        log.request_verification();
+        let cs = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event_loop should honor request_verification within STOP_SLICE");
+        assert!(
+            cs.added.iter().any(|p| p.as_str() == "late.rs"),
+            "expected late.rs added, got {cs:?}"
+        );
+        assert!(log.watermark() > wm);
+
+        stop.store(true, Ordering::SeqCst);
+        thread.join().expect("join event_loop");
     }
 
     #[test]

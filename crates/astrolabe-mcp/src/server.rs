@@ -1,19 +1,16 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    fmt,
-    ops::Deref,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
     },
-    time::Duration,
 };
 
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
-    cache::{CacheConfig, FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
+    cache::DEFAULT_MEMORY_BUDGET_BYTES,
     graph::{compute_centrality, dependencies, dependents, rank_for_task},
     render::{confidence_note, symbol_line},
     Confidence, EdgeKind, FileId,
@@ -35,10 +32,17 @@ use serde_json::{json, Value};
 
 use crate::{
     context::ClientContext,
-    index::{self, RepoIndex},
+    index::RepoIndex,
+    knobs::McpKnobs,
     openai_schema::sanitize_for_openai_tools,
+    session::{
+        self, append_stale_note, run_barrier, start_idle_ticker, start_root_indexing, teardown_all,
+        BarrierEffect, DispatchState, RootSession,
+    },
     TOOL_CATALOG_TTL_MS,
 };
+
+pub(crate) use crate::session::IndexState;
 
 const DEFAULT_BUDGET: usize = 2_500;
 const RESOURCE_THRESHOLD_TOKENS: usize = 4_000;
@@ -136,26 +140,6 @@ fn structured_output_override() -> Option<bool> {
 
 fn structured_output_for(context: &ClientContext) -> bool {
     structured_output_override().unwrap_or_else(|| context.structured_or_auto_off())
-}
-
-/// `FileCache` is not `Debug`; wrap it so `AstrolabeServer` can keep its derive.
-#[derive(Clone)]
-struct SharedFileCache(Arc<FileCache>);
-
-impl Deref for SharedFileCache {
-    type Target = FileCache;
-
-    fn deref(&self) -> &FileCache {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SharedFileCache {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FileCache")
-            .field("weighted_size", &self.weighted_size())
-            .finish()
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -339,165 +323,20 @@ pub(crate) struct TraceParams {
     pub budget_tokens: usize,
 }
 
-#[derive(Debug)]
-enum IndexState {
-    Building,
-    Ready(Arc<RepoIndex>),
-    Failed(String),
-}
-
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
+    /// Parent (multi) or the single index root. Memory tools and
+    /// `initial_instructions` use this; graph tools use the routed session.
     root: PathBuf,
-    state: Arc<RwLock<IndexState>>,
+    primary: Arc<RootSession>,
+    dispatch: Option<Arc<DispatchState>>,
+    ticker_stop: Arc<AtomicBool>,
     resources: Arc<Mutex<BTreeMap<String, String>>>,
     next_resource: Arc<AtomicU64>,
-    file_cache: SharedFileCache,
     cache_budget_bytes: u64,
-    cache_hits: Arc<AtomicU64>,
-    cache_misses: Arc<AtomicU64>,
-    /// Kept alive for the process lifetime so the watch thread is not stopped
-    /// by `WatchHandle::drop`. `None` when watching is disabled.
-    watch: Arc<Mutex<Option<astrolabe_core::watch::WatchHandle>>>,
-    /// Per-repo indexer election. `Some` while this process is the leader and
-    /// may persist `index.redb`. Dropped on shutdown so a sibling can promote.
-    indexer_lock: Arc<Mutex<Option<astrolabe_core::elect::IndexerLock>>>,
-    /// Backend for the language-server-backed tools. Defaults to a reporting
-    /// stub until a real server is wired in, so the tools stay callable and
-    /// explain what is missing instead of vanishing from the catalog.
-    precise: Arc<dyn crate::precise_tools::PreciseCapability>,
-    /// Named client context (`--context` / `ASTROLABE_CONTEXT`). Drives the
-    /// structured-output default and optional `excluded_tools` catalog filter.
     context: ClientContext,
-    /// Claude Code substitutes `structuredContent` for `content[0].text`.
-    /// Default off (`default` / `claude-code`). `ASTROLABE_STRUCTURED` overrides.
     structured_output: bool,
-    /// git churn 表缓存（get_hotspots 用）：每次调用都 spawn `git log` 会把
-    /// 最坏 10s 的子进程超时压进 serve 循环（审查 major）。TTL 内复用。
-    churn_cache: Arc<Mutex<Option<(std::time::Instant, astrolabe_core::churn::ChurnTable)>>>,
     tool_router: ToolRouter<Self>,
-}
-
-/// Index once, converting a panic in the engine into a reportable failure
-/// rather than taking the server down.
-fn build_index(root: &Path, persist: bool, parse_cache_bytes: u64) -> IndexState {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        index::build_with_options(root, persist, parse_cache_bytes)
-    }))
-    .map_err(|_| "底层索引能力尚未实现或发生 panic".to_string())
-    .and_then(|result| result.map_err(|error| error.to_string()))
-    .map(Arc::new)
-    .map(IndexState::Ready)
-    .unwrap_or_else(IndexState::Failed)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WatchMode {
-    Events,
-    Poll(Duration),
-}
-
-/// Watch the repository and incrementally rebuild the graph when files change.
-///
-/// The previous index keeps serving for the whole rebuild: dropping back to
-/// `Building` would make every tool call fail for a second because someone
-/// saved a file. A stale answer beats no answer here, and the window is short.
-/// A failed rebuild is also discarded rather than published, so one bad edit
-/// cannot replace a working index with an error.
-///
-/// Reindex loop:
-///   recv → coalesce (throttle window, merge every queued ChangeSet) →
-///   language-filter (non-source added/modified dropped; removed kept) →
-///   skip if empty → refresh IndexerLock (follower may promote) →
-///   apply_changeset on the last IncrementalIndex, or IncrementalIndex::build
-///   if there is no Ready snapshot (cold-start self-heal).
-fn start_watching(
-    root: PathBuf,
-    state: Arc<RwLock<IndexState>>,
-    slot: Arc<Mutex<Option<astrolabe_core::watch::WatchHandle>>>,
-    lock: Arc<Mutex<Option<astrolabe_core::elect::IndexerLock>>>,
-    mode: WatchMode,
-    parse_cache_bytes: u64,
-    throttle: Duration,
-) {
-    let watcher = astrolabe_core::watch::Watcher::new(root.clone());
-    let (rx, handle) = match mode {
-        WatchMode::Events => {
-            tracing::info!("watching for changes (native OS events)");
-            watcher.spawn()
-        }
-        WatchMode::Poll(interval) => {
-            tracing::info!(
-                interval_secs = interval.as_secs(),
-                "watching for changes (forced polling)"
-            );
-            watcher.poll_interval(interval).events(false).spawn()
-        }
-    };
-    *slot.lock().expect("watch lock poisoned") = Some(handle);
-
-    std::thread::Builder::new()
-        .name("astrolabe-reindex".into())
-        .spawn(move || {
-            crate::reindex::for_each_reindex_batch(rx, throttle, |changes| {
-                tracing::info!(
-                    added = changes.added.len(),
-                    modified = changes.modified.len(),
-                    removed = changes.removed.len(),
-                    "reindexing after file changes"
-                );
-                // Leader election is a demotion hint, not a correctness barrier.
-                // try_acquire is one open+flock; if we already hold the guard,
-                // skip the syscall. When the previous leader exits, the OS
-                // releases the lock and the next cycle here promotes a follower.
-                let persist = crate::reindex::refresh_leader(&lock, &root);
-                let opts = crate::reindex::mcp_index_options(persist, parse_cache_bytes);
-                let previous = match &*state.read().expect("index state lock poisoned") {
-                    IndexState::Ready(index) => Some(Arc::clone(index)),
-                    _ => None,
-                };
-                let snapshot = previous.as_ref().and_then(|index| index.incremental());
-                match crate::reindex::apply_reindex(&root, snapshot, changes, &opts) {
-                    Ok(incremental) => {
-                        *state.write().expect("index state lock poisoned") =
-                            IndexState::Ready(Arc::new(index::RepoIndex::from_incremental(
-                                root.clone(),
-                                incremental,
-                            )));
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "reindex failed; keeping previous index");
-                    }
-                }
-            });
-        })
-        .expect("failed to spawn reindex thread");
-}
-
-/// Parse watcher mode from the environment variable value:
-/// - Unset/None: `Some(WatchMode::Events)` (default: native OS events)
-/// - "0": `None` (watching disabled)
-/// - N > 0: `Some(WatchMode::Poll(Duration::from_secs(N)))` (forced polling fallback)
-/// - Invalid/non-integer: logs warning and defaults to `Some(WatchMode::Events)`
-fn parse_watch_mode(raw: Option<&str>) -> Option<WatchMode> {
-    match raw {
-        None => Some(WatchMode::Events),
-        Some(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(secs) => Some(WatchMode::Poll(Duration::from_secs(secs))),
-            Err(_) => {
-                tracing::warn!(
-                    value = %raw,
-                    "invalid ASTROLABE_WATCH_SECS; using default events watcher"
-                );
-                Some(WatchMode::Events)
-            }
-        },
-    }
-}
-
-fn watch_mode_from_env() -> Option<WatchMode> {
-    parse_watch_mode(std::env::var("ASTROLABE_WATCH_SECS").ok().as_deref())
 }
 
 impl AstrolabeServer {
@@ -523,9 +362,73 @@ impl AstrolabeServer {
         budget_bytes: u64,
         context: ClientContext,
     ) -> Self {
-        // Detection (`.` → walk up for `.git` / `.serena/project.yml`) lives
-        // in `main` / `resolve_index_root`. Here we only store an absolute
-        // path so every tool result can declare it.
+        Self::assemble(root, budget_bytes, context, McpKnobs::from_env(), None)
+    }
+
+    /// Multi-project dispatch mode: do not index the parent; children activate
+    /// on the first routed tool call.
+    pub fn with_multi_project(
+        root: PathBuf,
+        children: Vec<PathBuf>,
+        context: ClientContext,
+    ) -> Self {
+        let budget = cache_budget_from_env();
+        let knobs = McpKnobs::from_env();
+        let children: Vec<PathBuf> = children
+            .into_iter()
+            .map(|c| std::fs::canonicalize(&c).unwrap_or(c))
+            .collect();
+        tracing::info!(
+            root = %root.display(),
+            children = children.len(),
+            "starting in multi-project dispatch mode"
+        );
+        for child in &children {
+            tracing::info!(child = %child.display(), "multi-project child");
+        }
+        let dispatch = DispatchState::new(children, knobs.clone(), budget);
+        Self::assemble(root, budget, context, knobs, Some(dispatch))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_multi_project_knobs(
+        root: PathBuf,
+        children: Vec<PathBuf>,
+        knobs: McpKnobs,
+        budget_bytes: u64,
+    ) -> Self {
+        let children: Vec<PathBuf> = children
+            .into_iter()
+            .map(|c| std::fs::canonicalize(&c).unwrap_or(c))
+            .collect();
+        let dispatch = DispatchState::new(children, knobs.clone(), budget_bytes);
+        Self::assemble(
+            root,
+            budget_bytes,
+            ClientContext::default_builtin(),
+            knobs,
+            Some(dispatch),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_knobs(root: PathBuf, knobs: McpKnobs, budget_bytes: u64) -> Self {
+        Self::assemble(
+            root,
+            budget_bytes,
+            ClientContext::default_builtin(),
+            knobs,
+            None,
+        )
+    }
+
+    fn assemble(
+        root: PathBuf,
+        budget_bytes: u64,
+        context: ClientContext,
+        knobs: McpKnobs,
+        dispatch: Option<Arc<DispatchState>>,
+    ) -> Self {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let structured_output = structured_output_for(&context);
         tracing::info!(
@@ -535,98 +438,125 @@ impl AstrolabeServer {
             cache_budget_bytes = budget_bytes,
             "configured bounded file cache"
         );
-        // Real pool: servers start on the first precise query and are
-        // reclaimed when idle, so the graph-only tools pay nothing resident.
-        let precise: Arc<dyn crate::precise_tools::PreciseCapability> =
-            Arc::new(crate::live_backend::LiveBackend::new(root.clone()));
+        let primary = RootSession::new(root.clone(), knobs, budget_bytes);
         Self {
-            root,
-            state: Arc::new(RwLock::new(IndexState::Building)),
+            root: primary.root.clone(),
+            cache_budget_bytes: budget_bytes,
+            primary,
+            dispatch,
+            ticker_stop: Arc::new(AtomicBool::new(false)),
             resources: Arc::new(Mutex::new(BTreeMap::new())),
             next_resource: Arc::new(AtomicU64::new(1)),
-            file_cache: SharedFileCache(Arc::new(FileCache::new(CacheConfig {
-                budget_bytes,
-                ..CacheConfig::default()
-            }))),
-            cache_budget_bytes: budget_bytes,
-            cache_hits: Arc::new(AtomicU64::new(0)),
-            cache_misses: Arc::new(AtomicU64::new(0)),
-            watch: Arc::new(Mutex::new(None)),
-            indexer_lock: Arc::new(Mutex::new(None)),
-            precise,
             context,
             structured_output,
-            churn_cache: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
 
-    /// churn 表带 TTL 缓存（600s）：避免每次 get_hotspots 同步跑 git log
-    /// 子进程（审查 major：最坏 10s 阻塞 serve 循环）。
-    fn cached_churn(&self) -> astrolabe_core::churn::ChurnTable {
-        const CHURN_TTL: Duration = Duration::from_secs(600);
-        {
-            let guard = self.churn_cache.lock().expect("churn cache lock poisoned");
-            if let Some((at, table)) = guard.as_ref() {
-                if at.elapsed() < CHURN_TTL {
-                    return table.clone();
-                }
-            }
-        }
-        let table = astrolabe_core::churn::compute_churn(&self.root);
-        *self.churn_cache.lock().expect("churn cache lock poisoned") =
-            Some((std::time::Instant::now(), table.clone()));
-        table
-    }
-
     pub fn start_indexing(&self) {
-        let root = self.root.clone();
-        let state = Arc::clone(&self.state);
-        let watch_slot = Arc::clone(&self.watch);
-        let lock = Arc::clone(&self.indexer_lock);
-        let parse_cache_bytes = crate::reindex::parse_cache_bytes_from_env();
-        let throttle = crate::reindex::reindex_throttle_from_env();
-        tokio::task::spawn_blocking(move || {
-            let persist = crate::reindex::refresh_leader(&lock, &root);
-            let outcome = build_index(&root, persist, parse_cache_bytes);
-            let ready = matches!(outcome, IndexState::Ready(_));
-            *state.write().expect("index state lock poisoned") = outcome;
-            if ready {
-                // Start watching immediately after the first index lands.
-                // Anything edited between the two would otherwise be folded
-                // into the watcher's baseline and never reported.
-                if let Some(mode) = watch_mode_from_env() {
-                    start_watching(
-                        root,
-                        state,
-                        watch_slot,
-                        lock,
-                        mode,
-                        parse_cache_bytes,
-                        throttle,
-                    );
-                }
-            }
-        });
+        if let Some(dispatch) = &self.dispatch {
+            start_idle_ticker(Arc::clone(dispatch), Arc::clone(&self.ticker_stop));
+            return;
+        }
+        start_root_indexing(Arc::clone(&self.primary));
     }
 
-    /// Stop the watch thread. Called on shutdown; also lets tests avoid
-    /// leaving a poller running.
+    /// Stop watchers and the idle-evict ticker. Tests call this to avoid
+    /// leaving pollers running.
     pub fn stop_watching(&self) {
-        if let Some(handle) = self.watch.lock().expect("watch lock poisoned").take() {
-            handle.stop();
+        self.ticker_stop.store(true, Ordering::SeqCst);
+        self.primary.teardown();
+        if let Some(dispatch) = &self.dispatch {
+            teardown_all(dispatch);
         }
     }
 
-    fn with_index(&self, f: impl FnOnce(&RepoIndex) -> CallToolResult) -> CallToolResult {
-        match &*self.state.read().expect("index state lock poisoned") {
-            IndexState::Building => self.finish(text_error(
-                "索引正在后台构建；MCP 握手已完成，请稍后重试。confidence: unknown",
-            )),
-            IndexState::Failed(error) => self.finish(text_error(format!(
-                "索引构建失败：{error}\nconfidence: unknown"
-            ))),
-            IndexState::Ready(index) => f(index),
+    fn join_hint(parts: &[&str]) -> String {
+        parts
+            .iter()
+            .copied()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
+        match &self.dispatch {
+            None => Ok(Arc::clone(&self.primary)),
+            Some(dispatch) => match session::route_session(dispatch, hint) {
+                Ok(s) => Ok(s),
+                Err(msg) => Err(self.finish(text_error(msg))),
+            },
+        }
+    }
+
+    fn with_index(
+        &self,
+        hint: &str,
+        f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
+    ) -> CallToolResult {
+        self.with_index_barrier(hint, false, f)
+    }
+
+    fn with_fresh_index(
+        &self,
+        hint: &str,
+        f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
+    ) -> CallToolResult {
+        self.with_index_barrier(hint, true, f)
+    }
+
+    fn with_index_barrier(
+        &self,
+        hint: &str,
+        barrier: bool,
+        f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
+    ) -> CallToolResult {
+        let session = match self.session_for(hint) {
+            Ok(s) => s,
+            Err(err) => return err,
+        };
+        let effect = if barrier {
+            run_barrier(&session)
+        } else {
+            BarrierEffect::None
+        };
+        let result = match &*session.state.read().expect("index state lock poisoned") {
+            IndexState::Building => self.finish_at(
+                &session.root,
+                text_error("索引正在后台构建；MCP 握手已完成，请稍后重试。confidence: unknown"),
+            ),
+            IndexState::Failed(error) => self.finish_at(
+                &session.root,
+                text_error(format!("索引构建失败：{error}\nconfidence: unknown")),
+            ),
+            IndexState::Ready(index) => f(&session, index),
+        };
+        match effect {
+            BarrierEffect::None => result,
+            BarrierEffect::StaleNote(note) => append_stale_note(result, &note),
+        }
+    }
+
+    fn with_precise(
+        &self,
+        hint: &str,
+        barrier: bool,
+        f: impl FnOnce(&RootSession) -> CallToolResult,
+    ) -> CallToolResult {
+        let session = match self.session_for(hint) {
+            Ok(s) => s,
+            Err(err) => return err,
+        };
+        let effect = if barrier {
+            run_barrier(&session)
+        } else {
+            BarrierEffect::None
+        };
+        let result = self.finish_at(&session.root, f(&session));
+        match effect {
+            BarrierEffect::None => result,
+            BarrierEffect::StaleNote(note) => append_stale_note(result, &note),
         }
     }
 
@@ -647,8 +577,12 @@ impl AstrolabeServer {
         tools
     }
 
-    fn finish(&self, mut result: CallToolResult) -> CallToolResult {
-        let root = self.root.display().to_string();
+    fn finish(&self, result: CallToolResult) -> CallToolResult {
+        self.finish_at(&self.root, result)
+    }
+
+    fn finish_at(&self, root: &Path, mut result: CallToolResult) -> CallToolResult {
+        let root = root.display().to_string();
         let mut first_text = None;
         let mut content = Vec::with_capacity(result.content.len());
         for (index, block) in result.content.into_iter().enumerate() {
@@ -686,6 +620,16 @@ impl AstrolabeServer {
     }
 
     fn result(&self, title: &str, body: String, structured: Value) -> CallToolResult {
+        self.result_on(&self.root, title, body, structured)
+    }
+
+    fn result_on(
+        &self,
+        root: &Path,
+        title: &str,
+        body: String,
+        structured: Value,
+    ) -> CallToolResult {
         let body = if body.trim().is_empty() {
             "没有匹配结果。confidence: unknown".to_string()
         } else {
@@ -710,11 +654,11 @@ impl AstrolabeServer {
                 ContentBlock::resource_link(resource),
             ]);
             result.structured_content = Some(structured);
-            self.finish(result)
+            self.finish_at(root, result)
         } else {
             let mut result = CallToolResult::success(vec![ContentBlock::text(body)]);
             result.structured_content = Some(structured);
-            self.finish(result)
+            self.finish_at(root, result)
         }
     }
 
@@ -792,7 +736,7 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_fresh_index(&params.task_description, |session, index| {
             let base = compute_centrality(index.graph());
             let ranked = rank_for_task(index.graph(), &params.task_description, &base);
             let mut ids: Vec<_> = index.graph().files.iter().map(|file| file.id).collect();
@@ -845,7 +789,8 @@ impl AstrolabeServer {
                     "{omitted_symbols} 个符号因 budget_tokens 被省略。\n"
                 ));
             }
-            self.result(
+            self.result_on(
+                &session.root,
                 "resolve_context",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
@@ -867,10 +812,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<crate::precise_tools::FindReferencesParams>,
     ) -> CallToolResult {
-        self.finish(crate::precise_tools::run_find_references(
-            params,
-            self.precise.as_ref(),
-        ))
+        let hint = Self::join_hint(&[params.path.as_deref().unwrap_or(""), &params.symbol]);
+        self.with_precise(&hint, true, move |session| {
+            crate::precise_tools::run_find_references(params, session.precise.as_ref())
+        })
     }
 
     #[tool(
@@ -880,10 +825,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<crate::precise_tools::GotoDefinitionParams>,
     ) -> CallToolResult {
-        self.finish(crate::precise_tools::run_goto_definition(
-            params,
-            self.precise.as_ref(),
-        ))
+        let hint = params.path.clone();
+        self.with_precise(&hint, true, move |session| {
+            crate::precise_tools::run_goto_definition(params, session.precise.as_ref())
+        })
     }
 
     #[tool(
@@ -893,10 +838,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<crate::precise_tools::GetDiagnosticsParams>,
     ) -> CallToolResult {
-        self.finish(crate::precise_tools::run_get_diagnostics(
-            params,
-            self.precise.as_ref(),
-        ))
+        let hint = params.path.clone();
+        self.with_precise(&hint, false, move |session| {
+            crate::precise_tools::run_get_diagnostics(params, session.precise.as_ref())
+        })
     }
 
     #[tool(
@@ -906,10 +851,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<crate::precise_tools::GetSymbolInfoParams>,
     ) -> CallToolResult {
-        self.finish(crate::precise_tools::run_get_symbol_info(
-            params,
-            self.precise.as_ref(),
-        ))
+        let hint = Self::join_hint(&[&params.path, &params.symbol]);
+        self.with_precise(&hint, true, move |session| {
+            crate::precise_tools::run_get_symbol_info(params, session.precise.as_ref())
+        })
     }
 
     #[tool(
@@ -919,10 +864,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<crate::precise_tools::PlanRenameParams>,
     ) -> CallToolResult {
-        self.finish(crate::precise_tools::run_plan_rename(
-            params,
-            self.precise.as_ref(),
-        ))
+        let hint = Self::join_hint(&[params.path.as_deref().unwrap_or(""), &params.symbol]);
+        self.with_precise(&hint, true, move |session| {
+            crate::precise_tools::run_plan_rename(params, session.precise.as_ref())
+        })
     }
 
     #[tool(
@@ -932,11 +877,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<crate::precise_tools::ApplyRenameParams>,
     ) -> CallToolResult {
-        self.finish(crate::precise_tools::run_apply_rename(
-            params,
-            self.precise.as_ref(),
-            &self.root,
-        ))
+        let hint = Self::join_hint(&[params.path.as_deref().unwrap_or(""), &params.symbol]);
+        self.with_precise(&hint, true, move |session| {
+            crate::precise_tools::run_apply_rename(params, session.precise.as_ref(), &session.root)
+        })
     }
 
     #[tool(
@@ -946,7 +890,7 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<BudgetOnly>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_index("", |session, index| {
             let centrality = compute_centrality(index.graph());
             let mut ids: Vec<_> = index.graph().files.iter().map(|file| file.id).collect();
             ids.sort_by(|a, b| {
@@ -959,7 +903,8 @@ impl AstrolabeServer {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             let body = self.ranked_files(index, ids, params.budget_tokens, Confidence::Scoped);
-            self.result(
+            self.result_on(
+                &session.root,
                 "get_repo_skeleton",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
@@ -974,11 +919,11 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_fresh_index(&params.query, |session, index| {
             // "Class/method" 路径查询（含 "/"）走层级匹配器（Serena
             // NamePathMatcher 对应物：后缀匹配/绝对路径/kind 过滤/depth 展开）。
             if params.query.contains('/') {
-                return self.find_symbol_by_path(index, &params);
+                return self.find_symbol_by_path(&session.root, index, &params);
             }
             let needle = params.query.to_lowercase();
             // 命中对先收集 (锚点行, symbol 下标)，与展示列表同一排序源——
@@ -1015,6 +960,7 @@ impl AstrolabeServer {
             }
             if params.include_body && !hits.is_empty() {
                 self.attach_include_bodies(
+                    &session.root,
                     index,
                     &mut body,
                     &hits,
@@ -1022,7 +968,8 @@ impl AstrolabeServer {
                     params.budget_tokens,
                 );
             }
-            self.result(
+            self.result_on(
+                &session.root,
                 "find_symbol",
                 body,
                 json!({
@@ -1044,91 +991,96 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> CallToolResult {
-        self.with_index(|index| {
-            let regex = if params.regex {
-                match regex::Regex::new(&params.query) {
-                    Ok(regex) => Some(regex),
-                    Err(error) => {
-                        return text_error(format!("无效正则表达式：{error}"));
+        self.with_fresh_index(
+            &Self::join_hint(&[params.path_filter.as_deref().unwrap_or(""), &params.query]),
+            |session, index| {
+                let regex = if params.regex {
+                    match regex::Regex::new(&params.query) {
+                        Ok(regex) => Some(regex),
+                        Err(error) => {
+                            return text_error(format!("无效正则表达式：{error}"));
+                        }
                     }
-                }
-            } else {
-                None
-            };
-            let needle = params.query.to_lowercase();
-            let mut matches = Vec::new();
-            let mut hits = 0u64;
-            let mut misses = 0u64;
-            for file in &index.graph().files {
-                if params
-                    .path_filter
-                    .as_ref()
-                    .is_some_and(|filter| !file.path.as_str().contains(filter))
-                {
-                    continue;
-                }
-                let Some((lines, hit)) = index.cached_lines(&self.file_cache, file.path.as_str())
-                else {
-                    continue;
-                };
-                if hit {
-                    hits += 1;
                 } else {
-                    misses += 1;
-                }
-                for (line_no, line) in lines.iter().enumerate() {
-                    let matched = if let Some(regex) = &regex {
-                        regex.is_match(line)
-                    } else {
-                        line.to_lowercase().contains(&needle)
+                    None
+                };
+                let needle = params.query.to_lowercase();
+                let mut matches = Vec::new();
+                let mut hits = 0u64;
+                let mut misses = 0u64;
+                for file in &index.graph().files {
+                    if params
+                        .path_filter
+                        .as_ref()
+                        .is_some_and(|filter| !file.path.as_str().contains(filter))
+                    {
+                        continue;
+                    }
+                    let Some((lines, hit)) =
+                        index.cached_lines(&session.file_cache, file.path.as_str())
+                    else {
+                        continue;
                     };
-                    if matched {
-                        matches.push(format!("@{}:{} {}", file.path, line_no + 1, line.trim()));
+                    if hit {
+                        hits += 1;
+                    } else {
+                        misses += 1;
+                    }
+                    for (line_no, line) in lines.iter().enumerate() {
+                        let matched = if let Some(regex) = &regex {
+                            regex.is_match(line)
+                        } else {
+                            line.to_lowercase().contains(&needle)
+                        };
+                        if matched {
+                            matches.push(format!("@{}:{} {}", file.path, line_no + 1, line.trim()));
+                        }
                     }
                 }
-            }
-            self.cache_hits.fetch_add(hits, Ordering::Relaxed);
-            self.cache_misses.fetch_add(misses, Ordering::Relaxed);
-            tracing::debug!(
-                hits,
-                misses,
-                weighted_size = self.file_cache.weighted_size(),
-                budget_bytes = self.cache_budget_bytes,
-                "search_code file cache"
-            );
-            let (kept, omitted) =
-                truncate_ranked(&matches, params.budget_tokens, |line| format!("{line}\n"));
-            let shown = kept.len();
-            let truncated = omitted > 0;
-            let mode = if params.regex { "regex" } else { "literal" };
-            let mut body = format!(
-                "confidence: exact (磁盘源码字面匹配)\n{}",
-                render_search_mode_header(params.regex, &params.query)
-            );
-            body.push_str(&render_budget_status(shown, omitted, params.budget_tokens));
-            for line in kept {
-                body.push_str(line);
-                body.push('\n');
-            }
-            // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
-            // （对齐 find_references 的 `未找到对 … 的引用。` 空结果约定）。
-            if matches.is_empty() {
-                body.push_str("(未找到匹配的代码行)\n");
-            }
-            self.result(
-                "search_code",
-                body,
-                json!({
-                    "confidence": "exact",
-                    "mode": mode,
-                    "matches": matches.len(),
-                    "shown": shown,
-                    "omitted": omitted,
-                    "truncated": truncated,
-                    "budget_tokens": params.budget_tokens
-                }),
-            )
-        })
+                session.cache_hits.fetch_add(hits, Ordering::Relaxed);
+                session.cache_misses.fetch_add(misses, Ordering::Relaxed);
+                tracing::debug!(
+                    hits,
+                    misses,
+                    weighted_size = session.file_cache.weighted_size(),
+                    budget_bytes = session.cache_budget_bytes,
+                    "search_code file cache"
+                );
+                let (kept, omitted) =
+                    truncate_ranked(&matches, params.budget_tokens, |line| format!("{line}\n"));
+                let shown = kept.len();
+                let truncated = omitted > 0;
+                let mode = if params.regex { "regex" } else { "literal" };
+                let mut body = format!(
+                    "confidence: exact (磁盘源码字面匹配)\n{}",
+                    render_search_mode_header(params.regex, &params.query)
+                );
+                body.push_str(&render_budget_status(shown, omitted, params.budget_tokens));
+                for line in kept {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
+                // （对齐 find_references 的 `未找到对 … 的引用。` 空结果约定）。
+                if matches.is_empty() {
+                    body.push_str("(未找到匹配的代码行)\n");
+                }
+                self.result_on(
+                    &session.root,
+                    "search_code",
+                    body,
+                    json!({
+                        "confidence": "exact",
+                        "mode": mode,
+                        "matches": matches.len(),
+                        "shown": shown,
+                        "omitted": omitted,
+                        "truncated": truncated,
+                        "budget_tokens": params.budget_tokens
+                    }),
+                )
+            },
+        )
     }
 
     #[tool(
@@ -1138,9 +1090,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<DependentsParams>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_fresh_index(&params.target, |session, index| {
             let Some(target) = index.file_id(&params.target) else {
-                return self.result(
+                return self.result_on(
+                    &session.root,
                     "get_dependents",
                     format!("未找到目标路径：{}\nconfidence: exact", params.target),
                     json!({"confidence":"exact","found":false,"budget_tokens":params.budget_tokens}),
@@ -1152,7 +1105,8 @@ impl AstrolabeServer {
                 dependents(index.graph(), target)
             };
             let body = self.ranked_files(index, ids, params.budget_tokens, Confidence::Scoped);
-            self.result(
+            self.result_on(
+                &session.root,
                 "get_dependents",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
@@ -1167,11 +1121,12 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<TraceParams>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_fresh_index(&params.symbol, |session, index| {
             // depth>1：多跳树（对齐 openvisio trace.ts；环检测 + 缩进渲染）。
             if params.depth > 1 {
                 let body = self.trace_calls_tree_body(index, &params);
-                return self.result(
+                return self.result_on(
+                    &session.root,
                     "trace_calls",
                     body,
                     json!({"confidence":"syntactic","depth":params.depth.clamp(1, 6),"budget_tokens":params.budget_tokens}),
@@ -1223,7 +1178,8 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
             }
-            self.result(
+            self.result_on(
+                &session.root,
                 "trace_calls",
                 body,
                 json!({"confidence":"syntactic","budget_tokens":params.budget_tokens}),
@@ -1238,9 +1194,10 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<NeighborhoodParams>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_fresh_index(&params.target, |session, index| {
             let Some(target_id) = index.file_id(&params.target) else {
-                return self.result(
+                return self.result_on(
+                    &session.root,
                     "get_neighborhood",
                     format!("未找到目标文件：{}\n", params.target),
                     json!({"confidence":"unknown","budget_tokens":params.budget_tokens}),
@@ -1264,7 +1221,8 @@ impl AstrolabeServer {
             );
             if entries.is_empty() {
                 header.push_str("无邻域（目标孤立或超深度域）。\n");
-                return self.result(
+                return self.result_on(
+                    &session.root,
                     "get_neighborhood",
                     header,
                     json!({"confidence":"scoped","entries":0,"depth":depth,"budget_tokens":params.budget_tokens}),
@@ -1294,7 +1252,8 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
             }
-            self.result(
+            self.result_on(
+                &session.root,
                 "get_neighborhood",
                 body,
                 json!({"confidence":"scoped","entries":entries.len(),"depth":depth,"budget_tokens":params.budget_tokens}),
@@ -1414,7 +1373,7 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<GroupGraphParams>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_index("", |session, index| {
             let centrality = compute_centrality(index.graph());
             let depth = params.depth.clamp(1, 3) as u8;
             let (nodes, edges) =
@@ -1457,7 +1416,8 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
             }
-            self.result(
+            self.result_on(
+                &session.root,
                 "get_group_graph",
                 body,
                 json!({"confidence":"scoped","groups":nodes.len(),"edges":edges.len(),"depth":depth,"budget_tokens":params.budget_tokens}),
@@ -1472,6 +1432,7 @@ impl AstrolabeServer {
     #[allow(clippy::too_many_lines)]
     fn attach_include_bodies(
         &self,
+        root: &Path,
         index: &RepoIndex,
         body: &mut String,
         hits: &[(String, usize)],
@@ -1487,7 +1448,7 @@ impl AstrolabeServer {
                 failed += 1;
                 continue;
             };
-            match astrolabe_core::body::symbol_body(&self.root.join(file.path.as_str()), symbol) {
+            match astrolabe_core::body::symbol_body(&root.join(file.path.as_str()), symbol) {
                 Ok(text) if !text.is_empty() => {
                     let section = format!("\n----- body @ {line} -----\n{text}");
                     let section_tokens = estimate_tokens(&section);
@@ -1557,12 +1518,17 @@ impl AstrolabeServer {
 
     /// "Class/method" 路径查询分支：core::name_path 层级匹配 + 渲染。
     /// 与名称匹配分支一致地支持 include_body（kept → top5 → symbol_body/truncate）。
-    fn find_symbol_by_path(&self, index: &RepoIndex, params: &QueryParams) -> CallToolResult {
+    fn find_symbol_by_path(
+        &self,
+        root: &Path,
+        index: &RepoIndex,
+        params: &QueryParams,
+    ) -> CallToolResult {
         let kind = match params.kind.as_deref() {
             None => None,
             Some(name) => match kind_from_name(name) {
                 Ok(kind) => Some(kind),
-                Err(message) => return self.finish(text_error(message)),
+                Err(message) => return self.finish_at(root, text_error(message)),
             },
         };
         let kind = astrolabe_core::name_path::KindFilter(kind);
@@ -1618,9 +1584,17 @@ impl AstrolabeServer {
             body.push_str("(未找到匹配的符号)\n");
         }
         if params.include_body && !hits.is_empty() {
-            self.attach_include_bodies(index, &mut body, &hits, kept_count, params.budget_tokens);
+            self.attach_include_bodies(
+                root,
+                index,
+                &mut body,
+                &hits,
+                kept_count,
+                params.budget_tokens,
+            );
         }
-        self.result(
+        self.result_on(
+            root,
             "find_symbol",
             body,
             json!({
@@ -1711,11 +1685,11 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<BudgetOnly>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_index("", |session, index| {
             // churn 融合（对齐 openvisio buildHotspots）：中心性 × churn 增益。
             // 无 git / git 失败 → 空表 → 增益恒 1，退化为纯中心性（向后兼容）。
             let centrality = compute_centrality(index.graph());
-            let churn = self.cached_churn();
+            let churn = session.cached_churn();
             let mut scored: Vec<(FileId, f64)> = index
                 .graph()
                 .files
@@ -1769,7 +1743,8 @@ impl AstrolabeServer {
             if omitted > 0 {
                 header.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
             }
-            self.result(
+            self.result_on(
+                &session.root,
                 "get_hotspots",
                 header,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens,"churn_fused":churn_hits>0,"churn_files":churn_hits}),
@@ -1784,7 +1759,7 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<BudgetOnly>,
     ) -> CallToolResult {
-        self.with_index(|index| {
+        self.with_index("", |session, index| {
             let mut totals: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
             for file in &index.graph().files {
                 if let Some(language) = file.language {
@@ -1814,12 +1789,12 @@ impl AstrolabeServer {
             rows.sort_by(|a, b| b.cmp(a));
             let (kept, omitted) =
                 truncate_ranked(&rows, params.budget_tokens, |row| format!("{row}\n"));
-            let cache_bytes = self.file_cache.weighted_size();
-            let cache_hits = self.cache_hits.load(Ordering::Relaxed);
-            let cache_misses = self.cache_misses.load(Ordering::Relaxed);
+            let cache_bytes = session.file_cache.weighted_size();
+            let cache_hits = session.cache_hits.load(Ordering::Relaxed);
+            let cache_misses = session.cache_misses.load(Ordering::Relaxed);
             tracing::debug!(
                 weighted_size = cache_bytes,
-                budget_bytes = self.cache_budget_bytes,
+                budget_bytes = session.cache_budget_bytes,
                 cache_hits,
                 cache_misses,
                 "file cache occupancy"
@@ -1831,7 +1806,7 @@ impl AstrolabeServer {
                  ensure_language_server; AST-only = parse/index only (server not wired).\n\
                  Install is session-gated: ensure_language_server without confirm returns a \
                  plan only (latest, no download).\n",
-                self.cache_budget_bytes
+                session.cache_budget_bytes
             );
             for row in kept {
                 body.push_str(row);
@@ -1840,7 +1815,8 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 种语言因 budget_tokens 被省略。\n"));
             }
-            self.result(
+            self.result_on(
+                &session.root,
                 "get_languages",
                 body,
                 json!({
@@ -1954,6 +1930,7 @@ mod tests {
     use astrolabe_core::{
         graph::CodeGraph, CodeFile, CodeSymbol, Language, RelPath, SymbolId, SymbolKind,
     };
+    use std::time::Duration;
 
     fn ready_server() -> AstrolabeServer {
         let mut server =
@@ -1978,11 +1955,9 @@ mod tests {
             }],
             edges: vec![],
         };
-        *server.state.write().unwrap() = IndexState::Ready(Arc::new(RepoIndex::from_graph(
-            PathBuf::from("."),
-            graph,
-            Default::default(),
-        )));
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(
+            RepoIndex::from_graph(PathBuf::from("."), graph, Default::default()),
+        ));
         // Tests must not inherit ASTROLABE_STRUCTURED from the environment.
         server.structured_output = false;
         server
@@ -2247,7 +2222,7 @@ mod tests {
         .unwrap();
         let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
         let index = crate::index::build(&dir).expect("index");
-        *server.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
         server.structured_output = false;
         (server, dir)
     }
@@ -2294,14 +2269,14 @@ mod tests {
         let first = server.search_code(Parameters(params.clone()));
         let first_text = first.content[0].as_text().unwrap().text.as_str();
         assert!(first_text.contains("cache-me"), "{first_text}");
-        assert!(server.cache_misses.load(Ordering::Relaxed) >= 1);
-        assert_eq!(server.cache_hits.load(Ordering::Relaxed), 0);
+        assert!(server.primary.cache_misses.load(Ordering::Relaxed) >= 1);
+        assert_eq!(server.primary.cache_hits.load(Ordering::Relaxed), 0);
 
         let second = server.search_code(Parameters(params));
         let second_text = second.content[0].as_text().unwrap().text.as_str();
         assert!(second_text.contains("cache-me"), "{second_text}");
         assert!(
-            server.cache_hits.load(Ordering::Relaxed) >= 1,
+            server.primary.cache_hits.load(Ordering::Relaxed) >= 1,
             "second search of an unchanged file must hit"
         );
 
@@ -2327,7 +2302,7 @@ mod tests {
         const BUDGET: u64 = 32 * 1024;
         let server = AstrolabeServer::new_with_cache_budget(dir.clone(), BUDGET);
         let index = crate::index::build(&dir).expect("index");
-        *server.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
 
         let _ = server.search_code(Parameters(SearchParams {
             query: "payload".into(),
@@ -2336,7 +2311,7 @@ mod tests {
             budget_tokens: 200,
         }));
 
-        let weighted = server.file_cache.weighted_size();
+        let weighted = server.primary.file_cache.weighted_size();
         assert!(
             weighted > 0,
             "enough inserts should flush moka maintenance so occupancy is visible"
@@ -2434,7 +2409,7 @@ mod tests {
         std::fs::write(dir.join("hits.py"), source).unwrap();
         let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
         let index = crate::index::build(&dir).expect("index");
-        *server.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
         server.structured_output = true;
 
         let result = server.search_code(Parameters(SearchParams {
@@ -2535,7 +2510,7 @@ mod tests {
 
         let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
         let index = crate::index::build(&dir).expect("index");
-        *server.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
         server.structured_output = false;
 
         let result = server.find_symbol(Parameters(QueryParams {
@@ -2566,20 +2541,441 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn first_text(result: CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(ContentBlock::as_text)
+            .map(|c| c.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn wait_ready(server: &AstrolabeServer, timeout: Duration) {
+        let start = std::time::Instant::now();
+        loop {
+            match &*server.primary.state.read().unwrap() {
+                IndexState::Ready(_) => return,
+                IndexState::Failed(e) => panic!("index failed: {e}"),
+                IndexState::Building => {}
+            }
+            if start.elapsed() > timeout {
+                panic!("timeout waiting for Ready");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_session_ready(session: &crate::session::RootSession, timeout: Duration) {
+        let start = std::time::Instant::now();
+        loop {
+            match &*session.state.read().unwrap() {
+                IndexState::Ready(_) => return,
+                IndexState::Failed(e) => panic!("index failed: {e}"),
+                IndexState::Building => {}
+            }
+            if start.elapsed() > timeout {
+                panic!("timeout waiting for child Ready");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn git_marker(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+    }
+
+    fn test_knobs() -> crate::knobs::McpKnobs {
+        crate::knobs::McpKnobs {
+            safety_interval: Duration::ZERO,
+            reindex_throttle: Duration::from_secs(60),
+            watch_mode: Some(crate::knobs::WatchMode::Events),
+            ..crate::knobs::McpKnobs::default()
+        }
+    }
+
     #[test]
-    fn parse_watch_mode_matrix() {
-        assert_eq!(parse_watch_mode(None), Some(WatchMode::Events));
-        assert_eq!(parse_watch_mode(Some("")), Some(WatchMode::Events));
-        assert_eq!(parse_watch_mode(Some("0")), None);
-        assert_eq!(parse_watch_mode(Some(" 0 ")), None);
-        assert_eq!(
-            parse_watch_mode(Some("5")),
-            Some(WatchMode::Poll(Duration::from_secs(5)))
+    fn cold_build_edit_is_visible_at_ready() {
+        let dir = unique_temp_dir();
+        for i in 0..40 {
+            std::fs::write(
+                dir.join(format!("f{i}.py")),
+                format!("def f{i}():\n    return {i}\n"),
+            )
+            .unwrap();
+        }
+        let mut server =
+            AstrolabeServer::new_with_knobs(dir.clone(), test_knobs(), 8 * 1024 * 1024);
+        server.structured_output = false;
+        server.start_indexing();
+
+        let mut wrote = false;
+        for _ in 0..3000 {
+            let watching = server.primary.watch.lock().unwrap().is_some();
+            let building = matches!(*server.primary.state.read().unwrap(), IndexState::Building);
+            if watching && building {
+                std::fs::write(
+                    dir.join("during.py"),
+                    "def during_build_xyz():\n    return 1\n",
+                )
+                .unwrap();
+                wrote = true;
+                break;
+            }
+            if matches!(*server.primary.state.read().unwrap(), IndexState::Ready(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            wrote,
+            "never observed Building+watching window; cold build was too fast"
         );
-        assert_eq!(
-            parse_watch_mode(Some(" 10 ")),
-            Some(WatchMode::Poll(Duration::from_secs(10)))
+        wait_ready(&server, Duration::from_secs(30));
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            query: "during_build_xyz".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        })));
+        assert!(
+            text.contains("during_build_xyz"),
+            "Ready graph must include the in-flight edit, got {text}"
         );
-        assert_eq!(parse_watch_mode(Some("invalid")), Some(WatchMode::Events));
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn barrier_fresh_answers_without_staleness_note() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server =
+            AstrolabeServer::new_with_knobs(dir.clone(), test_knobs(), 8 * 1024 * 1024);
+        server.structured_output = false;
+        server.start_indexing();
+        wait_ready(&server, Duration::from_secs(20));
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            query: "alpha".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        })));
+        assert!(text.contains("alpha"), "{text}");
+        assert!(
+            !text.contains("confidence: unknown") || text.contains("syntactic"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("索引可能过期"),
+            "Fresh must not append staleness: {text}"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn barrier_repair_inlines_suspects_into_graph() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server =
+            AstrolabeServer::new_with_knobs(dir.clone(), test_knobs(), 8 * 1024 * 1024);
+        server.structured_output = false;
+        server.start_indexing();
+        wait_ready(&server, Duration::from_secs(20));
+
+        std::fs::write(dir.join("a.py"), "def alpha_v2():\n    return 2\n").unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            query: "alpha_v2".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        })));
+        assert!(
+            text.contains("alpha_v2"),
+            "inline Repair must update the graph, got {text}"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn barrier_degrade_appends_staleness_and_rebuilds() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut knobs = test_knobs();
+        knobs.barrier_max = 0;
+        let mut server = AstrolabeServer::new_with_knobs(dir.clone(), knobs, 8 * 1024 * 1024);
+        server.structured_output = false;
+        server.start_indexing();
+        wait_ready(&server, Duration::from_secs(20));
+
+        std::fs::write(dir.join("a.py"), "def alpha_v3():\n    return 3\n").unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            query: "alpha".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        })));
+        assert!(
+            text.contains("索引可能过期") && text.contains("confidence: unknown"),
+            "Degrade must append staleness_note, got {text}"
+        );
+        let start = std::time::Instant::now();
+        loop {
+            let probe = first_text(server.find_symbol(Parameters(QueryParams {
+                query: "alpha_v3".into(),
+                include_body: false,
+                substring: false,
+                kind: None,
+                depth: 0,
+                budget_tokens: 500,
+            })));
+            if probe.contains("alpha_v3") {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                panic!("background rebuild did not land alpha_v3: {probe}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn barrier_repair_empty_requests_verification() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server =
+            AstrolabeServer::new_with_knobs(dir.clone(), test_knobs(), 8 * 1024 * 1024);
+        server.structured_output = false;
+        server.start_indexing();
+        wait_ready(&server, Duration::from_secs(20));
+        let log = server
+            .primary
+            .freshness
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("watcher must publish a freshness log");
+        // Age the watermark past FRESH_WINDOW (5s) with no suspects.
+        std::thread::sleep(Duration::from_millis(5200));
+        let before = log.watermark();
+        let _ = server.find_symbol(Parameters(QueryParams {
+            query: "alpha".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        }));
+        let start = std::time::Instant::now();
+        while log.watermark() <= before {
+            if start.elapsed() > Duration::from_secs(3) {
+                panic!("request_verification did not advance the watermark");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_routes_hint_and_stores_in_child() {
+        let parent = unique_temp_dir();
+        let alpha = parent.join("alpha");
+        let beta = parent.join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        git_marker(&alpha);
+        git_marker(&beta);
+        std::fs::write(alpha.join("a.py"), "def alpha_unique():\n    return 1\n").unwrap();
+        std::fs::write(beta.join("b.py"), "def beta_unique():\n    return 2\n").unwrap();
+
+        let mut knobs = test_knobs();
+        knobs.watch_mode = None;
+        knobs.resident_roots = 2;
+        let mut server = AstrolabeServer::with_multi_project_knobs(
+            parent.clone(),
+            vec![alpha.clone(), beta.clone()],
+            knobs,
+            8 * 1024 * 1024,
+        );
+        server.structured_output = false;
+        server.start_indexing();
+
+        // Child name is a word-boundary hint; "alpha" also substring-matches
+        // the symbol `alpha_unique` without taking the path-query branch.
+        let priming = server.find_symbol(Parameters(QueryParams {
+            query: "alpha".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        }));
+        let priming_text = first_text(priming);
+        if priming_text.contains("索引正在后台构建") {
+            let session = {
+                let map = server.dispatch.as_ref().unwrap().sessions.lock().unwrap();
+                map.get(&alpha.canonicalize().unwrap_or(alpha.clone()))
+                    .cloned()
+                    .expect("alpha session after route")
+            };
+            wait_session_ready(&session, Duration::from_secs(20));
+        }
+        let session = {
+            let map = server.dispatch.as_ref().unwrap().sessions.lock().unwrap();
+            map.get(&alpha.canonicalize().unwrap_or(alpha.clone()))
+                .cloned()
+                .expect("alpha session")
+        };
+        wait_session_ready(&session, Duration::from_secs(20));
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            query: "alpha".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        })));
+        assert!(
+            text.starts_with(&format!("index_root: {}", session.root.display())),
+            "dispatch must declare the child root, got {text}"
+        );
+        assert!(text.contains("alpha_unique"), "{text}");
+        assert!(
+            astrolabe_core::index::store_path(&session.root)
+                .parent()
+                .unwrap()
+                .starts_with(&session.root),
+            "store must live under the child"
+        );
+        assert!(
+            !parent.join(".astrolabe").join("index.redb").exists(),
+            "parent must not grow an index store"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn dispatch_evict_releases_child_lock() {
+        let parent = unique_temp_dir();
+        let alpha = parent.join("alpha");
+        let beta = parent.join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        git_marker(&alpha);
+        git_marker(&beta);
+        std::fs::write(alpha.join("a.py"), "def alpha_fn():\n    return 1\n").unwrap();
+        std::fs::write(beta.join("b.py"), "def beta_fn():\n    return 2\n").unwrap();
+
+        let mut knobs = test_knobs();
+        knobs.watch_mode = None;
+        knobs.resident_roots = 1;
+        let mut server = AstrolabeServer::with_multi_project_knobs(
+            parent.clone(),
+            vec![alpha.clone(), beta.clone()],
+            knobs,
+            8 * 1024 * 1024,
+        );
+        server.structured_output = false;
+        server.start_indexing();
+
+        let _ = server.find_symbol(Parameters(QueryParams {
+            query: "alpha".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 200,
+        }));
+        let alpha_key = alpha.canonicalize().unwrap_or(alpha.clone());
+        let session = server
+            .dispatch
+            .as_ref()
+            .unwrap()
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&alpha_key)
+            .cloned()
+            .expect("alpha");
+        wait_session_ready(&session, Duration::from_secs(20));
+        assert!(
+            astrolabe_core::elect::IndexerLock::try_acquire(&alpha_key)
+                .unwrap()
+                .is_none(),
+            "resident child must hold the indexer lock"
+        );
+
+        let _ = server.find_symbol(Parameters(QueryParams {
+            query: "beta".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 200,
+        }));
+        let start = std::time::Instant::now();
+        loop {
+            if astrolabe_core::elect::IndexerLock::try_acquire(&alpha_key)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("evicted child did not release IndexerLock");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn dispatch_ambiguous_hint_lists_children() {
+        let parent = unique_temp_dir();
+        let alpha = parent.join("alpha");
+        let beta = parent.join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        git_marker(&alpha);
+        git_marker(&beta);
+        std::fs::write(alpha.join("a.py"), "def a():\n    return 1\n").unwrap();
+        std::fs::write(beta.join("b.py"), "def b():\n    return 2\n").unwrap();
+        let mut knobs = test_knobs();
+        knobs.watch_mode = None;
+        let mut server = AstrolabeServer::with_multi_project_knobs(
+            parent.clone(),
+            vec![alpha.clone(), beta.clone()],
+            knobs,
+            8 * 1024 * 1024,
+        );
+        server.structured_output = false;
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            query: "compare alpha and beta".into(),
+            include_body: false,
+            substring: false,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+        })));
+        assert!(text.contains("alpha") && text.contains("beta"), "{text}");
+        assert!(text.contains("confidence: unknown"), "{text}");
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }
