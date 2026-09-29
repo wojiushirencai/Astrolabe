@@ -13,19 +13,80 @@ use std::{
 
 use astrolabe_core::cache::FileCache;
 use astrolabe_core::graph::CodeGraph;
-use astrolabe_core::index::{index_repo, IndexOptions};
+use astrolabe_core::index::IncrementalIndex;
 use astrolabe_core::{CodeFile, FileId, IndexReport};
 
-#[derive(Debug)]
+use crate::reindex::mcp_index_options;
+
+/// Serving snapshot. Production holds an [`IncrementalIndex`] so the watch
+/// thread can `apply_changeset` without a full rescan. Unit tests that inject a
+/// synthetic graph use [`RepoIndex::from_graph`].
 pub(crate) struct RepoIndex {
     pub root: PathBuf,
-    pub graph: CodeGraph,
-    pub report: IndexReport,
+    inner: InnerIndex,
+}
+
+enum InnerIndex {
+    Incremental(IncrementalIndex),
+    #[cfg(test)]
+    Static {
+        graph: CodeGraph,
+        report: IndexReport,
+    },
+}
+
+impl std::fmt::Debug for RepoIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepoIndex")
+            .field("root", &self.root)
+            .field("files", &self.graph().files.len())
+            .field("symbols", &self.graph().symbols.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RepoIndex {
+    pub(crate) fn from_incremental(root: PathBuf, incremental: IncrementalIndex) -> Self {
+        Self {
+            root,
+            inner: InnerIndex::Incremental(incremental),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_graph(root: PathBuf, graph: CodeGraph, report: IndexReport) -> Self {
+        Self {
+            root,
+            inner: InnerIndex::Static { graph, report },
+        }
+    }
+
+    pub(crate) fn graph(&self) -> &CodeGraph {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => &inc.graph,
+            #[cfg(test)]
+            InnerIndex::Static { graph, .. } => graph,
+        }
+    }
+
+    pub(crate) fn report(&self) -> &IndexReport {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => &inc.report,
+            #[cfg(test)]
+            InnerIndex::Static { report, .. } => report,
+        }
+    }
+
+    pub(crate) fn incremental(&self) -> Option<&IncrementalIndex> {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => Some(inc),
+            #[cfg(test)]
+            InnerIndex::Static { .. } => None,
+        }
+    }
+
     pub fn file(&self, id: FileId) -> Option<&CodeFile> {
-        self.graph.files.iter().find(|file| file.id == id)
+        self.graph().files.iter().find(|file| file.id == id)
     }
 
     /// Load source lines through the process-wide [`FileCache`].
@@ -48,7 +109,7 @@ impl RepoIndex {
     pub fn file_id(&self, target: &str) -> Option<FileId> {
         let target = target.trim_start_matches("./");
         if let Some(file) = self
-            .graph
+            .graph()
             .files
             .iter()
             .find(|file| file.path.as_str() == target)
@@ -56,7 +117,7 @@ impl RepoIndex {
             return Some(file.id);
         }
         let suffix = format!("/{target}");
-        self.graph
+        self.graph()
             .files
             .iter()
             .filter(|file| file.path.as_str().ends_with(&suffix))
@@ -93,17 +154,19 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
     Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
+#[cfg(test)]
 pub(crate) fn build(root: &Path) -> anyhow::Result<RepoIndex> {
-    let opts = IndexOptions {
-        call_edges: true,
-        ..IndexOptions::default()
-    };
-    let (graph, report) = index_repo(root, &opts);
-    Ok(RepoIndex {
-        root: root.to_path_buf(),
-        graph,
-        report,
-    })
+    build_with_options(root, true, astrolabe_core::index::DEFAULT_PARSE_CACHE_BYTES)
+}
+
+pub(crate) fn build_with_options(
+    root: &Path,
+    persist: bool,
+    parse_cache_bytes: u64,
+) -> anyhow::Result<RepoIndex> {
+    let opts = mcp_index_options(persist, parse_cache_bytes);
+    let incremental = IncrementalIndex::build(root, &opts);
+    Ok(RepoIndex::from_incremental(root.to_path_buf(), incremental))
 }
 
 #[cfg(test)]
@@ -137,7 +200,7 @@ mod tests {
         let index = build(&dir).expect("index_repo should return a graph, not fail");
         assert!(
             index
-                .graph
+                .graph()
                 .files
                 .iter()
                 .any(|file| file.path.as_str().ends_with("hello.py")),
@@ -148,15 +211,19 @@ mod tests {
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()),
             index
-                .graph
+                .graph()
                 .files
                 .iter()
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
-            index.report.files_scanned,
-            index.report.files_parsed,
-            index.report.parse_failures,
-            index.report.unresolved_imports,
+            index.report().files_scanned,
+            index.report().files_parsed,
+            index.report().parse_failures,
+            index.report().unresolved_imports,
+        );
+        assert!(
+            index.incremental().is_some(),
+            "production build must retain an IncrementalIndex snapshot"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

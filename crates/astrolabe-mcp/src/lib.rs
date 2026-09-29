@@ -19,6 +19,7 @@ mod live_backend;
 mod memory;
 mod openai_schema;
 mod precise_tools;
+mod reindex;
 mod root;
 mod server;
 

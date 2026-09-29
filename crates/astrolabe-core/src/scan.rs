@@ -52,6 +52,10 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".next",
     ".openvisio",
     ".serena",
+    // Own store (index.redb). Must not depend on gitignore: `ignore` skips
+    // gitignore rules in non-git trees, so a store-written `.gitignore` of `*`
+    // is not enough.
+    ".astrolabe",
 ];
 
 /// Why a discovered file did not enter the index.
@@ -475,6 +479,44 @@ mod tests {
         let result = scan(dir.path(), &ScanOptions::default());
         assert_eq!(result.files, vec![RelPath::new("src/main.rs")]);
         assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn scan_prunes_astrolabe_index_dir_with_and_without_gitignore() {
+        let dir = TestDir::new();
+        dir.write("src/main.rs", "fn main() {}");
+        dir.write(".astrolabe/index.redb", "not-a-real-index");
+
+        for respect_gitignore in [true, false] {
+            let result = scan(
+                dir.path(),
+                &ScanOptions {
+                    respect_gitignore,
+                    ..ScanOptions::default()
+                },
+            );
+            assert_eq!(
+                result.files,
+                vec![RelPath::new("src/main.rs")],
+                "respect_gitignore={respect_gitignore}"
+            );
+            assert!(
+                result
+                    .files
+                    .iter()
+                    .all(|p| !p.as_str().contains(".astrolabe")),
+                "respect_gitignore={respect_gitignore}: {:?}",
+                result.files
+            );
+            assert!(
+                result
+                    .skipped
+                    .iter()
+                    .all(|(p, _)| !p.as_str().contains(".astrolabe")),
+                "respect_gitignore={respect_gitignore}: {:?}",
+                result.skipped
+            );
+        }
     }
 
     #[test]

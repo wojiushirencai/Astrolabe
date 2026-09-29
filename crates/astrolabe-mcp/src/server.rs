@@ -359,6 +359,9 @@ pub struct AstrolabeServer {
     /// Kept alive for the process lifetime so the watch thread is not stopped
     /// by `WatchHandle::drop`. `None` when watching is disabled.
     watch: Arc<Mutex<Option<astrolabe_core::watch::WatchHandle>>>,
+    /// Per-repo indexer election. `Some` while this process is the leader and
+    /// may persist `index.redb`. Dropped on shutdown so a sibling can promote.
+    indexer_lock: Arc<Mutex<Option<astrolabe_core::elect::IndexerLock>>>,
     /// Backend for the language-server-backed tools. Defaults to a reporting
     /// stub until a real server is wired in, so the tools stay callable and
     /// explain what is missing instead of vanishing from the catalog.
@@ -377,13 +380,15 @@ pub struct AstrolabeServer {
 
 /// Index once, converting a panic in the engine into a reportable failure
 /// rather than taking the server down.
-fn build_index(root: &Path) -> IndexState {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index::build(root)))
-        .map_err(|_| "底层索引能力尚未实现或发生 panic".to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()))
-        .map(Arc::new)
-        .map(IndexState::Ready)
-        .unwrap_or_else(IndexState::Failed)
+fn build_index(root: &Path, persist: bool, parse_cache_bytes: u64) -> IndexState {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        index::build_with_options(root, persist, parse_cache_bytes)
+    }))
+    .map_err(|_| "底层索引能力尚未实现或发生 panic".to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()))
+    .map(Arc::new)
+    .map(IndexState::Ready)
+    .unwrap_or_else(IndexState::Failed)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,18 +397,28 @@ pub(crate) enum WatchMode {
     Poll(Duration),
 }
 
-/// Watch the repository and rebuild the graph when files change.
+/// Watch the repository and incrementally rebuild the graph when files change.
 ///
 /// The previous index keeps serving for the whole rebuild: dropping back to
 /// `Building` would make every tool call fail for a second because someone
 /// saved a file. A stale answer beats no answer here, and the window is short.
 /// A failed rebuild is also discarded rather than published, so one bad edit
 /// cannot replace a working index with an error.
+///
+/// Reindex loop:
+///   recv → coalesce (throttle window, merge every queued ChangeSet) →
+///   language-filter (non-source added/modified dropped; removed kept) →
+///   skip if empty → refresh IndexerLock (follower may promote) →
+///   apply_changeset on the last IncrementalIndex, or IncrementalIndex::build
+///   if there is no Ready snapshot (cold-start self-heal).
 fn start_watching(
     root: PathBuf,
     state: Arc<RwLock<IndexState>>,
     slot: Arc<Mutex<Option<astrolabe_core::watch::WatchHandle>>>,
+    lock: Arc<Mutex<Option<astrolabe_core::elect::IndexerLock>>>,
     mode: WatchMode,
+    parse_cache_bytes: u64,
+    throttle: Duration,
 ) {
     let watcher = astrolabe_core::watch::Watcher::new(root.clone());
     let (rx, handle) = match mode {
@@ -424,29 +439,37 @@ fn start_watching(
     std::thread::Builder::new()
         .name("astrolabe-reindex".into())
         .spawn(move || {
-            while let Ok(changes) = rx.recv() {
-                // Drain any pending changesets accumulated during debounce/wake-up.
-                // Reindexing is a full rebuild, so batching back-to-back notifications
-                // prevents redundant rebuild bursts during heavy file activity.
-                while rx.try_recv().is_ok() {}
-
+            crate::reindex::for_each_reindex_batch(rx, throttle, |changes| {
                 tracing::info!(
                     added = changes.added.len(),
                     modified = changes.modified.len(),
                     removed = changes.removed.len(),
                     "reindexing after file changes"
                 );
-                match build_index(&root) {
-                    IndexState::Ready(index) => {
+                // Leader election is a demotion hint, not a correctness barrier.
+                // try_acquire is one open+flock; if we already hold the guard,
+                // skip the syscall. When the previous leader exits, the OS
+                // releases the lock and the next cycle here promotes a follower.
+                let persist = crate::reindex::refresh_leader(&lock, &root);
+                let opts = crate::reindex::mcp_index_options(persist, parse_cache_bytes);
+                let previous = match &*state.read().expect("index state lock poisoned") {
+                    IndexState::Ready(index) => Some(Arc::clone(index)),
+                    _ => None,
+                };
+                let snapshot = previous.as_ref().and_then(|index| index.incremental());
+                match crate::reindex::apply_reindex(&root, snapshot, changes, &opts) {
+                    Ok(incremental) => {
                         *state.write().expect("index state lock poisoned") =
-                            IndexState::Ready(index);
+                            IndexState::Ready(Arc::new(index::RepoIndex::from_incremental(
+                                root.clone(),
+                                incremental,
+                            )));
                     }
-                    IndexState::Failed(error) => {
+                    Err(error) => {
                         tracing::warn!(%error, "reindex failed; keeping previous index");
                     }
-                    IndexState::Building => unreachable!("build_index never returns Building"),
                 }
-            }
+            });
         })
         .expect("failed to spawn reindex thread");
 }
@@ -529,6 +552,7 @@ impl AstrolabeServer {
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             watch: Arc::new(Mutex::new(None)),
+            indexer_lock: Arc::new(Mutex::new(None)),
             precise,
             context,
             structured_output,
@@ -559,8 +583,12 @@ impl AstrolabeServer {
         let root = self.root.clone();
         let state = Arc::clone(&self.state);
         let watch_slot = Arc::clone(&self.watch);
+        let lock = Arc::clone(&self.indexer_lock);
+        let parse_cache_bytes = crate::reindex::parse_cache_bytes_from_env();
+        let throttle = crate::reindex::reindex_throttle_from_env();
         tokio::task::spawn_blocking(move || {
-            let outcome = build_index(&root);
+            let persist = crate::reindex::refresh_leader(&lock, &root);
+            let outcome = build_index(&root, persist, parse_cache_bytes);
             let ready = matches!(outcome, IndexState::Ready(_));
             *state.write().expect("index state lock poisoned") = outcome;
             if ready {
@@ -568,7 +596,15 @@ impl AstrolabeServer {
                 // Anything edited between the two would otherwise be folded
                 // into the watcher's baseline and never reported.
                 if let Some(mode) = watch_mode_from_env() {
-                    start_watching(root, state, watch_slot, mode);
+                    start_watching(
+                        root,
+                        state,
+                        watch_slot,
+                        lock,
+                        mode,
+                        parse_cache_bytes,
+                        throttle,
+                    );
                 }
             }
         });
@@ -757,9 +793,9 @@ impl AstrolabeServer {
         Parameters(params): Parameters<ResolveContextParams>,
     ) -> CallToolResult {
         self.with_index(|index| {
-            let base = compute_centrality(&index.graph);
-            let ranked = rank_for_task(&index.graph, &params.task_description, &base);
-            let mut ids: Vec<_> = index.graph.files.iter().map(|file| file.id).collect();
+            let base = compute_centrality(index.graph());
+            let ranked = rank_for_task(index.graph(), &params.task_description, &base);
+            let mut ids: Vec<_> = index.graph().files.iter().map(|file| file.id).collect();
             ids.sort_by(|a, b| {
                 ranked
                     .by_file
@@ -778,10 +814,10 @@ impl AstrolabeServer {
             );
             body.push_str(&format!(
                 "index: scanned={}, parsed={}, parse_failures={}, unresolved_imports={}\n",
-                index.report.files_scanned,
-                index.report.files_parsed,
-                index.report.parse_failures.len(),
-                index.report.unresolved_imports.len()
+                index.report().files_scanned,
+                index.report().files_parsed,
+                index.report().parse_failures.len(),
+                index.report().unresolved_imports.len()
             ));
             let mut remaining =
                 TokenBudget::new(params.budget_tokens.saturating_sub(estimate_tokens(&body)));
@@ -789,7 +825,7 @@ impl AstrolabeServer {
             for id in ids.into_iter().take(12) {
                 if let Some(file) = index.file(id) {
                     for symbol in index
-                        .graph
+                        .graph()
                         .symbols
                         .iter()
                         .filter(|symbol| symbol.file == id)
@@ -911,8 +947,8 @@ impl AstrolabeServer {
         Parameters(params): Parameters<BudgetOnly>,
     ) -> CallToolResult {
         self.with_index(|index| {
-            let centrality = compute_centrality(&index.graph);
-            let mut ids: Vec<_> = index.graph.files.iter().map(|file| file.id).collect();
+            let centrality = compute_centrality(index.graph());
+            let mut ids: Vec<_> = index.graph().files.iter().map(|file| file.id).collect();
             ids.sort_by(|a, b| {
                 centrality
                     .by_file
@@ -949,7 +985,7 @@ impl AstrolabeServer {
             // include_body 只对"用户实际看到的" kept 前几个附体（审查 major：
             // 原实现按 graph 构建序取前 5，可能对应被 budget 裁掉的符号）。
             let mut hits: Vec<(String, usize)> = Vec::new();
-            for (idx, symbol) in index.graph.symbols.iter().enumerate() {
+            for (idx, symbol) in index.graph().symbols.iter().enumerate() {
                 if symbol.name.to_lowercase().contains(&needle) {
                     if let Some(file) = index.file(symbol.file) {
                         hits.push((symbol_line(symbol, &file.path), idx));
@@ -1023,7 +1059,7 @@ impl AstrolabeServer {
             let mut matches = Vec::new();
             let mut hits = 0u64;
             let mut misses = 0u64;
-            for file in &index.graph.files {
+            for file in &index.graph().files {
                 if params
                     .path_filter
                     .as_ref()
@@ -1111,9 +1147,9 @@ impl AstrolabeServer {
                 );
             };
             let ids = if params.direction == "dependencies" {
-                dependencies(&index.graph, target)
+                dependencies(index.graph(), target)
             } else {
-                dependents(&index.graph, target)
+                dependents(index.graph(), target)
             };
             let body = self.ranked_files(index, ids, params.budget_tokens, Confidence::Scoped);
             self.result(
@@ -1142,14 +1178,14 @@ impl AstrolabeServer {
                 );
             }
             let wanted: BTreeSet<_> = index
-                .graph
+                .graph()
                 .symbols
                 .iter()
                 .filter(|symbol| symbol.name.eq_ignore_ascii_case(&params.symbol))
                 .map(|symbol| symbol.id.0)
                 .collect();
             let mut lines = BTreeSet::new();
-            for edge in index.graph.edges.iter().filter(|edge| edge.kind == EdgeKind::Call) {
+            for edge in index.graph().edges.iter().filter(|edge| edge.kind == EdgeKind::Call) {
                 let include = match params.direction.as_str() {
                     "callers" => wanted.contains(&edge.to),
                     "callees" => wanted.contains(&edge.from),
@@ -1158,8 +1194,8 @@ impl AstrolabeServer {
                 if !include {
                     continue;
                 }
-                let from = index.graph.symbols.iter().find(|symbol| symbol.id.0 == edge.from);
-                let to = index.graph.symbols.iter().find(|symbol| symbol.id.0 == edge.to);
+                let from = index.graph().symbols.iter().find(|symbol| symbol.id.0 == edge.from);
+                let to = index.graph().symbols.iter().find(|symbol| symbol.id.0 == edge.to);
                 if let (Some(from), Some(to), Some(from_file), Some(to_file)) = (
                     from,
                     to,
@@ -1217,7 +1253,7 @@ impl AstrolabeServer {
             };
             let depth = params.depth.clamp(1, u16::from(astrolabe_core::neighborhood::MAX_NEIGHBORHOOD_DEPTH)) as u8;
             let entries = astrolabe_core::neighborhood::neighborhood(
-                &index.graph,
+                index.graph(),
                 target_id,
                 direction,
                 depth,
@@ -1379,10 +1415,10 @@ impl AstrolabeServer {
         Parameters(params): Parameters<GroupGraphParams>,
     ) -> CallToolResult {
         self.with_index(|index| {
-            let centrality = compute_centrality(&index.graph);
+            let centrality = compute_centrality(index.graph());
             let depth = params.depth.clamp(1, 3) as u8;
             let (nodes, edges) =
-                astrolabe_core::group_graph::group_graph(&index.graph, &centrality, depth);
+                astrolabe_core::group_graph::group_graph(index.graph(), &centrality, depth);
             let header = format!(
                 "confidence: scoped {} (import 图文件夹聚合；depth={depth})\n\nnodes:\n",
                 confidence_note(Confidence::Scoped)
@@ -1446,7 +1482,7 @@ impl AstrolabeServer {
         let mut failed = 0usize;
         let mut spent = estimate_tokens(body);
         for (line, idx) in hits.iter().take(kept_count).take(5) {
-            let symbol = &index.graph.symbols[*idx];
+            let symbol = &index.graph().symbols[*idx];
             let Some(file) = index.file(symbol.file) else {
                 failed += 1;
                 continue;
@@ -1531,7 +1567,7 @@ impl AstrolabeServer {
         };
         let kind = astrolabe_core::name_path::KindFilter(kind);
         let matches = astrolabe_core::name_path::match_name_path(
-            &index.graph.symbols,
+            &index.graph().symbols,
             &params.query,
             params.substring,
             kind,
@@ -1541,7 +1577,7 @@ impl AstrolabeServer {
         let mut hits: Vec<(String, usize)> = Vec::new();
         for m in &matches {
             if let Some((idx, symbol)) = index
-                .graph
+                .graph()
                 .symbols
                 .iter()
                 .enumerate()
@@ -1616,21 +1652,21 @@ impl AstrolabeServer {
         // 同名符号多根一次建图 + 全森林硬上限（审查 major #3：逐根重建邻接、
         // 无节点上限，depth=6 稠密图组合爆炸）。
         let roots: Vec<_> = index
-            .graph
+            .graph()
             .symbols
             .iter()
             .filter(|symbol| symbol.name.eq_ignore_ascii_case(&params.symbol))
             .map(|symbol| symbol.id)
             .collect();
         let forest =
-            astrolabe_core::trace_tree::trace_forest(&index.graph, &roots, direction, depth, 2000);
+            astrolabe_core::trace_tree::trace_forest(index.graph(), &roots, direction, depth, 2000);
         if forest.entries.is_empty() {
             body.push_str("未找到同名符号或无可展开调用边。\n");
             return body;
         }
         // 预渲染 SymbolId → 锚点行，避免逐节点线性扫符号表（审查 major #3）。
         let mut line_by_id: BTreeMap<_, String> = BTreeMap::new();
-        for symbol in &index.graph.symbols {
+        for symbol in &index.graph().symbols {
             if let Some(file) = index.file(symbol.file) {
                 line_by_id.insert(symbol.id, symbol_line(symbol, &file.path));
             }
@@ -1678,10 +1714,10 @@ impl AstrolabeServer {
         self.with_index(|index| {
             // churn 融合（对齐 openvisio buildHotspots）：中心性 × churn 增益。
             // 无 git / git 失败 → 空表 → 增益恒 1，退化为纯中心性（向后兼容）。
-            let centrality = compute_centrality(&index.graph);
+            let centrality = compute_centrality(index.graph());
             let churn = self.cached_churn();
             let mut scored: Vec<(FileId, f64)> = index
-                .graph
+                .graph()
                 .files
                 .iter()
                 .map(|file| {
@@ -1750,7 +1786,7 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         self.with_index(|index| {
             let mut totals: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
-            for file in &index.graph.files {
+            for file in &index.graph().files {
                 if let Some(language) = file.language {
                     let total = totals.entry(language.name()).or_default();
                     total.0 += 1;
@@ -1942,11 +1978,11 @@ mod tests {
             }],
             edges: vec![],
         };
-        *server.state.write().unwrap() = IndexState::Ready(Arc::new(RepoIndex {
-            root: PathBuf::from("."),
+        *server.state.write().unwrap() = IndexState::Ready(Arc::new(RepoIndex::from_graph(
+            PathBuf::from("."),
             graph,
-            report: Default::default(),
-        }));
+            Default::default(),
+        )));
         // Tests must not inherit ASTROLABE_STRUCTURED from the environment.
         server.structured_output = false;
         server

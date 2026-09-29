@@ -16,6 +16,7 @@ pub mod body;
 pub mod budget;
 pub mod cache;
 pub mod churn;
+pub mod elect;
 pub mod graph;
 pub mod group_graph;
 pub mod index;

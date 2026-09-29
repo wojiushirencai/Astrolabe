@@ -19,8 +19,11 @@
 //!    a wake-up trigger. When debounced, [`Watcher::check`] runs [`crate::scan::scan`]
 //!    to diff against the last snapshot. This guarantees that `.gitignore`,
 //!    excluded directories, and binary/size limits are applied consistently.
-//! 4. **Safety net**: A slow periodic check (every 10 minutes) runs even during
-//!    complete event silence to guard against any dropped or lost OS events.
+//! 4. **Safety net**: A slow periodic check (every [`WatchConfig::safety_interval`],
+//!    default 10 minutes) runs even during complete event silence to guard
+//!    against any dropped or lost OS events. The first deadline is phase-shifted
+//!    by a random offset in `[0, interval)` so concurrent watchers on the same
+//!    tree do not stampede.
 //! 5. **Automatic polling fallback**: If the OS notification system fails to
 //!    initialize or encounters an error at runtime (e.g. exhausted inotify watches),
 //!    the watcher automatically logs a warning and falls back to polling at
@@ -31,7 +34,8 @@
 //! In event mode, idle CPU is 0.0% because the background thread sleeps on
 //! channel `recv_timeout`. When changes settle, a single `check` walks the tree.
 //! A file is hashed only when it looks different (`mtime`/size) or is
-//! still inside the mtime-precision window.
+//! still inside the mtime-precision window. The safety-interval walk is
+//! phase-jittered so N processes on one tree do not align their full scans.
 //!
 //! ## mtime precision
 //!
@@ -95,7 +99,7 @@ const EVENT_SAFETY_INTERVAL: Duration = Duration::from_secs(600);
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01b3;
 
-/// Polling cadence and emit delay for [`Watcher::spawn`].
+/// Polling cadence, emit delay, and event-mode safety scan for [`Watcher::spawn`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchConfig {
     /// Cadence for the polling fallback when native OS events are disabled or unavailable.
@@ -103,6 +107,15 @@ pub struct WatchConfig {
     /// Quiet period before a pending [`ChangeSet`] is sent. Rapid editor
     /// saves collapse into one event.
     pub debounce: Duration,
+    /// Periodic full-tree scan in event mode even during complete OS-event
+    /// silence. Guards against dropped or lost notifications. Default 10
+    /// minutes. `Duration::ZERO` disables the safety scan.
+    pub safety_interval: Duration,
+    /// Phase-shift the first safety-scan deadline by a random offset in
+    /// `[0, safety_interval)` so concurrent watchers on the same tree do not
+    /// stampede. Default true; tests that depend on loop timing should set
+    /// this false.
+    pub safety_jitter: bool,
 }
 
 impl Default for WatchConfig {
@@ -110,7 +123,23 @@ impl Default for WatchConfig {
         WatchConfig {
             poll_interval: Duration::from_secs(10),
             debounce: Duration::from_millis(500),
+            safety_interval: EVENT_SAFETY_INTERVAL,
+            safety_jitter: true,
         }
+    }
+}
+
+impl WatchConfig {
+    /// Periodic full-tree scan interval in event mode. See [`Self::safety_interval`].
+    pub fn safety_interval(mut self, d: Duration) -> Self {
+        self.safety_interval = d;
+        self
+    }
+
+    /// Enable or disable the first-scan phase offset. See [`Self::safety_jitter`].
+    pub fn safety_jitter(mut self, enabled: bool) -> Self {
+        self.safety_jitter = enabled;
+        self
     }
 }
 
@@ -282,6 +311,16 @@ impl Watcher {
 
     pub fn debounce(mut self, debounce: Duration) -> Self {
         self.config.debounce = debounce;
+        self
+    }
+
+    pub fn safety_interval(mut self, safety_interval: Duration) -> Self {
+        self.config.safety_interval = safety_interval;
+        self
+    }
+
+    pub fn safety_jitter(mut self, enabled: bool) -> Self {
+        self.config.safety_jitter = enabled;
         self
     }
 
@@ -512,6 +551,47 @@ fn init_notify(
     Some((rx, watcher))
 }
 
+/// Mix pid, a high-res clock, and a per-call counter into a u64.
+/// Not cryptographic — only used to desynchronize safety-scan deadlines.
+fn entropy64() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let mut h = FNV_OFFSET;
+    h ^= u64::from(std::process::id());
+    h = h.wrapping_mul(FNV_PRIME);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    h ^= nanos;
+    h = h.wrapping_mul(FNV_PRIME);
+    h ^= SEQ.fetch_add(1, Ordering::Relaxed);
+    h.wrapping_mul(FNV_PRIME)
+}
+
+/// Offset in `[0, interval)`. `interval == 0` yields zero.
+fn safety_phase_offset(interval: Duration, entropy: u64) -> Duration {
+    let total = interval.as_nanos();
+    if total == 0 {
+        return Duration::ZERO;
+    }
+    duration_from_nanos_u128((entropy as u128) % total)
+}
+
+fn duration_from_nanos_u128(n: u128) -> Duration {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    Duration::new((n / NANOS_PER_SEC) as u64, (n % NANOS_PER_SEC) as u32)
+}
+
+fn initial_last_safety(config: &WatchConfig) -> Instant {
+    let now = Instant::now();
+    if !config.safety_jitter {
+        return now;
+    }
+    now.checked_sub(safety_phase_offset(config.safety_interval, entropy64()))
+        .unwrap_or(now)
+}
+
 fn event_loop<F: EventFeed, G>(
     mut watcher: Watcher,
     mut feed: F,
@@ -520,8 +600,9 @@ fn event_loop<F: EventFeed, G>(
     stop: Arc<AtomicBool>,
 ) -> (Watcher, bool) {
     let debounce = watcher.config.debounce;
+    let safety_interval = watcher.config.safety_interval;
     let mut last_event: Option<Instant> = None;
-    let mut last_safety = Instant::now();
+    let mut last_safety = initial_last_safety(&watcher.config);
 
     // Seed baseline (!seeded → empty) or emit catch-up delta if already seeded.
     {
@@ -560,7 +641,8 @@ fn event_loop<F: EventFeed, G>(
         }
 
         let quiet = last_event.map(|t| t.elapsed() >= debounce).unwrap_or(false);
-        let safety_due = last_safety.elapsed() >= EVENT_SAFETY_INTERVAL;
+        // ZERO disables the safety scan (tests, or callers that only want events).
+        let safety_due = !safety_interval.is_zero() && last_safety.elapsed() >= safety_interval;
 
         if quiet || safety_due {
             last_event = None;
@@ -849,7 +931,11 @@ mod tests {
     }
 
     fn watcher(dir: &TestDir) -> Watcher {
-        Watcher::new(dir.path()).scan_options(test_scan())
+        // Jitter would make the first safety scan fire immediately with
+        // probability STOP_SLICE/interval; keep tests deterministic.
+        Watcher::new(dir.path())
+            .scan_options(test_scan())
+            .safety_jitter(false)
     }
 
     /// Bump mtime so tests do not depend on filesystem timestamp resolution.
@@ -1326,6 +1412,78 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("pending debounce flushed on stop");
         assert_eq!(cs.added, vec![RelPath::new("flushed.rs")], "{cs:?}");
+    }
+
+    struct TimeoutFeed;
+
+    impl EventFeed for TimeoutFeed {
+        fn recv_timeout(&mut self, timeout: Duration) -> Result<Result<(), ()>, RecvTimeoutError> {
+            // Honor the timeout so the loop does not busy-spin; event_loop
+            // passes STOP_SLICE (50 ms) here.
+            if !timeout.is_zero() {
+                thread::sleep(timeout);
+            }
+            Err(RecvTimeoutError::Timeout)
+        }
+    }
+
+    #[test]
+    fn watch_config_default_safety_interval_is_ten_minutes() {
+        let cfg = WatchConfig::default();
+        assert_eq!(cfg.safety_interval, Duration::from_secs(600));
+        assert!(cfg.safety_jitter);
+        assert_eq!(
+            WatchConfig::default()
+                .safety_interval(Duration::from_secs(30))
+                .safety_jitter(false)
+                .safety_interval,
+            Duration::from_secs(30)
+        );
+        assert!(!WatchConfig::default().safety_jitter(false).safety_jitter);
+    }
+
+    #[test]
+    fn safety_phase_offset_stays_inside_interval() {
+        let interval = Duration::from_secs(600);
+        for seed in [0u64, 1, 42, u64::MAX] {
+            let offset = safety_phase_offset(interval, seed);
+            assert!(offset < interval, "seed={seed} offset={offset:?}");
+        }
+        assert_eq!(safety_phase_offset(Duration::ZERO, 1), Duration::ZERO);
+        assert_eq!(
+            safety_phase_offset(Duration::from_nanos(1), 0),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn event_loop_safety_interval_scans_without_os_events() {
+        let dir = TestDir::new();
+        dir.write("seed.rs", "seed");
+        let mut w = watcher(&dir)
+            .safety_interval(Duration::from_millis(80))
+            .debounce(Duration::from_secs(60));
+        let _ = w.check();
+
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let _ = event_loop(w, TimeoutFeed, (), tx, stop_thread);
+        });
+
+        // Let the loop seed, then write so only the safety scan (not the
+        // startup check) can observe the new file.
+        thread::sleep(Duration::from_millis(30));
+        dir.write("late.rs", "late");
+
+        let cs = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("configured safety interval should pick up a silent write");
+        assert_eq!(cs.added, vec![RelPath::new("late.rs")], "{cs:?}");
+
+        stop.store(true, Ordering::SeqCst);
+        thread.join().expect("join event_loop");
     }
 
     #[test]

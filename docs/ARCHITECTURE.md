@@ -124,9 +124,13 @@ exact  >  scoped  >  syntactic  >  unknown
                     ┌──────────────────────────────────┐
                     │  Watcher: 原生事件驱动 + 快照 diff  │
                     │  故障自动降级 10s 轮询 / 600s 兜底 │
+                    │  默认 safety_jitter 错峰           │
                     └────────────┬─────────────────────┘
-                                 │ ChangeSet
+                                 │ ChangeSet（合并 + 语言过滤 + 2s 节流）
                                  ▼
+                    IncrementalIndex::apply_changeset
+                    （无 Ready 快照则 IncrementalIndex::build）
+                                 │
 根目录 ──► scan ──► FileIndex ──► ResolverSet::detect ──► apply_excludes
               │                      │
               │                      │ ProjectMeta（源根 / crate / paths）
@@ -155,7 +159,7 @@ exact  >  scoped  >  syntactic  >  unknown
 - `detect` 在首次 scan 之后，因为它要 `FileIndex`。构建系统声明的输出目录（Cargo `target`、tsconfig `outDir`）此时才知道，所以 `apply_excludes` 是内存过滤，不是二次走盘。
 - **store** 在 parse 两侧：命中则跳过 tree-sitter；未命中则编码写回。打不开、只读、坏掉都只记日志，索引继续走内存。
 - **cache**（`FileCache`）不参与建图。它是 MCP `search_code` 的读侧热层，按路径 + mtime，字节预算默认 256 MB（`ASTROLABE_CACHE_MB`）。README 记录：8 MB 预算下 RSS 停在约 45 MB 平台、16 轮查询不涨；1–2 MB 预算下缓存占用贴住上限（误差 <100 字节）。
-- **watch** 在 MCP 第一次索引成功之后启动。重建期间**旧图继续服务**；重建失败丢弃新结果。一次坏编辑不能把可用索引换成错误。默认采用**操作系统原生事件驱动（`notify`）唤醒快照 diff**，空闲时 0% CPU 占用；遭遇平台通知故障或后端错误时自动平滑降级为 **10s 轮询兜底**，并辅以 600s 周期性安全网扫描。大批量事件经 500ms 防抖合并，重建侧自动清空积压，避免持续变更产生冗余重建风暴。环境变量 `ASTROLABE_WATCH_SECS=0` 可彻底关闭监视，指定正整数 `N` 可强制使用 `N` 秒纯轮询模式。
+- **watch** 在 MCP 第一次索引成功之后启动。重建期间**旧图继续服务**；重建失败丢弃新结果。一次坏编辑不能把可用索引换成错误。默认采用**操作系统原生事件驱动（`notify`）唤醒快照 diff**，空闲时 0% CPU 占用；遭遇平台通知故障或后端错误时自动平滑降级为 **10s 轮询兜底**，并辅以 600s 周期性安全网扫描（`safety_jitter` 默认开启，多进程错开全树扫描）。`.astrolabe/` 已从 scan 硬排除。大批量事件经 500ms 防抖合并；MCP 侧再按语言过滤、合并节流窗口（默认 2s）后走 **`IncrementalIndex::apply_changeset`**（只解析 changeset 里的语言源文件），不再每个 ChangeSet 全量 `index_repo`。同仓多进程仅 leader 写 `index.redb`（`IndexerLock`）；follower 纯内存增量，leader 退出后可晋升。环境变量 `ASTROLABE_WATCH_SECS=0` 可彻底关闭监视，指定正整数 `N` 可强制使用 `N` 秒纯轮询模式。
 
 调用边开关：
 
@@ -176,10 +180,11 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 | `parse::queries` | 每语言 symbols/imports/calls | `LanguageQueries` | 符号召回门槛 ≥90% |
 | `resolvers` | 五语言模块路径 → 仓库文件 | `ResolverSet`；每语言一个无字段 unit struct | `types`；语言之间禁止互调 |
 | `graph` | import 图、PageRank、任务排序、可达性 | `CodeGraph`, `Centrality` | 只依赖 `types` |
-| `index` | 编排 scan→parse→resolve→graph | `IndexOptions`, `index_repo` | scan / parse / resolvers / store / graph |
+| `index` | 编排 scan→parse→resolve→graph；增量 `IncrementalIndex` | `IndexOptions`, `index_repo`, `IncrementalIndex` | scan / parse / resolvers / store / graph / watch::ChangeSet |
 | `store` | redb；解析缓存；整图表预留 | `Store`, `WRITE_BATCH`, `SCHEMA_VERSION` | 不进入查询热路径 |
 | `cache` | 有界内存文件缓存 | `FileCache`, `CacheConfig` | 被 MCP 使用 |
-| `watch` | 原生事件唤醒 + 防抖快照 diff + 轮询兜底 | `Watcher`, `ChangeSet`, `WatchHandle` | 复用 `scan`，保证监视集 = 索引集 |
+| `watch` | 原生事件唤醒 + 防抖快照 diff + 轮询兜底 + 安全扫描 jitter | `Watcher`, `ChangeSet`, `WatchHandle`, `WatchConfig` | 复用 `scan`，保证监视集 = 索引集 |
+| `elect` | 每仓 indexer leader 选举（flock / LockFileEx） | `IndexerLock` | 门控 `index.redb` 写入，不是查询正确性屏障 |
 | `budget` | 按排名截断工具输出 | `TokenBudget`, `truncate_ranked` | 估计是 `chars/4` |
 | `render` | `path:line` 锚点、置信度附注 | `anchor`, `symbol_line`, `confidence_note` | 给智能体读，不是给人看的 UI |
 | `lsp` | Phase 2 已实现：按需 LSP、精确查询 | `LanguageServer`, `Precise<T>`, `LspError` | 图谱问题不得进入此模块 |
@@ -193,8 +198,9 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 |---|---|
 | `main` | 根目录优先级：位置参数 → `ASTROLABE_ROOT` → cwd；stdio；日志在 stderr |
 | `lib` | `TOOL_COUNT = 13`（8 图谱 + 5 精确），`tools/list` 的 24h `ttlMs` |
-| `index` | 对 `index_repo` 的薄封装；**打开 `call_edges`** |
-| `server` | 十三个工具、索引状态机、watch 重建、`content[0]` 非空文本 |
+| `index` | 对 `IncrementalIndex::build` 的薄封装；**打开 `call_edges`**；Ready 快照可 `apply_changeset` |
+| `reindex` | 语言过滤、节流合并、leader 门控 persist |
+| `server` | 十三个工具、索引状态机、watch 增量重建、`content[0]` 非空文本 |
 | `precise_tools` | 精确层渲染：`find_references` / `goto_definition` / `get_diagnostics` / `plan_rename` / `apply_rename`（gated） |
 | `live_backend` | 按需 `LspPool` + rewrite planner；缺服务器标 `unknown` |
 
