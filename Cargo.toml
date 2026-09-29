@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lsp-types = "0.97"
 ast-grep-core = "0.45"
 oxc_allocator = "0.149"
-oxc_parser = "0.149"
+oxc_parser = "0.151"
 oxc_semantic = "0.149"
 oxc_span = "0.149"
 
