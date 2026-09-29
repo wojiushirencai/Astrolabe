@@ -10,6 +10,8 @@
 mod cli;
 mod context;
 mod ensure_ls;
+mod knobs;
+mod session;
 // hooks / instructions 对 bin（main.rs 的子命令分发）公开：hook 协议入口
 // 不经 ServerHandler，直接调用模块函数。
 pub mod hooks;
@@ -21,11 +23,15 @@ mod openai_schema;
 mod precise_tools;
 mod reindex;
 mod root;
+pub mod roots;
 mod server;
 
 pub use cli::{parse_launch, Launch, USAGE};
 pub use context::{resolve_context_name, ClientContext};
-pub use root::{find_project_root, resolve_index_root};
+pub use root::{
+    child_git_repos, count_root_files, find_project_root, is_cwd_sentinel, resolve_index_root,
+    resolve_root, ResolvedRoot, DEFAULT_MAX_ROOT_FILES,
+};
 pub use server::AstrolabeServer;
 
 pub const TOOL_CATALOG_TTL_MS: u64 = 86_400_000;
