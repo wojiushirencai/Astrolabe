@@ -2768,8 +2768,22 @@ mod tests {
             .unwrap()
             .clone()
             .expect("watcher must publish a freshness log");
-        // Age the watermark past FRESH_WINDOW (5s) with no suspects.
-        std::thread::sleep(Duration::from_millis(5200));
+        // Age the watermark past FRESH_WINDOW with no suspects. Waiting for
+        // the condition (instead of a fixed sleep) matters on loaded CI
+        // runners: the watcher thread can be starved past `wait_ready`, so
+        // the baseline check that pushes the watermark may land seconds
+        // late and a fixed sleep leaves the watermark "fresh" at query
+        // time — the barrier then answers Fresh and never requests a
+        // verification. atime noise is one-shot (relatime), so once the
+        // watermark has aged past the window no further bump races the query.
+        let aged = astrolabe_core::freshness::FRESH_WINDOW + Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while log.watermark().elapsed() < aged {
+            if std::time::Instant::now() > deadline {
+                panic!("watermark never aged past FRESH_WINDOW");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let before = log.watermark();
         let _ = server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
@@ -2781,7 +2795,10 @@ mod tests {
         }));
         let start = std::time::Instant::now();
         while log.watermark() <= before {
-            if start.elapsed() > Duration::from_secs(3) {
+            // Generous bound: on 2-vCPU CI runners the watch thread can be
+            // starved by the parallel test suite for seconds before it
+            // honors the verification request (STOP_SLICE is 50ms of idle).
+            if start.elapsed() > Duration::from_secs(10) {
                 panic!("request_verification did not advance the watermark");
             }
             std::thread::sleep(Duration::from_millis(20));
