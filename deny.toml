@@ -38,6 +38,9 @@ allow = [
     "NCSA",
     "CDLA-Permissive-2.0",
     "OpenSSL",
+    # bzip2 crate uses the original bzip2 license, which is BSD-style permissive.
+    # SPDX standardized this as "bzip2-1.0.6" (OSI-approved, GPL-compatible).
+    "bzip2-1.0.6",
 ]
 exceptions = []
 

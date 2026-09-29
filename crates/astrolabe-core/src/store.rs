@@ -19,7 +19,7 @@ use crate::types::{
     CodeEdge, CodeFile, CodeSymbol, Confidence, EdgeKind, FileId, Language, RelPath, SymbolId,
     SymbolKind,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
