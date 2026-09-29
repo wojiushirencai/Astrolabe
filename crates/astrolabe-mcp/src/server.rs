@@ -21,7 +21,7 @@ use rmcp::{
         CacheScope, CallToolResult, ContentBlock, Implementation, InitializeRequestParams,
         InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
         ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-        ResourceContents, ServerCapabilities, ServerInfo,
+        ResourceContents, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler,
@@ -1834,8 +1834,8 @@ impl AstrolabeServer {
 
 #[tool_handler]
 impl ServerHandler for AstrolabeServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
