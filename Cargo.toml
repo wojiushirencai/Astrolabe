@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Phase 2 (language-server routing) and Phase 3 (safe rewriting).
 lsp-types = "0.97"
 ast-grep-core = "0.45"
-oxc_allocator = "0.149"
+oxc_allocator = "0.151"
 oxc_parser = "0.149"
 oxc_semantic = "0.149"
 oxc_span = "0.149"
