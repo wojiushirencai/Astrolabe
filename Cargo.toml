@@ -27,7 +27,7 @@ memchr = "2.7"
 notify = "8"
 rayon = "1.10"
 moka = { version = "0.12", features = ["sync"] }
-redb = "2.6"
+redb = "4.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Phase 2 (language-server routing) and Phase 3 (safe rewriting).
