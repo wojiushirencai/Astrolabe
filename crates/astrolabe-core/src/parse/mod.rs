@@ -56,7 +56,7 @@ pub enum ParseError {
     Query(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ParsedFile {
     pub symbols: Vec<CodeSymbol>,
     /// Raw import specifiers, in source order. Resolution happens later, in

@@ -81,10 +81,14 @@ README 写 serena **73 MB / 1.0s / 10075 符号**。本机用上述口径，稳�
 
 1. **进程边界**。`cargo run --example` 的 RSS 含 cargo 父进程。本 bench 只计 example 二进制。
 2. **冷启动 vs 预热后**。丢弃的第一次 worker 会把 tree-sitter 语法、忽略规则树、页缓存一起算进去。本机见过 rust 预热 64 MB、openvisio-oss **75 MB / 1.3s**，随后稳态分别落到 20 MB / 14 MB。门禁必须看稳态，否则冷/热 CI 会对打。
-3. **对象**。MCP 常驻（tokio + 工具循环）会高于一次 `index_repo`。持久化 / 有界缓存接到编排层之后，应另开一列，不要和这条基线混用。
+3. **对象**。MCP 常驻（tokio + 工具循环）会高于一次 `index_repo`。持久化 / 有界缓存接到编排层之后，应另开一列，不要和这条基线混用。监视热更新走增量 apply，同样不要和冷/热 `index_repo` 混用。
 4. **并发改动**。测量窗口里别的任务在改 `src/index.rs`、`store.rs`、解析器；符号数从 10090 漂到 10051。以基线 JSON 里那一次为准。
 
 README 的 25 / 27 / 55 / 67 / 73 MB 保留为**对外叙事**。回归门禁以 `examples/baselines/*.json` 为准。
+
+## MCP 监视重建（不是 `index_bench` 口径）
+
+MCP 常驻进程的 watch 路径已改为 `IncrementalIndex::apply_changeset`：只解析 changeset 里的语言源文件，非语言文件（`.md` / `.log` 等）不触发重建，follower 不打开 `index.redb`。那条路径的 RSS/耗时不要拿来改本文件的 worker 基线。
 
 ## 本机实测
 
