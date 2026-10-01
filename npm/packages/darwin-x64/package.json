@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe/darwin-x64",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "The macOS x86_64 binary for astrolabe (x86_64-apple-darwin)",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -9,13 +9,24 @@
     "directory": "npm/packages/darwin-x64"
   },
   "homepage": "https://github.com/wojiushirencai/Astrolabe",
-  "os": ["darwin"],
-  "cpu": ["x64"],
-  "engines": { "node": ">=18" },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "preferUnplugged": true,
-  "files": ["astrolabe", "README.md"],
+  "files": [
+    "astrolabe",
+    "README.md"
+  ],
   "bin": {
     "astrolabe-darwin-x64": "astrolabe"
   },
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }

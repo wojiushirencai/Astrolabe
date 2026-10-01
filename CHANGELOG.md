@@ -6,7 +6,17 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-09-30
+## [0.4.1] - 2026-10-01
+
+### Fixed
+
+- **`search_code` 遵循调用方预算，消除误卸载与假死截断。**
+  - **动态资源阈值（遵循模型意图）**：MCP resource 卸载阈值由写死 4000 改为动态计算 `max(基线4000, 钳制后budget_tokens)`，并增加 128 tokens 的 SLACK 双保险；预先扣除头部开销（35 tokens），彻底根治调用方加大 `budget_tokens`（如 5000）后反而因超过 4000 被降级为 resource 链接的问题。
+  - **单行超长安全切片（UTF-8 边界安全）**：单行代码超长（>250 字符，如压缩的 `min.js` / 单行 JSON）时，以匹配项为中心截取前后各约 90 字符的安全窗口，并对匹配段长度进行封顶，避免单个压缩单行吃光几千 token 预算或导致后续匹配被全弃；定位基于原串的 `regex::Match`，杜绝 Unicode 小写变换造成的字节偏移错位 panic。
+  - **前瞻匹配摘要**：当工具结果确需转存为 MCP 资源时，在首个文本块中展示前 5 行有界前瞻摘要（≤200 tokens），让模型无需调 `resources/read` 即可获知匹配概貌。
+  - **零展示明确诊断**：当 `shown=0 && omitted>0` 时，如实提示首条匹配单项超过预算，指导收紧 `path_filter` 或调整参数。
+  - **`trace_calls` 树结构预算防护**：对深层树形调用链渲染增加 `budget_tokens` 截断与省略提示。
+  - **环境变量旋钮**：支持通过 `ASTROLABE_RESOURCE_THRESHOLD`（基线覆盖）与 `ASTROLABE_MAX_BUDGET_TOKENS`（硬上限覆盖，默认 32000）按需调整。
 
 ### Changed
 
