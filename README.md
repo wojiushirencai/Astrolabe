@@ -246,6 +246,8 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `ASTROLABE_IDLE_EVICT_SECS` | 多项目模式下子项目闲置多少秒后自动释放 | `300` |
 | `ASTROLABE_CONTEXT` | 指定客户端模式（`default` / `claude-code` / `cursor` / `codex` / `readonly`） | `default` |
 | `ASTROLABE_STRUCTURED` | 是否开启结构化输出（`1` 开启，`0` 关闭） | 默认关闭 |
+| `ASTROLABE_RESOURCE_THRESHOLD` | 工具结果超过该 token 估算值时卸载为 MCP resource（附前瞻摘要）；实际阈值为它与 `budget_tokens`（钳制后）的较大值 | `4000` |
+| `ASTROLABE_MAX_BUDGET_TOKENS` | `budget_tokens` 硬上限：动态卸载阈值取 `max(阈值基线, budget)` 时防止异常大的 budget 把阈值顶穿 | `32000` |
 | `ASTROLABE_WATCH_SECS` | 文件变更监听：未设置走原生系统事件（空闲 0% CPU）；`0` 关闭；`N` 走轮询兜底 | 未设置（原生事件优先） |
 | `ASTROLABE_REINDEX_MS` | 两次索引更新之间的最小间隔毫秒数（0 关间隔） | `2000` |
 | `ASTROLABE_STORM_PATHS` | 一次文件变动超过多少个路径时退回整库核对 | `5000` |

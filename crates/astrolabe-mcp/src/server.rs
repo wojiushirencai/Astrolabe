@@ -45,7 +45,24 @@ use crate::{
 pub(crate) use crate::session::IndexState;
 
 const DEFAULT_BUDGET: usize = 2_500;
-const RESOURCE_THRESHOLD_TOKENS: usize = 4_000;
+/// 资源卸载阈值基线：正文 token 估算超过阈值（含 SLACK）时转存为
+/// MCP resource。`ASTROLABE_RESOURCE_THRESHOLD` 可调，格式错误回退默认。
+pub(crate) const DEFAULT_RESOURCE_THRESHOLD_TOKENS: usize = 4_000;
+/// budget_tokens 硬上限：动态阈值取 `max(基线, clamp(caller_budget))` 时
+/// 防止异常大的 budget 把卸载阈值顶到天上。`ASTROLABE_MAX_BUDGET_TOKENS`
+/// 可调，格式错误回退默认。
+pub(crate) const DEFAULT_MAX_BUDGET_TOKENS: usize = 32_000;
+/// 阈值判定双保险：`chars/4` 估算器对真实 tokenizer 的偏差容忍量。
+pub(crate) const RESOURCE_SLACK_TOKENS: usize = 128;
+/// 单行展示的最大列宽（字符数）：超长匹配行只展示命中点附近的安全切片。
+const MAX_LINE_COLUMNS: usize = 250;
+/// 切片窗口在命中点前后各带的上下文字符数。
+const CONTEXT_PADDING: usize = 90;
+/// 匹配段自身封顶：`.*` 类命中可能横跨上万字符，只展示前 40 字符。
+const MAX_MATCH_SPAN_CHARS: usize = 40;
+/// search_code 头部（confidence/mode/截断状态行）的固定 token 开销估算，
+/// 从 budget 中先扣除，保证整个 body 不在阈值边界溢出。
+const SEARCH_HEADER_TOKENS: usize = 35;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
 fn default_budget() -> usize {
@@ -90,13 +107,21 @@ fn render_search_mode_header(regex: bool, query: &str) -> String {
 }
 
 /// Claude Code 默认丢弃 structuredContent，截断声明必须出现在正文。
+/// shown=0 且 omitted>0 是最坏情形：一条都没展示，必须专门诊断"首条
+/// 结果单项超预算"，否则输出只剩元信息，读起来像服务故障/吞内容。
 fn render_budget_status(shown: usize, omitted: usize, budget_tokens: usize) -> String {
     let truncated = omitted > 0;
     let mut status = format!("shown={shown} omitted={omitted} truncated={truncated}\n");
     if truncated {
-        status.push_str(&format!(
-            "这不是全集：{omitted} 条因 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查；本工具没有翻页。\n"
-        ));
+        if shown == 0 {
+            status.push_str(&format!(
+                "这不是全集：共找到 {omitted} 条匹配，但首条结果单项超过 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查；本工具没有翻页。\n"
+            ));
+        } else {
+            status.push_str(&format!(
+                "这不是全集：{omitted} 条因 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查；本工具没有翻页。\n"
+            ));
+        }
     }
     status
 }
@@ -121,6 +146,51 @@ fn parse_cache_budget_mb(raw: Option<&str>) -> u64 {
 
 fn cache_budget_from_env() -> u64 {
     parse_cache_budget_mb(std::env::var("ASTROLABE_CACHE_MB").ok().as_deref())
+}
+
+/// Parse a `usize` env var; invalid values warn and fall back to `default`
+/// so a typo cannot silently disable the knob.
+fn parse_env_usize(raw: Option<&str>, var: &str, default: usize) -> usize {
+    match raw {
+        None => default,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!(value = %raw, var = var, "invalid env var; using default");
+                default
+            }
+        },
+    }
+}
+
+/// `ASTROLABE_RESOURCE_THRESHOLD`：资源卸载阈值基线（默认 4000）。
+fn resource_threshold_base_from_env() -> usize {
+    parse_env_usize(
+        std::env::var("ASTROLABE_RESOURCE_THRESHOLD")
+            .ok()
+            .as_deref(),
+        "ASTROLABE_RESOURCE_THRESHOLD",
+        DEFAULT_RESOURCE_THRESHOLD_TOKENS,
+    )
+}
+
+/// `ASTROLABE_MAX_BUDGET_TOKENS`：budget_tokens 硬上限（默认 32000）。
+fn max_budget_tokens_from_env() -> usize {
+    parse_env_usize(
+        std::env::var("ASTROLABE_MAX_BUDGET_TOKENS").ok().as_deref(),
+        "ASTROLABE_MAX_BUDGET_TOKENS",
+        DEFAULT_MAX_BUDGET_TOKENS,
+    )
+}
+
+/// 纯函数核心（max 显式传入），便于测试在并行环境下不读 env。
+fn clamp_budget_within(raw: usize, max: usize) -> usize {
+    raw.clamp(1, max)
+}
+
+/// 将 budget 限制在 `[1, max_budget_tokens_from_env()]`。
+fn clamp_budget(raw: usize) -> usize {
+    clamp_budget_within(raw, max_budget_tokens_from_env())
 }
 
 /// `ASTROLABE_STRUCTURED` overrides the context default when set to a
@@ -619,8 +689,20 @@ impl AstrolabeServer {
         result
     }
 
-    fn result(&self, title: &str, body: String, structured: Value) -> CallToolResult {
-        self.result_on(&self.root, title, body, structured)
+    /// 动态卸载阈值：基线与 caller budget（钳制后）的较大者。caller 明确
+    /// 给了更大的 budget 时，正文允许留在线内而不是立刻被卸载。
+    fn resource_threshold_for(&self, caller_budget: Option<usize>) -> usize {
+        resource_threshold_base_from_env().max(caller_budget.map(clamp_budget).unwrap_or(0))
+    }
+
+    fn result(
+        &self,
+        title: &str,
+        body: String,
+        structured: Value,
+        budget: Option<usize>,
+    ) -> CallToolResult {
+        self.result_on(&self.root, title, body, structured, budget)
     }
 
     fn result_on(
@@ -629,13 +711,17 @@ impl AstrolabeServer {
         title: &str,
         body: String,
         structured: Value,
+        budget: Option<usize>,
     ) -> CallToolResult {
         let body = if body.trim().is_empty() {
             "没有匹配结果。confidence: unknown".to_string()
         } else {
             body
         };
-        if estimate_tokens(&body) > RESOURCE_THRESHOLD_TOKENS {
+        // 双保险：估算器有偏差，判定线额外加 SLACK，避免在阈值边界处
+        // 把刚好等于 budget 的正文误卸载。
+        let threshold = self.resource_threshold_for(budget);
+        if estimate_tokens(&body) > threshold.saturating_add(RESOURCE_SLACK_TOKENS) {
             let id = self.next_resource.fetch_add(1, Ordering::Relaxed);
             let uri = format!("astrolabe://results/{id}");
             self.resources
@@ -646,9 +732,10 @@ impl AstrolabeServer {
                 .with_description("Astrolabe 大型工具结果；通过 resources/read 获取完整文本")
                 .with_mime_type("text/plain")
                 .with_size(body.len() as u64);
+            let preview_text = resource_preview(&body);
             let mut result = CallToolResult::success(vec![
                 ContentBlock::text(format!(
-                    "{title} 结果较大（约 {} tokens），完整内容见资源：{uri}",
+                    "{title} 结果较大（约 {} tokens），已转存为资源：{uri}\n\n【前瞻匹配摘要】：\n{preview_text}\n\n如需完整内容可通过 resources/read 获取。",
                     estimate_tokens(&body)
                 )),
                 ContentBlock::resource_link(resource),
@@ -712,6 +799,7 @@ impl AstrolabeServer {
                 "context": self.context.name,
                 "budget_tokens": params.budget_tokens,
             }),
+            Some(params.budget_tokens),
         )
     }
 
@@ -794,6 +882,7 @@ impl AstrolabeServer {
                 "resolve_context",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -908,6 +997,7 @@ impl AstrolabeServer {
                 "get_repo_skeleton",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -980,6 +1070,7 @@ impl AstrolabeServer {
                     "truncated": truncated,
                     "budget_tokens": params.budget_tokens
                 }),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -1033,7 +1124,15 @@ impl AstrolabeServer {
                             line.to_lowercase().contains(&needle)
                         };
                         if matched {
-                            matches.push(format!("@{}:{} {}", file.path, line_no + 1, line.trim()));
+                            // P0：超长行先做单行安全切片（Unicode 边界安全），
+                            // 单条 match 不会把 budget 一口气吃光，也不会在
+                            // 大小写折叠差异上 panic。
+                            matches.push(format!(
+                                "@{}:{} {}",
+                                file.path,
+                                line_no + 1,
+                                clip_match_line(line, &params.query, regex.as_ref())
+                            ));
                         }
                     }
                 }
@@ -1046,8 +1145,12 @@ impl AstrolabeServer {
                     budget_bytes = session.cache_budget_bytes,
                     "search_code file cache"
                 );
+                // 头部（confidence/mode/截断状态）约 35 tokens 的固定开销先
+                // 扣除，保证整个 body 不会在阈值边界处溢出。
+                let clamped_budget = clamp_budget(params.budget_tokens);
+                let remaining = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS);
                 let (kept, omitted) =
-                    truncate_ranked(&matches, params.budget_tokens, |line| format!("{line}\n"));
+                    truncate_ranked(&matches, remaining, |line| format!("{line}\n"));
                 let shown = kept.len();
                 let truncated = omitted > 0;
                 let mode = if params.regex { "regex" } else { "literal" };
@@ -1055,7 +1158,7 @@ impl AstrolabeServer {
                     "confidence: exact (磁盘源码字面匹配)\n{}",
                     render_search_mode_header(params.regex, &params.query)
                 );
-                body.push_str(&render_budget_status(shown, omitted, params.budget_tokens));
+                body.push_str(&render_budget_status(shown, omitted, clamped_budget));
                 for line in kept {
                     body.push_str(line);
                     body.push('\n');
@@ -1078,6 +1181,7 @@ impl AstrolabeServer {
                         "truncated": truncated,
                         "budget_tokens": params.budget_tokens
                     }),
+                    Some(params.budget_tokens),
                 )
             },
         )
@@ -1097,6 +1201,7 @@ impl AstrolabeServer {
                     "get_dependents",
                     format!("未找到目标路径：{}\nconfidence: exact", params.target),
                     json!({"confidence":"exact","found":false,"budget_tokens":params.budget_tokens}),
+                    Some(params.budget_tokens),
                 );
             };
             let ids = if params.direction == "dependencies" {
@@ -1110,6 +1215,7 @@ impl AstrolabeServer {
                 "get_dependents",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -1130,6 +1236,7 @@ impl AstrolabeServer {
                     "trace_calls",
                     body,
                     json!({"confidence":"syntactic","depth":params.depth.clamp(1, 6),"budget_tokens":params.budget_tokens}),
+                    Some(params.budget_tokens),
                 );
             }
             let wanted: BTreeSet<_> = index
@@ -1183,6 +1290,7 @@ impl AstrolabeServer {
                 "trace_calls",
                 body,
                 json!({"confidence":"syntactic","budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -1201,6 +1309,7 @@ impl AstrolabeServer {
                     "get_neighborhood",
                     format!("未找到目标文件：{}\n", params.target),
                     json!({"confidence":"unknown","budget_tokens":params.budget_tokens}),
+                    Some(params.budget_tokens),
                 );
             };
             let direction = match params.direction.as_str() {
@@ -1226,6 +1335,7 @@ impl AstrolabeServer {
                     "get_neighborhood",
                     header,
                     json!({"confidence":"scoped","entries":0,"depth":depth,"budget_tokens":params.budget_tokens}),
+                    Some(params.budget_tokens),
                 );
             }
             let lines: Vec<String> = entries
@@ -1257,6 +1367,7 @@ impl AstrolabeServer {
                 "get_neighborhood",
                 body,
                 json!({"confidence":"scoped","entries":entries.len(),"depth":depth,"budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -1283,6 +1394,7 @@ impl AstrolabeServer {
                 "list_memories",
                 header,
                 json!({"confidence":"exact","count":0,"budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             );
         }
         let lines: Vec<String> = entries
@@ -1305,6 +1417,7 @@ impl AstrolabeServer {
             "list_memories",
             body,
             json!({"confidence":"exact","count":entries.len(),"budget_tokens":params.budget_tokens}),
+            Some(params.budget_tokens),
         )
     }
 
@@ -1320,11 +1433,13 @@ impl AstrolabeServer {
                 "read_memory",
                 truncate_body_text(&content, params.budget_tokens),
                 json!({"confidence":"exact","name":params.name,"budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             ),
             None => self.result(
                 "read_memory",
                 format!("记忆 `{}` 不存在（先 list_memories 查名）。confidence: exact\n", params.name),
                 json!({"confidence":"exact","found":false,"budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             ),
         }
     }
@@ -1341,6 +1456,7 @@ impl AstrolabeServer {
                 "write_memory",
                 format!("记忆 `{}` 已写入。\n", params.name),
                 json!({"confidence":"exact","name":params.name,"budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             ),
             Err(error) => self.finish(text_error(format!("写入失败：{error}"))),
         }
@@ -1357,6 +1473,7 @@ impl AstrolabeServer {
                 "delete_memory",
                 format!("记忆 `{}` 已删除。confidence: exact\n", params.name),
                 json!({"confidence":"exact","deleted":true,"budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             )
         } else {
             self.finish(text_error(format!(
@@ -1421,6 +1538,7 @@ impl AstrolabeServer {
                 "get_group_graph",
                 body,
                 json!({"confidence":"scoped","groups":nodes.len(),"edges":edges.len(),"depth":depth,"budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -1606,11 +1724,14 @@ impl AstrolabeServer {
                 "path_query": true,
                 "budget_tokens": params.budget_tokens
             }),
+            Some(params.budget_tokens),
         )
     }
 
     /// 多跳调用树（depth 1-6）：对每个同名符号各跑一棵 trace_tree，
     /// 缩进渲染 + 环标记。同名多根时各树以根锚点行分隔。
+    /// M3：整树渲染受 budget_tokens 截断保护——超大森林只保留预算内的
+    /// 前缀行并显式声明省略数，不无限内联。
     #[allow(clippy::too_many_lines)]
     fn trace_calls_tree_body(&self, index: &RepoIndex, params: &TraceParams) -> String {
         let direction = match params.direction.as_str() {
@@ -1619,7 +1740,7 @@ impl AstrolabeServer {
             _ => astrolabe_core::trace_tree::TraceDirection::Both,
         };
         let depth = params.depth.clamp(1, 6) as u8;
-        let mut body = format!(
+        let mut header = format!(
             "confidence: syntactic {}\n警告：调用图基于名字匹配，可能漏掉动态分派或包含同名误报。depth={depth}，(cycle) = 路径成环已截断。\n",
             confidence_note(Confidence::Syntactic)
         );
@@ -1635,8 +1756,8 @@ impl AstrolabeServer {
         let forest =
             astrolabe_core::trace_tree::trace_forest(index.graph(), &roots, direction, depth, 2000);
         if forest.entries.is_empty() {
-            body.push_str("未找到同名符号或无可展开调用边。\n");
-            return body;
+            header.push_str("未找到同名符号或无可展开调用边。\n");
+            return header;
         }
         // 预渲染 SymbolId → 锚点行，避免逐节点线性扫符号表（审查 major #3）。
         let mut line_by_id: BTreeMap<_, String> = BTreeMap::new();
@@ -1645,11 +1766,13 @@ impl AstrolabeServer {
                 line_by_id.insert(symbol.id, symbol_line(symbol, &file.path));
             }
         }
+        let mut lines: Vec<String> = Vec::new();
         for entry in &forest.entries {
             let Some(root_line) = line_by_id.get(&entry.root) else {
                 continue;
             };
-            body.push_str(&format!("\nroot: {root_line}\n"));
+            lines.push(String::new());
+            lines.push(format!("root: {root_line}"));
             // Both = Callees 树在前、Callers 树在后（trace_tree 语义）——第二
             // 个 depth=0 是分界，打分段头；depth=0 节点本身已由 root 头表达
             // （审查 major #4：根重复打印）。
@@ -1659,7 +1782,7 @@ impl AstrolabeServer {
                     if direction == astrolabe_core::trace_tree::TraceDirection::Both
                         && seen_root == 1
                     {
-                        body.push_str("--- callers ---\n");
+                        lines.push("--- callers ---".to_string());
                     }
                     seen_root += 1;
                     continue;
@@ -1668,12 +1791,27 @@ impl AstrolabeServer {
                     continue;
                 };
                 let cycle = if node.cycle { " (cycle)" } else { "" };
-                body.push_str(&format!(
-                    "{}{}{cycle}\n",
+                lines.push(format!(
+                    "{}{}{cycle}",
                     "  ".repeat(node.depth as usize),
                     line
                 ));
             }
+        }
+        // M3 树保护：树行纳入 budget_tokens，超出部分整行丢弃并声明。
+        let remaining = params
+            .budget_tokens
+            .saturating_sub(estimate_tokens(&header));
+        let (kept, omitted) = truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
+        let mut body = header;
+        for line in kept {
+            body.push_str(line);
+            body.push('\n');
+        }
+        if omitted > 0 {
+            body.push_str(&format!(
+                "{omitted} 个树节点因 budget_tokens 被省略（调用树过大；可减小 depth 或改用 find_references 后重查）。\n"
+            ));
         }
         body
     }
@@ -1748,6 +1886,7 @@ impl AstrolabeServer {
                 "get_hotspots",
                 header,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens,"churn_fused":churn_hits>0,"churn_files":churn_hits}),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -1827,6 +1966,7 @@ impl AstrolabeServer {
                     "file_cache_hits": cache_hits,
                     "file_cache_misses": cache_misses,
                 }),
+                Some(params.budget_tokens),
             )
         })
     }
@@ -1913,6 +2053,95 @@ fn truncate_body_text(text: &str, budget_tokens: usize) -> String {
         out.push_str(&format!("({omitted} 行因 budget_tokens 被省略)\n"));
     }
     out
+}
+
+/// P0 单行安全切片：超长匹配行只展示命中点附近的窗口。
+///
+/// 严禁用 `to_lowercase().find(..)` 拿字节偏移切原串——`İ`/`ẞ` 等字符的
+/// 大小写折叠会改变字节长度， lowered 串上的偏移在原串上漂移，切片直接
+/// panic。这里统一经 `regex::Match`（regex 保证字节偏移落在字符边界上）
+/// 定位命中；字面量搜索用 `regex::escape(needle)` 构建 case-insensitive
+/// regex 在原串上查找。找不到 Match（极端 Unicode 折叠差异，或命中只落
+/// 在被 trim 掉的空白里）时退回行首固定窗口兜底，绝不 unwrap/panic。
+fn clip_match_line(line: &str, needle: &str, regex: Option<&regex::Regex>) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= MAX_LINE_COLUMNS {
+        return trimmed.to_string();
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let total = chars.len();
+
+    let found = match regex {
+        Some(regex) => regex.find(trimmed),
+        None => regex::RegexBuilder::new(&regex::escape(needle))
+            .case_insensitive(true)
+            .build()
+            .ok()
+            .and_then(|literal| literal.find(trimmed)),
+    };
+    let Some(found) = found else {
+        // 安全兜底：行首 250 字符窗口 + 省略号。
+        let head: String = chars.into_iter().take(MAX_LINE_COLUMNS).collect();
+        return format!("{head}…");
+    };
+
+    // Match 的字节偏移保证在字符边界上；换算成字符下标再开窗口。
+    let start = trimmed[..found.start()].chars().count();
+    let span = found.as_str().chars().count();
+    let end = start + span;
+
+    let mut out = String::new();
+    let window_start = start.saturating_sub(CONTEXT_PADDING);
+    if window_start > 0 {
+        out.push('…');
+    }
+    out.extend(chars[window_start..start].iter());
+    if span > MAX_MATCH_SPAN_CHARS {
+        // 匹配段封顶：`.*` 命中上万字符时只展示前 40 字符。
+        out.extend(chars[start..start + MAX_MATCH_SPAN_CHARS].iter());
+        out.push_str(&format!("…[匹配段共 {span} 字符，超出部分已省略]"));
+    } else {
+        out.extend(chars[start..end].iter());
+    }
+    let after_end = (end + CONTEXT_PADDING).min(total);
+    out.extend(chars[end..after_end].iter());
+    if after_end < total {
+        out.push('…');
+    }
+    out
+}
+
+/// P1 前瞻摘要：资源卸载时从正文提取前 5 行、总量约 200 tokens 以内的
+/// 预览，塞进首个 TextContent——客户端不读 resource 也能判断"这次卸载
+/// 的内容是不是我要的"。首行单行超预算时按字符截断，保证 content[0]
+/// 始终有可读文本。
+fn resource_preview(body: &str) -> String {
+    const PREVIEW_LINES: usize = 5;
+    const PREVIEW_MAX_TOKENS: usize = 200;
+    let mut preview = String::new();
+    let mut cut = false;
+    for (index, line) in body.lines().enumerate() {
+        if index >= PREVIEW_LINES {
+            cut = true;
+            break;
+        }
+        let candidate = format!("{preview}{line}\n");
+        if estimate_tokens(&candidate) > PREVIEW_MAX_TOKENS {
+            if index == 0 {
+                // 单行就超预算：按字符截到 200 tokens（约 800 字符）内。
+                let clipped: String = line.chars().take(PREVIEW_MAX_TOKENS * 4).collect();
+                preview.push_str(&clipped);
+                preview.push_str("…\n");
+            }
+            cut = true;
+            break;
+        }
+        preview = candidate;
+    }
+    if cut {
+        preview.push_str("…（前瞻摘要已截断，完整内容见资源）\n");
+    }
+    preview.trim_end().to_string()
 }
 
 fn text_error(message: impl Into<String>) -> CallToolResult {
@@ -2184,13 +2413,324 @@ mod tests {
     #[test]
     fn large_results_keep_text_first_then_resource_link() {
         let server = ready_server();
+        // SLACK 双保险：必须超过 基线+SLACK 才卸载，恰好超基线 1 token
+        // 仍保持内联（见 dynamic_threshold_boundary_keeps_exact_budget_inline）。
         let result = server.result(
             "large",
-            "x".repeat((RESOURCE_THRESHOLD_TOKENS + 1) * 4),
+            "x".repeat((DEFAULT_RESOURCE_THRESHOLD_TOKENS + RESOURCE_SLACK_TOKENS + 1) * 4),
             json!({}),
+            None,
         );
         assert!(result.content[0].as_text().is_some());
         assert!(result.content[1].as_resource_link().is_some());
+    }
+
+    #[test]
+    fn dynamic_threshold_boundary_keeps_exact_budget_inline() {
+        let server = ready_server();
+        // caller budget=6000 且正文恰好 6000 tokens：<= threshold+SLACK，
+        // 必须保持内联，不被卸载（kept 恰好等于 budget 的边界）。
+        let inline = server.result("boundary", "x".repeat(6_000 * 4), json!({}), Some(6_000));
+        assert_eq!(
+            inline.content.len(),
+            1,
+            "exact-budget body must stay inline"
+        );
+        assert!(inline.content[0].as_text().is_some());
+
+        // 超过 budget + SLACK 后才卸载为资源。
+        let offloaded = server.result(
+            "boundary",
+            "x".repeat((6_000 + RESOURCE_SLACK_TOKENS + 1) * 4),
+            json!({}),
+            Some(6_000),
+        );
+        assert!(offloaded.content[0].as_text().is_some());
+        assert!(offloaded.content[1].as_resource_link().is_some());
+    }
+
+    #[test]
+    fn budget_clamp_hard_cap_and_floor() {
+        // 硬上限：异常大的 budget 被压回 max。
+        assert_eq!(clamp_budget_within(100_000, 32_000), 32_000);
+        assert_eq!(clamp_budget_within(32_000, 32_000), 32_000);
+        // 下限：0/1 钳到 1，预算永远非零正数。
+        assert_eq!(clamp_budget_within(0, 32_000), 1);
+        assert_eq!(clamp_budget_within(1, 32_000), 1);
+        // 常规值原样通过。
+        assert_eq!(clamp_budget_within(5_000, 32_000), 5_000);
+        assert_eq!(clamp_budget_within(9, 8), 8);
+        // env 解析：未设/空白数字/格式错误回退默认。
+        assert_eq!(parse_env_usize(None, "X", 4_000), 4_000);
+        assert_eq!(parse_env_usize(Some(" 123 "), "X", 4_000), 123);
+        assert_eq!(parse_env_usize(Some("nope"), "X", 4_000), 4_000);
+        assert_eq!(parse_env_usize(Some("0"), "X", 4_000), 0);
+    }
+
+    #[test]
+    fn resource_threshold_takes_max_of_base_and_clamped_budget() {
+        let server = ready_server();
+        let base = resource_threshold_base_from_env();
+        // 无 budget / 预算低于基线：阈值就是基线。
+        assert_eq!(server.resource_threshold_for(None), base);
+        assert_eq!(server.resource_threshold_for(Some(0)), base);
+        assert_eq!(server.resource_threshold_for(Some(100)), base.max(100));
+        // 预算高于基线：阈值抬到钳制后的 budget。
+        assert_eq!(
+            server.resource_threshold_for(Some(6_000)),
+            base.max(clamp_budget(6_000))
+        );
+        // 异常大的 budget 被硬上限压住，阈值不会无限抬升。
+        assert_eq!(clamp_budget(usize::MAX), max_budget_tokens_from_env());
+        assert_eq!(
+            server.resource_threshold_for(Some(usize::MAX)),
+            base.max(max_budget_tokens_from_env())
+        );
+    }
+
+    #[test]
+    fn offloaded_result_carries_lookahead_preview() {
+        let server = ready_server();
+        let mut body = String::new();
+        for i in 0..30 {
+            body.push_str(&format!("line-{i:02} {}\n", "z".repeat(660)));
+        }
+        // 30 行 × ~168 tokens ≈ 5040 tokens > 4000 + SLACK → 卸载。
+        let result = server.result("search_code", body.clone(), json!({}), Some(2_500));
+        assert!(result.content[0].as_text().is_some());
+        assert!(result.content[1].as_resource_link().is_some());
+        let text = result.content[0].as_text().unwrap().text.clone();
+        assert!(text.contains("已转存为资源"), "{text}");
+        assert!(text.contains("【前瞻匹配摘要】"), "{text}");
+        assert!(text.contains("line-00"), "{text}");
+        assert!(text.contains("resources/read"), "{text}");
+        // 摘要封顶 ~200 tokens：第 2 行就放不下，不能把整份 body 塞进摘要。
+        assert!(!text.contains("line-01 "), "{text}");
+        assert!(!text.contains("line-05"), "{text}");
+        // 资源里保存的是完整 body。
+        let stored = server.resources.lock().unwrap();
+        assert!(
+            stored.values().any(|v| v == &body),
+            "offloaded resource must hold the full body"
+        );
+    }
+
+    #[test]
+    fn clip_match_line_short_lines_are_returned_trimmed() {
+        assert_eq!(clip_match_line("  let x = 1;  ", "x", None), "let x = 1;");
+        // 正好 250 字符：边界内原样返回。
+        let exact: String = "a".repeat(MAX_LINE_COLUMNS);
+        assert_eq!(clip_match_line(&exact, "a", None), exact);
+        // 超一个字符才进入切片路径。
+        let over = format!("{exact}b");
+        let clipped = clip_match_line(&over, "a", None);
+        assert!(clipped.contains('…'), "{clipped}");
+        assert!(clipped.chars().count() <= MAX_LINE_COLUMNS + 1);
+    }
+
+    #[test]
+    fn clip_match_line_long_ascii_centers_on_needle() {
+        let line = format!("padding {} NEEDLE {}", "z".repeat(400), "y".repeat(400));
+        let clipped = clip_match_line(&line, "needle", None);
+        assert!(clipped.contains("NEEDLE"), "{clipped}");
+        assert!(
+            clipped.starts_with('…') && clipped.ends_with('…'),
+            "{clipped}"
+        );
+        assert!(clipped.chars().count() < 2 * MAX_LINE_COLUMNS, "{clipped}");
+    }
+
+    #[test]
+    fn clip_match_line_match_at_start_and_end_avoids_false_ellipses() {
+        // 行首命中：无前导省略号（窗口起点就是 0）。
+        let line = format!("NEEDLE{}", "z".repeat(400));
+        let clipped = clip_match_line(&line, "needle", None);
+        assert!(clipped.starts_with("NEEDLE"), "{clipped}");
+        assert!(!clipped.starts_with('…'), "{clipped}");
+        assert!(clipped.ends_with('…'), "{clipped}");
+
+        // 行尾命中：无尾随省略号（窗口终点贴齐行尾）。
+        let line = format!("{}NEEDLE", "z".repeat(400));
+        let clipped = clip_match_line(&line, "needle", None);
+        assert!(clipped.ends_with("NEEDLE"), "{clipped}");
+        assert!(clipped.starts_with('…'), "{clipped}");
+        assert!(!clipped.ends_with("NEEDLE…"), "{clipped}");
+    }
+
+    #[test]
+    fn clip_match_line_unicode_case_folding_never_panics() {
+        // ẞ (U+1E9E) 与 ß (U+00DF) 是 simple-case-folding 同组：regex 能在
+        // 原串上定位命中（naive 的 to_lowercase 字节偏移在这里会漂移 panic）。
+        let line = format!("{}ẞ{}", "x".repeat(300), "y".repeat(300));
+        let clipped = clip_match_line(&line, "ß", None);
+        assert!(clipped.contains('ẞ'), "{clipped}");
+
+        // İ (U+0130) 的完整小写是两个码点（i + U+0307），simple folding 不同
+        // 组：regex 找不到 Match，必须走行首安全窗口兜底而不是 panic。
+        let line = format!("{}İ tail", "İ".repeat(300));
+        let clipped = clip_match_line(&line, "i\u{307}", None);
+        assert!(clipped.chars().count() <= MAX_LINE_COLUMNS + 1, "{clipped}");
+        assert!(clipped.ends_with('…'), "{clipped}");
+    }
+
+    #[test]
+    fn clip_match_line_caps_huge_match_spans() {
+        // 纯 CJK 超长单行、命中整行（字面量 needle 覆盖全行）：匹配段封顶。
+        let line = "中".repeat(600);
+        let clipped = clip_match_line(&line, &line, None);
+        assert!(clipped.contains("匹配段"), "{clipped}");
+        assert!(clipped.contains('…'), "{clipped}");
+        assert!(clipped.chars().count() < MAX_LINE_COLUMNS, "{clipped}");
+        assert!(
+            !clipped.contains(&"中".repeat(MAX_MATCH_SPAN_CHARS + 1)),
+            "{clipped}"
+        );
+
+        // regex `.*` 类命中横跨整行：同样封顶。
+        let regex = regex::Regex::new("a.*b").unwrap();
+        let line = format!("a{}b", "m".repeat(500));
+        let clipped = clip_match_line(&line, "", Some(&regex));
+        assert!(clipped.contains("匹配段"), "{clipped}");
+        assert!(clipped.chars().count() < MAX_LINE_COLUMNS, "{clipped}");
+    }
+
+    #[test]
+    fn search_code_clips_overlong_matching_lines() {
+        let dir = unique_temp_dir();
+        std::fs::write(
+            dir.join("long.py"),
+            format!("marker = '{}'\n", "needle".repeat(300)),
+        )
+        .unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+
+        let result = server.search_code(Parameters(SearchParams {
+            query: "marker".into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: 2_500,
+        }));
+        let text = result.content[0].as_text().unwrap().text.clone();
+        let rendered = text
+            .lines()
+            .find(|line| line.contains("@long.py:1"))
+            .expect("match line must exist");
+        assert!(rendered.contains("marker"), "{rendered}");
+        assert!(rendered.contains('…'), "{rendered}");
+        assert!(
+            rendered.chars().count() < MAX_LINE_COLUMNS + 100,
+            "{rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_zero_shown_diagnoses_single_item_overflow() {
+        let dir = unique_temp_dir();
+        let mut source = String::from("needle = 0\n");
+        for i in 1..10 {
+            source.push_str(&format!("needle = {i}\n"));
+        }
+        std::fs::write(dir.join("hits.py"), source).unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+
+        // budget=1：扣掉头部 35 tokens 后剩余 0，首条匹配单项就超预算。
+        let result = server.search_code(Parameters(SearchParams {
+            query: "needle".into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: 1,
+        }));
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        assert!(text.contains("shown=0"), "{text}");
+        assert!(text.contains("truncated=true"), "{text}");
+        assert!(
+            text.contains("首条结果单项超过 budget_tokens=1 被省略"),
+            "{text}"
+        );
+        assert!(text.contains("本工具没有翻页"), "{text}");
+        // 一条都没展示时，正文绝不能出现匹配行内容本身。
+        assert!(!text.contains("@hits.py:1 "), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trace_calls_tree_respects_budget_tokens() {
+        let mut server =
+            AstrolabeServer::new_with_cache_budget(PathBuf::from("."), DEFAULT_MEMORY_BUDGET_BYTES);
+        // 30 个 caller → alpha：depth=2 的树有 30 个节点行，预算只给 10。
+        let mut symbols = vec![CodeSymbol {
+            id: SymbolId(0),
+            file: FileId(0),
+            name: "alpha".into(),
+            kind: SymbolKind::Function,
+            signature: "fn alpha()".into(),
+            start_line: 1,
+            end_line: 1,
+            exported: true,
+        }];
+        let mut edges = Vec::new();
+        for i in 1..=30u32 {
+            symbols.push(CodeSymbol {
+                id: SymbolId(i),
+                file: FileId(0),
+                name: format!("caller{i}"),
+                kind: SymbolKind::Function,
+                signature: format!("fn caller{i}()"),
+                start_line: i + 1,
+                end_line: i + 1,
+                exported: false,
+            });
+            edges.push(astrolabe_core::CodeEdge {
+                from: i,
+                to: 0,
+                kind: EdgeKind::Call,
+                weight: 1,
+                confidence: Confidence::Syntactic,
+            });
+        }
+        let graph = CodeGraph {
+            files: vec![CodeFile {
+                id: FileId(0),
+                path: RelPath::new("src/lib.rs"),
+                language: Some(Language::Rust),
+                loc: 40,
+                sha: String::new(),
+            }],
+            symbols,
+            edges,
+        };
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(
+            RepoIndex::from_graph(PathBuf::from("."), graph, Default::default()),
+        ));
+        server.structured_output = false;
+
+        let result = server.trace_calls(Parameters(TraceParams {
+            symbol: "alpha".into(),
+            direction: "callers".into(),
+            depth: 2,
+            budget_tokens: 10,
+        }));
+        let text = result.content[0].as_text().unwrap().text.clone();
+        assert!(text.contains("个树节点因 budget_tokens 被省略"), "{text}");
+        assert!(!text.contains("caller25"), "{text}");
+        // 大预算下同一棵树完整内联（保护不改变正常路径）。
+        let full = server.trace_calls(Parameters(TraceParams {
+            symbol: "alpha".into(),
+            direction: "callers".into(),
+            depth: 2,
+            budget_tokens: 4_000,
+        }));
+        let full_text = full.content[0].as_text().unwrap().text.clone();
+        assert!(full_text.contains("caller25"), "{full_text}");
     }
 
     fn unique_temp_dir() -> PathBuf {
