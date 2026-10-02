@@ -395,6 +395,7 @@ fn language_to_u8(language: Language) -> u8 {
         Language::Swift => 11,
         Language::Php => 12,
         Language::Vue => 13,
+        Language::Dart => 14,
     }
 }
 
@@ -441,6 +442,7 @@ fn language_from_u8(language: u8) -> Option<Language> {
         11 => Language::Swift,
         12 => Language::Php,
         13 => Language::Vue,
+        14 => Language::Dart,
         _ => return None,
     })
 }
@@ -818,5 +820,28 @@ mod tests {
             found: 1,
             expected: 2
         }));
+    }
+
+    #[test]
+    fn language_u8_roundtrip() {
+        for lang in [
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::C,
+            Language::Cpp,
+            Language::ObjC,
+            Language::ObjCpp,
+            Language::Swift,
+            Language::Php,
+            Language::Vue,
+            Language::Dart,
+        ] {
+            assert_eq!(language_from_u8(language_to_u8(lang)), Some(lang));
+        }
     }
 }

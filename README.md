@@ -47,7 +47,7 @@ Astrolabe 为什么能做到又快、又准、还省钱？核心在于三项工�
 
 ### 1. 确定性图谱：不烧一分钱 Token 的全库高清雷达
 - **人话解读**：看项目的宏观架构分层、查模块间的依赖关系、查改动一个文件会波及哪些上游代码……这些工作**根本不需要耗费昂贵的 LLM 算力去反复推理猜想**。
-- **原理**：Astrolabe 直接用 Rust 原生快速扫描源码并解析 `import` / `use` 语句，结合各语言构建配置（Cargo / Go Module / Maven / tsconfig 等）把模块路径精确映射成一张依赖拓扑图。查文件、查影响范围 1 秒返回精准结果，**一分钱 Token 都不用花**，而且保证 100% 确定，零模型幻觉。
+- **原理**：Astrolabe 直接用 Rust 原生快速扫描源码并解析 `import` / `use` 语句，结合各语言构建配置（Cargo / Go Module / Maven / tsconfig / pubspec 等）把模块路径精确映射成一张依赖拓扑图。查文件、查影响范围 1 秒返回精准结果，**一分钱 Token 都不用花**，而且保证 100% 确定，零模型幻觉。
 
 ### 2. 按需 LSP 分流：聪明干活、从不赖着不走的语言专家
 - **人话解读**：平时的架构浏览和依赖梳理只走超轻量的图谱；只有遇到“跨文件安全重命名”、“精确函数跳转”、“编译器语法诊断”这些真正需要编译器级精准分析的硬骨头时，Astrolabe 才会在后台悄悄启动对应的语言服务器（LSP）。
@@ -256,6 +256,8 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `ASTROLABE_CACHE_MB` | 文件解析内存缓存大小预算（MB） | `256` |
 | `ASTROLABE_PARSE_CACHE_MB` | 增量索引的内存缓存预算（MB） | `256` |
 | `ASTROLABE_LSP_TIMEOUT` | 单次 LSP 语言服务器响应超时时间（秒） | `300` |
+| `ASTROLABE_LSP_DART` | 覆盖 Dart 语言服务器（`dart language-server`）可执行文件路径 | 自动探测（随 Dart/Flutter SDK 自带） |
+| `ASTROLABE_LSP_<LANG>` | 覆盖指定语言 LSP 服务器可执行文件路径（如 `ASTROLABE_LSP_PYTHON`, `ASTROLABE_LSP_RUST`, `ASTROLABE_LSP_C` 等） | 自动探测对应 LSP |
 | `ASTROLABE_SLICE_READ_MAX` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为合法精读，不计入滥用 | `200` |
 | `ASTROLABE_READ_THRESHOLD` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） | `3` |
 | `ASTROLABE_DENY_SILENCE_SECS` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） | `120` |
@@ -276,6 +278,23 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 - **内存防护上限**：稳态内存上限设为 2 GiB，硬上限 4 GiB，防止失控的语言服务器拖垮整机。
 - **真就绪判定**：监控语言服务器启动后必须连续安静 1 秒无待处理任务，才正式标记为就绪，彻底杜绝冷索引期返回虚假空结果导致误删代码的问题。
 
+### 7. 语言支持与 LSP 矩阵
+
+Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM 消耗的文件级确定性图谱与按需编译级精确分析：
+
+| 语言 | 扩展名 | LSP 语言服务器 | 环境变量覆盖 | 备注 |
+|---|---|---|---|---|
+| **Python** | `.py`, `.pyi` | `pyright` | `ASTROLABE_LSP_PYTHON` | `npm i -g pyright`；支持 `pyproject.toml`、PEP 420 命名空间包 |
+| **Go** | `.go` | `gopls` | `ASTROLABE_LSP_GO` | `go install golang.org/x/tools/gopls@latest`；支持 `go.mod`、`go.work` |
+| **Rust** | `.rs` | `rust-analyzer` | `ASTROLABE_LSP_RUST` | `rustup component add rust-analyzer`；支持 Cargo workspace |
+| **Java** | `.java` | `jdtls` | `ASTROLABE_LSP_JAVA` | `brew install jdtls`；支持 Maven、Gradle 源根解析 |
+| **TypeScript / JS** | `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs` | `typescript-language-server` | `ASTROLABE_LSP_TYPESCRIPT` | 支持 `tsconfig.json` paths、Node workspace `package.json` |
+| **C / C++** | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.ipp` | `clangd` / `ccls` | `ASTROLABE_LSP_C`, `ASTROLABE_LSP_CXX` | `clangd --background-index`；支持 `#include` 路径解析 |
+| **Swift / ObjC** | `.swift`, `.m`, `.mm` | `sourcekit-lsp` / `clangd` | `ASTROLABE_LSP_SWIFT`, `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` | macOS Command Line Tools 自带 `sourcekit-lsp`；ObjC 可回退 `clangd` |
+| **PHP** | `.php` | `intelephense` / `phpactor` | `ASTROLABE_LSP_PHP` | `npm i -g intelephense`；支持 include/require 路径解析 |
+| **Vue** | `.vue` | `vue-language-server` (Volar) | `ASTROLABE_LSP_VUE` | SFC 内嵌 `<script>` / `<script setup>` 提取与语义解析 |
+| **Dart** | `.dart` | `dart language-server` | `ASTROLABE_LSP_DART` | 随 Dart / Flutter SDK 自带；`pubspec.yaml` 行级解析与多 pubspec monorepo 支持；`rootUri` 置 `null` 规避重复分析 |
+
 ---
 
 ## 七、防漂移拦截机制详解 (Anti-Drift Hooks)
@@ -283,7 +302,7 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 即使有 System Prompt 军规约束，大模型在上下文拉长后依然可能出现注意力衰退（Agent Drift），退化为盲目使用 `grep` / `read`。Astrolabe 提供了硬核的门禁拦截机制：
 
 ### 核心拦截与放行规则
-- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 58 种源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整），或连续 4 次混合调用，Hook 将坚决拦截并输出引导警告。
+- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 28 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截），或连续 4 次混合调用，Hook 将坚决拦截并输出引导警告。
 - **切片精读放行**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 调用视为合法精读，不计入滥用计数。同样，`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片命令亦放行。
 - **计数重置**：AI 只要调用任意 Astrolabe 工具（如 `resolve_context`、`find_symbol` 等），连续计数立即清零；若连续调用间隔超过设定时间，亦自动重置。
 - **智能放行窗口**：触发 Deny 后进入 120 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。

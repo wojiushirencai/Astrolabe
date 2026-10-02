@@ -135,6 +135,8 @@ const EXCLUDED_DIR_NAMES: &[&str] = &[
     ".next",
     ".openvisio",
     ".serena",
+    // Flutter / Dart toolchain artifacts. Fallback exclude for non-git trees.
+    ".dart_tool",
 ];
 
 /// Polling cadence, emit delay, event-mode safety scan, and storm threshold

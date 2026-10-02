@@ -27,7 +27,7 @@
 //! `detect` may still read a handful of build-config files (`go.mod`,
 //! `tsconfig.json`, …); those are not the 94k-file read+hash+parse path.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -218,6 +218,7 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
         Language::Java,
         Language::Rust,
         Language::TypeScript,
+        Language::Dart,
     ]
     .iter()
     .filter_map(|lang| resolvers.meta_for(*lang))
@@ -694,6 +695,12 @@ impl IncrementalIndex {
         index_repo_incremental(root, self, changes, opts)
     }
 
+    /// Admitted paths after resolver excludes, including non-source files
+    /// (`go.mod`, `Cargo.toml`, …) that resolvers need in [`FileIndex`].
+    pub fn admitted_paths(&self) -> &[RelPath] {
+        &self.files
+    }
+
     #[cfg(test)]
     fn product_bytes(&self) -> u64 {
         self.products.weighted_size()
@@ -817,6 +824,57 @@ pub fn index_repo_incremental(
         products,
         failures,
     }
+}
+
+/// Code file extensions across known programming languages (42 pure programming language extensions).
+///
+/// 收窄说明：这是"未支持编程语言"的统计口径，纯编程语言源码扩展名；
+/// 数据/配置文件（json, jsonc, yaml, yml, toml, html, css, graphql, gql, sql, sh, bash, ps1, tf, tfvars, hcl 等）
+/// 不在此列，避免把数据/配置文件提示为"尚未支持的语言"从而稀释信号；
+/// Serena 58 项全集的 read-deny 用途与统计用途分离。
+pub const KNOWN_CODE_EXTENSIONS: &[&str] = &[
+    "al", "c", "clj", "cljs", "cpp", "cs", "dart", "elm", "ex", "exs", "fs", "fsx", "go", "groovy",
+    "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m", "matlab", "nf",
+    "php", "proto", "py", "r", "rb", "rs", "scala", "sol", "svelte", "swift", "ts", "tsx", "vue",
+    "zig",
+];
+
+/// Count occurrences of unindexed code file extensions among admitted paths.
+///
+/// - `filter`: when Some, paths not containing this substring are skipped (same contains semantics as `path_filter`).
+/// - Skips paths where `in_graph(path.as_str())` is true.
+/// - Skips paths whose language is already supported (`Language::from_path(path).is_some()`).
+/// - Skips paths without an extension.
+/// - Gated by vocabulary: only extensions in `KNOWN_CODE_EXTENSIONS` are counted.
+/// - Extensions are normalized to lowercase.
+pub fn unindexed_code_exts(
+    admitted: &[RelPath],
+    in_graph: &dyn Fn(&str) -> bool,
+    filter: Option<&str>,
+) -> BTreeMap<String, u32> {
+    let mut counts = BTreeMap::new();
+    for p in admitted {
+        let s = p.as_str();
+        if let Some(f) = filter {
+            if !s.contains(f) {
+                continue;
+            }
+        }
+        if in_graph(s) {
+            continue;
+        }
+        if Language::from_path(p).is_some() {
+            continue;
+        }
+        let Some(ext) = p.extension() else {
+            continue;
+        };
+        let ext_lower = ext.to_ascii_lowercase();
+        if KNOWN_CODE_EXTENSIONS.contains(&ext_lower.as_str()) {
+            *counts.entry(ext_lower).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// Heuristic for "this specifier was meant to resolve inside the repo".
@@ -1590,5 +1648,58 @@ mod tests {
         x ^= x >> 7;
         x ^= x << 17;
         x
+    }
+
+    #[test]
+    fn test_unindexed_code_exts_basic() {
+        let admitted = vec![
+            RelPath::new("src/main.rs"),     // supported (Rust) -> skipped
+            RelPath::new("scripts/run.rb"),  // not supported, in KNOWN -> counted
+            RelPath::new("scripts/test.rb"), // not supported, in KNOWN -> counted
+            RelPath::new("src/App.kt"),      // not supported, in KNOWN -> counted
+            RelPath::new("data/info.json"),  // data file, removed from KNOWN -> skipped
+            RelPath::new("docs/readme.txt"), // txt not in KNOWN -> skipped
+            RelPath::new("LICENSE"),         // no ext -> skipped
+            RelPath::new("src/lib.rs"),      // in_graph -> skipped
+        ];
+
+        let in_graph = |p: &str| p == "src/lib.rs";
+        let counts = unindexed_code_exts(&admitted, &in_graph, None);
+        assert_eq!(counts.get("rb"), Some(&2));
+        assert_eq!(counts.get("kt"), Some(&1)); // .kt 仍被统计
+        assert_eq!(counts.get("json"), None); // .json 数据文件不再被统计
+        assert_eq!(counts.get("rs"), None);
+        assert_eq!(counts.get("txt"), None);
+    }
+
+    #[test]
+    fn test_unindexed_code_exts_with_filter() {
+        let admitted = vec![
+            RelPath::new("backend/script.lua"),
+            RelPath::new("frontend/script.lua"),
+            RelPath::new("backend/service.scala"),
+        ];
+        let in_graph = |_p: &str| false;
+        let counts = unindexed_code_exts(&admitted, &in_graph, Some("backend"));
+        assert_eq!(counts.get("lua"), Some(&1));
+        assert_eq!(counts.get("scala"), Some(&1));
+
+        let counts_fe = unindexed_code_exts(&admitted, &in_graph, Some("frontend"));
+        assert_eq!(counts_fe.get("lua"), Some(&1));
+        assert_eq!(counts_fe.get("scala"), None);
+    }
+
+    #[test]
+    fn test_unindexed_code_exts_case_insensitive_and_vocabulary() {
+        let admitted = vec![
+            RelPath::new("build/deploy.KT"),
+            RelPath::new("model.SCALA"),
+            RelPath::new("unknown.xyz123"),
+        ];
+        let in_graph = |_p: &str| false;
+        let counts = unindexed_code_exts(&admitted, &in_graph, None);
+        assert_eq!(counts.get("kt"), Some(&1));
+        assert_eq!(counts.get("scala"), Some(&1));
+        assert_eq!(counts.get("xyz123"), None);
     }
 }

@@ -777,6 +777,72 @@ impl AstrolabeServer {
     }
 }
 
+fn top_unindexed_exts(
+    counts: &std::collections::BTreeMap<String, u32>,
+    limit: usize,
+) -> Vec<(&str, u32)> {
+    let mut list: Vec<(&str, u32)> = counts.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    list.truncate(limit);
+    list
+}
+
+fn format_search_code_unindexed_hint(
+    counts: &std::collections::BTreeMap<String, u32>,
+    path_filter: Option<&str>,
+) -> Option<String> {
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    if max_count < 3 {
+        return None;
+    }
+    let top = top_unindexed_exts(counts, 3);
+    if top.is_empty() {
+        return None;
+    }
+    let ext_summary = top
+        .iter()
+        .map(|(ext, count)| format!("{count} 个 .{ext} 文件"))
+        .collect::<Vec<_>>()
+        .join("、");
+    let msg = match path_filter {
+        Some(filter) => format!(
+            "注意：path_filter '{filter}' 范围内有 {ext_summary}属于尚未支持的语言，未入代码索引——本结果只代表已索引语言中无匹配，不覆盖这些文件。请改用 Grep/Read 检索它们。\n"
+        ),
+        None => format!(
+            "注意：仓库内有 {ext_summary}属于尚未支持的语言，未入代码索引——本结果只代表已索引语言中无匹配，不覆盖这些文件。请改用 Grep/Read 检索它们。\n"
+        ),
+    };
+    Some(msg)
+}
+
+fn format_find_symbol_unindexed_hint(
+    counts: &std::collections::BTreeMap<String, u32>,
+) -> Option<String> {
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    if max_count < 3 {
+        return None;
+    }
+    let top = top_unindexed_exts(counts, 3);
+    if top.is_empty() {
+        return None;
+    }
+    let ext_summary = top
+        .iter()
+        .map(|(ext, count)| format!("{count} 个 .{ext}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    Some(format!(
+        "(仓库另有 {ext_summary} 等未支持语言的源码文件未入符号索引，符号搜索不覆盖它们——如需检索请用 Grep/Read)\n"
+    ))
+}
+
+fn file_extension(path: &str) -> Option<String> {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
 #[tool_router]
 impl AstrolabeServer {
     /// L2 bootstrap（Serena 模式）：返回完整《Astrolabe Instructions Manual》——
@@ -818,7 +884,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep."
+        description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn resolve_context(
         &self,
@@ -1003,7 +1069,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed."
+        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -1047,6 +1113,10 @@ impl AstrolabeServer {
             // include_body 附加，避免误导性的"无可提取的符号体"。
             if hits.is_empty() {
                 body.push_str("(未找到匹配的符号)\n");
+                let unindexed = index.unindexed_code_exts(None);
+                if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
+                    body.push_str(&hint);
+                }
             }
             if params.include_body && !hits.is_empty() {
                 self.attach_include_bodies(
@@ -1076,7 +1146,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search indexed source for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references."
+        description = "Search indexed source for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn search_code(
         &self,
@@ -1165,8 +1235,16 @@ impl AstrolabeServer {
                 }
                 // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
                 // （对齐 find_references 的 `未找到对 … 的引用。` 空结果约定）。
+                let mut unindexed_hint = false;
                 if matches.is_empty() {
                     body.push_str("(未找到匹配的代码行)\n");
+                    let counts = index.unindexed_code_exts(params.path_filter.as_deref());
+                    if let Some(hint) =
+                        format_search_code_unindexed_hint(&counts, params.path_filter.as_deref())
+                    {
+                        body.push_str(&hint);
+                        unindexed_hint = true;
+                    }
                 }
                 self.result_on(
                     &session.root,
@@ -1179,7 +1257,8 @@ impl AstrolabeServer {
                         "shown": shown,
                         "omitted": omitted,
                         "truncated": truncated,
-                        "budget_tokens": params.budget_tokens
+                        "budget_tokens": params.budget_tokens,
+                        "unindexed_hint": unindexed_hint
                     }),
                     Some(params.budget_tokens),
                 )
@@ -1196,10 +1275,20 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         self.with_fresh_index(&params.target, |session, index| {
             let Some(target) = index.file_id(&params.target) else {
+                let unindexed = index.unindexed_code_exts(None);
+                let target_ext = file_extension(&params.target);
+                let message = if let Some(ext) = target_ext.filter(|e| unindexed.contains_key(e)) {
+                    format!(
+                        "目标 {} 是 .{} 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。\nconfidence: exact",
+                        params.target, ext
+                    )
+                } else {
+                    format!("未找到目标路径：{}\nconfidence: exact", params.target)
+                };
                 return self.result_on(
                     &session.root,
                     "get_dependents",
-                    format!("未找到目标路径：{}\nconfidence: exact", params.target),
+                    message,
                     json!({"confidence":"exact","found":false,"budget_tokens":params.budget_tokens}),
                     Some(params.budget_tokens),
                 );
@@ -1304,10 +1393,20 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         self.with_fresh_index(&params.target, |session, index| {
             let Some(target_id) = index.file_id(&params.target) else {
+                let unindexed = index.unindexed_code_exts(None);
+                let target_ext = file_extension(&params.target);
+                let message = if let Some(ext) = target_ext.filter(|e| unindexed.contains_key(e)) {
+                    format!(
+                        "目标 {} 是 .{} 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。\n",
+                        params.target, ext
+                    )
+                } else {
+                    format!("未找到目标文件：{}\n", params.target)
+                };
                 return self.result_on(
                     &session.root,
                     "get_neighborhood",
-                    format!("未找到目标文件：{}\n", params.target),
+                    message,
                     json!({"confidence":"unknown","budget_tokens":params.budget_tokens}),
                     Some(params.budget_tokens),
                 );
@@ -1700,6 +1799,10 @@ impl AstrolabeServer {
         // 零命中时显式声明，避免只剩 confidence 元信息的歧义输出。
         if hits.is_empty() {
             body.push_str("(未找到匹配的符号)\n");
+            let unindexed = index.unindexed_code_exts(None);
+            if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
+                body.push_str(&hint);
+            }
         }
         if params.include_body && !hits.is_empty() {
             self.attach_include_bodies(
@@ -1939,7 +2042,8 @@ impl AstrolabeServer {
                 "file cache occupancy"
             );
             let mut body = format!(
-                "confidence: exact (来自已扫描文件元数据 + LSP discovery)\n\
+                "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart\n\
+                 confidence: exact (来自已扫描文件元数据 + LSP discovery)\n\
                  file_cache: {cache_bytes}/{} bytes, hits={cache_hits}, misses={cache_misses}\n\
                  LSP status: Ready = server on PATH; needs_install = ask user then \
                  ensure_language_server; AST-only = parse/index only (server not wired).\n\
@@ -1953,6 +2057,21 @@ impl AstrolabeServer {
             }
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 种语言因 budget_tokens 被省略。\n"));
+            }
+            let unindexed = index.unindexed_code_exts(None);
+            if unindexed.is_empty() {
+                body.push_str("unindexed source files: none\n");
+            } else {
+                let mut list: Vec<(&String, &u32)> = unindexed.iter().collect();
+                list.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                let items_str = list
+                    .into_iter()
+                    .map(|(ext, count)| format!(".{ext}×{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                body.push_str(&format!(
+                    "unindexed source files: {items_str} (语言暂不支持；这些文件不在符号/import 索引内，search_code/find_symbol 对其不可见，请用 Grep/Read)\n"
+                ));
             }
             self.result_on(
                 &session.root,
@@ -3534,5 +3653,272 @@ mod tests {
         assert!(text.contains("confidence: unknown"), "{text}");
         server.stop_watching();
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn unindexed_languages_end_to_end_hints_and_dart_contrast() {
+        let dir = unique_temp_dir();
+        std::fs::write(
+            dir.join("main.py"),
+            "def main():\n    print('hello from python')\n",
+        )
+        .unwrap();
+
+        // 3 个 .kt 文件 (未支持语言)
+        std::fs::write(dir.join("A.kt"), "class A { val x = 1 }\n").unwrap();
+        std::fs::write(dir.join("B.kt"), "class B { val y = 2 }\n").unwrap();
+        std::fs::write(dir.join("C.kt"), "class C { val z = 3 }\n").unwrap();
+
+        // 1 个 .dart 文件 (支持语言对照)
+        std::fs::write(
+            dir.join("service.dart"),
+            "void runService() {\n  print('dart service running');\n}\n",
+        )
+        .unwrap();
+
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = true;
+
+        // 1. search_code 零命中且无 path_filter，含 .kt×3 (N>=3) 时提示尚未支持语言且带计数
+        let search_miss = server.search_code(Parameters(SearchParams {
+            query: "nonexistent_code_pattern".into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: 2500,
+        }));
+        let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            search_text.contains("(未找到匹配的代码行)"),
+            "{search_text}"
+        );
+        assert!(search_text.contains("尚未支持的语言"), "{search_text}");
+        assert!(search_text.contains("3 个 .kt 文件"), "{search_text}");
+        assert!(search_text.contains("未入代码索引"), "{search_text}");
+        assert!(
+            search_text.contains("请改用 Grep/Read 检索它们"),
+            "{search_text}"
+        );
+        assert!(
+            search_text.contains("注意：仓库内有 3 个 .kt 文件属于尚未支持的语言"),
+            "{search_text}"
+        );
+        let structured = search_miss.structured_content.expect("structured");
+        assert_eq!(structured["unindexed_hint"], json!(true));
+
+        // 1b. 带 path_filter 的 search_code 零命中：filter 范围内 N>=3
+        let search_filter_hit_hint = server.search_code(Parameters(SearchParams {
+            query: "nonexistent".into(),
+            regex: false,
+            path_filter: Some(".kt".into()),
+            budget_tokens: 2500,
+        }));
+        let filter_hint_text = search_filter_hit_hint.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .as_str();
+        assert!(
+            filter_hint_text
+                .contains("注意：path_filter '.kt' 范围内有 3 个 .kt 文件属于尚未支持的语言"),
+            "{filter_hint_text}"
+        );
+        let filter_hint_structured = search_filter_hit_hint
+            .structured_content
+            .expect("structured");
+        assert_eq!(filter_hint_structured["unindexed_hint"], json!(true));
+
+        // 1c. 带 path_filter 的 search_code 零命中：filter 范围内 N<3 (仅 A.kt 匹配，计 1)
+        let search_filter_miss = server.search_code(Parameters(SearchParams {
+            query: "nonexistent".into(),
+            regex: false,
+            path_filter: Some("A.kt".into()),
+            budget_tokens: 2500,
+        }));
+        let filter_miss_text = search_filter_miss.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .as_str();
+        assert!(
+            filter_miss_text.contains("(未找到匹配的代码行)"),
+            "{filter_miss_text}"
+        );
+        assert!(
+            !filter_miss_text.contains("尚未支持的语言"),
+            "{filter_miss_text}"
+        );
+        let filter_structured = search_filter_miss.structured_content.expect("structured");
+        assert_eq!(filter_structured["unindexed_hint"], json!(false));
+
+        // 2. find_symbol 零命中提示
+        let symbol_miss = server.find_symbol(Parameters(QueryParams {
+            query: "NonExistentSymbol".into(),
+            budget_tokens: 2500,
+            depth: 0,
+            substring: false,
+            kind: None,
+            include_body: false,
+        }));
+        let symbol_text = symbol_miss.content[0].as_text().unwrap().text.as_str();
+        assert!(symbol_text.contains("(未找到匹配的符号)"), "{symbol_text}");
+        assert!(
+            symbol_text.contains("(仓库另有 3 个 .kt 等未支持语言的源码文件未入符号索引，符号搜索不覆盖它们——如需检索请用 Grep/Read)"),
+            "{symbol_text}"
+        );
+
+        // 3. get_dependents target=A.kt 精确文案
+        let dep_res = server.get_dependents(Parameters(DependentsParams {
+            target: "A.kt".into(),
+            direction: "dependents".into(),
+            budget_tokens: 2500,
+        }));
+        let dep_text = dep_res.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            dep_text.contains("目标 A.kt 是 .kt 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
+            "{dep_text}"
+        );
+
+        // 3b. get_neighborhood target=A.kt 精确文案
+        let neigh_res = server.get_neighborhood(Parameters(NeighborhoodParams {
+            target: "A.kt".into(),
+            direction: "both".into(),
+            depth: 2,
+            budget_tokens: 2500,
+        }));
+        let neigh_text = neigh_res.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            neigh_text.contains("目标 A.kt 是 .kt 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
+            "{neigh_text}"
+        );
+
+        // 4. get_languages 首行 supported、末尾 unindexed 行
+        let langs_res = server.get_languages(Parameters(BudgetOnly {
+            budget_tokens: 2500,
+        }));
+        let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
+        let first_body_line = langs_text
+            .lines()
+            .find(|l| !l.starts_with("index_root:"))
+            .expect("first line after index_root");
+        assert_eq!(
+            first_body_line,
+            "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart"
+        );
+        assert!(
+            langs_text.contains("unindexed source files: .kt×3"),
+            "{langs_text}"
+        );
+        assert!(
+            langs_text.contains("语言暂不支持；这些文件不在符号/import 索引内"),
+            "{langs_text}"
+        );
+
+        // 5. 对照验证：.dart 是支持语言
+        // 5a. .dart 决不出现在 unindexed 统计中
+        assert!(!langs_text.contains(".dart×"), "{langs_text}");
+        // 5b. .dart 源码能被 search_code 命中
+        let search_dart = server.search_code(Parameters(SearchParams {
+            query: "dart service running".into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: 2500,
+        }));
+        let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
+        assert!(dart_text.contains("@service.dart:2"), "{dart_text}");
+        assert!(!dart_text.contains("(未找到匹配的代码行)"), "{dart_text}");
+        let dart_structured = search_dart.structured_content.expect("structured");
+        assert_eq!(dart_structured["unindexed_hint"], json!(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unindexed_languages_threshold_under_three_does_not_hint() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("main.py"), "def main(): pass\n").unwrap();
+        // 仅 2 个 .kt 文件 (N = 2 < 3)
+        std::fs::write(dir.join("A.kt"), "class A\n").unwrap();
+        std::fs::write(dir.join("B.kt"), "class B\n").unwrap();
+
+        let server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+
+        // search_code 零命中：N<3 不应触发提示
+        let search_miss = server.search_code(Parameters(SearchParams {
+            query: "nonexistent".into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: 2500,
+        }));
+        let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            search_text.contains("(未找到匹配的代码行)"),
+            "{search_text}"
+        );
+        assert!(!search_text.contains("尚未支持的语言"), "{search_text}");
+
+        // find_symbol 零命中：N<3 不应触发提示
+        let symbol_miss = server.find_symbol(Parameters(QueryParams {
+            query: "NonExistent".into(),
+            budget_tokens: 2500,
+            depth: 0,
+            substring: false,
+            kind: None,
+            include_body: false,
+        }));
+        let symbol_text = symbol_miss.content[0].as_text().unwrap().text.as_str();
+        assert!(symbol_text.contains("(未找到匹配的符号)"), "{symbol_text}");
+        assert!(!symbol_text.contains("未支持语言"), "{symbol_text}");
+
+        // get_languages: >=1 就显示统计，这里有 2 个 .kt 仍会显示
+        let langs_res = server.get_languages(Parameters(BudgetOnly {
+            budget_tokens: 2500,
+        }));
+        let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            langs_text.contains("unindexed source files: .kt×2"),
+            "{langs_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unindexed_languages_none_when_all_supported() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("main.py"), "def main(): pass\n").unwrap();
+        std::fs::write(dir.join("app.dart"), "void main() {}\n").unwrap();
+
+        let server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+
+        let langs_res = server.get_languages(Parameters(BudgetOnly {
+            budget_tokens: 2500,
+        }));
+        let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            langs_text.contains("unindexed source files: none"),
+            "{langs_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_descriptions_declare_indexed_languages_boundary() {
+        let server = ready_server();
+        let tools = server.listed_tools();
+        for name in &["search_code", "find_symbol", "resolve_context"] {
+            let tool = tools.iter().find(|t| t.name == *name).expect(name);
+            let desc = tool.description.as_deref().unwrap_or("");
+            assert!(
+                desc.contains("Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart"),
+                "{name} description missing indexed languages notice: {desc}"
+            );
+        }
     }
 }

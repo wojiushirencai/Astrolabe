@@ -83,6 +83,8 @@ pub enum Language {
     Php,
     /// Vue single-file components (`.vue`).
     Vue,
+    /// Dart (.dart).
+    Dart,
 }
 
 impl Language {
@@ -103,6 +105,7 @@ impl Language {
             "swift" => Language::Swift,
             "php" => Language::Php,
             "vue" => Language::Vue,
+            "dart" => Language::Dart,
             _ => return None,
         })
     }
@@ -124,6 +127,7 @@ impl Language {
             "swift" => Some(Language::Swift),
             "php" => Some(Language::Php),
             "vue" => Some(Language::Vue),
+            "dart" => Some(Language::Dart),
             _ => None,
         }
     }
@@ -144,6 +148,7 @@ impl Language {
             Language::Swift => "swift",
             Language::Php => "php",
             Language::Vue => "vue",
+            Language::Dart => "dart",
         }
     }
 }
@@ -421,9 +426,15 @@ mod tests {
             Language::from_path(&RelPath::new("a.vue")),
             Some(Language::Vue)
         );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.dart")),
+            Some(Language::Dart)
+        );
         assert_eq!(Language::from_name("C++"), Some(Language::Cpp));
         assert_eq!(Language::from_name("objective-c"), Some(Language::ObjC));
         assert_eq!(Language::from_name("vue").unwrap().name(), "vue");
+        assert_eq!(Language::from_name("dart"), Some(Language::Dart));
+        assert_eq!(Language::Dart.name(), "dart");
     }
 
     #[test]

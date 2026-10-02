@@ -989,6 +989,7 @@ pub(crate) fn install_hint(language: Option<Language>) -> String {
                 Language::TypeScript,
                 Language::Java,
                 Language::Php,
+                Language::Dart,
             ] {
                 out.push_str("- ");
                 out.push_str(&install_hint_one(language));
@@ -1031,6 +1032,7 @@ fn install_hint_one(language: Language) -> String {
         Language::Vue => {
             "Vue（Volar / vue-language-server）：`npm i -g @vue/language-server`，stdio 启动 `vue-language-server --stdio`。可设 ASTROLABE_LSP_VUE。P0 单进程 Volar；双服务器/@vue/typescript-plugin 为后续（TODO）。".into()
         }
+        Language::Dart => "Dart（dart language-server）：内置于 Dart / Flutter SDK。".into(),
     }
 }
 
@@ -1863,6 +1865,13 @@ mod tests {
             "const onEvent = 1;\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_install_hint_includes_dart() {
+        let hint = install_hint(None);
+        assert!(hint.contains("Dart"));
+        assert!(hint.contains("dart language-server"));
     }
 
     fn tempfile_dir() -> PathBuf {

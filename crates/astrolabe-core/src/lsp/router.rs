@@ -257,6 +257,9 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::Vue => {
             "vue-language-server (`npm i -g @vue/language-server` or set ASTROLABE_LSP_VUE)"
         }
+        Language::Dart => {
+            "dart language-server (ships with the Dart SDK; set ASTROLABE_LSP_DART to override path)"
+        }
     }
 }
 
@@ -273,6 +276,7 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::C | Language::Cpp => "clangd",
         Language::Php => "intelephense",
         Language::Vue => "vue-language-server",
+        Language::Dart => "dart language-server",
     }
 }
 
