@@ -6,6 +6,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-03
+
 ### Added
 
 - **Dart（.dart）语言全链路代码图谱与精确语义支持。**
