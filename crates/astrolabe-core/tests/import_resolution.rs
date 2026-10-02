@@ -15,7 +15,7 @@
 use astrolabe_core::resolvers::ResolverSet;
 use astrolabe_core::types::join_rel;
 use astrolabe_core::{FileIndex, Language, RelPath};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ enum Kind {
     Java,
     Rust,
     TypeScript,
+    Dart,
 }
 
 struct Corpus {
@@ -122,6 +123,17 @@ fn corpus(kind: Kind) -> Corpus {
             kind,
             threshold: 1.0,
         },
+        Kind::Dart => Corpus {
+            language: "Dart",
+            name: "flutter-packages",
+            root: locate_corpus(
+                "ASTROLABE_CORPUS_DART",
+                "corpus/flutter-packages",
+                "flutter-packages",
+            ),
+            kind,
+            threshold: 1.0,
+        },
     }
 }
 
@@ -143,6 +155,7 @@ fn ignored_dir(name: &str) -> bool {
             | ".openvisio"
             | ".turbo"
             | ".cache"
+            | ".dart_tool"
     )
 }
 
@@ -1054,6 +1067,101 @@ fn ts_imports(root: &Path, paths: &[RelPath], index: &FileIndex) -> Vec<Import> 
     out
 }
 
+fn dart_pubspec_names(root: &Path, paths: &[RelPath]) -> Vec<String> {
+    let mut names = Vec::new();
+    for path in paths.iter().filter(|p| p.file_name() == "pubspec.yaml") {
+        let Some(text) = read(root, path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("name:") {
+                let name = rest
+                    .split('#')
+                    .next()
+                    .unwrap_or(rest)
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .trim();
+                if !name.is_empty() && !name.contains(char::is_whitespace) {
+                    names.push(name.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn dart_target(pubspecs: &[String], spec: &str) -> bool {
+    let stripped = spec.strip_prefix("package:").unwrap_or(spec);
+    pubspecs
+        .iter()
+        .any(|name| stripped == name || stripped.starts_with(&format!("{name}/")))
+}
+
+fn extract_dart_specs(src: &str) -> Vec<String> {
+    let clean = strip_c_comments(src, false);
+    let mut out = Vec::new();
+    for raw in clean.lines() {
+        let line = raw.trim();
+        let is_import = line.starts_with("import ") || line.starts_with("import\t");
+        let is_export = line.starts_with("export ") || line.starts_with("export\t");
+        let is_part = line.starts_with("part ") || line.starts_with("part\t");
+        if !is_import && !is_export && !is_part {
+            continue;
+        }
+        for s in quoted_strings(line) {
+            if !s.is_empty() {
+                out.push(s);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn dart_imports(root: &Path, paths: &[RelPath]) -> Vec<Import> {
+    let pubspecs = dart_pubspec_names(root, paths);
+    let mut out = Vec::new();
+    for from in paths.iter().filter(|p| p.extension() == Some("dart")) {
+        let Some(text) = read(root, from) else {
+            continue;
+        };
+        for spec in extract_dart_specs(&text) {
+            if dart_target(&pubspecs, &spec) {
+                out.push(Import {
+                    from: from.clone(),
+                    spec: spec.clone(),
+                    source: spec,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Dart 语料的"预期未解析"豁免清单：(from, spec) 对。
+///
+/// 实际未解析集合必须恰好等于本清单——多出的条目是真回归；缺失的条目
+/// 说明豁免过时，应删除。豁免条目不计入解析率分母，threshold 仍保持
+/// 1.0，对所有应解析的 import 是硬门槛。
+///
+/// 注: google_maps_flutter_ios_shared_code/example（上游 README 声明 "is not
+/// a package"，无 pubspec.yaml）下的两条 google_maps_flutter_example import
+/// 不在清单中——就近路由会命中同名 example 包（android/ios/sdk9/sdk10 四个
+/// 副本均带 example_google_map.dart），已能解析。
+const DART_UNRESOLVED_EXEMPTIONS: &[(&str, &str)] = &[
+    // skill eval 脚本运行期动态生成的模拟代码: 目标 dummy_eval_feature.dart
+    // 磁盘上不存在，但 ground truth 按 pubspec 名 camera_android_camerax
+    // 判为仓库内 import。
+    (
+        "packages/camera/camera_android_camerax/.agents/skills/pre-push-skill/evals/test_data/setup_mixed_missing_native_test.dart",
+        "package:camera_android_camerax/src/dummy_eval_feature.dart",
+    ),
+];
+
 fn ground_truth(corpus: &Corpus, paths: &[RelPath], index: &FileIndex) -> Vec<Import> {
     match corpus.kind {
         Kind::Python => python_imports(&corpus.root, paths, index),
@@ -1061,10 +1169,21 @@ fn ground_truth(corpus: &Corpus, paths: &[RelPath], index: &FileIndex) -> Vec<Im
         Kind::Java => java_imports(&corpus.root, paths),
         Kind::Rust => rust_imports(&corpus.root, paths),
         Kind::TypeScript => ts_imports(&corpus.root, paths, index),
+        Kind::Dart => dart_imports(&corpus.root, paths),
     }
 }
 
 fn run(kind: Kind) {
+    run_with_exemptions(kind, &[]);
+}
+
+/// Shared acceptance loop. `exemptions` lists `(from, spec)` pairs expected to
+/// stay unresolved because of corpus quirks rather than resolver bugs; the
+/// actual unresolved set must equal it exactly — extra entries are a real
+/// regression, missing entries mean an exemption went stale and must be
+/// deleted. Exempted imports leave the rate denominator so the threshold
+/// stays a hard 100% gate over everything that must resolve.
+fn run_with_exemptions(kind: Kind, exemptions: &[(&str, &str)]) {
     let corpus = corpus(kind);
     let (index, paths) = scan(&corpus.root);
     let imports = ground_truth(&corpus, &paths, &index);
@@ -1076,7 +1195,9 @@ fn run(kind: Kind) {
 
     let resolver_set = catch_unwind(AssertUnwindSafe(|| ResolverSet::detect(&index))).ok();
     let mut resolved = 0usize;
+    let mut exempt = 0usize;
     let mut unresolved = Vec::new();
+    let mut actual: BTreeSet<(&str, &str)> = BTreeSet::new();
     for import in &imports {
         let target = resolver_set.as_ref().and_then(|set| {
             catch_unwind(AssertUnwindSafe(|| {
@@ -1090,16 +1211,30 @@ fn run(kind: Kind) {
             .is_some_and(|path| index.contains(path.as_str()))
         {
             resolved += 1;
-        } else if unresolved.len() < 20 {
-            unresolved.push(format!(
-                "{} => {} ({})",
-                import.from, import.spec, import.source
-            ));
+        } else {
+            actual.insert((import.from.as_str(), import.spec.as_str()));
+            if exemptions.contains(&(import.from.as_str(), import.spec.as_str())) {
+                exempt += 1;
+            } else if unresolved.len() < 20 {
+                unresolved.push(format!(
+                    "{} => {} ({})",
+                    import.from, import.spec, import.source
+                ));
+            }
         }
     }
 
+    let expected: BTreeSet<(&str, &str)> = exemptions.iter().copied().collect();
+    let stale: Vec<_> = expected.difference(&actual).collect();
+    assert!(
+        stale.is_empty(),
+        "{} 豁免清单过时（以下条目已能解析，应从清单删除）: {:?}",
+        corpus.language,
+        stale
+    );
+
     let total = imports.len();
-    let rate = resolved as f64 / total as f64;
+    let rate = resolved as f64 / (total - exempt).max(1) as f64;
     println!(
         "ASTROLABE_RESULT|{}|{}|{}|{}|{:.2}|{}",
         corpus.language,
@@ -1225,6 +1360,31 @@ require("./cjs");
 }
 
 #[test]
+fn dart_extractor_skips_comments_and_extracts_imports() {
+    let specs = extract_dart_specs(
+        r#"
+// import 'package:decoy/decoy.dart';
+/*
+import 'package:decoy2/decoy2.dart';
+*/
+import 'package:flutter/material.dart';
+import 'package:my_app/app.dart' as app;
+export 'package:my_app/src/utils.dart' show helper;
+part 'app.g.dart';
+"#,
+    );
+    assert_eq!(
+        specs,
+        vec![
+            "package:flutter/material.dart",
+            "package:my_app/app.dart",
+            "package:my_app/src/utils.dart",
+            "app.g.dart",
+        ]
+    );
+}
+
+#[test]
 #[ignore = "真实语料验收；使用 cargo test -- --ignored 运行"]
 fn python_import_resolution() {
     run(Kind::Python);
@@ -1252,4 +1412,10 @@ fn rust_import_resolution() {
 #[ignore = "真实语料验收；使用 cargo test -- --ignored 运行"]
 fn typescript_import_resolution() {
     run(Kind::TypeScript);
+}
+
+#[test]
+#[ignore = "真实语料验收；使用 cargo test -- --ignored 运行"]
+fn dart_import_resolution() {
+    run_with_exemptions(Kind::Dart, DART_UNRESOLVED_EXEMPTIONS);
 }

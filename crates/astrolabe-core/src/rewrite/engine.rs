@@ -351,7 +351,8 @@ fn ident_start(c: char, lang: Option<Language>) -> bool {
             | Language::Tsx
             | Language::JavaScript
             | Language::Php
-            | Language::Vue,
+            | Language::Vue
+            | Language::Dart,
         ) => c.is_alphabetic() || c == '_' || c == '$',
         Some(
             Language::Python
@@ -375,7 +376,8 @@ fn ident_continue(c: char, lang: Option<Language>) -> bool {
             | Language::Tsx
             | Language::JavaScript
             | Language::Php
-            | Language::Vue,
+            | Language::Vue
+            | Language::Dart,
         ) => c.is_alphanumeric() || c == '_' || c == '$',
         Some(
             Language::Python
@@ -753,6 +755,78 @@ const SWIFT_KEYWORDS: &[&str] = &[
     "try",
 ];
 
+/// Dart reserved words, built-in identifiers, contextual keywords, and literals.
+/// Source: <https://dart.dev/language/keywords>
+const DART_KEYWORDS: &[&str] = &[
+    "Function",
+    "abstract",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "base",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "covariant",
+    "default",
+    "deferred",
+    "do",
+    "dynamic",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "extension",
+    "external",
+    "factory",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "get",
+    "hide",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "interface",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "sealed",
+    "set",
+    "show",
+    "static",
+    "super",
+    "switch",
+    "sync",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "typedef",
+    "var",
+    "void",
+    "when",
+    "while",
+    "with",
+    "yield",
+];
+
 fn keywords(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::Python => PYTHON_KEYWORDS,
@@ -764,6 +838,7 @@ fn keywords(lang: Language) -> &'static [&'static str] {
         Language::C | Language::Cpp | Language::ObjC | Language::ObjCpp => C_FAMILY_KEYWORDS,
         Language::Swift => SWIFT_KEYWORDS,
         Language::Vue => JS_KEYWORDS,
+        Language::Dart => DART_KEYWORDS,
     }
 }
 
@@ -870,7 +945,8 @@ fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
             | Language::Cpp
             | Language::ObjC
             | Language::ObjCpp
-            | Language::Swift,
+            | Language::Swift
+            | Language::Dart,
         )
         | None => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
     }
@@ -1188,6 +1264,7 @@ mod tests {
             JAVA_KEYWORDS,
             RUST_KEYWORDS,
             JS_KEYWORDS,
+            DART_KEYWORDS,
         ] {
             let mut sorted = table.to_vec();
             sorted.sort();
@@ -1410,6 +1487,8 @@ mod tests {
             ("a.go", "func", "keyword"),
             ("A.java", "class", "keyword"),
             ("a.rs", "fn", "keyword"),
+            ("a.dart", "sealed", "keyword"),
+            ("a.dart", "when", "keyword"),
             ("a.ts", "123abc", "digit"),
             ("a.ts", "on Event", "whitespace"),
         ];
@@ -1483,5 +1562,26 @@ mod tests {
         .unwrap();
         assert!(empty.sites.is_empty());
         assert_eq!(empty.confidence, Confidence::Unknown);
+    }
+
+    #[test]
+    fn dart_keyword_and_identifier_rules() {
+        assert!(is_keyword("sealed", Language::Dart));
+        assert!(is_keyword("when", Language::Dart));
+        assert!(is_keyword("Function", Language::Dart));
+        assert!(is_keyword("abstract", Language::Dart));
+        assert!(is_keyword("yield", Language::Dart));
+        assert!(!is_keyword("normalword", Language::Dart));
+
+        assert!(ident_start('$', Some(Language::Dart)));
+        assert!(ident_continue('x', Some(Language::Dart)));
+        assert!(ident_continue('$', Some(Language::Dart)));
+
+        // Leading $ in Dart identifiers
+        let source = "void $x() {}\n";
+        let resolver = FakeResolver::scoped(&[("a.dart", ident_hits(source, "$x"))]);
+        let plan = plan(&resolver, "$x", "on$Event", "a.dart", source, &[]).unwrap();
+        assert_eq!(plan.sites.len(), 1);
+        assert_eq!(plan.sites[0].replacement, "on$Event");
     }
 }

@@ -24,7 +24,7 @@ use crate::types::{Language, RelPath};
 use super::RewriteError;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
-const LANGUAGES: [Language; 10] = [
+const LANGUAGES: [Language; 11] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -35,6 +35,7 @@ const LANGUAGES: [Language; 10] = [
     Language::Php,
     Language::C,
     Language::Cpp,
+    Language::Dart,
 ];
 
 /// Parse-health of one file, captured before or after a rewrite.
@@ -261,6 +262,7 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Php => 7,
         Language::C => 8,
         Language::Cpp => 9,
+        Language::Dart => 10,
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -277,6 +279,7 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -503,6 +506,42 @@ mod tests {
         assert!(errors("fn f( {}\n", "lib.rs") > 0);
         assert_eq!(errors("def f():\n    return 1\n", "m.py"), 0);
         assert!(errors("def f(\n", "m.py") > 0);
+    }
+
+    #[test]
+    fn dart_error_nodes_and_clean_rewrite() {
+        let p = path("lib/greeter.dart");
+        let before = concat!(
+            "class Greeter {\n",
+            "  String greet(String name) {\n",
+            "    return \"Hello, $name!\";\n",
+            "  }\n",
+            "}\n",
+        );
+        let after_valid = concat!(
+            "class Greeter {\n",
+            "  String sayHello(String name) {\n",
+            "    return \"Hello, $name!\";\n",
+            "  }\n",
+            "}\n",
+        );
+        let after_broken = concat!(
+            "class Greeter {\n",
+            "  String greet(String name {\n",
+            "    return \"Hello, $name!\";\n",
+            "  }\n",
+            "}\n",
+        );
+
+        assert_eq!(errors(before, "lib/greeter.dart"), 0);
+        assert_eq!(errors(after_valid, "lib/greeter.dart"), 0);
+        assert!(errors(after_broken, "lib/greeter.dart") > 0);
+
+        let snap = snapshot([(&p, before)]);
+        verify(&snap, [(&p, after_valid)]).expect("clean Dart rewrite must pass");
+
+        let err = verify(&snap, [(&p, after_broken)]).unwrap_err();
+        assert_eq!(failed_path(err).as_str(), "lib/greeter.dart");
     }
 
     #[test]

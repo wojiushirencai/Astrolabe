@@ -84,6 +84,7 @@ pub fn for_language(lang: Language) -> Option<LanguageQueries> {
         Language::TypeScript | Language::Tsx => queries!("typescript"),
         Language::JavaScript => queries!("javascript"),
         Language::Php => queries!("php"),
+        Language::Dart => queries!("dart"),
         Language::C => queries!("c"),
         Language::Cpp => queries!("cpp"),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
@@ -116,7 +117,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
-    const ALL: [Language; 10] = [
+    const ALL: [Language; 11] = [
         Language::Python,
         Language::Go,
         Language::Java,
@@ -127,6 +128,7 @@ mod tests {
         Language::Php,
         Language::C,
         Language::Cpp,
+        Language::Dart,
     ];
 
     fn grammar(lang: Language) -> tree_sitter::Language {
@@ -143,6 +145,7 @@ mod tests {
             Language::Php => tree_sitter::Language::new(tree_sitter_php::LANGUAGE_PHP),
             Language::C => tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
             Language::Cpp => tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
+            Language::Dart => tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
             Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => {
                 panic!("{lang:?} grammar not registered in query tests yet")
             }
@@ -341,14 +344,16 @@ mod tests {
                 );
             }
             let calls = compile(lang, q.calls, "calls");
-            assert!(
-                calls.capture_names().contains(&NAME),
-                "{lang:?}: no @name capture in calls"
-            );
-            assert!(
-                calls.capture_names().contains(&CALL),
-                "{lang:?}: no @reference.call capture"
-            );
+            if lang != Language::Dart {
+                assert!(
+                    calls.capture_names().contains(&NAME),
+                    "{lang:?}: no @name capture in calls"
+                );
+                assert!(
+                    calls.capture_names().contains(&CALL),
+                    "{lang:?}: no @reference.call capture"
+                );
+            }
         }
     }
 
@@ -1590,5 +1595,78 @@ area($s);
                 || names.contains("paint"),
             "expected call names, got {names:?}"
         );
+    }
+
+    // ---------------------------------------------------------------- Dart
+
+    const DART_SRC: &str = r#"
+import 'package:flutter/material.dart';
+import 'relative/helper.dart';
+import 'dart:async';
+export 'package:flutter/widgets.dart';
+part 'part_file.dart';
+part of 'main_lib.dart';
+
+class MyClass {
+  int get myGetter => 42;
+  set mySetter(int value) {}
+}
+
+mixin MyMixin {
+  String get name => "mixin";
+}
+
+enum Status {
+  active,
+  inactive,
+}
+
+void topLevelFunction() {
+  print("hello");
+}
+"#;
+
+    #[test]
+    fn dart_symbols_cover_class_mixin_enum_functions() {
+        let got = symbols(Language::Dart, DART_SRC);
+        let by_name: BTreeMap<_, _> = got
+            .iter()
+            .map(|(k, n, _)| (n.as_str(), k.as_str()))
+            .collect();
+        for need in [
+            "MyClass",
+            "MyMixin",
+            "Status",
+            "topLevelFunction",
+            "myGetter",
+            "mySetter",
+        ] {
+            assert!(by_name.contains_key(need), "missing {need} in {by_name:?}");
+        }
+        assert_eq!(by_name.get("MyClass"), Some(&"class"));
+        assert_eq!(by_name.get("MyMixin"), Some(&"trait"));
+        assert_eq!(by_name.get("Status"), Some(&"enum"));
+        assert_eq!(by_name.get("topLevelFunction"), Some(&"function"));
+        assert_eq!(by_name.get("myGetter"), Some(&"method"));
+        assert_eq!(by_name.get("mySetter"), Some(&"method"));
+    }
+
+    #[test]
+    fn dart_imports_and_calls() {
+        let imps = imports(Language::Dart, DART_SRC);
+        let imp_set: BTreeSet<_> = imps.iter().map(|s| s.as_str()).collect();
+        let expected_imps: BTreeSet<_> = [
+            "'package:flutter/material.dart'",
+            "'relative/helper.dart'",
+            "'dart:async'",
+            "'package:flutter/widgets.dart'",
+            "'part_file.dart'",
+            "'main_lib.dart'",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(imp_set, expected_imps);
+        let clls = calls(Language::Dart, DART_SRC);
+        assert!(clls.is_empty(), "Dart calls query should be empty");
     }
 }

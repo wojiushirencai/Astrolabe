@@ -5,9 +5,10 @@
 //! numbers the server reports are the same ones the acceptance suite measures.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::UNIX_EPOCH,
 };
 
@@ -24,6 +25,7 @@ use crate::reindex::mcp_index_options;
 pub(crate) struct RepoIndex {
     pub root: PathBuf,
     inner: InnerIndex,
+    in_graph_paths: OnceLock<HashSet<String>>,
 }
 
 enum InnerIndex {
@@ -50,6 +52,7 @@ impl RepoIndex {
         Self {
             root,
             inner: InnerIndex::Incremental(incremental),
+            in_graph_paths: OnceLock::new(),
         }
     }
 
@@ -58,6 +61,7 @@ impl RepoIndex {
         Self {
             root,
             inner: InnerIndex::Static { graph, report },
+            in_graph_paths: OnceLock::new(),
         }
     }
 
@@ -87,6 +91,34 @@ impl RepoIndex {
 
     pub fn file(&self, id: FileId) -> Option<&CodeFile> {
         self.graph().files.iter().find(|file| file.id == id)
+    }
+
+    /// Count occurrences of unindexed code file extensions among admitted paths.
+    ///
+    /// Delegates to [`astrolabe_core::index::unindexed_code_exts`] on the retained
+    /// [`IncrementalIndex`]. Only returns entries for unindexed, unsupported code languages.
+    pub(crate) fn unindexed_code_exts(
+        &self,
+        filter: Option<&str>,
+    ) -> std::collections::BTreeMap<String, u32> {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => {
+                let in_graph_set = self.in_graph_paths.get_or_init(|| {
+                    self.graph()
+                        .files
+                        .iter()
+                        .map(|file| file.path.as_str().to_owned())
+                        .collect()
+                });
+                astrolabe_core::index::unindexed_code_exts(
+                    inc.admitted_paths(),
+                    &|path| in_graph_set.contains(path),
+                    filter,
+                )
+            }
+            #[cfg(test)]
+            InnerIndex::Static { .. } => std::collections::BTreeMap::new(),
+        }
     }
 
     /// Load source lines through the process-wide [`FileCache`].
@@ -254,6 +286,27 @@ mod tests {
         let (lines, hit) = load_source_lines(&cache, &dir, "hello.py").unwrap();
         assert!(!hit, "changed mtime must be a miss");
         assert_eq!(&*lines, &["line-two".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unindexed_code_exts_caches_in_graph_set() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("script.rb"), "puts 'hello'\n").unwrap();
+        let index = build(&dir).expect("index build");
+        assert!(index.in_graph_paths.get().is_none());
+
+        let counts1 = index.unindexed_code_exts(None);
+        assert_eq!(counts1.get("rb"), Some(&1));
+        assert!(index.in_graph_paths.get().is_some());
+
+        let cached_ptr = index.in_graph_paths.get().unwrap() as *const _;
+        let counts2 = index.unindexed_code_exts(None);
+        assert_eq!(counts2.get("rb"), Some(&1));
+        let cached_ptr2 = index.in_graph_paths.get().unwrap() as *const _;
+        assert_eq!(cached_ptr, cached_ptr2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

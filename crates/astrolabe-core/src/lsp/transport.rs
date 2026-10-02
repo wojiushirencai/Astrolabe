@@ -400,6 +400,11 @@ impl LspTransport {
         self.initialize_with(root, None)
     }
 
+    /// `initialize` request plus `initialized` notification.
+    ///
+    /// `initialization_options` overrides the per-language defaults from
+    /// [`initialization_options_for`]; `None` falls back to them, so callers
+    /// that never heard of those defaults keep today's behaviour.
     pub fn initialize_with(
         &self,
         root: &Path,
@@ -426,7 +431,16 @@ impl LspTransport {
             "locale": "en",
             "trace": "off",
         });
-        if let Some(options) = initialization_options {
+        if !send_root_uri(self.shared.spec.language) {
+            // Null is the spec value for "no root". The folders above keep
+            // carrying the workspace, which is the root cause fix — see
+            // `send_root_uri`.
+            params["rootPath"] = Value::Null;
+            params["rootUri"] = Value::Null;
+        }
+        if let Some(options) =
+            initialization_options.or_else(|| initialization_options_for(self.shared.spec.language))
+        {
             params["initializationOptions"] = options;
         }
 
@@ -813,6 +827,39 @@ fn language_id(language: Language) -> &'static str {
         Language::Swift => "swift",
         Language::Php => "php",
         Language::Vue => "vue",
+        Language::Dart => "dart",
+    }
+}
+
+/// Whether `initialize` should name the workspace root via `rootUri` /
+/// `rootPath` for this language.
+///
+/// The Dart analysis server counts `rootUri` as an analysis root *in addition
+/// to* `workspaceFolders` and never dedupes the two (oraios/serena#2045): in a
+/// monorepo the server analyses the whole repository twice and spins at full
+/// CPU while it does. Dart therefore initialises with a null root and keeps
+/// `workspaceFolders` as the single analysis root. Every other language keeps
+/// sending the root exactly as before.
+fn send_root_uri(language: Language) -> bool {
+    !matches!(language, Language::Dart)
+}
+
+/// Per-language `initializationOptions` merged into `initialize` when the
+/// caller has none of its own.
+///
+/// Mirrors Serena's Dart setup: the optional per-file niceties (closing
+/// labels, Dart and Flutter outlines) are switched off so the analysis server
+/// does the minimum work. `None` means "no options" and `initialize` then
+/// omits the field entirely, exactly as before this hook existed.
+fn initialization_options_for(language: Language) -> Option<Value> {
+    match language {
+        Language::Dart => Some(json!({
+            "onlyAnalyzeProjectsWithOpenFiles": false,
+            "closingLabels": false,
+            "outline": false,
+            "flutterOutline": false,
+        })),
+        _ => None,
     }
 }
 
@@ -1234,6 +1281,12 @@ fn handle_notification(shared: &Shared, method: &str, params: Option<&Value>) {
     if method == "$/progress" {
         track_progress(shared, &params);
     }
+    if method == "$/analyzerStatus" {
+        track_analyzer_status(shared, &params);
+    }
+    if method == "experimental/serverStatus" {
+        track_server_status(shared, &params);
+    }
     if method == "textDocument/publishDiagnostics" {
         if let Ok(parsed) = serde_json::from_value::<PublishDiagnosticsLoose>(params.clone()) {
             lock(&shared.diagnostics).insert(parsed.uri, parsed.diagnostics);
@@ -1270,6 +1323,57 @@ fn track_progress(shared: &Shared, params: &Value) {
             lock(&shared.active_progress).remove(&token);
         }
         _ => {}
+    }
+}
+
+/// Stable active-progress token shared by the Dart analysis notifications.
+///
+/// Both Dart notifications report the same internal analysis state machine, so
+/// they drive one token: whichever fires last wins, matching the server's own
+/// view. The name is server-specific enough never to collide with a genuine
+/// `$/progress` token.
+const ANALYZER_TOKEN: &str = "dart-analyzer";
+
+/// Follow `$/analyzerStatus` (`{"isAnalyzing": bool}`) from the Dart analysis
+/// server.
+///
+/// Dart does not guarantee `$/progress`. Without this mapping the settle
+/// window in [`LspTransport::wait_until_ready`] expires while startup analysis
+/// is still running, the server is declared ready too early, and the first
+/// definition / references query comes back empty because the index is not
+/// built yet. Tracked for every language — only the Dart server emits the
+/// method, so the branch is inert elsewhere.
+fn track_analyzer_status(shared: &Shared, params: &Value) {
+    if let Some(is_analyzing) = params.get("isAnalyzing").and_then(Value::as_bool) {
+        set_analyzer_active(shared, is_analyzing);
+    }
+}
+
+/// Follow `experimental/serverStatus` (`{"analysis": {"isAnalyzing": bool},
+/// "quiescent": bool}`), the newer Dart readiness notification.
+fn track_server_status(shared: &Shared, params: &Value) {
+    if let Some(is_analyzing) = params
+        .pointer("/analysis/isAnalyzing")
+        .and_then(Value::as_bool)
+    {
+        set_analyzer_active(shared, is_analyzing);
+    }
+    // `quiescent` is the server's own "everything has settled" signal.
+    if params.get("quiescent").and_then(Value::as_bool) == Some(true) {
+        lock(&shared.active_progress).remove(ANALYZER_TOKEN);
+    }
+}
+
+/// Apply a Dart analyzing transition to the shared progress state, mirroring
+/// the `begin` / `end` handling of `$/progress`.
+fn set_analyzer_active(shared: &Shared, is_analyzing: bool) {
+    if is_analyzing {
+        shared.saw_progress.store(true, Ordering::SeqCst);
+        // Analysis started (or resumed) — any earlier ready latch is stale.
+        shared.ready_confirmed.store(false, Ordering::Release);
+        lock(&shared.active_progress).insert(ANALYZER_TOKEN.to_string());
+    } else {
+        lock(&shared.active_progress).remove(ANALYZER_TOKEN);
     }
 }
 
@@ -1509,6 +1613,7 @@ if "--flood" in sys.argv:
         sys.stderr.buffer.flush()
 
 BATCH = []
+INITIALIZE_PARAMS = None
 
 while True:
     msg = read_msg()
@@ -1522,7 +1627,21 @@ while True:
     if method == "initialized" or "id" not in msg:
         continue
     if method == "initialize":
+        INITIALIZE_PARAMS = msg.get("params")
         reply(msg, {"capabilities": {"textDocumentSync": 1}, "serverInfo": {"name": "astrolabe-fake"}})
+    elif method == "last-initialize":
+        reply(msg, INITIALIZE_PARAMS)
+    elif method == "listen-analyzer":
+        send({"jsonrpc": "2.0", "method": "$/analyzerStatus", "params": {"isAnalyzing": True}})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"analysis": {"isAnalyzing": True}}})
+        reply(msg, {"ok": True})
+    elif method == "finish-analyzer":
+        send({"jsonrpc": "2.0", "method": "$/analyzerStatus", "params": {"isAnalyzing": False}})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"analysis": {"isAnalyzing": False}, "quiescent": True}})
+        reply(msg, {"ok": True})
+    elif method == "quiesce-analyzer":
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": True}})
+        reply(msg, {"ok": True})
     elif method == "shutdown":
         reply(msg, None)
     elif method == "ping":
@@ -1627,6 +1746,10 @@ while True:
     }
 
     fn spawn_fake(flood: bool, timeout: Duration) -> (LspTransport, TmpDir) {
+        spawn_fake_as(Language::Python, flood, timeout)
+    }
+
+    fn spawn_fake_as(language: Language, flood: bool, timeout: Duration) -> (LspTransport, TmpDir) {
         let tmp = unique_temp();
         let script = tmp.0.join("fake_lsp.py");
         fs::write(&script, FAKE_SERVER).expect("write fake server");
@@ -1635,7 +1758,7 @@ while True:
             args.push("--flood".into());
         }
         let spec = ServerSpec {
-            language: Language::Python,
+            language,
             command: python3(),
             args,
             install_hint: "install python3".into(),
@@ -1817,6 +1940,125 @@ while True:
         let info = t.initialize_result().unwrap();
         assert_eq!(info["serverInfo"]["name"], "astrolabe-fake");
         assert!(t.is_alive());
+        t.shutdown().unwrap();
+    }
+
+    #[test]
+    fn root_uri_policy_omits_root_only_for_dart() {
+        assert!(!send_root_uri(Language::Dart));
+        for language in [
+            Language::Python,
+            Language::Go,
+            Language::Java,
+            Language::Rust,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::C,
+            Language::Cpp,
+            Language::ObjC,
+            Language::ObjCpp,
+            Language::Swift,
+            Language::Php,
+            Language::Vue,
+        ] {
+            assert!(send_root_uri(language), "{language:?} must keep its root");
+        }
+    }
+
+    #[test]
+    fn initialization_options_are_dart_only() {
+        assert_eq!(
+            initialization_options_for(Language::Dart),
+            Some(json!({
+                "onlyAnalyzeProjectsWithOpenFiles": false,
+                "closingLabels": false,
+                "outline": false,
+                "flutterOutline": false,
+            }))
+        );
+        for language in [Language::Python, Language::Go, Language::Rust] {
+            assert_eq!(initialization_options_for(language), None);
+        }
+    }
+
+    #[test]
+    fn dart_initialize_nulls_root_but_keeps_workspace_folders() {
+        let (t, tmp) = spawn_fake_as(Language::Dart, false, Duration::from_secs(5));
+        t.initialize(&tmp.0).unwrap();
+        let params = t.request("last-initialize", json!({})).unwrap();
+        assert_eq!(params["rootUri"], Value::Null);
+        assert_eq!(params["rootPath"], Value::Null);
+        assert_eq!(
+            params["workspaceFolders"],
+            json!([{
+                "uri": path_to_file_uri(&tmp.0),
+                "name": tmp.0.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"),
+            }])
+        );
+        assert_eq!(
+            params["initializationOptions"],
+            json!({
+                "onlyAnalyzeProjectsWithOpenFiles": false,
+                "closingLabels": false,
+                "outline": false,
+                "flutterOutline": false,
+            })
+        );
+        t.shutdown().unwrap();
+    }
+
+    #[test]
+    fn non_dart_initialize_params_are_unchanged() {
+        let (t, tmp) = spawn_fake_as(Language::Rust, false, Duration::from_secs(5));
+        t.initialize(&tmp.0).unwrap();
+        // Rebuild the exact pre-Dart-support shape: full-value equality here is
+        // the byte-for-byte regression proof for every non-Dart language, as
+        // equal JSON values serialise identically.
+        let root_uri = path_to_file_uri(&tmp.0);
+        let expected = json!({
+            "processId": std::process::id(),
+            "rootPath": tmp.0.to_string_lossy(),
+            "rootUri": root_uri,
+            "capabilities": client_capabilities(),
+            "workspaceFolders": [{
+                "uri": root_uri,
+                "name": tmp.0.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"),
+            }],
+            "clientInfo": { "name": "astrolabe", "version": env!("CARGO_PKG_VERSION") },
+            "locale": "en",
+            "trace": "off",
+        });
+        let params = t.request("last-initialize", json!({})).unwrap();
+        assert_eq!(params, expected);
+
+        // Explicit caller options still win over the per-language defaults.
+        t.initialize_with(&tmp.0, Some(json!({ "custom": true })))
+            .unwrap();
+        let params = t.request("last-initialize", json!({})).unwrap();
+        assert_eq!(params["initializationOptions"], json!({ "custom": true }));
+        t.shutdown().unwrap();
+    }
+
+    #[test]
+    fn dart_analyzer_notifications_gate_readiness() {
+        let (t, _tmp) = spawn_fake(false, Duration::from_secs(5));
+
+        t.request("listen-analyzer", json!({})).unwrap();
+        assert!(t.is_busy(), "$/analyzerStatus must register active work");
+        assert!(t.shared.saw_progress.load(Ordering::SeqCst));
+
+        // quiescent alone must clear the shared token.
+        t.request("quiesce-analyzer", json!({})).unwrap();
+        assert!(!t.is_busy(), "quiescent must clear the analyzer token");
+
+        // The token re-arms when analysis resumes.
+        t.request("listen-analyzer", json!({})).unwrap();
+        assert!(t.is_busy());
+        t.request("finish-analyzer", json!({})).unwrap();
+        assert!(!t.is_busy(), "isAnalyzing=false must clear the token");
+
+        assert!(t.wait_until_ready(Duration::from_secs(3)));
         t.shutdown().unwrap();
     }
 
@@ -2168,5 +2410,101 @@ while True:
             other => panic!("expected Protocol error, got {other:?}"),
         }
         server.shutdown().unwrap();
+    }
+
+    /// End-to-end proof against the real `dart language-server` on this
+    /// machine: the customised handshake (null root, Dart options) must let
+    /// the server initialise, the analyzer-status notifications must drive
+    /// `wait_until_ready`, and a definition query on `main` must return a
+    /// location inside the repository. Run manually with
+    /// `cargo test -p astrolabe-core dart_language_server_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "spawns the local dart language-server against /Users/zhoulei/Project/AI-con"]
+    fn dart_language_server_live() {
+        let root = PathBuf::from("/Users/zhoulei/Project/AI-con");
+        let main_abs = root.join("src/app/lib/main.dart");
+        assert!(
+            main_abs.exists(),
+            "live test target missing: {}",
+            main_abs.display()
+        );
+
+        let spec = ServerSpec {
+            language: Language::Dart,
+            command: PathBuf::from("dart"),
+            args: vec!["language-server".into()],
+            install_hint: "install the Dart SDK (https://dart.dev/get-dart)".into(),
+        };
+        let t = LspTransport::spawn_in(&spec, &root, Duration::from_secs(60))
+            .expect("spawn dart language-server");
+        let started = Instant::now();
+        t.initialize(&root)
+            .expect("initialize dart language-server");
+
+        assert!(
+            t.wait_until_ready(Duration::from_secs(180)),
+            "dart server never became ready; notifications: {:?}",
+            t.notifications()
+        );
+        eprintln!(
+            "dart ready after {:?} (saw_progress={})",
+            started.elapsed(),
+            t.shared.saw_progress.load(Ordering::SeqCst)
+        );
+        for (method, params) in t.notifications() {
+            if method.contains("Status") || method == "$/progress" {
+                eprintln!("dart sent {method}: {params}");
+            }
+        }
+
+        let text = fs::read_to_string(&main_abs).unwrap();
+        let line = text
+            .lines()
+            .position(|l| l.contains("main("))
+            .expect("main( in main.dart");
+        let character = text.lines().nth(line).unwrap().find("main").unwrap() as u32;
+        t.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": path_to_file_uri(&main_abs),
+                    "languageId": "dart",
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        )
+        .expect("didOpen main.dart");
+        let result = t
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": path_to_file_uri(&main_abs) },
+                    "position": { "line": line as u32, "character": character },
+                }),
+            )
+            .expect("textDocument/definition on main");
+        let locations = locations_from_value(&result, &root);
+        assert!(
+            !locations.is_empty(),
+            "definition returned nothing: {result}"
+        );
+        for loc in &locations {
+            let abs = root.join(loc.path.as_str());
+            assert!(
+                abs.starts_with(&root) && abs.exists(),
+                "definition outside the repo or missing: {}",
+                abs.display()
+            );
+        }
+        eprintln!(
+            "dart live definition of main: {}",
+            locations
+                .iter()
+                .map(|l| format!("{}:{:?}", l.path.as_str(), l.range.start))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        t.shutdown().unwrap();
     }
 }

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Fetch the five pinned acceptance corpora into corpus/.
+# Fetch the pinned acceptance corpora into corpus/.
 #
 # Pins are tags or full commit SHAs — never a moving branch tip. Upstream
-# changes must not silently retune the five-language gate numbers.
+# changes must not silently retune the acceptance gate numbers.
 #
 # Override the destination with CORPUS_ROOT (default: <workspace>/corpus)
 # so CI and local dry-runs can clone without touching an existing tree.
 #
-# Evidence for each pin (2026-09-11):
+# Evidence for each pin (2026-09-11, dart added 2026-10-02):
 #   gin              tag v1.12.0              local corpus/go/version.go
 #   gson             tag gson-parent-2.14.0   existing CI clone + GitHub tag
 #   ripgrep          tag 15.2.0               local corpus/rust/Cargo.toml
 #   serena           commit 701e7c84…         origin/main; local feat HEAD
 #                                             48609832 is unpublished
 #   openvisio-oss    commit bdb1d2a3…         local HEAD == origin/main
+#   flutter-packages tag webview_flutter_wkwebview-v3.27.0 local corpus/dart (GitHub tag)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,6 +29,7 @@ CORPORA=(
   "rust|https://github.com/BurntSushi/ripgrep.git|15.2.0|"
   "python|https://github.com/oraios/serena.git|701e7c843f46c6a649203a488cece1bf19f1df90|--filter=blob:none"
   "typescript|https://github.com/syntaxPriest/openvisio-oss.git|bdb1d2a366d74ec92cc6d8968aed384ffad0c508|--filter=blob:none"
+  "dart|https://github.com/flutter/packages.git|webview_flutter_wkwebview-v3.27.0|"
 )
 
 is_sha() {
@@ -114,10 +116,21 @@ fetch_one() {
   echo "ok    $dest_name  $(current_commit "$dest")  $(git -C "$dest" describe --tags --always)"
 }
 
+TARGET="${1:-}"
+
 mkdir -p "$CORPUS_ROOT"
 
 for entry in "${CORPORA[@]}"; do
   IFS='|' read -r dest_name url ref extra_flags <<<"$entry"
+  if [[ -n "$TARGET" && "$TARGET" != "all" ]]; then
+    if [[ "$dest_name" != "$TARGET" ]]; then
+      if [[ "$dest_name" == "dart" && "$TARGET" == "flutter-packages" ]]; then
+        :
+      else
+        continue
+      fi
+    fi
+  fi
   fetch_one "$dest_name" "$url" "$ref" "$extra_flags"
 done
 

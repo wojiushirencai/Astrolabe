@@ -6,6 +6,36 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Added
+
+- **Dart（.dart）语言全链路代码图谱与精确语义支持。**
+  - **Tree-sitter 语法解析**：集成 `tree-sitter-dart 0.2`（ABI 兼容 host 0.27，141 个真实文件验证 0 ERROR 语法节点）。抽取 class、enum、mixin、function、getter、setter 等核心符号；识别 `_` 前缀私有成员命名约定并准确设置 `is_exported` 状态；完整捕获 `library_import`、`export`、`part` 及 `part of` 导入导出关系。
+  - **Pubspec 与依赖解析器（Resolver）**：实现针对 `pubspec.yaml` 的零依赖行级解析（列 0 严格锚定 `name:`，彻底规避依赖块内的嵌套 `name:` 陷阱），建立包名到 `lib/` 源码目录的精确映射；解析 `package:<pkg>/...`、相对路径与 `part` 指令；将 `dart:` SDK 库与外部第三方包识别并返回 `None`（排除于仓库内图谱）；支持包含多个 `pubspec.yaml` 的 monorepo 结构，同名包冲突按路径深度取最浅者；在扫描（scan）、文件监听（watch）与解析器排除（resolver excludes）三层防御式硬排除 `.dart_tool/`。
+  - **按需 LSP 与 dart language-server 调度**：接入随 Dart / Flutter SDK 自带的 `dart language-server`（prompt-only 交互提示，无需独立下载分发矩阵）；支持环境变量 `ASTROLABE_LSP_DART` 覆盖可执行文件路径；LSP `initialize` 请求中将 `rootUri` 显式置 `null` 并保留 `workspaceFolders`（规避 oraios/serena#2045 在 monorepo 下触发全盘重复分析与死循环空转）；注入 `initializationOptions` 四大配置项（`onlyAnalyzeProjectsWithOpenFiles: false`, `closingLabels: false`, `outline: false`, `flutterOutline: false`）；挂载 `$/analyzerStatus` 与 `experimental/serverStatus` 就绪通知映射（实测 Dart 3.13 走标准 `$/progress`，映射机制作为老版本 analyzer 兜底）；集成测试完成真实 definition 跳转验证。
+  - **重写支持与语法验证**：维护包含 67 个 Dart 关键字的 `DART_KEYWORDS`（字母序 binary_search 快速检索），重命名标识符允许 `$` 符号，开启 rename 后的 verify re-parse 语法校验。
+  - **实测性能与准确率**：在真实大型混合仓库 AI-con（Flutter + Go monorepo）中实现仓库内 Dart import 100% 精确解析；204 个 `.dart` 文件、1900 个符号在 885ms 内完成冷索引，峰值内存仅 93MB。
+
+- **显式语言声明与未覆盖诊断机制。**
+  - 工具元数据（description）全面声明当前支持的语言清单，帮助宿主客户端与模型在规划阶段明确能力边界。
+  - `search_code`、`find_symbol` 零命中以及 `get_dependents` 目标未找到时，主动返回“目标可能属于未支持语言”的显式诊断提示，消除模型误判“代码不存在”的歧义与空转。
+  - `get_languages` 扩展输出当前已支持（supported）的语言清单及未索引（unindexed）代码文件统计。
+
+### Changed
+
+- **防漂移 Hook 拦截口径收敛为支持语言集。**
+  - PreToolUse Hook 的全量源码文件 Read 拦截依据从 58 种扩展名全集收敛为 Astrolabe 实际支持的 28 项语言扩展名（`SUPPORTED_CODE_EXTENSIONS`），避免对未支持语言（如 `.kt`、`.scala`、`.rb`）的常规阅读产生误拦截；原 58 项 `KNOWN_CODE_EXTENSIONS` 完整保留作为未索引语言的统计分析口径。
+  - `grep` 与 `mixed` 的 deny 拦截提示文案中增加“未支持语言例外”说明（若目标文件属于 Astrolabe 未索引语言，grep 为正确工具，可忽略此提醒）。
+
+- **持久化存储向后兼容。**
+  - 存储层在枚举末尾追加 `Language::Dart` 映射值（`u8 = 14`），严格保证既有 Redb 索引的向前与向后二进制兼容。旧版本二进制读取包含 Dart 文件的新索引库时，语言标签安全退化为 `None`，文件节点与元数据正常保留。
+
+### Known Limitations
+
+- **调用链分析（trace_calls）暂未开放**：Dart 语法层面的调用边（call edges）在 v1 中返回空结果，计划后续版本支持。
+- **构建生成代码未排除**：由 build runner 生成的 `.g.dart`、`.freezed.dart` 等文件当前仍会进入索引，等待后续 glob 排除机制支持。
+- **冷启动 Settle 窗口与首查询兜底**：`dart language-server` 冷启动耗时（实测约 3.2s）略超当前统一的 3.0s LSP settle 静默窗口，首次查询由 `didOpen` 触发的优先即时分析机制兜底保障正确性。
+- **测试语料特定场景**：在包含多个 example 子项目的复杂语料 `flutter/packages` 中，同名包嵌套场景下的 import 解析率为 99.66%，待后续语料专项跟进。
+
 ## [0.4.1] - 2026-10-01
 
 ### Fixed

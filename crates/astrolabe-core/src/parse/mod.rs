@@ -31,7 +31,7 @@ mod vue;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SIGNATURE_CHARS: usize = 240;
-const LANGUAGES: [Language; 10] = [
+const LANGUAGES: [Language; 11] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -42,6 +42,7 @@ const LANGUAGES: [Language; 10] = [
     Language::Php,
     Language::C,
     Language::Cpp,
+    Language::Dart,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -176,6 +177,7 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Php => 7,
         Language::C => 8,
         Language::Cpp => 9,
+        Language::Dart => 10,
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -192,6 +194,7 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -325,6 +328,7 @@ fn is_exported(lang: Language, name: &str, node: tree_sitter::Node<'_>, source: 
             js_exported(name, node, source)
         }
         Language::Php => php_exported(node, source),
+        Language::Dart => !name.starts_with('_'),
         // Sibling P0 languages: treat as exported until their agents land visibility rules.
         Language::C
         | Language::Cpp
@@ -1191,7 +1195,8 @@ mod tests {
             | Language::ObjC
             | Language::ObjCpp
             | Language::Swift
-            | Language::Vue => Vec::new(),
+            | Language::Vue
+            | Language::Dart => Vec::new(),
         }
     }
 
@@ -1356,6 +1361,90 @@ mod tests {
     #[ignore = "真实语料符号召回验收；使用 cargo test -- --ignored 运行"]
     fn typescript_symbol_recall() {
         run_symbol_recall(RecallLang::TypeScript);
+    }
+
+    #[test]
+    #[ignore = "Dart ABI spike on AI-con project"]
+    fn dart_abi_spike_on_aicon() {
+        let lang = Language::Dart;
+        let ts_lang = grammar(lang).expect("Dart grammar must be present");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&ts_lang)
+            .expect("tree-sitter set_language must succeed for Dart");
+
+        let q_sources = queries::for_language(lang).expect("Dart queries must be present");
+        let sym_query =
+            Query::new(&ts_lang, q_sources.symbols).expect("symbols query must compile");
+        let imp_query =
+            Query::new(&ts_lang, q_sources.imports).expect("imports query must compile");
+
+        let root = std::path::Path::new("/Users/zhoulei/Project/AI-con/src/app/lib");
+        if !root.exists() {
+            println!(
+                "AI-con path does not exist, skipping spike: {}",
+                root.display()
+            );
+            return;
+        }
+
+        let mut dart_files = Vec::new();
+        fn collect_dart(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect_dart(&path, out);
+                    } else if path.extension().is_some_and(|ext| ext == "dart") {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+        collect_dart(root, &mut dart_files);
+
+        let total_files = dart_files.len();
+        let mut error_files = 0;
+        let mut total_symbols = 0;
+        let mut total_imports = 0;
+
+        for path in &dart_files {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let tree = parser
+                .parse(&content, None)
+                .expect("parser should produce a tree");
+            let root_node = tree.root_node();
+            if root_node.has_error() {
+                error_files += 1;
+            }
+
+            let syms = extract_symbols(lang, &sym_query, root_node, &content);
+            total_symbols += syms.len();
+
+            let imps = extract_imports(&imp_query, root_node, &content);
+            total_imports += imps.len();
+        }
+
+        let error_rate = if total_files > 0 {
+            error_files as f64 / total_files as f64
+        } else {
+            0.0
+        };
+
+        println!("=== Dart ABI Spike on AI-con ===");
+        println!("Total Dart files: {total_files}");
+        println!(
+            "Files with ERROR/MISSING: {error_files} ({:.2}%)",
+            error_rate * 100.0
+        );
+        println!("Total symbols extracted: {total_symbols}");
+        println!("Total imports extracted: {total_imports}");
+
+        assert!(
+            error_rate < 0.10,
+            "ERROR file rate {:.2}% exceeds threshold of 10%",
+            error_rate * 100.0
+        );
     }
 
     // ------------------------------------------------------------- masking

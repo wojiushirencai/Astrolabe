@@ -88,6 +88,8 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".next",
     ".openvisio",
     ".serena",
+    // Flutter / Dart toolchain artifacts. Fallback exclude for non-git trees.
+    ".dart_tool",
     // Own store (index.redb). Must not depend on gitignore: `ignore` skips
     // gitignore rules in non-git trees, so a store-written `.gitignore` of `*`
     // is not enough.

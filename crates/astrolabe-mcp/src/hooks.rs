@@ -150,13 +150,13 @@ pub(crate) const READ_SHELL_COMMANDS: &[&str] = &[
     "gc",
 ];
 
-/// 源码文件后缀名全集（照抄 Serena 58 个扩展名，只针对代码文件做 read deny）
-pub(crate) const CODE_FILE_EXTENSIONS: &[&str] = &[
-    "al", "bash", "c", "clj", "cljs", "cpp", "cs", "css", "dart", "elm", "ex", "exs", "fs", "fsx",
-    "go", "graphql", "gql", "groovy", "h", "hcl", "hpp", "hs", "html", "java", "jl", "js", "json",
-    "jsonc", "jsx", "kt", "kts", "lean", "lua", "m", "matlab", "nf", "php", "proto", "ps1", "py",
-    "r", "rb", "rs", "scala", "sh", "sol", "sql", "svelte", "swift", "tf", "tfvars", "toml", "ts",
-    "tsx", "vue", "yaml", "yml", "zig",
+/// 仅 Astrolabe 支持语言的源码扩展名（hook 拦截口径）。
+/// hook 的目的是引导用 Astrolabe，对 Astrolabe 不能索引的语言不该拦截；
+/// 与 core types.rs 的 Language::from_path 保持同步（新语言落地时此表必须同步加）。
+/// 未支持语言统计词表见 astrolabe_core::index::KNOWN_CODE_EXTENSIONS。
+pub(crate) const SUPPORTED_CODE_EXTENSIONS: &[&str] = &[
+    "py", "pyi", "go", "java", "rs", "ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx", "c",
+    "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp", "m", "mm", "swift", "php", "vue", "dart",
 ];
 
 /// 触发 hook 的客户端类型
@@ -422,7 +422,7 @@ pub(crate) fn is_code_file_path(path: &str) -> bool {
     }
     if let Some(ext) = Path::new(cleaned).extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_ascii_lowercase();
-        CODE_FILE_EXTENSIONS.contains(&ext_lower.as_str())
+        SUPPORTED_CODE_EXTENSIONS.contains(&ext_lower.as_str())
     } else {
         false
     }
@@ -835,18 +835,23 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
 pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let max_limit = config().slice_read_max_limit;
     let readonly_note = format!(" Note: all Astrolabe tools except apply_rename are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} (e.g. Read with offset and limit) are permitted and not counted as abuses.");
+    let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_languages tool), grep is the correct tool for them — ignore this reminder.";
     let (reason, ctx) = match deny_kind {
         DenyKind::Grep => (
             "Too many consecutive grep calls without using symbolic tools. You can continue using grep now if needed, the counter was reset.",
-            "You were using many grep calls recently. Consider using Astrolabe's symbolic mcp tools instead for more code-centric search (search_code / find_references are read-only and return path:line anchors). You can continue using grep now if needed, the counter was reset.",
+            format!(
+                "You were using many grep calls recently. Consider using Astrolabe's symbolic mcp tools instead for more code-centric search (search_code / find_references are read-only and return path:line anchors). You can continue using grep now if needed, the counter was reset.{unindexed_lang_note}"
+            ),
         ),
         DenyKind::Read => (
             "Too many consecutive read calls of files without using symbolic tools. You can continue using read now if needed, the counter was reset.",
-            "You were using many read calls on files recently. Consider using Astrolabe's symbolic mcp tools instead for more targeted reads (read-only exploration included: find_symbol / search_code return exact bodies and path:line anchors without whole-file reads). You can continue using read now if needed, the counter was reset.",
+            "You were using many read calls on files recently. Consider using Astrolabe's symbolic mcp tools instead for more targeted reads (read-only exploration included: find_symbol / search_code return exact bodies and path:line anchors without whole-file reads). You can continue using read now if needed, the counter was reset.".to_string(),
         ),
         DenyKind::Mixed => (
             "Too many consecutive non-symbolic tool calls (mixed grep and read). You can continue using these tools now if needed, the counter was reset.",
-            "You were alternating between grep and read file calls recently without using Astrolabe's symbolic mcp tools. Consider using symbolic search and targeted symbol reads instead for more code-centric exploration. You can continue using these tools now if needed, the counter was reset.",
+            format!(
+                "You were alternating between grep and read file calls recently without using Astrolabe's symbolic mcp tools. Consider using symbolic search and targeted symbol reads instead for more code-centric exploration. You can continue using these tools now if needed, the counter was reset.{unindexed_lang_note}"
+            ),
         ),
     };
     let ctx = format!("{ctx}{readonly_note}");
@@ -2721,5 +2726,93 @@ mod tests {
             Some(v) => std::env::set_var(ENV_DENY_SILENCE_SECS, v),
             None => std::env::remove_var(ENV_DENY_SILENCE_SECS),
         }
+    }
+
+    #[test]
+    fn test_is_code_file_path_supported_vs_unsupported() {
+        // 未支持语言不应计为代码文件（不拦截）
+        assert!(!is_code_file_path("a.kt"));
+        assert!(!is_code_file_path("a.scala"));
+        assert!(!is_code_file_path("a.rb"));
+        assert!(!is_code_file_path("noext"));
+
+        // 支持的语言应计为代码文件（拦截）
+        assert!(is_code_file_path("a.dart"));
+        assert!(is_code_file_path("a.py"));
+        assert!(is_code_file_path("a.rs"));
+
+        // 带引号的路径 trim 逻辑仍正常工作
+        assert!(is_code_file_path("'a.py'"));
+        assert!(is_code_file_path("\"a.rs\""));
+        assert!(!is_code_file_path("'a.kt'"));
+    }
+
+    #[test]
+    fn test_classify_tool_unsupported_language_read() {
+        let kind_kt = classify_tool(
+            "read",
+            Client::ClaudeCode,
+            Some("src/Main.kt"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            kind_kt,
+            ToolKind::Read {
+                is_code_file: false
+            }
+        );
+
+        let kind_scala = classify_tool(
+            "read",
+            Client::ClaudeCode,
+            Some("src/Main.scala"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            kind_scala,
+            ToolKind::Read {
+                is_code_file: false
+            }
+        );
+
+        let kind_dart = classify_tool(
+            "read",
+            Client::ClaudeCode,
+            Some("lib/main.dart"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(kind_dart, ToolKind::Read { is_code_file: true });
+    }
+
+    #[test]
+    fn test_build_output_grep_and_mixed_contain_ignore_reminder() {
+        let reminder_sub = "ignore this reminder";
+
+        let cc_grep = build_output(Client::ClaudeCode, DenyKind::Grep);
+        assert!(
+            cc_grep.contains(reminder_sub),
+            "Grep deny output should contain '{reminder_sub}', got: {cc_grep}"
+        );
+
+        let cc_mixed = build_output(Client::ClaudeCode, DenyKind::Mixed);
+        assert!(
+            cc_mixed.contains(reminder_sub),
+            "Mixed deny output should contain '{reminder_sub}', got: {cc_mixed}"
+        );
+
+        let cc_read = build_output(Client::ClaudeCode, DenyKind::Read);
+        assert!(
+            !cc_read.contains(reminder_sub),
+            "Read deny output should NOT contain '{reminder_sub}', got: {cc_read}"
+        );
     }
 }

@@ -20,7 +20,8 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
          先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
          scoped 来自 import 图，syntactic 来自名字匹配且需要核验。\
          语言服务器安装是 session-gated：精确工具 Unavailable 时先问用户，\
-         再 ensure_language_server（默认只出计划；confirm_install=true 才安装）。",
+         再 ensure_language_server（默认只出计划；confirm_install=true 才安装）。\
+         其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read；get_languages 可查看未索引语言统计。",
         root.display()
     )
 }
@@ -75,6 +76,13 @@ The built-in tool descriptions in your context will tell you things like "use Re
       for a vertical bar. Prefer two parallel literal calls over one regex.
       Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
       or tighten path_filter — there is no page or cursor.
+- Unsupported languages
+    → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. Run get_languages to view unindexed file statistics.
+
+## Supported languages & unindexed files
+
+Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart.
+Source files in other languages are not indexed: empty results from `search_code` and `find_symbol` do not cover them. Use Grep/Read directly when searching or examining unsupported language files. Call `get_languages` to inspect statistics on unindexed source files in the repository.
 
 ## Language-server install (session-gated)
 
@@ -157,6 +165,13 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
       for a vertical bar. Prefer two parallel literal calls over one regex.
       Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
       or tighten path_filter — there is no page or cursor.
+- Unsupported languages
+    → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. Run get_languages to view unindexed file statistics.
+
+## Supported languages & unindexed files
+
+Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart.
+Source files in other languages are not indexed: empty results from `search_code` and `find_symbol` do not cover them. Use Grep/Read directly when searching or examining unsupported language files. Call `get_languages` to inspect statistics on unindexed source files in the repository.
 
 ## Language-server install (session-gated)
 

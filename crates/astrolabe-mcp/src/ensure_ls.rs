@@ -28,7 +28,7 @@ fn default_confirm() -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct EnsureLanguageServerParams {
     #[schemars(
-        description = "Language to ensure a server for (python/go/java/rust/typescript/tsx/javascript/c/cpp/objc/objcpp/swift/php/vue). Case-insensitive."
+        description = "Language to ensure a server for (python/go/java/rust/typescript/tsx/javascript/c/cpp/objc/objcpp/swift/php/vue/dart). Case-insensitive."
     )]
     pub language: String,
     /// When false (default): return an install plan only — never download.
@@ -59,7 +59,9 @@ pub(crate) fn run_ensure_language_server(
             return text_result(
                 format!(
                     "confidence: unknown\n{err}\n\
-                     Supported: python, go, java, rust, typescript, tsx, javascript,                      c, cpp, objc, objcpp, swift, php, vue.\n                     get_languages reports Ready / needs_install / AST-only per language.\n"
+                     Supported: python, go, java, rust, typescript, tsx, javascript, \
+                     c, cpp, objc, objcpp, swift, php, vue, dart.\n\
+                     get_languages reports Ready / needs_install / AST-only per language.\n"
                 ),
                 json!({
                     "confidence": "unknown",
@@ -281,6 +283,27 @@ mod tests {
         assert_eq!(
             result.structured_content.as_ref().unwrap()["status"],
             json!("stub_not_implemented")
+        );
+    }
+
+    #[test]
+    fn unsupported_language_returns_supported_list_with_dart() {
+        let installer = StubInstaller::new(Discovery::new(""));
+        let result = run_ensure_language_server(
+            EnsureLanguageServerParams {
+                language: "cobol".into(),
+                confirm_install: false,
+                version: None,
+                budget_tokens: 800,
+            },
+            &installer,
+        );
+        let text = first_text(&result);
+        assert!(text.contains("Supported:"));
+        assert!(text.contains("dart"));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["status"],
+            json!("unknown_language")
         );
     }
 }

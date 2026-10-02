@@ -52,6 +52,7 @@ pub const PROBED_LANGUAGES: &[Language] = &[
     Language::Swift,
     Language::Php,
     Language::Vue,
+    Language::Dart,
 ];
 
 /// Snapshot of PATH and override variables used for one probe.
@@ -244,6 +245,13 @@ const VUE: &[Candidate] = &[Candidate {
     bin: "vue-language-server",
     args: &["--stdio"],
     install: "npm i -g @vue/language-server",
+}];
+
+const DART: &[Candidate] = &[Candidate {
+    bin: "dart",
+    args: &["language-server"],
+    install:
+        "dart language-server ships with the Dart SDK (https://dart.dev/get-dart); a Flutter SDK also provides it",
 }];
 
 const JAVA_UNAVAILABLE: &str = "\
@@ -597,10 +605,14 @@ impl Discovery {
         }
         let cands = candidates(language);
         if cands.is_empty() {
+            let key = env_override_keys(language)
+                .first()
+                .copied()
+                .unwrap_or("ASTROLABE_LSP");
             return format!(
                 "AST-only: no language-server discovery candidates wired for {}.                  Or set {} to an executable when support lands.",
                 language.name(),
-                env_override_keys(language)[0]
+                key
             );
         }
         let bins: Vec<&str> = cands.iter().map(|c| c.bin).collect();
@@ -622,6 +634,9 @@ impl Discovery {
             }
             Language::ObjC | Language::ObjCpp => {
                 " Prefer sourcekit-lsp (RFC); clangd is a practical fallback for                   .m/.mm (Serena routes ObjC there). Pure .h headers remain                   Language::C unless content-aware ObjC header detection lands."
+            }
+            Language::Dart => {
+                " dart language-server 随 Dart SDK 自带；Flutter 工程安装 Flutter SDK 即可获得。"
             }
             _ => "",
         };
@@ -654,7 +669,7 @@ pub fn probe_report() -> Vec<ProbeResult> {
 
 /// Primary override variable for `language` (`ASTROLABE_LSP_PYTHON`, …).
 pub fn env_override_var(language: Language) -> &'static str {
-    env_override_keys(language)[0]
+    env_override_keys(language).first().copied().unwrap_or("")
 }
 
 fn candidates(language: Language) -> &'static [Candidate] {
@@ -669,6 +684,7 @@ fn candidates(language: Language) -> &'static [Candidate] {
         Language::Swift => APPLE_SWIFT,
         Language::ObjC | Language::ObjCpp => APPLE_OBJC,
         Language::Vue => VUE,
+        Language::Dart => DART,
     }
 }
 
@@ -688,6 +704,7 @@ fn env_override_keys(language: Language) -> &'static [&'static str] {
         Language::ObjCpp => &["ASTROLABE_LSP_OBJCPP", "ASTROLABE_LSP_SWIFT"],
         Language::Swift => &["ASTROLABE_LSP_SWIFT"],
         Language::Vue => &["ASTROLABE_LSP_VUE"],
+        Language::Dart => &["ASTROLABE_LSP_DART"],
     }
 }
 
@@ -707,6 +724,7 @@ fn override_keys_all() -> &'static [&'static str] {
         "ASTROLABE_LSP_OBJCPP",
         "ASTROLABE_LSP_SWIFT",
         "ASTROLABE_LSP_VUE",
+        "ASTROLABE_LSP_DART",
     ]
 }
 
@@ -725,6 +743,9 @@ pub fn catalog_install_spec(language: Language) -> Option<InstallSpec> {
         // Official clangd GitHub release (Serena pins 19.1.2). Only used when
         // AutoInstallMode::On — Prompt/Off never download.
         Language::C | Language::Cpp => clangd_install_spec(),
+        // Dart language-server ships with the Dart / Flutter SDK; no standalone
+        // download matrix exists. Prompt-only: manual install guidance.
+        Language::Dart => None,
         _ => None,
     }
 }
@@ -831,6 +852,7 @@ fn find_candidate_by_bin(bin: &str) -> Option<&'static Candidate> {
         .chain(APPLE_SWIFT)
         .chain(APPLE_OBJC)
         .chain(VUE)
+        .chain(DART)
         .find(|c| c.bin == bin)
 }
 
@@ -1057,6 +1079,10 @@ mod tests {
                 }
                 Language::Vue => {
                     assert!(result.install_hint.contains("@vue/language-server"))
+                }
+                Language::Dart => {
+                    assert!(result.install_hint.contains("Dart SDK"));
+                    assert!(result.install_hint.contains("dart language-server"));
                 }
             }
             assert!(
@@ -1410,6 +1436,7 @@ mod tests {
         assert_eq!(env_override_var(Language::ObjC), "ASTROLABE_LSP_OBJC");
         assert_eq!(env_override_var(Language::ObjCpp), "ASTROLABE_LSP_OBJCPP");
         assert_eq!(env_override_var(Language::Vue), "ASTROLABE_LSP_VUE");
+        assert_eq!(env_override_var(Language::Dart), "ASTROLABE_LSP_DART");
     }
 
     #[test]
@@ -1592,5 +1619,50 @@ mod tests {
             spec.command
         );
         assert!(spec.args.is_empty());
+    }
+
+    #[test]
+    fn finds_dart_language_server_on_path() {
+        let dir = scratch();
+        fake_bin(&dir.0, "dart");
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Dart)
+            .expect("dart on PATH");
+        assert!(
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("dart"),
+            "got {:?}",
+            spec.command
+        );
+        assert_eq!(spec.args, vec!["language-server"]);
+        assert_eq!(spec.language, Language::Dart);
+        assert!(spec.install_hint.contains("Dart SDK"));
+    }
+
+    #[test]
+    fn dart_discovery_without_binary_needs_install_with_guidance() {
+        let d = Discovery::new("");
+        let probed = d.probe(Language::Dart);
+        assert!(!probed.available());
+        assert!(probed.install_hint.contains("dart language-server"));
+        assert!(probed.install_hint.contains("Dart SDK"));
+        assert!(probed.install_hint.contains("ASTROLABE_LSP_DART"));
+        let needs = probed.needs_install.expect("structured hint");
+        assert_eq!(needs.hint.language, Language::Dart);
+    }
+
+    #[test]
+    fn dart_env_override_is_respected() {
+        let dir = scratch();
+        let dart = fake_bin(&dir.0, "dart");
+        let spec = Discovery::new("")
+            .with_env("ASTROLABE_LSP_DART", dart.to_string_lossy())
+            .discover(Language::Dart)
+            .unwrap();
+        assert_eq!(spec.command, dart);
+        assert_eq!(spec.args, vec!["language-server"]);
     }
 }

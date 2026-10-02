@@ -22,6 +22,11 @@
 //! | Java       | gson          | 971             | 0%        | 100%   |
 //! | Rust       | ripgrep       | 197             | 23%       | 100%   |
 //! | TypeScript | openvisio-oss | 211             | 100%      | 100%   |
+//! | Dart       | flutter-pkg   | 4067            | 0%        | 100%   |
+//!
+//! Note on Dart resolution: maps `pubspec.yaml` package names to `<pubspec_dir>/lib`,
+//! resolving `package:<name>/<rest>` and relative imports to in-repo files while
+//! correctly returning `None` for SDK (`dart:`) and third-party packages.
 //!
 //! Each resolver owns exactly one file in this directory and must not touch
 //! another. Shared behaviour belongs in [`crate::types`].
@@ -30,6 +35,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::types::{FileIndex, Language, ModuleResolver, ProjectMeta, RelPath};
 
+pub mod dart;
 pub mod go;
 pub mod java;
 pub mod python;
@@ -44,6 +50,7 @@ pub fn all() -> Vec<Box<dyn ModuleResolver>> {
         Box::new(java::JavaResolver),
         Box::new(rust::RustResolver),
         Box::new(typescript::TypeScriptResolver),
+        Box::new(dart::DartResolver),
     ]
 }
 
@@ -347,6 +354,7 @@ mod tests {
             Language::Java,
             Language::Rust,
             Language::TypeScript,
+            Language::Dart,
         ] {
             assert!(
                 set.meta_for(lang).is_some(),
