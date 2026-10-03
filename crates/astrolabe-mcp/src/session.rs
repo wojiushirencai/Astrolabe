@@ -188,12 +188,43 @@ fn bootstrap_root(session: Arc<RootSession>) {
     // Edits during IncrementalIndex::build must arrive as channel events, not
     // be absorbed into a post-build baseline; the reindex thread buffers them
     // until Ready and applies once.
+    //
+    // `start_watching` publishes the handle before the watch thread finishes
+    // its first `check`. Waiting here closes that gap: a file created after
+    // the handle exists but before the scan returns would otherwise be sealed
+    // into the baseline (no event) while `build_index` walks past it.
     if let Some(mode) = session.knobs.watch_mode {
         start_watching(&session, mode);
+        wait_for_watcher_baseline(&session);
     }
 
     let outcome = build_index(&session.root, persist, session.knobs.parse_cache_bytes);
     publish_ready(&session, outcome);
+}
+
+/// Block the cold build until the watcher thread has sealed its baseline.
+///
+/// No-op when watching is disabled. Gives up after 60s so a stuck watch
+/// thread cannot pin the server in `Building` forever.
+fn wait_for_watcher_baseline(session: &RootSession) {
+    let log = {
+        let guard = session.freshness.lock().expect("freshness lock poisoned");
+        guard.as_ref().map(Arc::clone)
+    };
+    let Some(log) = log else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !log.is_seeded() {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                root = %session.root.display(),
+                "watcher baseline was not ready before the cold build; edits during startup may be missed"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Watch the repository and incrementally rebuild the graph when files change.
