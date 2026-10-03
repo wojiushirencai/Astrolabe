@@ -209,6 +209,10 @@ pub struct FreshnessLog {
     /// [`STOP_SLICE`] and runs a full [`Watcher::check`] (which calls
     /// [`FreshnessLog::note_verified`]).
     verify_requested: AtomicBool,
+    /// First completed full [`Watcher::check`] (the spawn baseline). The
+    /// cold build must not start until this is set, or a file created in
+    /// the gap is absorbed into the baseline and never emitted.
+    seeded: AtomicBool,
 }
 
 struct FreshnessInner {
@@ -229,6 +233,7 @@ impl FreshnessLog {
                 suspects: Vec::new(),
             }),
             verify_requested: AtomicBool::new(false),
+            seeded: AtomicBool::new(false),
         }
     }
 
@@ -246,6 +251,14 @@ impl FreshnessLog {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FreshnessInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True after the first full [`Watcher::check`] has sealed the baseline.
+    ///
+    /// [`Watcher::spawn_with_log`] returns before that scan finishes. Callers
+    /// that must not race the baseline (the MCP cold build) wait on this.
+    pub fn is_seeded(&self) -> bool {
+        self.seeded.load(Ordering::SeqCst)
     }
 
     /// Instant of the last completed verification (full check or directed).
@@ -300,6 +313,7 @@ impl FreshnessLog {
         g.watermark = Instant::now();
         g.distrusted = false;
         g.suspects.clear();
+        self.seeded.store(true, Ordering::SeqCst);
     }
 
     fn bump_watermark(&self) {
@@ -2380,6 +2394,7 @@ mod tests {
     fn freshness_log_watermark_and_suspect_paths() {
         let log = FreshnessLog::new();
         let t0 = log.watermark();
+        assert!(!log.is_seeded());
         assert!(!log.distrusted());
         assert!(log.suspect_paths(t0).is_empty());
 
@@ -2401,6 +2416,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(2));
         log.note_verified();
+        assert!(log.is_seeded());
         assert!(!log.distrusted());
         assert!(log.watermark() > t0);
         assert!(log.suspect_paths(t0).is_empty());

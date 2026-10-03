@@ -3267,11 +3267,22 @@ mod tests {
         server.structured_output = false;
         server.start_indexing();
 
+        // The watch handle is published before the baseline scan finishes.
+        // Writing in that gap used to be sealed into the snapshot (no event)
+        // while the cold walk missed the file, so Ready never contained it.
+        // Wait until the baseline is sealed and the build is still running.
         let mut wrote = false;
-        for _ in 0..3000 {
-            let watching = server.primary.watch.lock().unwrap().is_some();
+        let write_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < write_deadline {
+            let seeded = server
+                .primary
+                .freshness
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|log| log.is_seeded());
             let building = matches!(*server.primary.state.read().unwrap(), IndexState::Building);
-            if watching && building {
+            if seeded && building {
                 std::fs::write(
                     dir.join("during.py"),
                     "def during_build_xyz():\n    return 1\n",
@@ -3287,17 +3298,29 @@ mod tests {
         }
         assert!(
             wrote,
-            "never observed Building+watching window; cold build was too fast"
+            "never observed Building after watcher baseline; cold build was too fast"
         );
         wait_ready(&server, Duration::from_secs(30));
-        let text = first_text(server.find_symbol(Parameters(QueryParams {
-            query: "during_build_xyz".into(),
-            include_body: false,
-            substring: false,
-            kind: None,
-            depth: 0,
-            budget_tokens: 500,
-        })));
+        // Notify delivery and the 500ms debounce can land the changeset just
+        // after the Ready publish. The edit must still show up (pending drain
+        // or the query barrier), not be dropped. Poll instead of asserting
+        // on the first query, which raced that handoff on CI.
+        let visible_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut text = String::new();
+        while std::time::Instant::now() < visible_deadline {
+            text = first_text(server.find_symbol(Parameters(QueryParams {
+                query: "during_build_xyz".into(),
+                include_body: false,
+                substring: false,
+                kind: None,
+                depth: 0,
+                budget_tokens: 500,
+            })));
+            if text.contains("during_build_xyz") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             text.contains("during_build_xyz"),
             "Ready graph must include the in-flight edit, got {text}"
