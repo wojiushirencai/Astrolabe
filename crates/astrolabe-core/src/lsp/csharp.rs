@@ -73,8 +73,9 @@ pub fn strip_roslyn_symbol_name(name: &str) -> &str {
     name
 }
 
-/// Prefer the shallowest `.sln` / `.slnx` (BFS), else `.csproj` files.
-/// Skips `bin`, `obj`, `.vs`, and hidden directories.
+/// Prefer the shallowest `.sln` / `.slnx` (BFS), else `.csproj` and `.vbproj`
+/// files. Skips `bin`, `obj`, `.vs`, and hidden directories. Visual Basic
+/// opens the same Roslyn server; there is no separate discovery env.
 pub fn find_csharp_workspace(root: &Path) -> Option<CsharpWorkspace> {
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
     queue.push_back(root.to_path_buf());
@@ -112,7 +113,7 @@ pub fn find_csharp_workspace(root: &Path) -> Option<CsharpWorkspace> {
             if lower.ends_with(".sln") || lower.ends_with(".slnx") {
                 return Some(CsharpWorkspace::Solution(path));
             }
-            if lower.ends_with(".csproj") {
+            if lower.ends_with(".csproj") || lower.ends_with(".vbproj") {
                 projects.push(path);
             }
         }
@@ -244,6 +245,38 @@ mod tests {
             Some(CsharpWorkspace::Projects(ps)) => {
                 assert_eq!(ps.len(), 1);
                 assert_eq!(ps[0].file_name().unwrap(), "App.csproj");
+            }
+            other => panic!("expected projects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_vbproj_when_no_solution() {
+        let dir = scratch();
+        fs::write(dir.0.join("App.vbproj"), "proj").unwrap();
+        match find_csharp_workspace(&dir.0) {
+            Some(CsharpWorkspace::Projects(ps)) => {
+                assert_eq!(ps.len(), 1);
+                assert_eq!(ps[0].file_name().unwrap(), "App.vbproj");
+            }
+            other => panic!("expected projects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collects_vbproj_alongside_csproj() {
+        let dir = scratch();
+        fs::create_dir_all(dir.0.join("src")).unwrap();
+        fs::write(dir.0.join("src").join("App.csproj"), "proj").unwrap();
+        fs::write(dir.0.join("src").join("Lib.vbproj"), "proj").unwrap();
+        match find_csharp_workspace(&dir.0) {
+            Some(CsharpWorkspace::Projects(ps)) => {
+                let names: Vec<String> = ps
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                assert!(names.iter().any(|n| n == "App.csproj"), "{names:?}");
+                assert!(names.iter().any(|n| n == "Lib.vbproj"), "{names:?}");
             }
             other => panic!("expected projects, got {other:?}"),
         }

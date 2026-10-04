@@ -263,6 +263,9 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::CSharp => {
             "Microsoft.CodeAnalysis.LanguageServer via `dotnet <dll> --stdio` (.NET 10 runtime; set ASTROLABE_LSP_CSHARP)"
         }
+        Language::VisualBasic => {
+            "Microsoft.CodeAnalysis.LanguageServer via `dotnet <dll> --stdio` (.NET 10 runtime; set ASTROLABE_LSP_CSHARP; same server as C#)"
+        }
     }
 }
 
@@ -280,7 +283,7 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Php => "intelephense",
         Language::Vue => "vue-language-server",
         Language::Dart => "dart language-server",
-        Language::CSharp => "Microsoft.CodeAnalysis.LanguageServer",
+        Language::CSharp | Language::VisualBasic => "Microsoft.CodeAnalysis.LanguageServer",
     }
 }
 

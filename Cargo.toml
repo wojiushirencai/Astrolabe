@@ -51,6 +51,9 @@ tree-sitter-php = "0.24"
 tree-sitter-dart = "0.2"
 # Modern LanguageFn mode, isomorphic to dart/php, verified under host tree-sitter 0.27.
 tree-sitter-c-sharp = "0.23.5"
+# LanguageFn mode, same host tree-sitter 0.27 contract as tree-sitter-c-sharp.
+# tree-sitter is a dev-dependency of the crate only (tree-sitter-language ^0.1).
+tree-sitter-vb-dotnet = "0.1.0"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 # astrolabe-mcp. Caret (not `=`) so patch releases still apply.

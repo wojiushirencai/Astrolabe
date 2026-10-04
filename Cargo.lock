@@ -104,6 +104,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "tree-sitter-vb-dotnet",
  "ureq",
  "zip",
 ]
@@ -2617,6 +2618,16 @@ name = "tree-sitter-typescript"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-vb-dotnet"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180e4a199378505f9305c3d01d6ece8a8d34035f310de1c727693f8a2296025e"
 dependencies = [
  "cc",
  "tree-sitter-language",

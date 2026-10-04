@@ -45,6 +45,7 @@ tree-sitter-javascript.workspace = true
 tree-sitter-php.workspace = true
 tree-sitter-dart.workspace = true
 tree-sitter-c-sharp.workspace = true
+tree-sitter-vb-dotnet.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true
 sha2.workspace = true

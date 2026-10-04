@@ -87,6 +87,8 @@ pub enum Language {
     Dart,
     /// C# (`.cs`).
     CSharp,
+    /// Visual Basic .NET (`.vb` only; not `.bas` / `.frm`).
+    VisualBasic,
 }
 
 impl Language {
@@ -109,6 +111,7 @@ impl Language {
             "vue" => Language::Vue,
             "dart" => Language::Dart,
             "cs" => Language::CSharp,
+            "vb" => Language::VisualBasic,
             _ => return None,
         })
     }
@@ -132,6 +135,7 @@ impl Language {
             "vue" => Some(Language::Vue),
             "dart" => Some(Language::Dart),
             "csharp" | "cs" | "c#" => Some(Language::CSharp),
+            "vb" | "visualbasic" | "visual-basic" => Some(Language::VisualBasic),
             _ => None,
         }
     }
@@ -154,6 +158,7 @@ impl Language {
             Language::Vue => "vue",
             Language::Dart => "dart",
             Language::CSharp => "csharp",
+            Language::VisualBasic => "vb",
         }
     }
 }
@@ -547,6 +552,22 @@ mod tests {
         assert_eq!(Language::from_name("cs"), Some(Language::CSharp));
         assert_eq!(Language::from_name("C#"), Some(Language::CSharp));
         assert_eq!(Language::CSharp.name(), "csharp");
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.vb")),
+            Some(Language::VisualBasic)
+        );
+        assert!(Language::from_path(&RelPath::new("a.bas")).is_none());
+        assert!(Language::from_path(&RelPath::new("a.frm")).is_none());
+        assert_eq!(Language::from_name("vb"), Some(Language::VisualBasic));
+        assert_eq!(
+            Language::from_name("visualbasic"),
+            Some(Language::VisualBasic)
+        );
+        assert_eq!(
+            Language::from_name("visual-basic"),
+            Some(Language::VisualBasic)
+        );
+        assert_eq!(Language::VisualBasic.name(), "vb");
     }
 
     #[test]
