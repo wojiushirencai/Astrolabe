@@ -156,7 +156,7 @@ pub(crate) const READ_SHELL_COMMANDS: &[&str] = &[
 /// 未支持语言统计词表见 astrolabe_core::index::KNOWN_CODE_EXTENSIONS。
 pub(crate) const SUPPORTED_CODE_EXTENSIONS: &[&str] = &[
     "py", "pyi", "go", "java", "rs", "ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx", "c",
-    "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp", "m", "mm", "swift", "php", "vue", "dart",
+    "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp", "m", "mm", "swift", "php", "vue", "dart", "cs",
 ];
 
 /// 触发 hook 的客户端类型

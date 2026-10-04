@@ -85,6 +85,8 @@ pub enum Language {
     Vue,
     /// Dart (.dart).
     Dart,
+    /// C# (.cs). Not .csx, Razor, or VB.
+    CSharp,
 }
 
 impl Language {
@@ -106,6 +108,7 @@ impl Language {
             "php" => Language::Php,
             "vue" => Language::Vue,
             "dart" => Language::Dart,
+            "cs" => Language::CSharp,
             _ => return None,
         })
     }
@@ -128,6 +131,7 @@ impl Language {
             "php" => Some(Language::Php),
             "vue" => Some(Language::Vue),
             "dart" => Some(Language::Dart),
+            "csharp" | "c#" | "cs" => Some(Language::CSharp),
             _ => None,
         }
     }
@@ -149,6 +153,7 @@ impl Language {
             Language::Php => "php",
             Language::Vue => "vue",
             Language::Dart => "dart",
+            Language::CSharp => "csharp",
         }
     }
 }

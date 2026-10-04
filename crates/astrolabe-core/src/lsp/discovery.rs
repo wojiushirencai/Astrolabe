@@ -53,6 +53,7 @@ pub const PROBED_LANGUAGES: &[Language] = &[
     Language::Php,
     Language::Vue,
     Language::Dart,
+    Language::CSharp,
 ];
 
 /// Snapshot of PATH and override variables used for one probe.
@@ -254,6 +255,15 @@ const DART: &[Candidate] = &[Candidate {
         "dart language-server ships with the Dart SDK (https://dart.dev/get-dart); a Flutter SDK also provides it",
 }];
 
+/// Roslyn LS is a DLL launched via `dotnet <dll> --stdio`. The "bin" is the
+/// DLL file name discovered on PATH (file presence, not +x). OmniSharp and
+/// community csharp-ls are intentionally not candidates.
+const CSHARP: &[Candidate] = &[Candidate {
+    bin: "Microsoft.CodeAnalysis.LanguageServer.dll",
+    args: &["--stdio"],
+    install: super::csharp::CSHARP_INSTALL_HINT,
+}];
+
 const JAVA_UNAVAILABLE: &str = "\
 jdtls not found on PATH. Eclipse JDT Language Server (eclipse.jdt.ls) is the \
 mainstream Java LSP, but it is not a single static binary.
@@ -351,6 +361,9 @@ impl Discovery {
     ///
     /// Ladder: env override → PATH → cache → (if On) install → Unavailable hint.
     pub fn probe(&self, language: Language) -> ProbeResult {
+        if language == Language::CSharp {
+            return self.probe_csharp();
+        }
         if let Some((key, value)) = self.override_value(language) {
             match self.resolve_override(&value) {
                 Some(command) => {
@@ -638,6 +651,9 @@ impl Discovery {
             Language::Dart => {
                 " dart language-server 随 Dart SDK 自带；Flutter 工程安装 Flutter SDK 即可获得。"
             }
+            Language::CSharp => {
+                " Roslyn Microsoft.CodeAnalysis.LanguageServer via `dotnet <dll> --stdio`; requires .NET 10 runtime to run the server (analyzed projects may target older frameworks). Not OmniSharp; not community csharp-ls."
+            }
             _ => "",
         };
         format!(
@@ -647,6 +663,121 @@ impl Discovery {
             env_override_keys(language)[0],
             extra
         )
+    }
+
+    /// C#: `ASTROLABE_LSP_CSHARP` (DLL or bare name) then a user-installed
+    /// `Microsoft.CodeAnalysis.LanguageServer.dll` on PATH. Launch is always
+    /// `dotnet <dll> --stdio`. No OmniSharp / csharp-ls / silent download.
+    fn probe_csharp(&self) -> ProbeResult {
+        let language = Language::CSharp;
+        if let Some((key, value)) = self.override_value(language) {
+            match self.resolve_csharp_dll(&value) {
+                Some(dll) => match self.require_dotnet_for_csharp(&dll) {
+                    Ok(spec) => {
+                        let install_hint = spec.install_hint.clone();
+                        return ProbeResult {
+                            language,
+                            spec: Some(spec),
+                            install_hint,
+                            needs_install: None,
+                        };
+                    }
+                    Err(hint) => return self.unavailable(language, hint),
+                },
+                None => {
+                    let hint = format!(
+                        "{key} is set to `{value}` but that Roslyn language-server DLL was not found. {}",
+                        self.missing_hint(language)
+                    );
+                    return self.unavailable(language, hint);
+                }
+            }
+        }
+
+        for candidate in candidates(language) {
+            if let Some(dll) = self.find_file_on_path(candidate.bin) {
+                match self.require_dotnet_for_csharp(&dll) {
+                    Ok(spec) => {
+                        let install_hint = spec.install_hint.clone();
+                        return ProbeResult {
+                            language,
+                            spec: Some(spec),
+                            install_hint,
+                            needs_install: None,
+                        };
+                    }
+                    Err(hint) => return self.unavailable(language, hint),
+                }
+            }
+        }
+
+        self.unavailable(language, self.missing_hint(language))
+    }
+
+    fn resolve_csharp_dll(&self, value: &str) -> Option<PathBuf> {
+        let path = Path::new(value);
+        if path.is_absolute() || path.components().count() > 1 {
+            let found = self.existing_file(path)?;
+            // Accept the official DLL name or any *.dll the user pointed at.
+            if found
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+            {
+                return Some(found);
+            }
+            return None;
+        }
+        // Bare name: search PATH for the DLL file (not requiring +x).
+        self.find_file_on_path(value)
+    }
+
+    fn require_dotnet_for_csharp(&self, dll: &Path) -> Result<ServerSpec, String> {
+        let Some(dotnet) = self.find_on_path("dotnet") else {
+            return Err(format!(
+                "found Roslyn DLL at {} but `dotnet` is not on PATH. {}",
+                dll.display(),
+                super::csharp::CSHARP_INSTALL_HINT
+            ));
+        };
+        Ok(csharp_spec(dotnet, dll.to_path_buf()))
+    }
+
+    /// PATH lookup that only requires a regular file (Roslyn DLL is not +x).
+    fn find_file_on_path(&self, name: &str) -> Option<PathBuf> {
+        for dir in &self.path_dirs {
+            let candidate = dir.join(name);
+            if let Some(found) = self.existing_file(&candidate) {
+                return Some(found);
+            }
+            if !self.windows {
+                continue;
+            }
+            // Case-insensitive filename match for Windows-shaped tests on Linux.
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let entry_name = entry.file_name();
+                if !entry_name
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(name)
+                {
+                    continue;
+                }
+                if let Some(found) = self.existing_file(&entry.path()) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    fn existing_file(&self, path: &Path) -> Option<PathBuf> {
+        let Ok(meta) = path.metadata() else {
+            return None;
+        };
+        meta.is_file().then(|| path.to_path_buf())
     }
 }
 
@@ -685,6 +816,7 @@ fn candidates(language: Language) -> &'static [Candidate] {
         Language::ObjC | Language::ObjCpp => APPLE_OBJC,
         Language::Vue => VUE,
         Language::Dart => DART,
+        Language::CSharp => CSHARP,
     }
 }
 
@@ -705,6 +837,7 @@ fn env_override_keys(language: Language) -> &'static [&'static str] {
         Language::Swift => &["ASTROLABE_LSP_SWIFT"],
         Language::Vue => &["ASTROLABE_LSP_VUE"],
         Language::Dart => &["ASTROLABE_LSP_DART"],
+        Language::CSharp => &["ASTROLABE_LSP_CSHARP"],
     }
 }
 
@@ -725,6 +858,7 @@ fn override_keys_all() -> &'static [&'static str] {
         "ASTROLABE_LSP_SWIFT",
         "ASTROLABE_LSP_VUE",
         "ASTROLABE_LSP_DART",
+        "ASTROLABE_LSP_CSHARP",
     ]
 }
 
@@ -746,6 +880,8 @@ pub fn catalog_install_spec(language: Language) -> Option<InstallSpec> {
         // Dart language-server ships with the Dart / Flutter SDK; no standalone
         // download matrix exists. Prompt-only: manual install guidance.
         Language::Dart => None,
+        // Roslyn LS is optional/external; never silent-download.
+        Language::CSharp => None,
         _ => None,
     }
 }
@@ -817,6 +953,15 @@ fn clangd_install_spec() -> Option<InstallSpec> {
     }
 }
 
+fn csharp_spec(dotnet: PathBuf, dll: PathBuf) -> ServerSpec {
+    ServerSpec {
+        language: Language::CSharp,
+        command: dotnet,
+        args: vec![dll.to_string_lossy().into_owned(), "--stdio".to_string()],
+        install_hint: super::csharp::CSHARP_INSTALL_HINT.to_string(),
+    }
+}
+
 fn spec_from_candidate(language: Language, command: PathBuf, candidate: &Candidate) -> ServerSpec {
     ServerSpec {
         language,
@@ -853,6 +998,7 @@ fn find_candidate_by_bin(bin: &str) -> Option<&'static Candidate> {
         .chain(APPLE_OBJC)
         .chain(VUE)
         .chain(DART)
+        .chain(CSHARP)
         .find(|c| c.bin == bin)
 }
 
@@ -1083,6 +1229,12 @@ mod tests {
                 Language::Dart => {
                     assert!(result.install_hint.contains("Dart SDK"));
                     assert!(result.install_hint.contains("dart language-server"));
+                }
+                Language::CSharp => {
+                    assert!(result.install_hint.contains("Microsoft.CodeAnalysis.LanguageServer"));
+                    assert!(result.install_hint.contains(".NET 10"));
+                    assert!(result.install_hint.contains("ASTROLABE_LSP_CSHARP"));
+                    assert!(result.install_hint.contains("dotnet"));
                 }
             }
             assert!(
@@ -1437,6 +1589,7 @@ mod tests {
         assert_eq!(env_override_var(Language::ObjCpp), "ASTROLABE_LSP_OBJCPP");
         assert_eq!(env_override_var(Language::Vue), "ASTROLABE_LSP_VUE");
         assert_eq!(env_override_var(Language::Dart), "ASTROLABE_LSP_DART");
+        assert_eq!(env_override_var(Language::CSharp), "ASTROLABE_LSP_CSHARP");
     }
 
     #[test]
@@ -1665,4 +1818,85 @@ mod tests {
         assert_eq!(spec.command, dart);
         assert_eq!(spec.args, vec!["language-server"]);
     }
+
+    #[test]
+    fn csharp_env_override_dll_launches_via_dotnet_stdio() {
+        let dir = scratch();
+        let dotnet = fake_bin(&dir.0, "dotnet");
+        let dll = dir.0.join("Microsoft.CodeAnalysis.LanguageServer.dll");
+        fs::write(&dll, b"fake-dll").unwrap();
+        let spec = discovery_with_dirs(&[&dir.0])
+            .with_env("ASTROLABE_LSP_CSHARP", dll.to_string_lossy())
+            .discover(Language::CSharp)
+            .expect("env dll + dotnet on PATH");
+        assert_eq!(spec.command, dotnet);
+        assert_eq!(
+            spec.args,
+            vec![dll.to_string_lossy().into_owned(), "--stdio".to_string()]
+        );
+        assert_eq!(spec.language, Language::CSharp);
+        assert!(spec.install_hint.contains(".NET 10"));
+    }
+
+    #[test]
+    fn csharp_finds_dll_candidate_on_path() {
+        let dir = scratch();
+        let dotnet = fake_bin(&dir.0, "dotnet");
+        let dll = dir.0.join("Microsoft.CodeAnalysis.LanguageServer.dll");
+        fs::write(&dll, b"fake-dll").unwrap();
+        let spec = discovery_with_dirs(&[&dir.0])
+            .discover(Language::CSharp)
+            .expect("dll + dotnet on PATH");
+        assert_eq!(spec.command, dotnet);
+        assert_eq!(spec.args[0], dll.to_string_lossy());
+        assert_eq!(spec.args[1], "--stdio");
+    }
+
+    #[test]
+    fn csharp_env_override_wins_over_path_dll() {
+        let path_dir = scratch();
+        let env_dir = scratch();
+        fake_bin(&path_dir.0, "dotnet");
+        fake_bin(&env_dir.0, "dotnet");
+        let path_dll = path_dir.0.join("Microsoft.CodeAnalysis.LanguageServer.dll");
+        let env_dll = env_dir.0.join("Microsoft.CodeAnalysis.LanguageServer.dll");
+        fs::write(&path_dll, b"path").unwrap();
+        fs::write(&env_dll, b"env").unwrap();
+        let spec = discovery_with_dirs(&[&path_dir.0, &env_dir.0])
+            .with_env("ASTROLABE_LSP_CSHARP", env_dll.to_string_lossy())
+            .discover(Language::CSharp)
+            .unwrap();
+        assert_eq!(spec.args[0], env_dll.to_string_lossy());
+    }
+
+    #[test]
+    fn csharp_without_dll_needs_install_mentions_net10() {
+        let d = Discovery::new("");
+        let probed = d.probe(Language::CSharp);
+        assert!(!probed.available());
+        assert!(probed.install_hint.contains("Microsoft.CodeAnalysis.LanguageServer"));
+        assert!(probed.install_hint.contains(".NET 10"));
+        assert!(probed.install_hint.contains("ASTROLABE_LSP_CSHARP"));
+        assert!(probed.install_hint.contains("dotnet"));
+        assert!(!probed.install_hint.to_ascii_lowercase().contains("omnisharp")
+            || probed.install_hint.contains("Not OmniSharp"));
+        let needs = probed.needs_install.expect("structured hint");
+        assert_eq!(needs.hint.language, Language::CSharp);
+    }
+
+    #[test]
+    fn csharp_dll_without_dotnet_is_unavailable() {
+        let dir = scratch();
+        let dll = dir.0.join("Microsoft.CodeAnalysis.LanguageServer.dll");
+        fs::write(&dll, b"fake-dll").unwrap();
+        // PATH has the dll but no dotnet.
+        let err = discovery_with_dirs(&[&dir.0])
+            .discover(Language::CSharp)
+            .unwrap_err();
+        let (lang, hint) = unavailable_hint(err);
+        assert_eq!(lang, Language::CSharp);
+        assert!(hint.contains("dotnet"), "{hint}");
+        assert!(hint.contains(".NET 10") || hint.contains("Microsoft.CodeAnalysis"), "{hint}");
+    }
+
 }

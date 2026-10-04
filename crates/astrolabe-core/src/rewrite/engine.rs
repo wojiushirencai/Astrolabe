@@ -352,7 +352,8 @@ fn ident_start(c: char, lang: Option<Language>) -> bool {
             | Language::JavaScript
             | Language::Php
             | Language::Vue
-            | Language::Dart,
+            | Language::Dart
+            | Language::CSharp,
         ) => c.is_alphabetic() || c == '_' || c == '$',
         Some(
             Language::Python
@@ -377,7 +378,8 @@ fn ident_continue(c: char, lang: Option<Language>) -> bool {
             | Language::JavaScript
             | Language::Php
             | Language::Vue
-            | Language::Dart,
+            | Language::Dart
+            | Language::CSharp,
         ) => c.is_alphanumeric() || c == '_' || c == '$',
         Some(
             Language::Python
@@ -839,6 +841,8 @@ fn keywords(lang: Language) -> &'static [&'static str] {
         Language::Swift => SWIFT_KEYWORDS,
         Language::Vue => JS_KEYWORDS,
         Language::Dart => DART_KEYWORDS,
+        // Parser-owned on another branch; empty until C# rewrite keywords land.
+        Language::CSharp => &[],
     }
 }
 
@@ -932,7 +936,7 @@ fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
     match lang {
         Some(Language::Python) => classify_python(source.as_bytes(), &mut kind),
         Some(Language::Go) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Go),
-        Some(Language::Java | Language::Php) => {
+        Some(Language::Java | Language::Php | Language::CSharp) => {
             classify_c_like(source.as_bytes(), &mut kind, Flavor::Java)
         }
         Some(Language::Rust) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Rust),
