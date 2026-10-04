@@ -197,6 +197,7 @@ fn import_adjacency(
     context_files: Option<&BTreeSet<FileId>>,
 ) -> Vec<Vec<(usize, f64)>> {
     let mut aggregated: BTreeMap<(usize, usize), u64> = BTreeMap::new();
+    // Namespace fan-out and name-matched calls are not real file references.
     for edge in g.edges.iter().filter(|edge| edge.kind == EdgeKind::Import) {
         let (from, to) = (FileId(edge.from), FileId(edge.to));
         let (Some(&from_i), Some(&to_i)) = (positions.get(&from), positions.get(&to)) else {
@@ -297,6 +298,7 @@ fn reachable_imports(g: &CodeGraph, target: FileId, reverse: bool) -> Vec<FileId
     }
 
     let mut adjacency: BTreeMap<FileId, BTreeSet<FileId>> = BTreeMap::new();
+    // Namespace fan-out and name-matched calls are not real file references.
     for edge in g.edges.iter().filter(|edge| edge.kind == EdgeKind::Import) {
         let (from, to) = (FileId(edge.from), FileId(edge.to));
         if !known.contains(&from) || !known.contains(&to) {
@@ -409,6 +411,44 @@ mod tests {
     fn pagerank_orders_a_three_node_chain() {
         let centrality = compute_centrality(&graph(vec![import(0, 1), import(1, 2)]));
         assert_eq!(ranked(&centrality), vec![FileId(2), FileId(1), FileId(0)]);
+    }
+
+    #[test]
+    fn pagerank_ignores_namespace_fanout_and_name_matched_calls() {
+        let imports_only = graph(vec![import(0, 1)]);
+        let mixed = graph(vec![
+            import(0, 1),
+            CodeEdge {
+                from: 0,
+                to: 2,
+                kind: EdgeKind::Namespace,
+                weight: 4,
+                confidence: Confidence::Scoped,
+            },
+            CodeEdge {
+                from: 1,
+                to: 0,
+                kind: EdgeKind::Call,
+                weight: 9,
+                confidence: Confidence::Syntactic,
+            },
+        ]);
+        assert_eq!(
+            compute_centrality(&imports_only),
+            compute_centrality(&mixed)
+        );
+        assert_eq!(
+            dependencies(&mixed, FileId(0)),
+            dependencies(&imports_only, FileId(0))
+        );
+        assert!(
+            !dependencies(&mixed, FileId(0)).contains(&FileId(2)),
+            "namespace edges are not file dependencies"
+        );
+        assert!(
+            dependents(&mixed, FileId(0)).is_empty(),
+            "a name-matched call into a file is not a dependent"
+        );
     }
 
     #[test]

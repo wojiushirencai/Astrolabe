@@ -41,8 +41,8 @@ use crate::resolvers::ResolverSet;
 use crate::scan::{self, ScanOptions, ScanResult};
 use crate::store::{self, Store};
 use crate::types::{
-    CodeEdge, CodeFile, CodeSymbol, Confidence, EdgeKind, FileId, FileIndex, Language, RelPath,
-    SymbolId,
+    CodeEdge, CodeFile, CodeSymbol, Confidence, EdgeKind, FileId, FileIndex, ImportResolution,
+    Language, RelPath, SymbolId,
 };
 use crate::watch::ChangeSet;
 use crate::IndexReport;
@@ -219,6 +219,8 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
         Language::Rust,
         Language::TypeScript,
         Language::Dart,
+        Language::CSharp,
+        Language::VisualBasic,
     ]
     .iter()
     .filter_map(|lang| resolvers.meta_for(*lang))
@@ -505,8 +507,8 @@ fn assemble_graph(
     for row in &parsed {
         let from = index_of[&row.path];
         for spec in &row.parsed.imports {
-            match resolvers.resolve(&row.path, spec, files) {
-                Some(target) => {
+            match resolvers.resolve_import(&row.path, spec, files) {
+                ImportResolution::File(target) => {
                     if let Some(&to) = index_of.get(&target) {
                         edges.push(CodeEdge {
                             from: from.0,
@@ -518,12 +520,48 @@ fn assemble_graph(
                         });
                     }
                 }
-                None => {
+                ImportResolution::Namespace { files: targets, .. } => {
+                    // Every declaring file, partials included. Not an Import:
+                    // PageRank stays on real file edges.
+                    for target in targets {
+                        if let Some(&to) = index_of.get(&target) {
+                            edges.push(CodeEdge {
+                                from: from.0,
+                                to: to.0,
+                                kind: EdgeKind::Namespace,
+                                weight: 1,
+                                confidence: Confidence::Scoped,
+                            });
+                        }
+                    }
+                }
+                ImportResolution::Unresolved => {
                     if looks_internal(spec) {
                         report
                             .unresolved_imports
                             .push((row.path.clone(), spec.clone()));
                     }
+                }
+            }
+        }
+    }
+
+    // ProjectReference is a file-level import even when no source file
+    // repeats it as a using. Endpoints that were not parsed are skipped;
+    // the relationship still lives on ProjectMeta::project_refs.
+    for (_lang, meta) in resolvers.iter_meta() {
+        for pref in &meta.project_refs {
+            let from_path = RelPath::new(&pref.from);
+            let to_path = RelPath::new(&pref.to);
+            if let (Some(&from), Some(&to)) = (index_of.get(&from_path), index_of.get(&to_path)) {
+                if from != to {
+                    edges.push(CodeEdge {
+                        from: from.0,
+                        to: to.0,
+                        kind: EdgeKind::Import,
+                        weight: 1,
+                        confidence: Confidence::Scoped,
+                    });
                 }
             }
         }
@@ -826,17 +864,17 @@ pub fn index_repo_incremental(
     }
 }
 
-/// Code file extensions across known programming languages (42 pure programming language extensions).
+/// Code file extensions across known programming languages (46 pure programming language extensions).
 ///
 /// 收窄说明：这是"未支持编程语言"的统计口径，纯编程语言源码扩展名；
 /// 数据/配置文件（json, jsonc, yaml, yml, toml, html, css, graphql, gql, sql, sh, bash, ps1, tf, tfvars, hcl 等）
 /// 不在此列，避免把数据/配置文件提示为"尚未支持的语言"从而稀释信号；
 /// Serena 58 项全集的 read-deny 用途与统计用途分离。
 pub const KNOWN_CODE_EXTENSIONS: &[&str] = &[
-    "al", "c", "clj", "cljs", "cpp", "cs", "dart", "elm", "ex", "exs", "fs", "fsx", "go", "groovy",
-    "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m", "matlab", "nf",
-    "php", "proto", "py", "r", "rb", "rs", "scala", "sol", "svelte", "swift", "ts", "tsx", "vue",
-    "zig",
+    "al", "c", "clj", "cljs", "cpp", "cs", "cshtml", "csx", "dart", "elm", "ex", "exs", "fs",
+    "fsx", "go", "groovy", "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua",
+    "m", "matlab", "nf", "php", "proto", "py", "r", "razor", "rb", "rs", "scala", "sol", "svelte",
+    "swift", "ts", "tsx", "vb", "vue", "zig",
 ];
 
 /// Count occurrences of unindexed code file extensions among admitted paths.
@@ -1701,5 +1739,23 @@ mod tests {
         assert_eq!(counts.get("kt"), Some(&1));
         assert_eq!(counts.get("scala"), Some(&1));
         assert_eq!(counts.get("xyz123"), None);
+    }
+
+    #[test]
+    fn csx_is_classified_not_unindexed() {
+        let admitted = vec![
+            RelPath::new("scripts/main.csx"),
+            RelPath::new("lib/bin/Hidden.csx"),
+        ];
+        let in_graph = |_p: &str| false;
+        let counts = unindexed_code_exts(&admitted, &in_graph, None);
+        assert!(
+            !counts.contains_key("csx"),
+            ".csx is C#, not an unsupported extension: {counts:?}"
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("scripts/main.csx")),
+            Some(Language::CSharp)
+        );
     }
 }

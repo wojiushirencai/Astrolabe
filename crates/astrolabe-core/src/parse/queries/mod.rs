@@ -85,6 +85,8 @@ pub fn for_language(lang: Language) -> Option<LanguageQueries> {
         Language::JavaScript => queries!("javascript"),
         Language::Php => queries!("php"),
         Language::Dart => queries!("dart"),
+        Language::CSharp => queries!("csharp"),
+        Language::VisualBasic => queries!("vb"),
         Language::C => queries!("c"),
         Language::Cpp => queries!("cpp"),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
@@ -117,7 +119,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
-    const ALL: [Language; 11] = [
+    const ALL: [Language; 13] = [
         Language::Python,
         Language::Go,
         Language::Java,
@@ -129,6 +131,8 @@ mod tests {
         Language::C,
         Language::Cpp,
         Language::Dart,
+        Language::CSharp,
+        Language::VisualBasic,
     ];
 
     fn grammar(lang: Language) -> tree_sitter::Language {
@@ -146,6 +150,8 @@ mod tests {
             Language::C => tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
             Language::Cpp => tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
             Language::Dart => tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
+            Language::CSharp => tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
+            Language::VisualBasic => tree_sitter::Language::new(tree_sitter_vb_dotnet::LANGUAGE),
             Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => {
                 panic!("{lang:?} grammar not registered in query tests yet")
             }
@@ -1668,5 +1674,203 @@ void topLevelFunction() {
         assert_eq!(imp_set, expected_imps);
         let clls = calls(Language::Dart, DART_SRC);
         assert!(clls.is_empty(), "Dart calls query should be empty");
+    }
+
+    // --------------------------------------------------------------- C#
+
+    const CSHARP_SRC: &str = r#"
+using System;
+using System.Collections.Generic;
+using static System.Math;
+using IO = System.IO;
+using global::System.Text;
+
+namespace App.Demo;
+
+public class Widget {
+    public Widget() {}
+    public int Count { get; set; }
+    public void Run() {
+        Console.WriteLine(Max(1, Count));
+        var created = new Widget();
+        Helper.Go();
+    }
+}
+
+public struct Point {}
+public interface IShape {}
+public enum Color { Red }
+public record Person(string Name);
+"#;
+
+    #[test]
+    fn csharp_symbols_cover_types_members_and_namespace() {
+        let got = symbols(Language::CSharp, CSHARP_SRC);
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(k, n, _)| (k.as_str(), n.as_str()))
+            .collect();
+        for need in [
+            ("module", "App.Demo"),
+            ("class", "Widget"),
+            ("method", "Widget"),
+            ("field", "Count"),
+            ("method", "Run"),
+            ("struct", "Point"),
+            ("interface", "IShape"),
+            ("enum", "Color"),
+            ("class", "Person"),
+        ] {
+            assert!(pairs.contains(&need), "missing {need:?} in {pairs:?}");
+        }
+    }
+
+    #[test]
+    fn csharp_imports_cover_using_static_and_alias() {
+        let imps = imports(Language::CSharp, CSHARP_SRC);
+        let set: BTreeSet<_> = imps.iter().map(|s| s.as_str()).collect();
+        for need in [
+            "System",
+            "System.Collections.Generic",
+            "System.Math",
+            "System.IO",
+            "global::System.Text",
+        ] {
+            assert!(set.contains(need), "missing import {need} in {set:?}");
+        }
+        let q = for_language(Language::CSharp).unwrap();
+        let rows = run(Language::CSharp, q.imports, "imports", CSHARP_SRC);
+        assert!(
+            rows.iter().any(|m| m.get("import.static").is_some()
+                && m.get("import").map(|c| c.text.as_str()) == Some("System.Math")),
+            "using static not flagged: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(
+                |m| m.get("import.alias").map(|c| c.text.as_str()) == Some("IO")
+                    && m.get("import").map(|c| c.text.as_str()) == Some("System.IO")
+            ),
+            "alias using not flagged: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn csharp_calls_cover_invocation_and_construction() {
+        let got = calls(Language::CSharp, CSHARP_SRC);
+        let names: BTreeSet<_> = got.iter().map(|s| s.as_str()).collect();
+        for need in ["WriteLine", "Max", "Widget", "Go"] {
+            assert!(names.contains(need), "missing call {need} in {names:?}");
+        }
+    }
+
+    const VB_SRC: &str = r#"Imports System.Text
+Namespace Acme.Lib
+    Public Class Widget
+        Public Sub Run()
+            Console.WriteLine("hi")
+        End Sub
+        Public Function Count() As Integer
+            Return Math.Max(1, 2)
+        End Function
+        Public Property Name As String
+    End Class
+    Public Module Helper
+        Public Function N() As Integer
+            Return 1
+        End Function
+    End Module
+    Public Structure Point
+    End Structure
+    Public Interface IFoo
+    End Interface
+    Public Enum Color
+        Red
+    End Enum
+End Namespace
+"#;
+
+    #[test]
+    fn vb_symbols_cover_types_methods_and_properties() {
+        assert_symbols(
+            Language::VisualBasic,
+            VB_SRC,
+            &[
+                ("module", "Acme.Lib"),
+                ("class", "Widget"),
+                ("method", "Run"),
+                ("method", "Count"),
+                ("field", "Name"),
+                ("module", "Helper"),
+                ("method", "N"),
+                ("struct", "Point"),
+                ("interface", "IFoo"),
+                ("enum", "Color"),
+            ],
+        );
+    }
+
+    #[test]
+    fn vb_imports_capture_each_namespace() {
+        let got = imports(Language::VisualBasic, "Imports System.Text, Acme.Lib\n");
+        assert_eq!(got, vec!["System.Text".to_string(), "Acme.Lib".to_string()]);
+    }
+
+    #[test]
+    fn vb_calls_cover_invocation_and_construction() {
+        let got = calls(Language::VisualBasic, VB_SRC);
+        let names: BTreeSet<_> = got.iter().map(|s| s.as_str()).collect();
+        for need in ["WriteLine", "Max"] {
+            assert!(names.contains(need), "missing call {need} in {names:?}");
+        }
+        let with_new = format!("{VB_SRC}\nClass Boot\n    Sub Main()\n        Dim w = New Widget()\n    End Sub\nEnd Class\n");
+        let got = calls(Language::VisualBasic, &with_new);
+        let names: BTreeSet<_> = got.iter().map(|s| s.as_str()).collect();
+        assert!(names.contains("Widget"), "missing New Widget in {names:?}");
+    }
+
+    /// Small `.csx` script: top-level statements plus a local function and a type.
+    /// Classified as C# (`Language::from_path`), extracted with the C# queries.
+    const CSX_SRC: &str = r#"
+using System;
+using Acme.Lib;
+
+Console.WriteLine("hi");
+
+void Greet(string name) {
+    Console.WriteLine(name);
+}
+
+public class ScriptBox {
+    public int Count { get; set; }
+    public void Run() {}
+}
+"#;
+
+    #[test]
+    fn csharp_csx_script_yields_symbols() {
+        assert_eq!(
+            Language::from_path(&crate::types::RelPath::new("scripts/main.csx")),
+            Some(Language::CSharp)
+        );
+        let got = symbols(Language::CSharp, CSX_SRC);
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(k, n, _)| (k.as_str(), n.as_str()))
+            .collect();
+        for need in [
+            ("function", "Greet"),
+            ("class", "ScriptBox"),
+            ("field", "Count"),
+            ("method", "Run"),
+        ] {
+            assert!(pairs.contains(&need), "missing {need:?} in {pairs:?}");
+        }
+        let imps = imports(Language::CSharp, CSX_SRC);
+        let set: BTreeSet<_> = imps.iter().map(|s| s.as_str()).collect();
+        assert!(set.contains("System"), "missing using System in {set:?}");
+        assert!(
+            set.contains("Acme.Lib"),
+            "missing using Acme.Lib in {set:?}"
+        );
     }
 }

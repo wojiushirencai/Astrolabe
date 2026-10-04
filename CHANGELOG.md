@@ -6,6 +6,21 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-05
+
+### Added
+
+- **C# (.cs), C# script (.csx), Razor and cshtml, and Visual Basic (.vb) syntactic graph.**
+  - C# (`.cs`) and C# script (`.csx`).
+  - Razor and cshtml: C# extracted from `@code` and `@using`. No Razor language server.
+  - Visual Basic (`.vb`).
+  - Optional Roslyn via `ASTROLABE_LSP_CSHARP` (`dotnet` plus `Microsoft.CodeAnalysis.LanguageServer.dll`, no auto-download).
+
+### Known Limitations
+
+- Official Roslyn packages do not ship Visual Basic assemblies, so VB go-to-definition was not verified.
+- No Windows test environment.
+
 ## [0.5.0] - 2026-10-03
 
 ### Added

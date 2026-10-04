@@ -343,6 +343,7 @@ fn edge_kind_to_u8(kind: EdgeKind) -> u8 {
         EdgeKind::Import => 0,
         EdgeKind::Call => 1,
         EdgeKind::Inherit => 2,
+        EdgeKind::Namespace => 3,
     }
 }
 
@@ -396,6 +397,8 @@ fn language_to_u8(language: Language) -> u8 {
         Language::Php => 12,
         Language::Vue => 13,
         Language::Dart => 14,
+        Language::CSharp => 15,
+        Language::VisualBasic => 16,
     }
 }
 
@@ -443,6 +446,8 @@ fn language_from_u8(language: u8) -> Option<Language> {
         12 => Language::Php,
         13 => Language::Vue,
         14 => Language::Dart,
+        15 => Language::CSharp,
+        16 => Language::VisualBasic,
         _ => return None,
     })
 }
@@ -559,6 +564,9 @@ impl From<EdgeWire> for CodeEdge {
                 0 => EdgeKind::Import,
                 1 => EdgeKind::Call,
                 2 => EdgeKind::Inherit,
+                3 => EdgeKind::Namespace,
+                // Unknown future tags stay Call so an older reader does not
+                // invent Import edges. Namespace is tag 3, append-only.
                 _ => EdgeKind::Call,
             },
             weight: edge.weight,
@@ -840,6 +848,8 @@ mod tests {
             Language::Php,
             Language::Vue,
             Language::Dart,
+            Language::CSharp,
+            Language::VisualBasic,
         ] {
             assert_eq!(language_from_u8(language_to_u8(lang)), Some(lang));
         }

@@ -27,11 +27,14 @@ use crate::types::{CodeSymbol, FileId, Language, RelPath, SymbolId, SymbolKind};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 pub mod queries;
+mod razor;
 mod vue;
+
+pub(crate) use razor::extract_razor_csharp;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SIGNATURE_CHARS: usize = 240;
-const LANGUAGES: [Language; 11] = [
+const LANGUAGES: [Language; 13] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -43,6 +46,8 @@ const LANGUAGES: [Language; 11] = [
     Language::C,
     Language::Cpp,
     Language::Dart,
+    Language::CSharp,
+    Language::VisualBasic,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +103,17 @@ impl ParserPool {
         if lang == Language::Vue {
             return vue::parse_sfc(self, path, source);
         }
+        // Razor / cshtml stay Language::CSharp (no extra parser-pool slot).
+        // Extract before the C# grammar; a `.cs` stand-in path avoids
+        // extracting twice. The caller still attributes symbols to `path`.
+        if lang == Language::CSharp && razor::is_razor_source(path.as_str()) {
+            let extracted = razor::extract_razor_csharp(source);
+            return self.parse(
+                Language::CSharp,
+                &RelPath::new("__astrolabe_razor_extract__.cs"),
+                &extracted,
+            );
+        }
         let index = language_index(lang).ok_or(ParseError::NoGrammar(lang))?;
         let mut slot = self.parsers[index]
             .lock()
@@ -146,7 +162,7 @@ impl ParserPool {
         let calls_query = Query::new(&grammar, query_sources.calls).map_err(query_error)?;
 
         let symbols = extract_symbols(lang, &symbols_query, tree.root_node(), source);
-        let imports = extract_imports(&imports_query, tree.root_node(), source);
+        let imports = extract_imports(lang, &imports_query, tree.root_node(), source);
         let calls = extract_calls(&calls_query, tree.root_node(), source);
 
         // `tree`, all Nodes, queries, and cursors are local and drop here.
@@ -178,6 +194,8 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::C => 8,
         Language::Cpp => 9,
         Language::Dart => 10,
+        Language::CSharp => 11,
+        Language::VisualBasic => 12,
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -195,6 +213,8 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::VisualBasic => tree_sitter_vb_dotnet::LANGUAGE.into(),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -261,13 +281,58 @@ fn extract_symbols(
     symbols
 }
 
-fn extract_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
-    extract_named_captures(query, root, source, |name| {
-        name == "import" || name == "source" || name == "module"
-    })
-    .into_iter()
-    .map(|(text, _)| unquote(text.trim()).to_owned())
-    .collect()
+fn extract_imports(
+    lang: Language,
+    query: &Query,
+    root: tree_sitter::Node<'_>,
+    source: &str,
+) -> Vec<String> {
+    // Other languages keep the raw specifier. C# must emit the forms
+    // `resolvers/csharp.rs` documents (`static:`, `alias:`, or a bare
+    // namespace name) or namespace usings and type usings collapse together.
+    if lang != Language::CSharp && lang != Language::VisualBasic {
+        return extract_named_captures(query, root, source, |name| {
+            name == "import" || name == "source" || name == "module"
+        })
+        .into_iter()
+        .map(|(text, _)| unquote(text.trim()).to_owned())
+        .collect();
+    }
+
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, root, source.as_bytes());
+    let mut output = Vec::new();
+    while let Some(query_match) = matches.next() {
+        let mut import_text: Option<String> = None;
+        let mut is_static = false;
+        let mut is_alias = false;
+        for capture in query_match.captures() {
+            let name = capture_names[capture.index as usize];
+            let Ok(text) = capture.node.utf8_text(source.as_bytes()) else {
+                continue;
+            };
+            match name {
+                "import" => import_text = Some(unquote(text.trim()).to_owned()),
+                "import.static" => is_static = true,
+                "import.alias" => is_alias = true,
+                _ => {}
+            }
+        }
+        let Some(text) = import_text else {
+            continue;
+        };
+        let text = text.strip_prefix("global::").unwrap_or(&text);
+        let spec = if is_static {
+            format!("static:{text}")
+        } else if is_alias {
+            format!("alias:{text}")
+        } else {
+            text.to_owned()
+        };
+        output.push(spec);
+    }
+    output
 }
 
 fn extract_calls(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<(String, u32)> {
@@ -335,7 +400,9 @@ fn is_exported(lang: Language, name: &str, node: tree_sitter::Node<'_>, source: 
         | Language::ObjC
         | Language::ObjCpp
         | Language::Swift
-        | Language::Vue => true,
+        | Language::Vue
+        | Language::CSharp
+        | Language::VisualBasic => true,
     }
 }
 
@@ -1196,7 +1263,9 @@ mod tests {
             | Language::ObjCpp
             | Language::Swift
             | Language::Vue
-            | Language::Dart => Vec::new(),
+            | Language::Dart
+            | Language::CSharp
+            | Language::VisualBasic => Vec::new(),
         }
     }
 
@@ -1421,7 +1490,7 @@ mod tests {
             let syms = extract_symbols(lang, &sym_query, root_node, &content);
             total_symbols += syms.len();
 
-            let imps = extract_imports(&imp_query, root_node, &content);
+            let imps = extract_imports(lang, &imp_query, root_node, &content);
             total_imports += imps.len();
         }
 

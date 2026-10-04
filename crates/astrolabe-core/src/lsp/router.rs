@@ -260,6 +260,12 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::Dart => {
             "dart language-server (ships with the Dart SDK; set ASTROLABE_LSP_DART to override path)"
         }
+        Language::CSharp => {
+            "Microsoft.CodeAnalysis.LanguageServer via `dotnet <dll> --stdio` (.NET 10 runtime; set ASTROLABE_LSP_CSHARP)"
+        }
+        Language::VisualBasic => {
+            "Microsoft.CodeAnalysis.LanguageServer via `dotnet <dll> --stdio` (.NET 10 runtime; set ASTROLABE_LSP_CSHARP; same server as C#)"
+        }
     }
 }
 
@@ -277,6 +283,7 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Php => "intelephense",
         Language::Vue => "vue-language-server",
         Language::Dart => "dart language-server",
+        Language::CSharp | Language::VisualBasic => "Microsoft.CodeAnalysis.LanguageServer",
     }
 }
 
@@ -675,7 +682,16 @@ fn name_matched_locations(graph: &CodeGraph, name: &str, op: LspOp) -> Vec<Locat
         return Vec::new();
     }
     let files: BTreeMap<FileId, &CodeFile> = graph.files.iter().map(|f| (f.id, f)).collect();
-    let named: Vec<&CodeSymbol> = graph.symbols.iter().filter(|s| s.name == name).collect();
+    let needle = crate::lsp::csharp::strip_roslyn_symbol_name(name);
+    let named: Vec<&CodeSymbol> = graph
+        .symbols
+        .iter()
+        .filter(|s| {
+            s.name == name
+                || s.name == needle
+                || crate::lsp::csharp::strip_roslyn_symbol_name(&s.name) == needle
+        })
+        .collect();
     let mut ids: BTreeSet<SymbolId> = named.iter().map(|s| s.id).collect();
     if matches!(op, LspOp::References) {
         for e in graph.edges.iter().filter(|e| e.kind == EdgeKind::Call) {

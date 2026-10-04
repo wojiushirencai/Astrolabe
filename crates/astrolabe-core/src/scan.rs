@@ -90,6 +90,12 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".serena",
     // Flutter / Dart toolchain artifacts. Fallback exclude for non-git trees.
     ".dart_tool",
+    // MSBuild / Visual Studio output. `bin` is intentionally not listed:
+    // Rust crates keep sources in `src/bin`. C# / VB project output `bin/`
+    // is excluded per project (`ProjectMeta::excludes`), never as a global
+    // path component.
+    "obj",
+    ".vs",
     // Own store (index.redb). Must not depend on gitignore: `ignore` skips
     // gitignore rules in non-git trees, so a store-written `.gitignore` of `*`
     // is not enough.

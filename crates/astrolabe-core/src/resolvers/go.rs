@@ -122,8 +122,7 @@ impl ModuleResolver for GoResolver {
         ProjectMeta {
             source_roots,
             modules,
-            excludes: Vec::new(),
-            overrides: Vec::new(),
+            ..Default::default()
         }
     }
 
