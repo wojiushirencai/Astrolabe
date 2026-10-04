@@ -27,7 +27,10 @@ use crate::types::{CodeSymbol, FileId, Language, RelPath, SymbolId, SymbolKind};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 pub mod queries;
+mod razor;
 mod vue;
+
+pub(crate) use razor::extract_razor_csharp;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SIGNATURE_CHARS: usize = 240;
@@ -99,6 +102,17 @@ impl ParserPool {
         // Vue SFCs: embedded <script> extraction (no tree-sitter-vue on ABI 0.27).
         if lang == Language::Vue {
             return vue::parse_sfc(self, path, source);
+        }
+        // Razor / cshtml stay Language::CSharp (no extra parser-pool slot).
+        // Extract before the C# grammar; a `.cs` stand-in path avoids
+        // extracting twice. The caller still attributes symbols to `path`.
+        if lang == Language::CSharp && razor::is_razor_source(path.as_str()) {
+            let extracted = razor::extract_razor_csharp(source);
+            return self.parse(
+                Language::CSharp,
+                &RelPath::new("__astrolabe_razor_extract__.cs"),
+                &extracted,
+            );
         }
         let index = language_index(lang).ok_or(ParseError::NoGrammar(lang))?;
         let mut slot = self.parsers[index]

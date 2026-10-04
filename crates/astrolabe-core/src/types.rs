@@ -85,7 +85,8 @@ pub enum Language {
     Vue,
     /// Dart (.dart).
     Dart,
-    /// C# (`.cs`, `.csx`). Same variant and storage tag as `.cs`.
+    /// C# (`.cs`, `.csx`, `.razor`, `.cshtml`). Same variant and storage tag.
+    /// `.razor` / `.cshtml` are extracted to C# before tree-sitter. Not a Razor language.
     CSharp,
     /// Visual Basic .NET (`.vb` only; not `.bas` / `.frm`).
     VisualBasic,
@@ -110,7 +111,9 @@ impl Language {
             "php" => Language::Php,
             "vue" => Language::Vue,
             "dart" => Language::Dart,
-            "cs" | "csx" => Language::CSharp,
+            // `.razor` / `.cshtml` are not a language tag. C# is extracted
+            // before tree-sitter. `.csx` uses the C# grammar as-is.
+            "cs" | "csx" | "razor" | "cshtml" => Language::CSharp,
             "vb" => Language::VisualBasic,
             _ => return None,
         })
@@ -553,6 +556,14 @@ mod tests {
         );
         assert_eq!(
             Language::from_path(&RelPath::new("scripts/main.csx")),
+            Some(Language::CSharp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.razor")),
+            Some(Language::CSharp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("Pages/_ViewImports.cshtml")),
             Some(Language::CSharp)
         );
         assert_eq!(Language::from_name("csharp"), Some(Language::CSharp));

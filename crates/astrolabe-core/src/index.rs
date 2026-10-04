@@ -864,17 +864,17 @@ pub fn index_repo_incremental(
     }
 }
 
-/// Code file extensions across known programming languages (44 pure programming language extensions).
+/// Code file extensions across known programming languages (46 pure programming language extensions).
 ///
 /// 收窄说明：这是"未支持编程语言"的统计口径，纯编程语言源码扩展名；
 /// 数据/配置文件（json, jsonc, yaml, yml, toml, html, css, graphql, gql, sql, sh, bash, ps1, tf, tfvars, hcl 等）
 /// 不在此列，避免把数据/配置文件提示为"尚未支持的语言"从而稀释信号；
 /// Serena 58 项全集的 read-deny 用途与统计用途分离。
 pub const KNOWN_CODE_EXTENSIONS: &[&str] = &[
-    "al", "c", "clj", "cljs", "cpp", "cs", "csx", "dart", "elm", "ex", "exs", "fs", "fsx", "go",
-    "groovy", "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m",
-    "matlab", "nf", "php", "proto", "py", "r", "rb", "rs", "scala", "sol", "svelte", "swift", "ts",
-    "tsx", "vb", "vue", "zig",
+    "al", "c", "clj", "cljs", "cpp", "cs", "cshtml", "csx", "dart", "elm", "ex", "exs", "fs", "fsx",
+    "go", "groovy", "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m",
+    "matlab", "nf", "php", "proto", "py", "r", "razor", "rb", "rs", "scala", "sol", "svelte",
+    "swift", "ts", "tsx", "vb", "vue", "zig",
 ];
 
 /// Count occurrences of unindexed code file extensions among admitted paths.

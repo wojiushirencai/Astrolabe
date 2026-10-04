@@ -5,7 +5,13 @@
 //! (MSBuild `GetPathOfFileAbove` — one file, the closest one). The csproj
 //! overrides the props. SDK defaults fill whatever is still empty:
 //! `RootNamespace` is the project file name, and `Microsoft.NET.Sdk*` turns
-//! on default compile items (`.cs` and `.csx` under the project).
+//! on default compile items (`.cs` and `.csx` under the project). In-repo
+//! `.razor` and `.cshtml` are included in that set as well, but only after
+//! [`crate::parse::extract_razor_csharp`] pulls C# out of them. Raw markup is
+//! never scanned. That is what lets a namespace declared in `@code` satisfy a
+//! `_ViewImports.cshtml` `@using`. `System` / `System.*` and names no file
+//! declares (NuGet) still resolve to nothing. This is Astrolabe's index set,
+//! not an MSBuild `Compile` item.
 //!
 //! # Import specs
 //!
@@ -192,6 +198,7 @@ impl ModuleResolver for CSharpResolver {
                 let Some(text) = files.read(&path) else {
                     continue;
                 };
+                let text = declarations_source(&path, text);
                 let (namespaces, types) = extract_declarations(&text);
                 for ns in namespaces {
                     if framework_namespace(&ns) {
@@ -950,14 +957,28 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn is_csproj(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".csproj")
+/// `.cs` and `.csx` share `Language::CSharp` and are compile items, so a
+/// `using` inside a script can become a namespace edge. `.razor` / `.cshtml`
+/// are the same language after [`declarations_source`] extracts C#.
+fn is_csharp_source(path: &str) -> bool {
+    matches!(
+        RelPath::new(path).extension(),
+        Some("cs" | "csx" | "razor" | "cshtml")
+    )
 }
 
-/// `.cs` and `.csx` share `Language::CSharp`. Script files are compile items
-/// so a `using` inside a script can become a namespace edge.
-fn is_csharp_source(path: &str) -> bool {
-    matches!(RelPath::new(path).extension(), Some("cs") | Some("csx"))
+/// `.razor` / `.cshtml` contribute the extracted C# only. `.cs` and `.csx`
+/// are unchanged.
+fn declarations_source(path: &str, text: String) -> String {
+    if matches!(RelPath::new(path).extension(), Some("razor" | "cshtml")) {
+        crate::parse::extract_razor_csharp(&text)
+    } else {
+        text
+    }
+}
+
+fn is_csproj(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".csproj")
 }
 
 fn csproj_name(path: &str) -> String {

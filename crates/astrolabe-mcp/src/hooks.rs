@@ -157,7 +157,7 @@ pub(crate) const READ_SHELL_COMMANDS: &[&str] = &[
 pub(crate) const SUPPORTED_CODE_EXTENSIONS: &[&str] = &[
     "py", "pyi", "go", "java", "rs", "ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx", "c",
     "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp", "m", "mm", "swift", "php", "vue", "dart",
-    "cs", "csx", "vb",
+    "cs", "cshtml", "csx", "razor", "vb",
 ];
 
 /// 触发 hook 的客户端类型
