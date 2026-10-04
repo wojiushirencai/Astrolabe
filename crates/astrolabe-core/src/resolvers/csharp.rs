@@ -5,7 +5,7 @@
 //! (MSBuild `GetPathOfFileAbove` — one file, the closest one). The csproj
 //! overrides the props. SDK defaults fill whatever is still empty:
 //! `RootNamespace` is the project file name, and `Microsoft.NET.Sdk*` turns
-//! on default compile items (`**/*.cs`).
+//! on default compile items (`.cs` and `.csx` under the project).
 //!
 //! # Import specs
 //!
@@ -464,7 +464,7 @@ fn compile_files(files: &FileIndex, prep: &Prepared, projects: &[(String, String
     let dir = &prep.facts.directory;
     if prep.facts.default_compile_items {
         for path in files.iter() {
-            if path.extension() != Some("cs") {
+            if !is_csharp_source(path.as_str()) {
                 continue;
             }
             let path = path.as_str();
@@ -513,14 +513,14 @@ fn add_include(
     let pattern = pattern.replace('\\', "/");
     if !pattern.contains('*') {
         if let Some(full) = normalize_include(dir, &pattern) {
-            if files.contains(&full) && full.ends_with(".cs") && !skipped_tree(&full) {
+            if files.contains(&full) && is_csharp_source(&full) && !skipped_tree(&full) {
                 out.insert(full);
             }
         }
         return;
     }
     for path in files.iter() {
-        if path.extension() != Some("cs") {
+        if !is_csharp_source(path.as_str()) {
             continue;
         }
         let path = path.as_str();
@@ -952,6 +952,12 @@ fn parse_bool(value: &str) -> Option<bool> {
 
 fn is_csproj(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".csproj")
+}
+
+/// `.cs` and `.csx` share `Language::CSharp`. Script files are compile items
+/// so a `using` inside a script can become a namespace edge.
+fn is_csharp_source(path: &str) -> bool {
+    matches!(RelPath::new(path).extension(), Some("cs") | Some("csx"))
 }
 
 fn csproj_name(path: &str) -> String {
@@ -1634,5 +1640,123 @@ mod tests {
         let usings = &meta.projects[0].implicit_usings;
         assert!(usings.iter().any(|u| u == "System.Linq"));
         assert!(usings.iter().any(|u| u == "Microsoft.AspNetCore.Builder"));
+    }
+
+    #[test]
+    fn csx_default_compile_using_becomes_namespace_edge() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "app/App.csproj",
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Acme.App</RootNamespace>
+  </PropertyGroup>
+</Project>"#,
+        );
+        write(
+            root,
+            "app/Script.csx",
+            "namespace Acme.Scripts;\npublic class Box {}\n",
+        );
+        write(
+            root,
+            "app/Program.cs",
+            "namespace Acme.App;\nusing Acme.Scripts;\nclass Program { static void Main() {} }\n",
+        );
+        write(
+            root,
+            "app/bin/Skip.csx",
+            "namespace Acme.Scripts;\npublic class Hidden {}\n",
+        );
+        write(
+            root,
+            "app/obj/Skip.csx",
+            "namespace Acme.Scripts;\npublic class HiddenObj {}\n",
+        );
+        write(
+            root,
+            "app/.vs/Skip.csx",
+            "namespace Acme.Scripts;\npublic class HiddenVs {}\n",
+        );
+        let files = FileIndex::new(
+            root,
+            [
+                "app/App.csproj",
+                "app/Script.csx",
+                "app/Program.cs",
+                "app/bin/Skip.csx",
+                "app/obj/Skip.csx",
+                "app/.vs/Skip.csx",
+            ]
+            .map(RelPath::new),
+        );
+        let meta = CSharpResolver.detect(&files);
+        let ns = meta
+            .namespaces
+            .iter()
+            .find(|n| n.namespace == "Acme.Scripts")
+            .unwrap();
+        assert_eq!(ns.files, vec!["app/Script.csx".to_string()]);
+        let from = RelPath::new("app/Program.cs");
+        match CSharpResolver.resolve_import(&from, "using Acme.Scripts;", &files, &meta) {
+            ImportResolution::Namespace { files, .. } => {
+                assert_eq!(files, vec![RelPath::new("app/Script.csx")]);
+            }
+            other => panic!("script using should be a namespace edge: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_csx_compile_include_is_a_namespace_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "only/Only.csproj",
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Extra.csx" />
+    <Compile Include="glob/*.csx" />
+  </ItemGroup>
+</Project>"#,
+        );
+        write(root, "only/Extra.csx", "namespace N;\nclass Scripted {}\n");
+        write(root, "only/Other.csx", "namespace N;\nclass Skipped {}\n");
+        write(
+            root,
+            "only/glob/Also.csx",
+            "namespace N;\nclass Globbed {}\n",
+        );
+        write(
+            root,
+            "only/glob/Skip.cs",
+            "namespace Other;\nclass NotGlob {}\n",
+        );
+        let files = FileIndex::new(
+            root,
+            [
+                "only/Only.csproj",
+                "only/Extra.csx",
+                "only/Other.csx",
+                "only/glob/Also.csx",
+                "only/glob/Skip.cs",
+            ]
+            .map(RelPath::new),
+        );
+        let meta = CSharpResolver.detect(&files);
+        let ns = meta.namespaces.iter().find(|n| n.namespace == "N").unwrap();
+        assert_eq!(
+            ns.files,
+            vec![
+                "only/Extra.csx".to_string(),
+                "only/glob/Also.csx".to_string(),
+            ]
+        );
     }
 }

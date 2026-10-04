@@ -863,17 +863,17 @@ pub fn index_repo_incremental(
     }
 }
 
-/// Code file extensions across known programming languages (42 pure programming language extensions).
+/// Code file extensions across known programming languages (43 pure programming language extensions).
 ///
 /// 收窄说明：这是"未支持编程语言"的统计口径，纯编程语言源码扩展名；
 /// 数据/配置文件（json, jsonc, yaml, yml, toml, html, css, graphql, gql, sql, sh, bash, ps1, tf, tfvars, hcl 等）
 /// 不在此列，避免把数据/配置文件提示为"尚未支持的语言"从而稀释信号；
 /// Serena 58 项全集的 read-deny 用途与统计用途分离。
 pub const KNOWN_CODE_EXTENSIONS: &[&str] = &[
-    "al", "c", "clj", "cljs", "cpp", "cs", "dart", "elm", "ex", "exs", "fs", "fsx", "go", "groovy",
-    "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m", "matlab", "nf",
-    "php", "proto", "py", "r", "rb", "rs", "scala", "sol", "svelte", "swift", "ts", "tsx", "vue",
-    "zig",
+    "al", "c", "clj", "cljs", "cpp", "cs", "csx", "dart", "elm", "ex", "exs", "fs", "fsx", "go",
+    "groovy", "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m",
+    "matlab", "nf", "php", "proto", "py", "r", "rb", "rs", "scala", "sol", "svelte", "swift", "ts",
+    "tsx", "vue", "zig",
 ];
 
 /// Count occurrences of unindexed code file extensions among admitted paths.
@@ -1738,5 +1738,23 @@ mod tests {
         assert_eq!(counts.get("kt"), Some(&1));
         assert_eq!(counts.get("scala"), Some(&1));
         assert_eq!(counts.get("xyz123"), None);
+    }
+
+    #[test]
+    fn csx_is_classified_not_unindexed() {
+        let admitted = vec![
+            RelPath::new("scripts/main.csx"),
+            RelPath::new("lib/bin/Hidden.csx"),
+        ];
+        let in_graph = |_p: &str| false;
+        let counts = unindexed_code_exts(&admitted, &in_graph, None);
+        assert!(
+            counts.get("csx").is_none(),
+            ".csx is C#, not an unsupported extension: {counts:?}"
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("scripts/main.csx")),
+            Some(Language::CSharp)
+        );
     }
 }
