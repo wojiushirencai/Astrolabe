@@ -35,3 +35,11 @@
 
 (file_scoped_namespace_declaration
   name: (_) @name) @definition.module
+
+;; Top-level local functions (C# scripts and file-level statements).
+;; The grammar already has `local_function_statement` under `global_statement`.
+;; Nested local functions inside methods are not matched.
+(compilation_unit
+  (global_statement
+    (local_function_statement
+      name: (identifier) @name) @definition.function))

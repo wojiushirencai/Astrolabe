@@ -157,7 +157,7 @@ pub(crate) const READ_SHELL_COMMANDS: &[&str] = &[
 pub(crate) const SUPPORTED_CODE_EXTENSIONS: &[&str] = &[
     "py", "pyi", "go", "java", "rs", "ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx", "c",
     "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp", "m", "mm", "swift", "php", "vue", "dart",
-    "cs", "vb",
+    "cs", "csx", "vb",
 ];
 
 /// 触发 hook 的客户端类型
@@ -2741,6 +2741,7 @@ mod tests {
         assert!(is_code_file_path("a.dart"));
         assert!(is_code_file_path("a.py"));
         assert!(is_code_file_path("a.rs"));
+        assert!(is_code_file_path("scripts/main.csx"));
 
         // 带引号的路径 trim 逻辑仍正常工作
         assert!(is_code_file_path("'a.py'"));

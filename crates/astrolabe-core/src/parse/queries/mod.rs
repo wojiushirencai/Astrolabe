@@ -1827,4 +1827,50 @@ End Namespace
         let names: BTreeSet<_> = got.iter().map(|s| s.as_str()).collect();
         assert!(names.contains("Widget"), "missing New Widget in {names:?}");
     }
+
+    /// Small `.csx` script: top-level statements plus a local function and a type.
+    /// Classified as C# (`Language::from_path`), extracted with the C# queries.
+    const CSX_SRC: &str = r#"
+using System;
+using Acme.Lib;
+
+Console.WriteLine("hi");
+
+void Greet(string name) {
+    Console.WriteLine(name);
+}
+
+public class ScriptBox {
+    public int Count { get; set; }
+    public void Run() {}
+}
+"#;
+
+    #[test]
+    fn csharp_csx_script_yields_symbols() {
+        assert_eq!(
+            Language::from_path(&crate::types::RelPath::new("scripts/main.csx")),
+            Some(Language::CSharp)
+        );
+        let got = symbols(Language::CSharp, CSX_SRC);
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(k, n, _)| (k.as_str(), n.as_str()))
+            .collect();
+        for need in [
+            ("function", "Greet"),
+            ("class", "ScriptBox"),
+            ("field", "Count"),
+            ("method", "Run"),
+        ] {
+            assert!(pairs.contains(&need), "missing {need:?} in {pairs:?}");
+        }
+        let imps = imports(Language::CSharp, CSX_SRC);
+        let set: BTreeSet<_> = imps.iter().map(|s| s.as_str()).collect();
+        assert!(set.contains("System"), "missing using System in {set:?}");
+        assert!(
+            set.contains("Acme.Lib"),
+            "missing using Acme.Lib in {set:?}"
+        );
+    }
 }

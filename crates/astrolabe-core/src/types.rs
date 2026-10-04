@@ -85,7 +85,7 @@ pub enum Language {
     Vue,
     /// Dart (.dart).
     Dart,
-    /// C# (`.cs`).
+    /// C# (`.cs`, `.csx`). Same variant and storage tag as `.cs`.
     CSharp,
     /// Visual Basic .NET (`.vb` only; not `.bas` / `.frm`).
     VisualBasic,
@@ -110,7 +110,7 @@ impl Language {
             "php" => Language::Php,
             "vue" => Language::Vue,
             "dart" => Language::Dart,
-            "cs" => Language::CSharp,
+            "cs" | "csx" => Language::CSharp,
             "vb" => Language::VisualBasic,
             _ => return None,
         })
@@ -547,7 +547,14 @@ mod tests {
             Language::from_path(&RelPath::new("a.cs")),
             Some(Language::CSharp)
         );
-        assert!(Language::from_path(&RelPath::new("a.csx")).is_none());
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.csx")),
+            Some(Language::CSharp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("scripts/main.csx")),
+            Some(Language::CSharp)
+        );
         assert_eq!(Language::from_name("csharp"), Some(Language::CSharp));
         assert_eq!(Language::from_name("cs"), Some(Language::CSharp));
         assert_eq!(Language::from_name("C#"), Some(Language::CSharp));
