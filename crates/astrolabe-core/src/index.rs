@@ -871,9 +871,9 @@ pub fn index_repo_incremental(
 /// 不在此列，避免把数据/配置文件提示为"尚未支持的语言"从而稀释信号；
 /// Serena 58 项全集的 read-deny 用途与统计用途分离。
 pub const KNOWN_CODE_EXTENSIONS: &[&str] = &[
-    "al", "c", "clj", "cljs", "cpp", "cs", "cshtml", "csx", "dart", "elm", "ex", "exs", "fs", "fsx",
-    "go", "groovy", "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m",
-    "matlab", "nf", "php", "proto", "py", "r", "razor", "rb", "rs", "scala", "sol", "svelte",
+    "al", "c", "clj", "cljs", "cpp", "cs", "cshtml", "csx", "dart", "elm", "ex", "exs", "fs",
+    "fsx", "go", "groovy", "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua",
+    "m", "matlab", "nf", "php", "proto", "py", "r", "razor", "rb", "rs", "scala", "sol", "svelte",
     "swift", "ts", "tsx", "vb", "vue", "zig",
 ];
 
@@ -1750,7 +1750,7 @@ mod tests {
         let in_graph = |_p: &str| false;
         let counts = unindexed_code_exts(&admitted, &in_graph, None);
         assert!(
-            counts.get("csx").is_none(),
+            !counts.contains_key("csx"),
             ".csx is C#, not an unsupported extension: {counts:?}"
         );
         assert_eq!(

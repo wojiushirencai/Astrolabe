@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use crate::types::{Confidence, Language, RelPath};
 
-pub mod diagnostics;
 pub mod csharp;
+pub mod diagnostics;
 pub mod discovery;
 pub mod install;
 pub mod installer;

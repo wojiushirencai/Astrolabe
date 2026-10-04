@@ -667,10 +667,7 @@ fn apply_xml(xml: &str, props: &mut BuildProps) {
                     if include.is_empty() {
                         continue;
                     }
-                    let is_static = tag
-                        .attr("Static")
-                        .and_then(|v| parse_bool(v))
-                        .unwrap_or(false);
+                    let is_static = tag.attr("Static").and_then(parse_bool).unwrap_or(false);
                     if is_static {
                         props.global_static_usings.push(include);
                     } else {
@@ -983,7 +980,7 @@ fn is_csproj(name: &str) -> bool {
 
 fn csproj_name(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
-    name.trim_end_matches(|c: char| c == ' ')
+    name.trim_end_matches(' ')
         .rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(name)
