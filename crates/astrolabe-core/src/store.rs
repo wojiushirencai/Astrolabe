@@ -343,6 +343,7 @@ fn edge_kind_to_u8(kind: EdgeKind) -> u8 {
         EdgeKind::Import => 0,
         EdgeKind::Call => 1,
         EdgeKind::Inherit => 2,
+        EdgeKind::Namespace => 3,
     }
 }
 
@@ -561,6 +562,9 @@ impl From<EdgeWire> for CodeEdge {
                 0 => EdgeKind::Import,
                 1 => EdgeKind::Call,
                 2 => EdgeKind::Inherit,
+                3 => EdgeKind::Namespace,
+                // Unknown future tags stay Call so an older reader does not
+                // invent Import edges. Namespace is tag 3, append-only.
                 _ => EdgeKind::Call,
             },
             weight: edge.weight,

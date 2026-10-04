@@ -294,6 +294,7 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 | **PHP** | `.php` | `intelephense` / `phpactor` | `ASTROLABE_LSP_PHP` | `npm i -g intelephense`；支持 include/require 路径解析 |
 | **Vue** | `.vue` | `vue-language-server` (Volar) | `ASTROLABE_LSP_VUE` | SFC 内嵌 `<script>` / `<script setup>` 提取与语义解析 |
 | **Dart** | `.dart` | `dart language-server` | `ASTROLABE_LSP_DART` | 随 Dart / Flutter SDK 自带；`pubspec.yaml` 行级解析与多 pubspec monorepo 支持；`rootUri` 置 `null` 规避重复分析 |
+| **C#** | `.cs` | `Microsoft.CodeAnalysis.LanguageServer`（可选 Roslyn） | `ASTROLABE_LSP_CSHARP` | 索引 `.cs` 符号；命名空间 using 扇出到每个声明文件（不进 PageRank）；`ProjectReference` 记为 Import。Roslyn 为 `dotnet <dll> --stdio`，需要 .NET 10 runtime（工程目标框架可更旧），不静默下载，不是 OmniSharp / csharp-ls |
 
 ---
 

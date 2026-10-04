@@ -41,8 +41,8 @@ use crate::resolvers::ResolverSet;
 use crate::scan::{self, ScanOptions, ScanResult};
 use crate::store::{self, Store};
 use crate::types::{
-    CodeEdge, CodeFile, CodeSymbol, Confidence, EdgeKind, FileId, FileIndex, Language, RelPath,
-    SymbolId,
+    CodeEdge, CodeFile, CodeSymbol, Confidence, EdgeKind, FileId, FileIndex, ImportResolution,
+    Language, RelPath, SymbolId,
 };
 use crate::watch::ChangeSet;
 use crate::IndexReport;
@@ -219,6 +219,7 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
         Language::Rust,
         Language::TypeScript,
         Language::Dart,
+        Language::CSharp,
     ]
     .iter()
     .filter_map(|lang| resolvers.meta_for(*lang))
@@ -505,8 +506,8 @@ fn assemble_graph(
     for row in &parsed {
         let from = index_of[&row.path];
         for spec in &row.parsed.imports {
-            match resolvers.resolve(&row.path, spec, files) {
-                Some(target) => {
+            match resolvers.resolve_import(&row.path, spec, files) {
+                ImportResolution::File(target) => {
                     if let Some(&to) = index_of.get(&target) {
                         edges.push(CodeEdge {
                             from: from.0,
@@ -518,12 +519,48 @@ fn assemble_graph(
                         });
                     }
                 }
-                None => {
+                ImportResolution::Namespace { files: targets, .. } => {
+                    // Every declaring file, partials included. Not an Import:
+                    // PageRank stays on real file edges.
+                    for target in targets {
+                        if let Some(&to) = index_of.get(&target) {
+                            edges.push(CodeEdge {
+                                from: from.0,
+                                to: to.0,
+                                kind: EdgeKind::Namespace,
+                                weight: 1,
+                                confidence: Confidence::Scoped,
+                            });
+                        }
+                    }
+                }
+                ImportResolution::Unresolved => {
                     if looks_internal(spec) {
                         report
                             .unresolved_imports
                             .push((row.path.clone(), spec.clone()));
                     }
+                }
+            }
+        }
+    }
+
+    // ProjectReference is a file-level import even when no source file
+    // repeats it as a using. Endpoints that were not parsed are skipped;
+    // the relationship still lives on ProjectMeta::project_refs.
+    for (_lang, meta) in resolvers.iter_meta() {
+        for pref in &meta.project_refs {
+            let from_path = RelPath::new(&pref.from);
+            let to_path = RelPath::new(&pref.to);
+            if let (Some(&from), Some(&to)) = (index_of.get(&from_path), index_of.get(&to_path)) {
+                if from != to {
+                    edges.push(CodeEdge {
+                        from: from.0,
+                        to: to.0,
+                        kind: EdgeKind::Import,
+                        weight: 1,
+                        confidence: Confidence::Scoped,
+                    });
                 }
             }
         }

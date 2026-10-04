@@ -106,8 +106,7 @@ impl ModuleResolver for PythonResolver {
         ProjectMeta {
             source_roots: det.roots,
             modules: det.modules,
-            excludes: Vec::new(),
-            overrides: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1047,8 +1046,7 @@ where = ["src", "lib"]
                 name: "mypkg".into(),
                 dir: "lib".into(),
             }],
-            excludes: vec![],
-            overrides: vec![],
+            ..Default::default()
         };
         assert_eq!(
             resolve(&files, &m, "main.py", "mypkg.core"),
