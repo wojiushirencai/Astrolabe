@@ -1034,7 +1034,7 @@ fn install_hint_one(language: Language) -> String {
         }
         Language::Dart => "Dart（dart language-server）：内置于 Dart / Flutter SDK。".into(),
         Language::CSharp => {
-            "C#（csharp-ls / OmniSharp）：设置 ASTROLABE_LSP_CSHARP 指向可执行文件。".into()
+            "C#（Microsoft.CodeAnalysis.LanguageServer）：`dotnet <dll> --stdio`；需要 .NET 10 runtime（分析目标框架可更旧）；设置 ASTROLABE_LSP_CSHARP。非 OmniSharp / csharp-ls。".into()
         }
     }
 }

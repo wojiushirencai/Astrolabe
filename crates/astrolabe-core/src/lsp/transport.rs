@@ -447,6 +447,10 @@ impl LspTransport {
         let result = self.request("initialize", params)?;
         *lock(&self.shared.initialize_result) = Some(result.clone());
         self.notify("initialized", json!({}))?;
+        // Roslyn requires solution/open or project/open after initialized.
+        if self.shared.spec.language == Language::CSharp {
+            super::csharp::open_csharp_workspace(self, root)?;
+        }
         Ok(result)
     }
 
@@ -1500,7 +1504,7 @@ fn parse_content_length(header: &[u8]) -> Option<usize> {
     None
 }
 
-fn path_to_file_uri(path: &Path) -> String {
+pub(crate) fn path_to_file_uri(path: &Path) -> String {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
