@@ -108,7 +108,9 @@ impl Language {
             "php" => Language::Php,
             "vue" => Language::Vue,
             "dart" => Language::Dart,
-            "cs" => Language::CSharp,
+            // Razor markup is not a language tag. C# is extracted before
+            // tree-sitter; `.csx` stays unmapped (another worker).
+            "cs" | "razor" | "cshtml" => Language::CSharp,
             _ => return None,
         })
     }
@@ -540,6 +542,14 @@ mod tests {
         assert_eq!(Language::Dart.name(), "dart");
         assert_eq!(
             Language::from_path(&RelPath::new("a.cs")),
+            Some(Language::CSharp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.razor")),
+            Some(Language::CSharp)
+        );
+        assert_eq!(
+            Language::from_path(&RelPath::new("Pages/_ViewImports.cshtml")),
             Some(Language::CSharp)
         );
         assert!(Language::from_path(&RelPath::new("a.csx")).is_none());

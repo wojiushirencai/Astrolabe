@@ -5,7 +5,12 @@
 //! (MSBuild `GetPathOfFileAbove` — one file, the closest one). The csproj
 //! overrides the props. SDK defaults fill whatever is still empty:
 //! `RootNamespace` is the project file name, and `Microsoft.NET.Sdk*` turns
-//! on default compile items (`**/*.cs`).
+//! on default compile items (`**/*.cs`). In-repo `.razor` and `.cshtml` are
+//! included in that set as well, but only after [`crate::parse::extract_razor_csharp`]
+//! pulls C# out of them. Raw markup is never scanned. That is what lets a
+//! namespace declared in `@code` satisfy a `_ViewImports.cshtml` `@using`.
+//! `System` / `System.*` and names no file declares (NuGet) still resolve
+//! to nothing. This is Astrolabe's index set, not an MSBuild `Compile` item.
 //!
 //! # Import specs
 //!
@@ -192,6 +197,7 @@ impl ModuleResolver for CSharpResolver {
                 let Some(text) = files.read(&path) else {
                     continue;
                 };
+                let text = declarations_source(&path, text);
                 let (namespaces, types) = extract_declarations(&text);
                 for ns in namespaces {
                     if framework_namespace(&ns) {
@@ -464,7 +470,7 @@ fn compile_files(files: &FileIndex, prep: &Prepared, projects: &[(String, String
     let dir = &prep.facts.directory;
     if prep.facts.default_compile_items {
         for path in files.iter() {
-            if path.extension() != Some("cs") {
+            if !is_csharp_source_file(path.as_str()) {
                 continue;
             }
             let path = path.as_str();
@@ -513,14 +519,14 @@ fn add_include(
     let pattern = pattern.replace('\\', "/");
     if !pattern.contains('*') {
         if let Some(full) = normalize_include(dir, &pattern) {
-            if files.contains(&full) && full.ends_with(".cs") && !skipped_tree(&full) {
+            if files.contains(&full) && is_csharp_source_file(&full) && !skipped_tree(&full) {
                 out.insert(full);
             }
         }
         return;
     }
     for path in files.iter() {
-        if path.extension() != Some("cs") {
+        if !is_csharp_source_file(path.as_str()) {
             continue;
         }
         let path = path.as_str();
@@ -947,6 +953,22 @@ fn parse_bool(value: &str) -> Option<bool> {
         "true" | "enable" | "enabled" => Some(true),
         "false" | "disable" | "disabled" => Some(false),
         _ => None,
+    }
+}
+
+fn is_csharp_source_file(path: &str) -> bool {
+    matches!(
+        RelPath::new(path).extension(),
+        Some("cs" | "razor" | "cshtml")
+    )
+}
+
+/// `.razor` / `.cshtml` contribute the extracted C# only. `.cs` is unchanged.
+fn declarations_source(path: &str, text: String) -> String {
+    if matches!(RelPath::new(path).extension(), Some("razor" | "cshtml")) {
+        crate::parse::extract_razor_csharp(&text)
+    } else {
+        text
     }
 }
 
