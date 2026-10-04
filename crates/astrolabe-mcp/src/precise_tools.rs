@@ -1036,6 +1036,9 @@ fn install_hint_one(language: Language) -> String {
         Language::CSharp => {
             "C#（Microsoft.CodeAnalysis.LanguageServer）：`dotnet <dll> --stdio`；需要 .NET 10 runtime（分析目标框架可更旧）；设置 ASTROLABE_LSP_CSHARP。非 OmniSharp / csharp-ls。".into()
         }
+        Language::VisualBasic => {
+            "Visual Basic .NET（同一 Microsoft.CodeAnalysis.LanguageServer）：`dotnet <dll> --stdio`；与 C# 共用 ASTROLABE_LSP_CSHARP；.vb / .vbproj / .sln。非 OmniSharp。".into()
+        }
     }
 }
 

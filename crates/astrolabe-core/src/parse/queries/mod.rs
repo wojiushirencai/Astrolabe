@@ -86,6 +86,7 @@ pub fn for_language(lang: Language) -> Option<LanguageQueries> {
         Language::Php => queries!("php"),
         Language::Dart => queries!("dart"),
         Language::CSharp => queries!("csharp"),
+        Language::VisualBasic => queries!("vb"),
         Language::C => queries!("c"),
         Language::Cpp => queries!("cpp"),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
@@ -118,7 +119,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
-    const ALL: [Language; 12] = [
+    const ALL: [Language; 13] = [
         Language::Python,
         Language::Go,
         Language::Java,
@@ -131,6 +132,7 @@ mod tests {
         Language::Cpp,
         Language::Dart,
         Language::CSharp,
+        Language::VisualBasic,
     ];
 
     fn grammar(lang: Language) -> tree_sitter::Language {
@@ -149,6 +151,7 @@ mod tests {
             Language::Cpp => tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
             Language::Dart => tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
             Language::CSharp => tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
+            Language::VisualBasic => tree_sitter::Language::new(tree_sitter_vb_dotnet::LANGUAGE),
             Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => {
                 panic!("{lang:?} grammar not registered in query tests yet")
             }
@@ -1758,5 +1761,70 @@ public record Person(string Name);
         for need in ["WriteLine", "Max", "Widget", "Go"] {
             assert!(names.contains(need), "missing call {need} in {names:?}");
         }
+    }
+
+    const VB_SRC: &str = r#"Imports System.Text
+Namespace Acme.Lib
+    Public Class Widget
+        Public Sub Run()
+            Console.WriteLine("hi")
+        End Sub
+        Public Function Count() As Integer
+            Return Math.Max(1, 2)
+        End Function
+        Public Property Name As String
+    End Class
+    Public Module Helper
+        Public Function N() As Integer
+            Return 1
+        End Function
+    End Module
+    Public Structure Point
+    End Structure
+    Public Interface IFoo
+    End Interface
+    Public Enum Color
+        Red
+    End Enum
+End Namespace
+"#;
+
+    #[test]
+    fn vb_symbols_cover_types_methods_and_properties() {
+        assert_symbols(
+            Language::VisualBasic,
+            VB_SRC,
+            &[
+                ("module", "Acme.Lib"),
+                ("class", "Widget"),
+                ("method", "Run"),
+                ("method", "Count"),
+                ("field", "Name"),
+                ("module", "Helper"),
+                ("method", "N"),
+                ("struct", "Point"),
+                ("interface", "IFoo"),
+                ("enum", "Color"),
+            ],
+        );
+    }
+
+    #[test]
+    fn vb_imports_capture_each_namespace() {
+        let got = imports(Language::VisualBasic, "Imports System.Text, Acme.Lib\n");
+        assert_eq!(got, vec!["System.Text".to_string(), "Acme.Lib".to_string()]);
+    }
+
+    #[test]
+    fn vb_calls_cover_invocation_and_construction() {
+        let got = calls(Language::VisualBasic, VB_SRC);
+        let names: BTreeSet<_> = got.iter().map(|s| s.as_str()).collect();
+        for need in ["WriteLine", "Max"] {
+            assert!(names.contains(need), "missing call {need} in {names:?}");
+        }
+        let with_new = format!("{VB_SRC}\nClass Boot\n    Sub Main()\n        Dim w = New Widget()\n    End Sub\nEnd Class\n");
+        let got = calls(Language::VisualBasic, &with_new);
+        let names: BTreeSet<_> = got.iter().map(|s| s.as_str()).collect();
+        assert!(names.contains("Widget"), "missing New Widget in {names:?}");
     }
 }

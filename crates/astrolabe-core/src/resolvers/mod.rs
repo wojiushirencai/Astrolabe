@@ -50,6 +50,7 @@ pub mod java;
 pub mod python;
 pub mod rust;
 pub mod typescript;
+pub mod visualbasic;
 
 /// All resolvers, one per supported language.
 pub fn all() -> Vec<Box<dyn ModuleResolver>> {
@@ -61,6 +62,7 @@ pub fn all() -> Vec<Box<dyn ModuleResolver>> {
         Box::new(typescript::TypeScriptResolver),
         Box::new(dart::DartResolver),
         Box::new(csharp::CSharpResolver),
+        Box::new(visualbasic::VisualBasicResolver),
     ]
 }
 
@@ -394,6 +396,7 @@ mod tests {
             Language::TypeScript,
             Language::Dart,
             Language::CSharp,
+            Language::VisualBasic,
         ] {
             assert!(
                 set.meta_for(lang).is_some(),

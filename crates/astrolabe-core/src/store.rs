@@ -398,6 +398,7 @@ fn language_to_u8(language: Language) -> u8 {
         Language::Vue => 13,
         Language::Dart => 14,
         Language::CSharp => 15,
+        Language::VisualBasic => 16,
     }
 }
 
@@ -446,6 +447,7 @@ fn language_from_u8(language: u8) -> Option<Language> {
         13 => Language::Vue,
         14 => Language::Dart,
         15 => Language::CSharp,
+        16 => Language::VisualBasic,
         _ => return None,
     })
 }
@@ -847,6 +849,7 @@ mod tests {
             Language::Vue,
             Language::Dart,
             Language::CSharp,
+            Language::VisualBasic,
         ] {
             assert_eq!(language_from_u8(language_to_u8(lang)), Some(lang));
         }

@@ -220,6 +220,7 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
         Language::TypeScript,
         Language::Dart,
         Language::CSharp,
+        Language::VisualBasic,
     ]
     .iter()
     .filter_map(|lang| resolvers.meta_for(*lang))
@@ -863,7 +864,7 @@ pub fn index_repo_incremental(
     }
 }
 
-/// Code file extensions across known programming languages (42 pure programming language extensions).
+/// Code file extensions across known programming languages (43 pure programming language extensions).
 ///
 /// 收窄说明：这是"未支持编程语言"的统计口径，纯编程语言源码扩展名；
 /// 数据/配置文件（json, jsonc, yaml, yml, toml, html, css, graphql, gql, sql, sh, bash, ps1, tf, tfvars, hcl 等）
@@ -872,8 +873,8 @@ pub fn index_repo_incremental(
 pub const KNOWN_CODE_EXTENSIONS: &[&str] = &[
     "al", "c", "clj", "cljs", "cpp", "cs", "dart", "elm", "ex", "exs", "fs", "fsx", "go", "groovy",
     "h", "hpp", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lean", "lua", "m", "matlab", "nf",
-    "php", "proto", "py", "r", "rb", "rs", "scala", "sol", "svelte", "swift", "ts", "tsx", "vue",
-    "zig",
+    "php", "proto", "py", "r", "rb", "rs", "scala", "sol", "svelte", "swift", "ts", "tsx", "vb",
+    "vue", "zig",
 ];
 
 /// Count occurrences of unindexed code file extensions among admitted paths.

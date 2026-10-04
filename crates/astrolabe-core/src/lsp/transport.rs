@@ -448,7 +448,10 @@ impl LspTransport {
         *lock(&self.shared.initialize_result) = Some(result.clone());
         self.notify("initialized", json!({}))?;
         // Roslyn requires solution/open or project/open after initialized.
-        if self.shared.spec.language == Language::CSharp {
+        if matches!(
+            self.shared.spec.language,
+            Language::CSharp | Language::VisualBasic
+        ) {
             super::csharp::open_csharp_workspace(self, root)?;
         }
         Ok(result)
@@ -833,6 +836,7 @@ fn language_id(language: Language) -> &'static str {
         Language::Vue => "vue",
         Language::Dart => "dart",
         Language::CSharp => "csharp",
+        Language::VisualBasic => "vb",
     }
 }
 

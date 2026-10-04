@@ -363,7 +363,8 @@ fn ident_start(c: char, lang: Option<Language>) -> bool {
             | Language::ObjC
             | Language::ObjCpp
             | Language::Swift
-            | Language::CSharp,
+            | Language::CSharp
+            | Language::VisualBasic,
         )
         | None => c.is_alphabetic() || c == '_' || (lang.is_none() && c == '$'),
     }
@@ -389,14 +390,20 @@ fn ident_continue(c: char, lang: Option<Language>) -> bool {
             | Language::ObjC
             | Language::ObjCpp
             | Language::Swift
-            | Language::CSharp,
+            | Language::CSharp
+            | Language::VisualBasic,
         )
         | None => c.is_alphanumeric() || c == '_' || (lang.is_none() && c == '$'),
     }
 }
 
 fn is_keyword(name: &str, lang: Language) -> bool {
-    keywords(lang).binary_search(&name).is_ok()
+    let table = keywords(lang);
+    if lang == Language::VisualBasic {
+        let lower = name.to_ascii_lowercase();
+        return table.binary_search(&lower.as_str()).is_ok();
+    }
+    table.binary_search(&name).is_ok()
 }
 
 /// Python 3 keywords, including the soft keywords `match` / `case` / `type`.
@@ -936,6 +943,163 @@ const CSHARP_KEYWORDS: &[&str] = &[
     "yield",
 ];
 
+/// Visual Basic keywords, lowercase. Compared case-insensitively.
+const VB_KEYWORDS: &[&str] = &[
+    "addhandler",
+    "addressof",
+    "alias",
+    "and",
+    "andalso",
+    "as",
+    "boolean",
+    "byref",
+    "byval",
+    "call",
+    "case",
+    "catch",
+    "cbool",
+    "cbyte",
+    "cchar",
+    "cdate",
+    "cdbl",
+    "cdec",
+    "char",
+    "cint",
+    "class",
+    "clng",
+    "cobj",
+    "const",
+    "continue",
+    "csbyte",
+    "cshort",
+    "csng",
+    "cstr",
+    "ctype",
+    "cuint",
+    "culng",
+    "cushort",
+    "date",
+    "decimal",
+    "declare",
+    "default",
+    "delegate",
+    "dim",
+    "directcast",
+    "do",
+    "double",
+    "each",
+    "else",
+    "elseif",
+    "end",
+    "endif",
+    "enum",
+    "erase",
+    "error",
+    "event",
+    "exit",
+    "false",
+    "finally",
+    "for",
+    "friend",
+    "function",
+    "get",
+    "gettype",
+    "getxmlnamespace",
+    "global",
+    "gosub",
+    "goto",
+    "handles",
+    "if",
+    "implements",
+    "imports",
+    "in",
+    "inherits",
+    "integer",
+    "interface",
+    "is",
+    "isnot",
+    "let",
+    "lib",
+    "like",
+    "long",
+    "loop",
+    "me",
+    "mod",
+    "module",
+    "mustinherit",
+    "mustoverride",
+    "mybase",
+    "myclass",
+    "namespace",
+    "narrowing",
+    "new",
+    "next",
+    "not",
+    "nothing",
+    "notinheritable",
+    "notoverridable",
+    "object",
+    "of",
+    "on",
+    "operator",
+    "option",
+    "optional",
+    "or",
+    "orelse",
+    "out",
+    "overloads",
+    "overridable",
+    "overrides",
+    "paramarray",
+    "partial",
+    "private",
+    "property",
+    "protected",
+    "public",
+    "raiseevent",
+    "readonly",
+    "redim",
+    "rem",
+    "removehandler",
+    "resume",
+    "return",
+    "sbyte",
+    "select",
+    "set",
+    "shadows",
+    "shared",
+    "short",
+    "single",
+    "static",
+    "step",
+    "stop",
+    "string",
+    "structure",
+    "sub",
+    "synclock",
+    "then",
+    "throw",
+    "to",
+    "true",
+    "try",
+    "trycast",
+    "typeof",
+    "uinteger",
+    "ulong",
+    "ushort",
+    "using",
+    "variant",
+    "wend",
+    "when",
+    "while",
+    "widening",
+    "with",
+    "withevents",
+    "writeonly",
+    "xor",
+    "yield",
+];
+
 fn keywords(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::Python => PYTHON_KEYWORDS,
@@ -949,6 +1113,7 @@ fn keywords(lang: Language) -> &'static [&'static str] {
         Language::Vue => JS_KEYWORDS,
         Language::Dart => DART_KEYWORDS,
         Language::CSharp => CSHARP_KEYWORDS,
+        Language::VisualBasic => VB_KEYWORDS,
     }
 }
 
@@ -1035,6 +1200,7 @@ enum Flavor {
     Java,
     Rust,
     Js,
+    Vb,
 }
 
 fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
@@ -1060,6 +1226,7 @@ fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
             | Language::CSharp,
         )
         | None => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
+        Some(Language::VisualBasic) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Vb),
     }
     kind
 }
@@ -1166,6 +1333,31 @@ fn classify_c_like(bytes: &[u8], kind: &mut [SliceKind], flavor: Flavor) {
                 i += 1;
             }
             i = (i + 3).min(n);
+            mark(kind, start, i, SliceKind::String);
+            continue;
+        }
+        if matches!(flavor, Flavor::Vb) && bytes[i] == b'\'' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            mark(kind, start, i, SliceKind::Comment);
+            continue;
+        }
+        if matches!(flavor, Flavor::Vb) && bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < n && bytes[i] != b'\n' {
+                if bytes[i] == b'"' {
+                    if i + 1 < n && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
             mark(kind, start, i, SliceKind::String);
             continue;
         }
@@ -1377,6 +1569,7 @@ mod tests {
             JS_KEYWORDS,
             DART_KEYWORDS,
             CSHARP_KEYWORDS,
+            VB_KEYWORDS,
         ] {
             let mut sorted = table.to_vec();
             sorted.sort();

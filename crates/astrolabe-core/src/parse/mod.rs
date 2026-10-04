@@ -31,7 +31,7 @@ mod vue;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SIGNATURE_CHARS: usize = 240;
-const LANGUAGES: [Language; 12] = [
+const LANGUAGES: [Language; 13] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -44,6 +44,7 @@ const LANGUAGES: [Language; 12] = [
     Language::Cpp,
     Language::Dart,
     Language::CSharp,
+    Language::VisualBasic,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -180,6 +181,7 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Cpp => 9,
         Language::Dart => 10,
         Language::CSharp => 11,
+        Language::VisualBasic => 12,
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -198,6 +200,7 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::VisualBasic => tree_sitter_vb_dotnet::LANGUAGE.into(),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -273,7 +276,7 @@ fn extract_imports(
     // Other languages keep the raw specifier. C# must emit the forms
     // `resolvers/csharp.rs` documents (`static:`, `alias:`, or a bare
     // namespace name) or namespace usings and type usings collapse together.
-    if lang != Language::CSharp {
+    if lang != Language::CSharp && lang != Language::VisualBasic {
         return extract_named_captures(query, root, source, |name| {
             name == "import" || name == "source" || name == "module"
         })
@@ -384,7 +387,8 @@ fn is_exported(lang: Language, name: &str, node: tree_sitter::Node<'_>, source: 
         | Language::ObjCpp
         | Language::Swift
         | Language::Vue
-        | Language::CSharp => true,
+        | Language::CSharp
+        | Language::VisualBasic => true,
     }
 }
 
@@ -1246,7 +1250,8 @@ mod tests {
             | Language::Swift
             | Language::Vue
             | Language::Dart
-            | Language::CSharp => Vec::new(),
+            | Language::CSharp
+            | Language::VisualBasic => Vec::new(),
         }
     }
 
