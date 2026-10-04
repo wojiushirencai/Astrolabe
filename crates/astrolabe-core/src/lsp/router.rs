@@ -260,6 +260,9 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::Dart => {
             "dart language-server (ships with the Dart SDK; set ASTROLABE_LSP_DART to override path)"
         }
+        Language::CSharp => {
+            "csharp-ls (https://github.com/razzmatazz/csharp-language-server; set ASTROLABE_LSP_CSHARP)"
+        }
     }
 }
 
@@ -277,6 +280,7 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Php => "intelephense",
         Language::Vue => "vue-language-server",
         Language::Dart => "dart language-server",
+        Language::CSharp => "csharp-ls",
     }
 }
 

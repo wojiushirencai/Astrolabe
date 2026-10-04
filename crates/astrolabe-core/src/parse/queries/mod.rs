@@ -87,7 +87,9 @@ pub fn for_language(lang: Language) -> Option<LanguageQueries> {
         Language::Dart => queries!("dart"),
         Language::C => queries!("c"),
         Language::Cpp => queries!("cpp"),
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        Language::CSharp | Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => {
+            return None
+        }
     })
 }
 
@@ -146,7 +148,11 @@ mod tests {
             Language::C => tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
             Language::Cpp => tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
             Language::Dart => tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
-            Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => {
+            Language::CSharp
+            | Language::ObjC
+            | Language::ObjCpp
+            | Language::Swift
+            | Language::Vue => {
                 panic!("{lang:?} grammar not registered in query tests yet")
             }
         }

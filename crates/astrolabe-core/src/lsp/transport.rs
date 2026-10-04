@@ -828,6 +828,7 @@ fn language_id(language: Language) -> &'static str {
         Language::Php => "php",
         Language::Vue => "vue",
         Language::Dart => "dart",
+        Language::CSharp => "csharp",
     }
 }
 

@@ -85,6 +85,10 @@ pub enum Language {
     Vue,
     /// Dart (.dart).
     Dart,
+    /// C# (`.cs`). Appended after Dart so existing storage tags stay put.
+    /// The parser may still be landing on another branch; resolvers only need
+    /// the variant and the storage tag.
+    CSharp,
 }
 
 impl Language {
@@ -106,6 +110,7 @@ impl Language {
             "php" => Language::Php,
             "vue" => Language::Vue,
             "dart" => Language::Dart,
+            "cs" => Language::CSharp,
             _ => return None,
         })
     }
@@ -128,6 +133,7 @@ impl Language {
             "php" => Some(Language::Php),
             "vue" => Some(Language::Vue),
             "dart" => Some(Language::Dart),
+            "csharp" | "c#" | "cs" => Some(Language::CSharp),
             _ => None,
         }
     }
@@ -149,6 +155,7 @@ impl Language {
             Language::Php => "php",
             Language::Vue => "vue",
             Language::Dart => "dart",
+            Language::CSharp => "csharp",
         }
     }
 }
@@ -288,6 +295,68 @@ pub struct ProjectMeta {
     pub excludes: Vec<String>,
     /// Declaration-site path redirections, sorted for determinism.
     pub overrides: Vec<PathOverride>,
+    /// One entry per build project the resolver understood (C# SDK projects).
+    /// Other languages leave this empty.
+    pub projects: Vec<ProjectFacts>,
+    /// In-repo project references. Each one is a file-level import
+    /// (`from` manifest → `to` manifest), not a namespace fan-out.
+    pub project_refs: Vec<ProjectRef>,
+    /// Files that declare a namespace, including partial types split across
+    /// files. A namespace `using` relates to every file here; it is not an
+    /// [`EdgeKind::Import`].
+    pub namespaces: Vec<NamespaceFiles>,
+    /// Named types found while indexing namespaces. `using static` and type
+    /// aliases collapse to one file only when exactly one `file` declares the
+    /// type.
+    pub type_decls: Vec<TypeDecl>,
+}
+
+/// Build facts for one project file. C# fills this from the `csproj` and the
+/// nearest `Directory.Build.props`. Unused by other languages.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectFacts {
+    /// Repo-relative project file (`app/App.csproj`).
+    pub manifest: String,
+    /// Repo-relative project directory. `""` is the repo root.
+    pub directory: String,
+    /// SDK attribute, e.g. `Microsoft.NET.Sdk`. Empty for non-SDK projects.
+    pub sdk: String,
+    /// Effective `RootNamespace` (props, then csproj, else the project name).
+    pub root_namespace: String,
+    /// SDK implicit usings when `ImplicitUsings` is enable. Framework names;
+    /// they resolve to nothing.
+    pub implicit_usings: Vec<String>,
+    /// Extra global namespace usings from `<Using Include="..."/>`.
+    pub global_usings: Vec<String>,
+    /// `<Using Include="..." Static="true"/>` targets (type names).
+    pub global_static_usings: Vec<String>,
+    /// Effective default compile items (`**/*.cs` under the project).
+    pub default_compile_items: bool,
+}
+
+/// File-level project reference. Stored as [`EdgeKind::Import`] when both
+/// manifests are graph nodes. PageRank may see this edge; it is one file to
+/// one file.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProjectRef {
+    pub from: String,
+    pub to: String,
+}
+
+/// Every file that declares `namespace`, partials included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceFiles {
+    pub namespace: String,
+    pub files: Vec<String>,
+}
+
+/// One type declaration. The same `(namespace, name)` may appear in several
+/// files when the type is partial.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TypeDecl {
+    pub namespace: String,
+    pub name: String,
+    pub file: String,
 }
 
 impl ProjectMeta {
@@ -328,6 +397,35 @@ pub trait ModuleResolver: Send + Sync {
         files: &FileIndex,
         meta: &ProjectMeta,
     ) -> Option<RelPath>;
+
+    /// Richer than [`Self::resolve`]. The default keeps today's single-file
+    /// import. C# overrides it so a namespace `using` can name every declaring
+    /// file without being collapsed into one [`EdgeKind::Import`].
+    fn resolve_import(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> ImportResolution {
+        match self.resolve(from, spec, files, meta) {
+            Some(path) => ImportResolution::File(path),
+            None => ImportResolution::Unresolved,
+        }
+    }
+}
+
+/// What an import specifier is allowed to become in the graph.
+///
+/// `File` is a real import edge (PageRank). `Namespace` is a relationship to
+/// every file that declares the namespace and must not be stored as `File`,
+/// even when only one file declares it. `Unresolved` is the right answer for
+/// the standard library and for packages that are not in this repo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportResolution {
+    Unresolved,
+    File(RelPath),
+    Namespace { name: String, files: Vec<RelPath> },
 }
 
 // ------------------------------------------------------------------- graph
@@ -378,11 +476,18 @@ pub struct CodeSymbol {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EdgeKind {
     /// File imports file. Derived from build config + import statements.
+    /// PageRank, dependents, and group aggregation use only this kind.
     Import,
     /// Symbol calls symbol. Name-based, hence `Confidence::Syntactic`.
+    /// Not a real reference: PageRank does not follow it.
     Call,
     /// Type extends/implements type.
     Inherit,
+    /// A namespace `using` relates the importer to every file that declares
+    /// that namespace (C# partials included). Not an [`EdgeKind::Import`]:
+    /// never collapsed to one file, and never an input to PageRank.
+    /// Storage tag 3, appended after Inherit.
+    Namespace,
 }
 
 #[derive(Clone, Debug)]
@@ -435,6 +540,12 @@ mod tests {
         assert_eq!(Language::from_name("vue").unwrap().name(), "vue");
         assert_eq!(Language::from_name("dart"), Some(Language::Dart));
         assert_eq!(Language::Dart.name(), "dart");
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.cs")),
+            Some(Language::CSharp)
+        );
+        assert_eq!(Language::from_name("C#"), Some(Language::CSharp));
+        assert_eq!(Language::CSharp.name(), "csharp");
     }
 
     #[test]

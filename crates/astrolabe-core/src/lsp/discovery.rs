@@ -53,6 +53,7 @@ pub const PROBED_LANGUAGES: &[Language] = &[
     Language::Php,
     Language::Vue,
     Language::Dart,
+    Language::CSharp,
 ];
 
 /// Snapshot of PATH and override variables used for one probe.
@@ -252,6 +253,14 @@ const DART: &[Candidate] = &[Candidate {
     args: &["language-server"],
     install:
         "dart language-server ships with the Dart SDK (https://dart.dev/get-dart); a Flutter SDK also provides it",
+}];
+
+/// Minimum probe so `Language::CSharp` is not an empty discovery hole.
+/// The language branch can replace this with OmniSharp / csharp-ls policy.
+const CSHARP: &[Candidate] = &[Candidate {
+    bin: "csharp-ls",
+    args: &[],
+    install: "csharp-ls (https://github.com/razzmatazz/csharp-language-server); or set ASTROLABE_LSP_CSHARP",
 }];
 
 const JAVA_UNAVAILABLE: &str = "\
@@ -638,6 +647,7 @@ impl Discovery {
             Language::Dart => {
                 " dart language-server 随 Dart SDK 自带；Flutter 工程安装 Flutter SDK 即可获得。"
             }
+            Language::CSharp => " csharp-ls speaks LSP on stdio; OmniSharp is not auto-detected.",
             _ => "",
         };
         format!(
@@ -685,6 +695,7 @@ fn candidates(language: Language) -> &'static [Candidate] {
         Language::ObjC | Language::ObjCpp => APPLE_OBJC,
         Language::Vue => VUE,
         Language::Dart => DART,
+        Language::CSharp => CSHARP,
     }
 }
 
@@ -705,6 +716,7 @@ fn env_override_keys(language: Language) -> &'static [&'static str] {
         Language::Swift => &["ASTROLABE_LSP_SWIFT"],
         Language::Vue => &["ASTROLABE_LSP_VUE"],
         Language::Dart => &["ASTROLABE_LSP_DART"],
+        Language::CSharp => &["ASTROLABE_LSP_CSHARP"],
     }
 }
 
@@ -725,6 +737,7 @@ fn override_keys_all() -> &'static [&'static str] {
         "ASTROLABE_LSP_SWIFT",
         "ASTROLABE_LSP_VUE",
         "ASTROLABE_LSP_DART",
+        "ASTROLABE_LSP_CSHARP",
     ]
 }
 
@@ -1084,6 +1097,9 @@ mod tests {
                     assert!(result.install_hint.contains("Dart SDK"));
                     assert!(result.install_hint.contains("dart language-server"));
                 }
+                Language::CSharp => {
+                    assert!(result.install_hint.contains("csharp-ls"));
+                }
             }
             assert!(
                 result.needs_install.is_some(),
@@ -1437,6 +1453,7 @@ mod tests {
         assert_eq!(env_override_var(Language::ObjCpp), "ASTROLABE_LSP_OBJCPP");
         assert_eq!(env_override_var(Language::Vue), "ASTROLABE_LSP_VUE");
         assert_eq!(env_override_var(Language::Dart), "ASTROLABE_LSP_DART");
+        assert_eq!(env_override_var(Language::CSharp), "ASTROLABE_LSP_CSHARP");
     }
 
     #[test]

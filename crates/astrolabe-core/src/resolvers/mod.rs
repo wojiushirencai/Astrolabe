@@ -28,6 +28,14 @@
 //! resolving `package:<name>/<rest>` and relative imports to in-repo files while
 //! correctly returning `None` for SDK (`dart:`) and third-party packages.
 //!
+//! C# reads SDK-style projects (`csproj` + the nearest `Directory.Build.props`).
+//! An in-repo `ProjectReference` is one file-level import. A namespace `using`
+//! is an [`crate::types::EdgeKind::Namespace`] relationship to every file that
+//! declares that namespace (partials included), never a single import.
+//! `System.*` and names no file declares (NuGet) resolve to nothing.
+//! `using static` and aliases are an import only when exactly one in-repo
+//! file declares the type.
+//!
 //! Each resolver owns exactly one file in this directory and must not touch
 //! another. Shared behaviour belongs in [`crate::types`].
 
@@ -35,6 +43,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::types::{FileIndex, Language, ModuleResolver, ProjectMeta, RelPath};
 
+pub mod csharp;
 pub mod dart;
 pub mod go;
 pub mod java;
@@ -51,6 +60,7 @@ pub fn all() -> Vec<Box<dyn ModuleResolver>> {
         Box::new(rust::RustResolver),
         Box::new(typescript::TypeScriptResolver),
         Box::new(dart::DartResolver),
+        Box::new(csharp::CSharpResolver),
     ]
 }
 
@@ -113,15 +123,43 @@ impl ResolverSet {
     /// is a valid answer for stdlib and third-party imports. A panic inside
     /// the owning resolver is also `None` — unresolved, not a crashed index.
     pub fn resolve(&self, from: &RelPath, spec: &str, files: &FileIndex) -> Option<RelPath> {
-        let lang = Language::from_path(from)?;
+        match self.resolve_import(from, spec, files) {
+            crate::types::ImportResolution::File(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Full resolution. [`ImportResolution::Namespace`] must be stored as
+    /// [`crate::types::EdgeKind::Namespace`], not collapsed to one import.
+    /// A panic in the owning resolver is [`ImportResolution::Unresolved`].
+    pub fn resolve_import(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+    ) -> crate::types::ImportResolution {
+        let Some(lang) = Language::from_path(from) else {
+            return crate::types::ImportResolution::Unresolved;
+        };
         // TS and TSX and JS share one resolver.
         let owner = match lang {
             Language::Tsx | Language::JavaScript | Language::Vue => Language::TypeScript,
             other => other,
         };
-        let r = self.resolvers.iter().find(|r| r.language() == owner)?;
-        let meta = self.meta_for(owner)?;
-        isolate_resolver(owner, "resolve", || r.resolve(from, spec, files, meta)).flatten()
+        let Some(r) = self.resolvers.iter().find(|r| r.language() == owner) else {
+            return crate::types::ImportResolution::Unresolved;
+        };
+        let Some(meta) = self.meta_for(owner) else {
+            return crate::types::ImportResolution::Unresolved;
+        };
+        isolate_resolver(owner, "resolve", || {
+            r.resolve_import(from, spec, files, meta)
+        })
+        .unwrap_or(crate::types::ImportResolution::Unresolved)
+    }
+
+    pub fn iter_meta(&self) -> impl Iterator<Item = &(Language, ProjectMeta)> {
+        self.meta.iter()
     }
 }
 
@@ -355,6 +393,7 @@ mod tests {
             Language::Rust,
             Language::TypeScript,
             Language::Dart,
+            Language::CSharp,
         ] {
             assert!(
                 set.meta_for(lang).is_some(),

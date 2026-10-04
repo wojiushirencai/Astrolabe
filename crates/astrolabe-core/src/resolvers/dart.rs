@@ -86,7 +86,7 @@ impl ModuleResolver for DartResolver {
             source_roots,
             modules,
             excludes,
-            overrides: Vec::new(),
+            ..Default::default()
         }
     }
 

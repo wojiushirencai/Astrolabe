@@ -1033,6 +1033,9 @@ fn install_hint_one(language: Language) -> String {
             "Vue（Volar / vue-language-server）：`npm i -g @vue/language-server`，stdio 启动 `vue-language-server --stdio`。可设 ASTROLABE_LSP_VUE。P0 单进程 Volar；双服务器/@vue/typescript-plugin 为后续（TODO）。".into()
         }
         Language::Dart => "Dart（dart language-server）：内置于 Dart / Flutter SDK。".into(),
+        Language::CSharp => {
+            "C#（csharp-ls）：`dotnet tool install -g csharp-ls`，或设置 ASTROLABE_LSP_CSHARP。".into()
+        }
     }
 }
 

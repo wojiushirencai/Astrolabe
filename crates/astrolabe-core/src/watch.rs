@@ -137,6 +137,9 @@ const EXCLUDED_DIR_NAMES: &[&str] = &[
     ".serena",
     // Flutter / Dart toolchain artifacts. Fallback exclude for non-git trees.
     ".dart_tool",
+    // MSBuild intermediate output and Visual Studio. See scan::EXCLUDED_DIRS.
+    "obj",
+    ".vs",
 ];
 
 /// Polling cadence, emit delay, event-mode safety scan, and storm threshold
