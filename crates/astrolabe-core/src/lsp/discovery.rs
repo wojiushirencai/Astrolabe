@@ -685,6 +685,7 @@ fn candidates(language: Language) -> &'static [Candidate] {
         Language::ObjC | Language::ObjCpp => APPLE_OBJC,
         Language::Vue => VUE,
         Language::Dart => DART,
+        Language::CSharp => &[],
     }
 }
 
@@ -705,6 +706,7 @@ fn env_override_keys(language: Language) -> &'static [&'static str] {
         Language::Swift => &["ASTROLABE_LSP_SWIFT"],
         Language::Vue => &["ASTROLABE_LSP_VUE"],
         Language::Dart => &["ASTROLABE_LSP_DART"],
+        Language::CSharp => &["ASTROLABE_LSP_CSHARP"],
     }
 }
 
@@ -1084,6 +1086,7 @@ mod tests {
                     assert!(result.install_hint.contains("Dart SDK"));
                     assert!(result.install_hint.contains("dart language-server"));
                 }
+                Language::CSharp => {}
             }
             assert!(
                 result.needs_install.is_some(),

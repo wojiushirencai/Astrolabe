@@ -362,7 +362,8 @@ fn ident_start(c: char, lang: Option<Language>) -> bool {
             | Language::Cpp
             | Language::ObjC
             | Language::ObjCpp
-            | Language::Swift,
+            | Language::Swift
+            | Language::CSharp,
         )
         | None => c.is_alphabetic() || c == '_' || (lang.is_none() && c == '$'),
     }
@@ -387,7 +388,8 @@ fn ident_continue(c: char, lang: Option<Language>) -> bool {
             | Language::Cpp
             | Language::ObjC
             | Language::ObjCpp
-            | Language::Swift,
+            | Language::Swift
+            | Language::CSharp,
         )
         | None => c.is_alphanumeric() || c == '_' || (lang.is_none() && c == '$'),
     }
@@ -827,6 +829,113 @@ const DART_KEYWORDS: &[&str] = &[
     "yield",
 ];
 
+/// C# keywords and literals, plus contextual keywords that are not valid
+/// identifiers where a rename would target them (`record`, `var`, `async` /
+/// `await`, …). Source: C# language reference, "Keywords".
+const CSHARP_KEYWORDS: &[&str] = &[
+    "abstract",
+    "alias",
+    "and",
+    "as",
+    "async",
+    "await",
+    "base",
+    "bool",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "checked",
+    "class",
+    "const",
+    "continue",
+    "decimal",
+    "default",
+    "delegate",
+    "do",
+    "double",
+    "dynamic",
+    "else",
+    "enum",
+    "event",
+    "explicit",
+    "extern",
+    "false",
+    "file",
+    "finally",
+    "fixed",
+    "float",
+    "for",
+    "foreach",
+    "global",
+    "goto",
+    "if",
+    "implicit",
+    "in",
+    "init",
+    "int",
+    "interface",
+    "internal",
+    "is",
+    "lock",
+    "long",
+    "nameof",
+    "namespace",
+    "new",
+    "nint",
+    "not",
+    "notnull",
+    "nuint",
+    "null",
+    "object",
+    "operator",
+    "or",
+    "out",
+    "override",
+    "params",
+    "partial",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "record",
+    "ref",
+    "required",
+    "return",
+    "sbyte",
+    "scoped",
+    "sealed",
+    "short",
+    "sizeof",
+    "stackalloc",
+    "static",
+    "string",
+    "struct",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "uint",
+    "ulong",
+    "unchecked",
+    "unmanaged",
+    "unsafe",
+    "ushort",
+    "using",
+    "var",
+    "virtual",
+    "void",
+    "volatile",
+    "when",
+    "where",
+    "while",
+    "with",
+    "yield",
+];
+
 fn keywords(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::Python => PYTHON_KEYWORDS,
@@ -839,6 +948,7 @@ fn keywords(lang: Language) -> &'static [&'static str] {
         Language::Swift => SWIFT_KEYWORDS,
         Language::Vue => JS_KEYWORDS,
         Language::Dart => DART_KEYWORDS,
+        Language::CSharp => CSHARP_KEYWORDS,
     }
 }
 
@@ -946,7 +1056,8 @@ fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
             | Language::ObjC
             | Language::ObjCpp
             | Language::Swift
-            | Language::Dart,
+            | Language::Dart
+            | Language::CSharp,
         )
         | None => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
     }
@@ -1265,6 +1376,7 @@ mod tests {
             RUST_KEYWORDS,
             JS_KEYWORDS,
             DART_KEYWORDS,
+            CSHARP_KEYWORDS,
         ] {
             let mut sorted = table.to_vec();
             sorted.sort();

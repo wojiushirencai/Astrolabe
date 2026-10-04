@@ -85,6 +85,8 @@ pub enum Language {
     Vue,
     /// Dart (.dart).
     Dart,
+    /// C# (`.cs`).
+    CSharp,
 }
 
 impl Language {
@@ -106,6 +108,7 @@ impl Language {
             "php" => Language::Php,
             "vue" => Language::Vue,
             "dart" => Language::Dart,
+            "cs" => Language::CSharp,
             _ => return None,
         })
     }
@@ -128,6 +131,7 @@ impl Language {
             "php" => Some(Language::Php),
             "vue" => Some(Language::Vue),
             "dart" => Some(Language::Dart),
+            "csharp" | "cs" | "c#" => Some(Language::CSharp),
             _ => None,
         }
     }
@@ -149,6 +153,7 @@ impl Language {
             Language::Php => "php",
             Language::Vue => "vue",
             Language::Dart => "dart",
+            Language::CSharp => "csharp",
         }
     }
 }
@@ -435,6 +440,15 @@ mod tests {
         assert_eq!(Language::from_name("vue").unwrap().name(), "vue");
         assert_eq!(Language::from_name("dart"), Some(Language::Dart));
         assert_eq!(Language::Dart.name(), "dart");
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.cs")),
+            Some(Language::CSharp)
+        );
+        assert!(Language::from_path(&RelPath::new("a.csx")).is_none());
+        assert_eq!(Language::from_name("csharp"), Some(Language::CSharp));
+        assert_eq!(Language::from_name("cs"), Some(Language::CSharp));
+        assert_eq!(Language::from_name("C#"), Some(Language::CSharp));
+        assert_eq!(Language::CSharp.name(), "csharp");
     }
 
     #[test]

@@ -630,6 +630,7 @@ fn server_label(language: Language) -> &'static str {
         Language::Php => "intelephense",
         Language::Vue => "vue-language-server",
         Language::Dart => "dart language-server",
+        Language::CSharp => "csharp-ls",
     }
 }
 

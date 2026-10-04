@@ -24,7 +24,7 @@ use crate::types::{Language, RelPath};
 use super::RewriteError;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
-const LANGUAGES: [Language; 11] = [
+const LANGUAGES: [Language; 12] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -36,6 +36,7 @@ const LANGUAGES: [Language; 11] = [
     Language::C,
     Language::Cpp,
     Language::Dart,
+    Language::CSharp,
 ];
 
 /// Parse-health of one file, captured before or after a rewrite.
@@ -263,6 +264,7 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::C => 8,
         Language::Cpp => 9,
         Language::Dart => 10,
+        Language::CSharp => 11,
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
@@ -280,6 +282,7 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
     })
 }
