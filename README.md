@@ -260,7 +260,7 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `ASTROLABE_LSP_<LANG>` | 覆盖指定语言 LSP 服务器可执行文件路径（如 `ASTROLABE_LSP_PYTHON`, `ASTROLABE_LSP_RUST`, `ASTROLABE_LSP_C` 等） | 自动探测对应 LSP |
 | `ASTROLABE_SLICE_READ_MAX` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为合法精读，不计入滥用 | `200` |
 | `ASTROLABE_READ_THRESHOLD` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） | `3` |
-| `ASTROLABE_DENY_SILENCE_SECS` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） | `120` |
+| `ASTROLABE_DENY_SILENCE_SECS` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） | `15` |
 | `RUST_LOG` | 日志级别（`error` / `warn` / `info` / `debug`） | `info` |
 
 ### 5. 索引缓存与增量更新
@@ -307,8 +307,8 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 - **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 28 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截），或连续 4 次混合调用，Hook 将坚决拦截并输出引导警告。
 - **切片精读放行**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 调用视为合法精读，不计入滥用计数。同样，`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片命令亦放行。
 - **计数重置**：AI 只要调用任意 Astrolabe 工具（如 `resolve_context`、`find_symbol` 等），连续计数立即清零；若连续调用间隔超过设定时间，亦自动重置。
-- **智能放行窗口**：触发 Deny 后进入 120 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。
-- **状态存储与清理**：会话状态持久化于 `~/.astrolabe/hook_data/<session_id>/counter.json`；会话结束时通过 `SessionEnd` 自动清理，不留垃圾。
+- **智能放行窗口**：触发 Deny 后进入 15 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。
+- **状态存储与清理**：会话状态持久化于 `~/.astrolabe/hook_data/<session_id>/counter.json`；子代理调用时（payload 携带 `agent_id` / `agentId` 字段）按 `~/.astrolabe/hook_data/<session_id>/<agent_id>/counter.json` 分片，并发子代理各自独立计数、互不清零互不消音；会话结束时通过 `SessionEnd` 自动清理（含子代理分片目录），不留垃圾。
 
 ---
 

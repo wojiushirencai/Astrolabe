@@ -4,7 +4,13 @@
 //! 可通过环境变量覆盖默认阈值：
 //! - `ASTROLABE_SLICE_READ_MAX`: 切片精读最大行数（默认 200）
 //! - `ASTROLABE_READ_THRESHOLD`: 连续全文件 Read deny 阈值（默认 3）
-//! - `ASTROLABE_DENY_SILENCE_SECS`: deny 后静默窗口秒数（默认 120）
+//! - `ASTROLABE_DENY_SILENCE_SECS`: deny 后静默窗口秒数（默认 15）
+//!
+//! 子代理计数隔离：并发子 Agent 触发的 PreToolUse payload 携带 `agent_id` / `agentId`
+//! （主线程 payload 不含该字段）时，计数状态按 `~/.astrolabe/hook_data/<session_id>/<agent分量>/`
+//! 分片落盘，各子代理独立计数。字段缺失、空白或类型不符（非 String/Number）时静默回退会话级
+//! 平面路径；标识含非法路径字符或超长（>128 字节）时收敛为 `ag-<fnv1a64 hex>` 哈希分片
+//! （尽力而为，不报错）。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +30,7 @@ pub(crate) const READ_RESET_PERIOD_SECONDS: f64 = 1000.0;
 pub(crate) const NON_SYMBOLIC_RESET_PERIOD_SECONDS: f64 = 2000.0;
 
 /// deny 后静默窗口（秒）默认值：窗口内整个 hook 变为 no-op（不增计数、不发 deny）
-pub(crate) const DEFAULT_MIN_DENY_INTERVAL_SECONDS: f64 = 120.0;
+pub(crate) const DEFAULT_MIN_DENY_INTERVAL_SECONDS: f64 = 15.0;
 
 /// 切片精读（slice read）最大 limit 默认值：显式带 limit 且 limit<=200 的局部阅读视为合法精读，
 /// 不计 read 滥用（Serena 哲学："read a few lines" 时内置 Read 完全正当）。
@@ -296,12 +302,45 @@ pub(crate) fn sanitize_session_id(session_id: &str) -> Result<&str, &'static str
     Ok(session_id)
 }
 
-/// 构造会话持久化目录路径：~/.astrolabe/hook_data/<session_id>
+/// FNV-1a 64 位哈希：把任意 agent_id 收敛为固定长度、路径安全的十六进制分量
+fn fnv1a64(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// 将 agent_id 收敛为单一安全路径分量。
+///
+/// trim 后非空、长度 ≤ 128、且能通过 [`sanitize_session_id`] 校验（`[A-Za-z0-9_-]`）
+/// 时原样返回；否则返回 `ag-<fnv1a64 十六进制>`（防路径穿越，兼容带冒号/点/斜杠的 agent 名）。
+fn sanitize_agent_component(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && trimmed.len() <= 128 && sanitize_session_id(trimmed).is_ok() {
+        trimmed.to_string()
+    } else {
+        format!("ag-{:016x}", fnv1a64(trimmed))
+    }
+}
+
+/// 构造会话持久化目录路径：`~/.astrolabe/hook_data/<session_id>`；
+/// `agent_id` 为 Some 时追加子代理分片 `~/.astrolabe/hook_data/<session_id>/<agent分量>`。
 ///
 /// `session_id` 必须通过 [`sanitize_session_id`]；失败时返回错误信息。
-fn get_hook_data_dir(home: &Path, session_id: &str) -> Result<PathBuf, &'static str> {
+/// agent 分量由 [`sanitize_agent_component`] 收敛，永不失败。
+fn get_hook_data_dir(
+    home: &Path,
+    session_id: &str,
+    agent_id: Option<&str>,
+) -> Result<PathBuf, &'static str> {
     let session_id = sanitize_session_id(session_id)?;
-    Ok(home.join(".astrolabe").join("hook_data").join(session_id))
+    let dir = home.join(".astrolabe").join("hook_data").join(session_id);
+    Ok(match agent_id {
+        Some(agent) => dir.join(sanitize_agent_component(agent)),
+        None => dir,
+    })
 }
 
 /// 从磁盘读取 CounterState
@@ -889,7 +928,8 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
 ///
 /// `session_id` 非法时返回 `InvalidInput`；删除失败时向上传播 IO 错误。
 pub(crate) fn cleanup_session(home: &Path, session_id: &str) -> std::io::Result<()> {
-    let dir = get_hook_data_dir(home, session_id)
+    // agent 子目录随会话目录 remove_dir_all 一并递归删除，无需按 agent 分片
+    let dir = get_hook_data_dir(home, session_id, None)
         .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
@@ -947,6 +987,17 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
         let _ = writeln!(stderr, "{msg}");
         return 2;
     }
+
+    // 提取 agent_id / agentId（子代理内触发的 PreToolUse payload 才携带，主线程不含）。
+    // 尽力而为：缺失或类型不符时视为无分片，落回会话级平面路径，不报错。
+    let agent_id = input_data
+        .get("agent_id")
+        .or_else(|| input_data.get("agentId"))
+        .and_then(|v| match v {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        });
 
     // 提取 tool_name / toolName
     let raw_tool_name = input_data
@@ -1037,6 +1088,7 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
     tracing::debug!(
         client = %client_name,
         session_id = %session_id,
+        ?agent_id,
         tool_name = %tool_name,
         ?tool_kind,
         "处理 PreToolUse hook 调用"
@@ -1044,10 +1096,10 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
 
     let now_ts = now.unwrap_or_else(current_timestamp);
 
-    // 计算持久化路径（session_id 已 sanitize）
+    // 计算持久化路径（session_id 已 sanitize；agent 分量由 sanitize_agent_component 收敛）
     let home = home_override.map(PathBuf::from).or_else(get_user_home);
     let persistence_path = match home.as_ref() {
-        Some(h) => match get_hook_data_dir(h, &session_id) {
+        Some(h) => match get_hook_data_dir(h, &session_id, agent_id.as_deref()) {
             Ok(dir) => Some(dir.join("counter.json")),
             Err(msg) => {
                 let _ = writeln!(stderr, "{msg}");
@@ -1369,19 +1421,19 @@ mod tests {
     }
 
     #[test]
-    fn test_6_silent_window_within_120s() {
+    fn test_6_silent_window_within_15s() {
         let mut counter = CounterState {
             last_deny_ts: Some(1000.0),
             ..CounterState::default()
         };
 
-        // 50s 后调用处于 120s 静默窗口内，应当为 Silenced，不更新计数
-        let d1 = decide(&mut counter, ToolKind::Grep, 1050.0);
+        // 10s 后调用处于 15s 静默窗口内，应当为 Silenced，不更新计数
+        let d1 = decide(&mut counter, ToolKind::Grep, 1010.0);
         assert_eq!(d1, Decision::Silenced);
         assert_eq!(counter.n_grep, 0);
 
-        // 120s 后调用离开静默窗口，正常放行并更新计数
-        let d2 = decide(&mut counter, ToolKind::Grep, 1120.0);
+        // 15s 后调用离开静默窗口，正常放行并更新计数
+        let d2 = decide(&mut counter, ToolKind::Grep, 1015.0);
         assert_eq!(d2, Decision::Allow);
         assert_eq!(counter.n_grep, 1);
     }
@@ -1444,7 +1496,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let temp_home = std::env::temp_dir().join(format!("astrolabe_hook_test_{rand_id}"));
-        let sess_dir = get_hook_data_dir(&temp_home, "sess_123").unwrap();
+        let sess_dir = get_hook_data_dir(&temp_home, "sess_123", None).unwrap();
         std::fs::create_dir_all(&sess_dir).unwrap();
         std::fs::write(sess_dir.join("counter.json"), "{}").unwrap();
         assert!(sess_dir.exists());
@@ -1507,7 +1559,7 @@ mod tests {
         assert!(sanitize_session_id("a\\b").is_err());
         assert!(sanitize_session_id("has space").is_err());
         assert!(sanitize_session_id("dot.dot").is_err());
-        assert!(get_hook_data_dir(Path::new("/tmp"), "../x").is_err());
+        assert!(get_hook_data_dir(Path::new("/tmp"), "../x", None).is_err());
     }
 
     #[test]
@@ -1629,14 +1681,15 @@ mod tests {
         let out_str = String::from_utf8_lossy(&out);
         assert!(out_str.contains("\"permissionDecision\":\"deny\""));
 
-        // 4th grep at 150.0 (in silent window) -> Allow / Silenced (no output)
+        // 4th grep at 110.0 (8s after the deny at 102.0, inside the 15s silent window)
+        // -> Silenced (no output, no counter update)
         out.clear();
         let code4 = run_remind_impl(
             "claude-code",
             payload_grep.as_bytes(),
             &mut out,
             &mut err,
-            Some(150.0),
+            Some(110.0),
             Some(&temp_home),
         );
         assert_eq!(code4, 0);
@@ -2382,7 +2435,7 @@ mod tests {
         }
 
         // 计数不增加：NeutralAllow 不写盘，counter.json 保持缺省（全 0、无 deny）
-        let counter_path = get_hook_data_dir(&temp_home, sess_id)
+        let counter_path = get_hook_data_dir(&temp_home, sess_id, None)
             .unwrap()
             .join("counter.json");
         let counter = load_counter(&counter_path);
@@ -2678,7 +2731,7 @@ mod tests {
         let default_cfg = HooksConfig::default();
         assert_eq!(default_cfg.slice_read_max_limit, 200);
         assert_eq!(default_cfg.read_threshold, 3);
-        assert_eq!(default_cfg.min_deny_interval_seconds, 120.0);
+        assert_eq!(default_cfg.min_deny_interval_seconds, 15.0);
     }
 
     #[test]
@@ -2816,5 +2869,469 @@ mod tests {
             !cc_read.contains(reminder_sub),
             "Read deny output should NOT contain '{reminder_sub}', got: {cc_read}"
         );
+    }
+
+    #[test]
+    fn test_agent_scoped_counters_isolate_sibling_subagents() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_agent_iso_{rand_id}"));
+        let sess_id = "agent_iso_sess";
+
+        let mk_payload = |agent: &str| {
+            serde_json::json!({
+                "session_id": sess_id,
+                "agent_id": agent,
+                "tool_name": "grep",
+                "tool_input": {}
+            })
+            .to_string()
+        };
+        let payload_a = mk_payload("agent-a");
+        let payload_b = mk_payload("agent-b");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        // agent-a：3 次 grep（100/101/102）-> 第 3 次触发自己的 deny
+        for (i, now) in [100.0, 101.0, 102.0].iter().enumerate() {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                payload_a.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(*now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            if i < 2 {
+                assert!(out.is_empty(), "agent-a 第 {} 次 grep 不应 deny", i + 1);
+            }
+        }
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("\"permissionDecision\":\"deny\""),
+            "agent-a 第 3 次 grep 应触发 deny，got: {out_str}"
+        );
+
+        // agent-b：同会话第 1 次 grep（now=103）不受 agent-a 计数影响，无 deny 输出
+        out.clear();
+        let code_b1 = run_remind_impl(
+            "claude-code",
+            payload_b.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(103.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code_b1, 0);
+        assert!(
+            out.is_empty(),
+            "agent-b 首次 grep 不应被 agent-a 的 deny 计数/静默窗波及"
+        );
+
+        // 补强：agent-b 继续累计到自己的第 3 次（105）必须触发 deny。
+        // 若分片失效（共享 counter），agent-b 会整体落在 agent-a deny 的 15s 静默窗内，
+        // 三次全部 Silenced 无输出——该断言可区分两种实现。
+        for now in [104.0, 105.0] {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                payload_b.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+        }
+        let out_b_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_b_str.contains("\"permissionDecision\":\"deny\""),
+            "agent-b 第 3 次 grep 应触发独立 deny，got: {out_b_str}"
+        );
+
+        // 落盘路径按 agent 分片
+        assert!(get_hook_data_dir(&temp_home, sess_id, Some("agent-a"))
+            .unwrap()
+            .join("counter.json")
+            .exists());
+        assert!(get_hook_data_dir(&temp_home, sess_id, Some("agent-b"))
+            .unwrap()
+            .join("counter.json")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_missing_agent_id_uses_flat_session_counter_path() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_no_agent_{rand_id}"));
+        let sess_id = "no_agent_sess";
+
+        let payload = serde_json::json!({
+            "session_id": sess_id,
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_remind_impl(
+            "claude-code",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+
+        // counter.json 仍落在 hook_data/<sid>/counter.json 平面路径，会话目录下无子目录
+        let sess_dir = get_hook_data_dir(&temp_home, sess_id, None).unwrap();
+        assert!(sess_dir.join("counter.json").exists());
+        let entries: Vec<_> = std::fs::read_dir(&sess_dir).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "无 agent_id 时会话目录应只有 counter.json 一个条目"
+        );
+        assert!(entries[0].as_ref().unwrap().path().is_file());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_camel_case_agent_id_field_shards_counter() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_camel_agent_{rand_id}"));
+        let sess_id = "camel_agent_sess";
+
+        // 驼峰 agentId 字段同样命中分片
+        let payload = serde_json::json!({
+            "session_id": sess_id,
+            "agentId": "camel-agent",
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_remind_impl(
+            "claude-code",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+
+        assert!(get_hook_data_dir(&temp_home, sess_id, Some("camel-agent"))
+            .unwrap()
+            .join("counter.json")
+            .exists());
+        // 未落会话级平面路径
+        assert!(!get_hook_data_dir(&temp_home, sess_id, None)
+            .unwrap()
+            .join("counter.json")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_unsafe_agent_id_falls_back_to_hashed_shard() {
+        // 纯函数层：合法 agent_id 原样保留；穿越型/超长串收敛为 ag-<fnv1a64> 哈希分量
+        // FNV-1a 64 标准测试向量（写死常数，防算法实现写错而期望值同错仍绿）
+        assert_eq!(fnv1a64(""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64("a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(sanitize_agent_component("agent-a"), "agent-a");
+        let expected_evil = format!("ag-{:016x}", fnv1a64("../evil"));
+        assert_eq!(sanitize_agent_component("../evil"), expected_evil);
+        let long_id = "a".repeat(200);
+        let expected_long = format!("ag-{:016x}", fnv1a64(&long_id));
+        assert_eq!(sanitize_agent_component(&long_id), expected_long);
+        // 边界钉死：`..`/`/`/绝对路径/unicode/空白串全部收敛为哈希分量（不以输入原样出现）；
+        // 空白串 trim 后为空 → 哈希的即 offset 基值；恰好 128 字节仍原样、129 字节走哈希
+        for bad in ["..", "/", "/etc/passwd", "café", "   "] {
+            let got = sanitize_agent_component(bad);
+            assert_eq!(
+                got.len(),
+                3 + 16,
+                "应收敛为 ag-<16hex> 哈希分量: {bad} -> {got}"
+            );
+            assert!(
+                got.starts_with("ag-"),
+                "应收敛为 ag-<16hex> 哈希分量: {bad} -> {got}"
+            );
+        }
+        assert_eq!(
+            sanitize_agent_component("   "),
+            format!("ag-{:016x}", 0xcbf29ce484222325u64)
+        );
+        let id_128 = "a".repeat(128);
+        assert_eq!(sanitize_agent_component(&id_128), id_128);
+        let id_129 = "a".repeat(129);
+        assert_eq!(
+            sanitize_agent_component(&id_129),
+            format!("ag-{:016x}", fnv1a64(&id_129))
+        );
+
+        // e2e 层：非法 agent_id 落哈希分片，未逃出 temp home，且与会话级计数互相隔离
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_evil_agent_{rand_id}"));
+        let sess_id = "evil_agent_sess";
+
+        let mk_agent_payload = |agent: &str| {
+            serde_json::json!({
+                "session_id": sess_id,
+                "agent_id": agent,
+                "tool_name": "grep",
+                "tool_input": {}
+            })
+            .to_string()
+        };
+        let payload_evil = mk_agent_payload("../evil");
+        let payload_long = mk_agent_payload(&long_id);
+        let payload_flat = serde_json::json!({
+            "session_id": sess_id,
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        // 穿越型 agent_id：3 次 grep 触发自己分片内的 deny
+        for (i, now) in [100.0, 101.0, 102.0].iter().enumerate() {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                payload_evil.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(*now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            if i < 2 {
+                assert!(out.is_empty());
+            }
+        }
+        assert!(String::from_utf8_lossy(&out).contains("\"permissionDecision\":\"deny\""));
+
+        // 超长 agent_id：独立分片，3 次 grep 第 3 次触发自己分片内的 deny
+        // （若分片失效退化为共享 counter，evil 的 deny@102 静默窗 [102,117) 会把这里全部消音，
+        //   该 deny 断言即可区分"真隔离"与"被共享静默窗消音"）
+        for (i, now) in [103.0, 104.0, 105.0].iter().enumerate() {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                payload_long.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(*now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            if i < 2 {
+                assert!(out.is_empty());
+            }
+        }
+        assert!(String::from_utf8_lossy(&out).contains("\"permissionDecision\":\"deny\""));
+
+        // 会话级（无 agent_id）第 1 次 grep 不受穿越型/超长 agent 的 deny 静默窗影响
+        out.clear();
+        let code_flat = run_remind_impl(
+            "claude-code",
+            payload_flat.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(106.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code_flat, 0);
+        assert!(out.is_empty());
+
+        // 落盘断言：两个哈希分片 + 会话级平面 counter 各自存在
+        let sess_dir = get_hook_data_dir(&temp_home, sess_id, None).unwrap();
+        assert!(sess_dir.join(&expected_evil).join("counter.json").exists());
+        assert!(sess_dir.join(&expected_long).join("counter.json").exists());
+        assert!(sess_dir.join("counter.json").exists());
+
+        // 未逃出 temp home："../evil" 未在 hook_data 层穿出会话目录
+        assert!(!temp_home
+            .join(".astrolabe")
+            .join("hook_data")
+            .join("evil")
+            .exists());
+        let hook_data_entries: Vec<_> =
+            std::fs::read_dir(temp_home.join(".astrolabe").join("hook_data"))
+                .unwrap()
+                .collect();
+        assert_eq!(
+            hook_data_entries.len(),
+            1,
+            "hook_data 下应只有会话目录一个条目"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_agent_id_extraction_type_and_field_edges() {
+        // 提取层边界：空串/空白/Bool/Null → 会话级平面路径；Number → 分片；agent_id 优先于 agentId
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_agent_edge_{rand_id}"));
+        let mut err = Vec::new();
+
+        let flat_cases: Vec<(&str, &str)> = vec![
+            (
+                "edge_empty",
+                r#"{"session_id":"edge_empty","agent_id":"","tool_name":"grep","tool_input":{}}"#,
+            ),
+            (
+                "edge_blank",
+                r#"{"session_id":"edge_blank","agent_id":"   ","tool_name":"grep","tool_input":{}}"#,
+            ),
+            (
+                "edge_bool",
+                r#"{"session_id":"edge_bool","agent_id":true,"tool_name":"grep","tool_input":{}}"#,
+            ),
+            (
+                "edge_null",
+                r#"{"session_id":"edge_null","agent_id":null,"tool_name":"grep","tool_input":{}}"#,
+            ),
+        ];
+        for (sess, payload) in &flat_cases {
+            let mut out = Vec::new();
+            let code = run_remind_impl(
+                "claude-code",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(100.0),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0, "{sess} 应正常处理");
+            let sess_dir = get_hook_data_dir(&temp_home, sess, None).unwrap();
+            assert!(
+                sess_dir.join("counter.json").exists(),
+                "{sess} 应落会话级平面 counter"
+            );
+            let entries: Vec<_> = std::fs::read_dir(&sess_dir).unwrap().collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "{sess} 会话目录应只有 counter.json 一个条目"
+            );
+        }
+
+        // Number 类型 agent_id → 转 string 后作为合法分片分量
+        let mut out = Vec::new();
+        let payload_num =
+            r#"{"session_id":"edge_number","agent_id":12345,"tool_name":"grep","tool_input":{}}"#;
+        let code = run_remind_impl(
+            "claude-code",
+            payload_num.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0);
+        assert!(get_hook_data_dir(&temp_home, "edge_number", None)
+            .unwrap()
+            .join("12345")
+            .join("counter.json")
+            .exists());
+
+        // agent_id 与 agentId 同时出现 → snake_case 优先（与 session_id 提取同构）
+        out.clear();
+        let payload_both = r#"{"session_id":"edge_both","agent_id":"snake-x","agentId":"camel-y","tool_name":"grep","tool_input":{}}"#;
+        let code = run_remind_impl(
+            "claude-code",
+            payload_both.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0);
+        let both_dir = get_hook_data_dir(&temp_home, "edge_both", None).unwrap();
+        assert!(
+            both_dir.join("snake-x").join("counter.json").exists(),
+            "agent_id 应优先于 agentId"
+        );
+        assert!(!both_dir.join("camel-y").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_cleanup_removes_nested_agent_shard_dirs() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_agent_cleanup_{rand_id}"));
+        let sess_id = "agent_cleanup_sess";
+
+        // 先带 agent_id remind 造出嵌套分片状态
+        let payload = serde_json::json!({
+            "session_id": sess_id,
+            "agent_id": "agent-x",
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_remind_impl(
+            "claude-code",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+
+        let sess_dir = get_hook_data_dir(&temp_home, sess_id, None).unwrap();
+        assert!(sess_dir.join("agent-x").join("counter.json").exists());
+
+        // SessionEnd cleanup 只带 session_id：整个会话目录（含 agent 分片）递归删除
+        let clean_payload = serde_json::json!({ "session_id": sess_id }).to_string();
+        let mut clean_err = Vec::new();
+        let clean_code =
+            run_cleanup_impl(clean_payload.as_bytes(), &mut clean_err, Some(&temp_home));
+        assert_eq!(clean_code, 0);
+        assert!(!sess_dir.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
     }
 }

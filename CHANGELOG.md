@@ -6,6 +6,18 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-07
+
+### Fixed
+
+- **防漂移 Hook 计数按子代理 `agent_id` 分片，修复并发子代理互相清零/消音。**
+  - PreToolUse payload 携带 `agent_id` / `agentId`（并发子 Agent 场景才有，主线程不含）时，计数状态落盘到 `~/.astrolabe/hook_data/<session_id>/<agent_id>/counter.json`，各子代理独立计数；此前所有子代理共享同一 counter，任一子代理调用符号工具即全局清零、任一 deny 的静默窗消音全部子代理，3 次阈值在并发下永远无法稳定触发。
+  - 分片名不合法（路径穿越、超长、非法字符等）时回退 FNV-1a 64 位哈希分量（`ag-<hex>`），防路径穿越；字段缺失或类型不符时静默回退会话级平面路径，尽力而为不报错。`SessionEnd` 清理仍按会话目录整体递归删除（含子代理分片）。
+
+### Changed
+
+- **deny 后静默窗默认从 120 秒缩短为 15 秒**（`ASTROLABE_DENY_SILENCE_SECS` 可覆盖），降低单一 deny 误消音后续合法排查的时长。
+
 ## [0.6.0] - 2026-10-05
 
 ### Added
