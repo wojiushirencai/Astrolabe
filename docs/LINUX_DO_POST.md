@@ -59,7 +59,7 @@
   - 连续 4 次混合无脑探索
   - 👉 **Hook 会直接截断并返回 Deny**，强制注入提示词，引导模型改用 Astrolabe 的 `search_code` / `find_symbol` / `resolve_context` 等低 Token 消耗工具。
 - **优雅放行切片精读**：我们深刻理解开发者的排查需求，因此 hook 做了精细化放行 —— **只要 Agent 使用带有 `limit <= 200` 的 offset/limit 切片读取，完全视为合法精准排查，绝不计入滥用计数！**（可通过 `ASTROLABE_SLICE_READ_MAX` 环境变量调整阈值）
-- **120 秒静默保护**：拦截后自动给予 120 秒冷却期，绝不打断紧急的调试节奏。（可通过 `ASTROLABE_DENY_SILENCE_SECS` 环境变量调整）
+- **15 秒静默保护**：拦截后自动给予 15 秒冷却期，绝不打断紧急的调试节奏。（可通过 `ASTROLABE_DENY_SILENCE_SECS` 环境变量调整）
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "astrolabe",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "description": "Deterministic code-graph MCP server. Zero-dependency Node shim that runs a native binary.",
   "keywords": [
     "mcp",
@@ -30,12 +30,12 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@astrolabe/darwin-arm64": "0.5.0",
-    "@astrolabe/darwin-x64": "0.5.0",
-    "@astrolabe/linux-x64-gnu": "0.5.0",
-    "@astrolabe/linux-x64-musl": "0.5.0",
-    "@astrolabe/linux-arm64-gnu": "0.5.0",
-    "@astrolabe/win32-x64-msvc": "0.5.0"
+    "@astrolabe/darwin-arm64": "0.7.0",
+    "@astrolabe/darwin-x64": "0.7.0",
+    "@astrolabe/linux-x64-gnu": "0.7.0",
+    "@astrolabe/linux-x64-musl": "0.7.0",
+    "@astrolabe/linux-arm64-gnu": "0.7.0",
+    "@astrolabe/win32-x64-msvc": "0.7.0"
   },
   "publishConfig": {
     "access": "public"

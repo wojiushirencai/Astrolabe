@@ -183,4 +183,4 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 | `ASTROLABE_CONTEXT` | `default` | 客户端上下文预设（`claude-code`, `cursor`, `codex`, `readonly` 等） |
 | `ASTROLABE_SLICE_READ_MAX` | `200` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为合法精读，不计入滥用 |
 | `ASTROLABE_READ_THRESHOLD` | `3` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） |
-| `ASTROLABE_DENY_SILENCE_SECS` | `120` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） |
+| `ASTROLABE_DENY_SILENCE_SECS` | `15` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） |
