@@ -11,6 +11,12 @@
 //! 分片落盘，各子代理独立计数。字段缺失、空白或类型不符（非 String/Number）时静默回退会话级
 //! 平面路径；标识含非法路径字符或超长（>128 字节）时收敛为 `ag-<fnv1a64 hex>` 哈希分片
 //! （尽力而为，不报错）。
+//!
+//! 支持客户端：claude-code / codebuddy / vscode / codex / grok，以及 CC 协议同构的
+//! kimicode（Moonshot Kimi Code CLI）、zcode（智谱 Z.ai ZCode）、cursor（Cursor CLI/Agent，
+//! 原生扁平输出格式）、opencode（插件桥接调用）。session_id 提取链含 `conversation_id` /
+//! `conversationId` fallback：Cursor 原生 preToolUse 只带 conversation_id，缺失该 fallback
+//! 会导致 exit 2，而 Cursor 语义下 exit 2 = deny，将误拦一切工具调用。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -174,6 +180,14 @@ pub(crate) enum Client {
     Vscode,
     Codex,
     Grok,
+    /// Moonshot Kimi Code CLI（协议与 Claude Code 同构）
+    KimiCode,
+    /// 智谱 Z.ai ZCode（协议与 Claude Code 同构）
+    ZCode,
+    /// Cursor CLI/Agent（含原生 hooks，扁平 deny 输出）
+    Cursor,
+    /// OpenCode（经 TS 插件桥接调用）
+    OpenCode,
     Other,
 }
 
@@ -184,7 +198,11 @@ impl Client {
             "codebuddy" => Client::Codebuddy,
             "vscode" => Client::Vscode,
             "codex" => Client::Codex,
-            "grok" => Client::Grok,
+            "grok" | "grokbuild" | "grok-build" => Client::Grok,
+            "kimicode" | "kimi-code" | "kimi_code" | "kimi" => Client::KimiCode,
+            "zcode" | "z-code" | "zai" => Client::ZCode,
+            "cursor" | "cursor-agent" | "cursor_agent" | "cursor-cli" => Client::Cursor,
+            "opencode" => Client::OpenCode,
             _ => Client::Other,
         }
     }
@@ -500,6 +518,17 @@ fn is_sed_in_place(args_str: &str) -> bool {
     })
 }
 
+/// 从 JSON 值提取非空 id 字符串（String trim 非空或 Number→字符串）。
+/// 用于 session/conversation/agent 标识的跨键 fallback 解析：按"第一个合法值"而非
+/// "第一个存在的键"取值，null/空白占位键会被跳过继续找后续键。
+fn json_nonempty_id(v: Option<&serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// 从 tool_input JSON 字段提取 u64（接受 Number 或可解析为数字的 String）
 fn json_value_as_u64(v: &serde_json::Value) -> Option<u64> {
     match v {
@@ -667,7 +696,14 @@ pub(crate) fn is_read_code_file_call(
 
     if matches!(
         client,
-        Client::Codex | Client::Grok | Client::ClaudeCode | Client::Codebuddy
+        Client::Codex
+            | Client::Grok
+            | Client::ClaudeCode
+            | Client::Codebuddy
+            | Client::KimiCode
+            | Client::ZCode
+            | Client::Cursor
+            | Client::OpenCode
     ) {
         if let Some(args_str) = command_args_str {
             let args = iter_shell_path_arguments(args_str);
@@ -698,8 +734,16 @@ pub(crate) fn classify_tool(
     }
 
     // 2. 检查是否为 grep 类工具
+    // KimiCode / ZCode / Cursor / OpenCode 协议与 CC 同构：工具名 read/grep/search_for_pattern
+    // （lowercase 后命中），命令型工具的 tool_input 带 command 字段（cmd/command 提取已覆盖）；
+    // Cursor 的命令工具名是 "Shell"，靠 command 内容识别 grep/cat 等，无需特判工具名。
     let is_grep = match client {
-        Client::ClaudeCode | Client::Codebuddy => {
+        Client::ClaudeCode
+        | Client::Codebuddy
+        | Client::KimiCode
+        | Client::ZCode
+        | Client::Cursor
+        | Client::OpenCode => {
             tool_name == "grep"
                 || tool_name.contains("search_for_pattern")
                 || command_name
@@ -724,7 +768,12 @@ pub(crate) fn classify_tool(
 
     // 3. 检查是否为 read 类工具
     let is_read = match client {
-        Client::ClaudeCode | Client::Codebuddy => {
+        Client::ClaudeCode
+        | Client::Codebuddy
+        | Client::KimiCode
+        | Client::ZCode
+        | Client::Cursor
+        | Client::OpenCode => {
             tool_name == "read"
                 || tool_name.contains("read_file")
                 || command_name
@@ -897,7 +946,7 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let ctx = format!("{ctx}{readonly_note}");
 
     match client {
-        Client::Grok => serde_json::json!({
+        Client::Grok | Client::OpenCode => serde_json::json!({
             "decision": "deny",
             "reason": reason,
         })
@@ -910,17 +959,27 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
             }
         })
         .to_string(),
-        Client::ClaudeCode | Client::Codebuddy | Client::Vscode | Client::Other => {
-            serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                    "additionalContext": ctx,
-                }
-            })
-            .to_string()
-        }
+        // Cursor 原生扁平格式：不映射 additionalContext，长引导文案必须放 agent_message
+        Client::Cursor => serde_json::json!({
+            "permission": "deny",
+            "user_message": reason,
+            "agent_message": ctx,
+        })
+        .to_string(),
+        Client::ClaudeCode
+        | Client::Codebuddy
+        | Client::Vscode
+        | Client::KimiCode
+        | Client::ZCode
+        | Client::Other => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+                "additionalContext": ctx,
+            }
+        })
+        .to_string(),
     }
 }
 
@@ -965,15 +1024,16 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
         }
     };
 
-    // 提取 session_id / sessionId
-    let session_id = input_data
-        .get("session_id")
-        .or_else(|| input_data.get("sessionId"))
-        .and_then(|v| match v {
-            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        });
+    // 提取 session_id / sessionId / conversation_id / conversationId
+    // （Cursor 原生 preToolUse 只带 conversation_id；缺失时 exit 2 在 Cursor 语义下等于 deny）
+    let session_id = [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+    ]
+    .iter()
+    .find_map(|k| json_nonempty_id(input_data.get(*k)));
 
     let session_id = match session_id {
         Some(s) => s,
@@ -990,14 +1050,9 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
 
     // 提取 agent_id / agentId（子代理内触发的 PreToolUse payload 才携带，主线程不含）。
     // 尽力而为：缺失或类型不符时视为无分片，落回会话级平面路径，不报错。
-    let agent_id = input_data
-        .get("agent_id")
-        .or_else(|| input_data.get("agentId"))
-        .and_then(|v| match v {
-            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        });
+    let agent_id = ["agent_id", "agentId"]
+        .iter()
+        .find_map(|k| json_nonempty_id(input_data.get(*k)));
 
     // 提取 tool_name / toolName
     let raw_tool_name = input_data
@@ -1027,12 +1082,15 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
         .or_else(|| input_data.get("toolInput"));
 
     if let Some(serde_json::Value::Object(map)) = raw_tool_input {
-        // 取 file_path / filePath / target_file / targetFile
+        // 取 file_path / filePath / target_file / targetFile / path
+        // （path 放最后兜底：Cursor 原生 Read 的字段是 tool_input.path；
+        //  grep 类工具的 path 参数不影响判定——grep 分类先于 read 判定）
         let fp = map
             .get("file_path")
             .or_else(|| map.get("filePath"))
             .or_else(|| map.get("target_file"))
             .or_else(|| map.get("targetFile"))
+            .or_else(|| map.get("path"))
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
@@ -1173,14 +1231,15 @@ pub(crate) fn run_cleanup_impl<R: Read, E: Write>(
         }
     };
 
-    let session_id = input_data
-        .get("session_id")
-        .or_else(|| input_data.get("sessionId"))
-        .and_then(|v| match v {
-            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        });
+    // 与 remind 同构：conversation_id / conversationId fallback 兼容 Cursor 原生 payload
+    let session_id = [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+    ]
+    .iter()
+    .find_map(|k| json_nonempty_id(input_data.get(*k)));
 
     let session_id = match session_id {
         Some(s) => s,
@@ -1487,6 +1546,27 @@ mod tests {
         assert_eq!(grok_val["decision"], "deny");
         assert!(grok_val["reason"].is_string());
         assert!(grok_val.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn test_client_from_str_aliases() {
+        // grok 的别名与大小写/空白变体都应映射到 Client::Grok
+        for s in [
+            "grok",
+            "grokbuild",
+            "grok-build",
+            "Grok",
+            "GROK",
+            "GrokBuild",
+            "GROKBUILD",
+            "Grok-Build",
+            "  grokbuild  ",
+        ] {
+            assert_eq!(Client::from_str(s), Client::Grok, "input: {s:?}");
+        }
+        // 未知名仍回落 Other；带空格的 "grok build" 不在别名表内
+        assert_eq!(Client::from_str("unknown-client"), Client::Other);
+        assert_eq!(Client::from_str("grok build"), Client::Other);
     }
 
     #[test]
@@ -3291,6 +3371,119 @@ mod tests {
     }
 
     #[test]
+    fn test_session_id_fallback_skips_invalid_placeholder() {
+        // null/空白占位键应被跳过继续找后续键（而非取"第一个存在的键"后解析失败 exit 2）
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_id_fallback_{rand_id}"));
+
+        // session_id=null 占位 + conversation_id 合法；agent_id 空串占位 + agentId 合法
+        let payload = serde_json::json!({
+            "session_id": null,
+            "conversation_id": "conv-abc",
+            "agent_id": "",
+            "agentId": "camel-1",
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_remind_impl(
+            "cursor",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0, "应跳过占位键用 conversation_id，而非 exit 2");
+        // 计数落盘：会话目录 conv-abc、分片 camel-1（agent_id 空串被跳过）
+        let sess_dir = get_hook_data_dir(&temp_home, "conv-abc", None).unwrap();
+        assert!(sess_dir.join("camel-1").join("counter.json").exists());
+        assert!(!sess_dir.join("counter.json").exists());
+
+        // cleanup 同构：conversation_id 可清理
+        let clean_payload = serde_json::json!({ "conversation_id": "conv-abc" }).to_string();
+        let mut clean_err = Vec::new();
+        let clean_code =
+            run_cleanup_impl(clean_payload.as_bytes(), &mut clean_err, Some(&temp_home));
+        assert_eq!(clean_code, 0);
+        assert!(!sess_dir.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_cursor_native_read_path_field_classification() {
+        // Cursor 原生 Read 的 tool_input.path 提取：非代码文件（README.md）不计 read 滥用，
+        // 代码文件（.rs）正常累计并在第 3 次 deny（输出为 Cursor 原生扁平格式）
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_cursor_path_{rand_id}"));
+        let mut err = Vec::new();
+
+        let mk_read_payload = |sess: &str, path: &str| {
+            serde_json::json!({
+                "conversation_id": sess,
+                "tool_name": "Read",
+                "tool_input": { "path": path }
+            })
+            .to_string()
+        };
+
+        // 会话 A：README.md ×3 → 非代码文件，不触发 Read deny
+        let payload_readme = mk_read_payload("cursor-path-a", "README.md");
+        for (i, now) in [100.0, 101.0, 102.0].iter().enumerate() {
+            let mut out = Vec::new();
+            let code = run_remind_impl(
+                "cursor",
+                payload_readme.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(*now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            assert!(
+                out.is_empty(),
+                "README 非代码文件，第 {} 次不应 deny（path 未提取时会误走保守分支）",
+                i + 1
+            );
+        }
+
+        // 会话 B：src/main.rs ×3 → 代码文件，第 3 次 deny 且为 Cursor 扁平格式
+        let payload_code = mk_read_payload("cursor-path-b", "src/main.rs");
+        let mut out = Vec::new();
+        for (i, now) in [100.0, 101.0, 102.0].iter().enumerate() {
+            out.clear();
+            let code = run_remind_impl(
+                "cursor",
+                payload_code.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(*now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            if i < 2 {
+                assert!(out.is_empty());
+            }
+        }
+        let denied = String::from_utf8_lossy(&out);
+        assert!(denied.contains("\"permission\":\"deny\""));
+        assert!(denied.contains("user_message"));
+        assert!(denied.contains("agent_message"));
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
     fn test_cleanup_removes_nested_agent_shard_dirs() {
         let rand_id = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3331,6 +3524,381 @@ mod tests {
             run_cleanup_impl(clean_payload.as_bytes(), &mut clean_err, Some(&temp_home));
         assert_eq!(clean_code, 0);
         assert!(!sess_dir.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_client_from_str_new_client_aliases() {
+        // KimiCode（Moonshot Kimi Code CLI，协议 CC 同构）
+        for s in [
+            "kimicode",
+            "kimi-code",
+            "kimi_code",
+            "kimi",
+            "KimiCode",
+            "KIMI",
+            "  Kimi-Code  ",
+        ] {
+            assert_eq!(Client::from_str(s), Client::KimiCode, "input: {s:?}");
+        }
+        // ZCode（智谱 Z.ai ZCode）
+        for s in ["zcode", "z-code", "zai", "ZCode", "ZAI", " z-code "] {
+            assert_eq!(Client::from_str(s), Client::ZCode, "input: {s:?}");
+        }
+        // Cursor（Cursor CLI/Agent）
+        for s in [
+            "cursor",
+            "cursor-agent",
+            "cursor_agent",
+            "cursor-cli",
+            "Cursor",
+            "Cursor-Agent",
+            " cursor-cli ",
+        ] {
+            assert_eq!(Client::from_str(s), Client::Cursor, "input: {s:?}");
+        }
+        // OpenCode（插件桥接调用）
+        for s in ["opencode", "OpenCode", "OPENCODE", " opencode "] {
+            assert_eq!(Client::from_str(s), Client::OpenCode, "input: {s:?}");
+        }
+        // 未知名仍回落 Other；带空格的 "kimi code" 不在别名表内
+        assert_eq!(Client::from_str("unknown-client"), Client::Other);
+        assert_eq!(Client::from_str("kimi code"), Client::Other);
+    }
+
+    #[test]
+    fn test_classify_cursor_opencode_kimi_zcode_cc_isomorphic() {
+        // Cursor：命令工具名是 "Shell"，靠 command 内容识别 grep/cat 等
+        assert_eq!(
+            classify_tool(
+                "shell",
+                Client::Cursor,
+                None,
+                Some("grep"),
+                Some("-rn foo src/"),
+                None,
+                None
+            ),
+            ToolKind::Grep
+        );
+        // Cursor："Read" 无 limit → Read（代码文件），非切片
+        assert_eq!(
+            classify_tool(
+                "read",
+                Client::Cursor,
+                Some("src/main.rs"),
+                None,
+                None,
+                None,
+                None
+            ),
+            ToolKind::Read { is_code_file: true }
+        );
+        // Cursor：原生 grep 工具名直接命中
+        assert_eq!(
+            classify_tool("grep", Client::Cursor, None, None, None, None, None),
+            ToolKind::Grep
+        );
+
+        // OpenCode：read / grep 工具名同理
+        assert_eq!(
+            classify_tool(
+                "read",
+                Client::OpenCode,
+                Some("src/main.rs"),
+                None,
+                None,
+                None,
+                None
+            ),
+            ToolKind::Read { is_code_file: true }
+        );
+        assert_eq!(
+            classify_tool("grep", Client::OpenCode, None, None, None, None, None),
+            ToolKind::Grep
+        );
+
+        // KimiCode / ZCode 与 CC 同臂
+        assert_eq!(
+            classify_tool("grep", Client::KimiCode, None, None, None, None, None),
+            ToolKind::Grep
+        );
+        assert_eq!(
+            classify_tool(
+                "read",
+                Client::ZCode,
+                Some("src/main.rs"),
+                None,
+                None,
+                None,
+                None
+            ),
+            ToolKind::Read { is_code_file: true }
+        );
+
+        // is_read_code_file_call：四家并入 CC 的 shell 路径参数判定臂
+        for c in [
+            Client::KimiCode,
+            Client::ZCode,
+            Client::Cursor,
+            Client::OpenCode,
+        ] {
+            assert!(is_read_code_file_call(true, None, c, Some("src/a.rs")));
+            assert!(!is_read_code_file_call(true, None, c, Some("README.md")));
+        }
+    }
+
+    #[test]
+    fn test_classify_grok_terminal_command_tool_names() {
+        // Grok Build：命令工具名是 run_terminal_command（snake_case），靠 command 内容识别 grep
+        assert_eq!(
+            classify_tool(
+                "run_terminal_command",
+                Client::Grok,
+                None,
+                Some("grep"),
+                Some("pattern lib.rs"),
+                None,
+                None
+            ),
+            ToolKind::Grep
+        );
+        // Grok Build：read_file 无 limit → Read 分支（现有逻辑已覆盖，钉死防回归）
+        assert_eq!(
+            classify_tool(
+                "read_file",
+                Client::Grok,
+                Some("src/lib.rs"),
+                None,
+                None,
+                None,
+                None
+            ),
+            ToolKind::Read { is_code_file: true }
+        );
+    }
+
+    #[test]
+    fn test_build_output_new_client_formats() {
+        // Cursor：原生扁平格式，三键齐备且无 hookSpecificOutput；
+        // Cursor 不映射 additionalContext，长引导文案必须放 agent_message
+        let cursor_out = build_output(Client::Cursor, DenyKind::Grep);
+        let cursor_val: serde_json::Value = serde_json::from_str(&cursor_out).unwrap();
+        assert_eq!(cursor_val["permission"], "deny");
+        assert!(cursor_val["user_message"].is_string());
+        assert!(cursor_val["agent_message"].is_string());
+        assert!(cursor_val.get("hookSpecificOutput").is_none());
+        let agent_msg = cursor_val["agent_message"].as_str().unwrap();
+        let user_msg = cursor_val["user_message"].as_str().unwrap();
+        assert!(
+            agent_msg.len() > user_msg.len(),
+            "agent_message 应承载长引导文案: agent={agent_msg} user={user_msg}"
+        );
+        assert!(agent_msg.contains("read-only"));
+
+        // OpenCode：与 Grok 同臂的扁平 decision/reason
+        let oc_out = build_output(Client::OpenCode, DenyKind::Read);
+        let oc_val: serde_json::Value = serde_json::from_str(&oc_out).unwrap();
+        assert_eq!(oc_val["decision"], "deny");
+        assert!(oc_val["reason"].is_string());
+        assert!(oc_val.get("hookSpecificOutput").is_none());
+        assert!(oc_val.get("permission").is_none());
+
+        // KimiCode / ZCode：与 CC 同臂的三字段标准输出
+        for (name, client) in [("kimicode", Client::KimiCode), ("zcode", Client::ZCode)] {
+            let out = build_output(client, DenyKind::Mixed);
+            let val: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                val["hookSpecificOutput"]["hookEventName"], "PreToolUse",
+                "{name}"
+            );
+            assert_eq!(
+                val["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{name}"
+            );
+            assert!(
+                val["hookSpecificOutput"]["permissionDecisionReason"].is_string(),
+                "{name}"
+            );
+            assert!(
+                val["hookSpecificOutput"]["additionalContext"].is_string(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conversation_id_session_fallback_remind_and_cleanup() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_conv_id_{rand_id}"));
+
+        // String 型 conversation_id（Cursor 原生形态）：remind 正常计数，写盘路径用该 id
+        // （修复前此处 exit 2，Cursor 语义下等于 deny 一切工具调用）
+        let payload_str = serde_json::json!({
+            "conversation_id": "conv_str_sess",
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_remind_impl(
+            "cursor",
+            payload_str.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+        assert!(get_hook_data_dir(&temp_home, "conv_str_sess", None)
+            .unwrap()
+            .join("counter.json")
+            .exists());
+
+        // Number 型 conversationId（驼峰）：转字符串后同样落盘
+        let payload_num = serde_json::json!({
+            "conversationId": 98765,
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+        out.clear();
+        let code_num = run_remind_impl(
+            "cursor",
+            payload_num.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(101.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code_num, 0);
+        assert!(out.is_empty());
+        assert!(get_hook_data_dir(&temp_home, "98765", None)
+            .unwrap()
+            .join("counter.json")
+            .exists());
+
+        // cleanup 按 conversation_id 清理（幂等）
+        let clean_payload = serde_json::json!({ "conversation_id": "conv_str_sess" }).to_string();
+        let mut clean_err = Vec::new();
+        let clean_code =
+            run_cleanup_impl(clean_payload.as_bytes(), &mut clean_err, Some(&temp_home));
+        assert_eq!(clean_code, 0);
+        assert!(!get_hook_data_dir(&temp_home, "conv_str_sess", None)
+            .unwrap()
+            .exists());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_cursor_shell_tool_e2e_flat_deny() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_cursor_e2e_{rand_id}"));
+
+        // Cursor 原生 payload：只带 conversation_id + Shell 工具 + command 含 grep
+        let payload = serde_json::json!({
+            "conversation_id": "cursor_shell_sess",
+            "tool_name": "Shell",
+            "tool_input": { "command": "grep -rn foo src/" }
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        for i in 0..2 {
+            out.clear();
+            let code = run_remind_impl(
+                "cursor",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(100.0 + i as f64),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            assert!(out.is_empty());
+        }
+
+        // 第 3 次 -> Cursor 扁平 deny：permission / user_message / agent_message
+        out.clear();
+        let code3 = run_remind_impl(
+            "cursor",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(102.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code3, 0);
+        let val: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out).trim()).unwrap();
+        assert_eq!(val["permission"], "deny");
+        assert!(val["user_message"].is_string());
+        assert!(val["agent_message"].is_string());
+        assert!(val.get("hookSpecificOutput").is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_opencode_e2e_flat_decision_deny() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_oc_e2e_{rand_id}"));
+
+        // OpenCode：grep 工具 3 次触发与 Grok 同臂的扁平 decision deny
+        let payload = serde_json::json!({
+            "session_id": "oc_flat_sess",
+            "tool_name": "grep",
+            "tool_input": {}
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        for i in 0..2 {
+            out.clear();
+            let code = run_remind_impl(
+                "opencode",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(100.0 + i as f64),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            assert!(out.is_empty());
+        }
+
+        out.clear();
+        let code3 = run_remind_impl(
+            "opencode",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(102.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code3, 0);
+        let val: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out).trim()).unwrap();
+        assert_eq!(val["decision"], "deny");
+        assert!(val["reason"].is_string());
+        assert!(val.get("hookSpecificOutput").is_none());
 
         let _ = std::fs::remove_dir_all(&temp_home);
     }

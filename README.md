@@ -151,6 +151,172 @@ npx -y astrolabe /path/to/your/repo
 > }
 > ```
 
+#### 1b. Codebuddy / Grok 等 CLI
+
+Astrolabe 防漂移 Hook 层已内置对 **Codebuddy** 与 **Grok** 客户端的识别与拦截输出：
+- `--client=codebuddy`：走与 Claude Code 同构的工具名识别规则（覆盖 `grep`、`read`、`search_for_pattern`、`read_file` 及 shell 常见命令），输出兼容 CC 的 `hookSpecificOutput` 结构化决策；
+- `--client=grok`（支持 `grokbuild`、`grok-build` 别名）：识别 `grep` 与 `read_file` 及 shell 命令，输出 Grok 规范的扁平 JSON 格式（`{"decision":"deny","reason":...}`）；
+- **Context 行为**：Codebuddy 与 Grok 目前均使用 `default` 温和级上下文（无特殊 schema 限制或工具过滤，无需指定单独 `--context` 参数）。
+
+> **Hook 配方示例（适用于宿主支持 CC 兼容 hooks 的情况）**：
+> 若所使用的 Codebuddy 或 Grok 宿主环境支持 Claude Code 兼容的 hooks 配置语法，可沿用与上方 CC 相同的 settings 配方，只需将 PreToolUse 命令中的 `--client` 替换为对应值即可：
+>
+> *Codebuddy 示例*：
+> ```json
+> {
+>   "hooks": {
+>     "PreToolUse": [
+>       {
+>         "matcher": "",
+>         "hooks": [
+>           {
+>             "type": "command",
+>             "command": "astrolabe hooks remind --client=codebuddy"
+>           }
+>         ]
+>       }
+>     ],
+>     "SessionEnd": [
+>       {
+>         "matcher": "",
+>         "hooks": [
+>           {
+>             "type": "command",
+>             "command": "astrolabe hooks cleanup"
+>           }
+>         ]
+>       }
+>     ]
+>   }
+> }
+> ```
+>
+> *Grok 示例*：
+> 将 command 替换为 `astrolabe hooks remind --client=grok` 即可。若宿主为其它自定义 hook 触发机制，只需将 PreToolUse payload（包含 `session_id` 与 `tool_name` 等 JSON 字段）经 stdin 送入该命令，并读取 stdout 返回的扁平 deny 决策。
+
+#### 1c. Cursor / Kimi / ZCode / OpenCode / Grok Build
+
+##### 1. Cursor CLI
+
+Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容能力：
+- **配置文件**：放置于 `~/.cursor/hooks.json`（全局）或当前项目根目录 `.cursor/hooks.json`。事件名使用小驼峰（`preToolUse`、`sessionEnd`）。另外，Cursor 也会自动加载 `.claude/settings.json`（第三方兼容模式，PreToolUse 自动映射，但注意该模式不映射 `additionalContext`）。
+- **工具识别与输出格式**：内置工具名包括 `Shell`、`Read`、`Write`、`Grep`、`Task`；Astrolabe `--client=cursor`（别名：`cursor-agent`、`cursor_agent`、`cursor-cli`）输出 Cursor 原生扁平格式 `{"permission":"deny","user_message":...,"agent_message":...}`，长引导文案直接注入 `agent_message` 送达模型。
+- **会话识别兼容**：Cursor 原生 preToolUse 事件仅传递 `conversation_id`，Astrolabe 内部会话提取逻辑已原生兼容 `conversation_id` / `conversationId` fallback。
+
+**完整配方（`.cursor/hooks.json`）**：
+```json
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "astrolabe hooks remind --client=cursor",
+        "matcher": "Shell|Read|Grep"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "astrolabe hooks cleanup"
+      }
+    ]
+  }
+}
+```
+
+##### 2. Grok Build
+
+针对 `xai-org/grok-build`（CLI 名 `grok`）：
+- **配置文件**：放置于 `~/.grok/hooks/astrolabe.json`（全局）或项目级 `.grok/hooks/astrolabe.json`。
+- **项目级授信提示**：若使用项目级 hooks 配置，必须在 Grok CLI 中执行 `/hooks-trust` 完成授信后方可生效。
+- **匹配与决策**：Grok 内置工具使用 snake_case（`run_terminal_command`、`read_file`、`grep`），matcher 建议同时编写 PascalCase 别名与 snake_case：`"Bash|Read|Grep|run_terminal_command|read_file|grep"`。Astrolabe 原生兼容驼峰 payload（`sessionId`、`toolName`、`toolInput`），并通过 `--client=grok` 输出 Grok 一等公民原生扁平决策 `{"decision":"deny","reason":...}`；退出码遵循规范（2 代表阻断、1 代表 fail-open 放行）。
+
+**完整配方（`~/.grok/hooks/astrolabe.json`）**：
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Grep|run_terminal_command|read_file|grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "astrolabe hooks remind --client=grok",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "astrolabe hooks cleanup",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+##### 3. Kimi Code CLI 与 ZCode
+
+- **Kimi Code CLI**（Moonshot，CLI 命令 `kimi`，仓库 `MoonshotAI/kimi-code`）：
+  - 配置文件位于 `~/.kimi-code/config.toml` 的 `[[hooks]]` 配置块（支持 `PreToolUse`、`PostToolUse` 与 `matcher`）；
+  - 协议与 Claude Code 同构（通过 stdin 输入 JSON：包含 `session_id`、`tool_name`、`tool_input`；deny 拦截输出 `hookSpecificOutput` 结构化决策或 exit 2 阻断）；内置工具识别覆盖 `Read`、`Grep`、`Bash`；
+  - PreToolUse 命令参数使用 `--client=kimicode`（别名：`kimi-code`、`kimi_code`、`kimi`）；
+  - *示意配置（注：TOML 具体键名未经逐字核对，以下为示意级示例，请以官方文档为准）*：
+    ```toml
+    # ~/.kimi-code/config.toml 示意配置（具体键名以官方文档为准）
+    [[hooks]]
+    event = "PreToolUse"
+    matcher = "Read|Grep|Bash"
+    command = "astrolabe hooks remind --client=kimicode"
+
+    [[hooks]]
+    event = "SessionEnd"
+    command = "astrolabe hooks cleanup"
+    ```
+- **ZCode**（智谱 Z.ai，仓库 `zai-org/ZCode`）：
+  - Hook 协议与 Claude Code 完全同构（支持 `PreToolUse` 事件、`session_id` 状态管理以及 `hookSpecificOutput` 结构化决策输出）；
+  - PreToolUse 命令参数使用 `--client=zcode`（别名：`z-code`、`zai`），输出兼容 CC 的三字段结构；SessionEnd 调用 `astrolabe hooks cleanup`。
+
+##### 4. OpenCode
+
+针对 `anomalyco/opencode`（`opencode.ai`）：
+- **机制说明**：OpenCode 宿主本身未提供预置 hooks 命令体系，但提供了灵活的 TypeScript 插件扩展能力。通过在 `tool.execute.before` 钩子中抛出 `Error` 即可实现工具调用拦截。
+- `--client=opencode` 输出扁平 `{"decision":"deny","reason":...}`，正好供 TypeScript 桥接插件解析。
+- **桥接插件模板（`.opencode/plugins/astrolabe-guard.ts`）**：
+```typescript
+import type { Plugin } from "@opencode-ai/plugin";
+
+export const AstrolabeGuard: Plugin = async () => {
+  return {
+    "tool.execute.before": async (input, output) => {
+      const payload = JSON.stringify({
+        session_id: input.sessionID,
+        tool_name: input.tool,
+        tool_input: output.args ?? {},
+      });
+      const proc = Bun.spawnSync(["astrolabe", "hooks", "remind", "--client=opencode"], {
+        stdin: payload, stdout: "pipe", stderr: "pipe",
+      });
+      const stdout = new TextDecoder().decode(proc.stdout).trim();
+      if (stdout) {
+        const decision = JSON.parse(stdout);
+        if (decision.decision === "deny") {
+          throw new Error(decision.reason);
+        }
+      }
+    },
+  };
+};
+export default AstrolabeGuard;
+```
+
 #### 2. Cursor 配置
 在项目根目录 `.cursor/mcp.json` 中添加配置：
 

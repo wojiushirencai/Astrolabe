@@ -26,7 +26,11 @@ ROOT 优先级：位置参数 → ASTROLABE_ROOT → .（从 cwd 探测）
 子命令（Serena 式防漂移 hooks 与提示词输出）:
   hooks remind --client=NAME   PreToolUse hook：stdin 读 hook payload，计数连续
                                grep/read 滥用，超阈值输出 deny 决策 JSON。
-                               client: claude-code/codebuddy/vscode/codex/grok
+                               client: claude-code/codebuddy/vscode/codex/grok/
+                                       kimicode/zcode/cursor/opencode
+                               （grokbuild/grok-build 亦映射为 grok；
+                                kimi-code/kimi_code/kimi→kimicode，z-code/zai→zcode，
+                                cursor-agent/cursor_agent/cursor-cli→cursor）
   hooks cleanup                SessionEnd hook：按 stdin session_id 清理状态目录
   print-cc-system-prompt-override
                                输出 Claude Code --system-prompt 整体替换文本

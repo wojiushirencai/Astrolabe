@@ -6,6 +6,17 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-07
+
+### Added
+
+- **防漂移 Hook 客户端全面扩展（Cursor CLI、Grok Build、Kimi Code、ZCode、OpenCode）。**
+  - **Cursor CLI 适配**：新增 `Client::Cursor`（别名 `cursor` / `cursor-agent` / `cursor_agent` / `cursor-cli`），原生输出 Cursor 扁平 deny 格式（`{"permission":"deny","user_message":...,"agent_message":...}`），长引导警告注入 `agent_message` 直达模型；PreToolUse payload 会话识别支持 `conversation_id` / `conversationId` fallback，无缝对接 Cursor 原生 `preToolUse` 事件。
+  - **Grok Build 配方与别名**：完善 Grok Build（`xai-org/grok-build`）规范支持（别名 `grok` / `grokbuild` / `grok-build`），输出一等公民扁平格式 `{"decision":"deny","reason":...}`，提供 `~/.grok/hooks/astrolabe.json` 配方、项目级 `/hooks-trust` 授信说明及工具 matcher 双命名建议。
+  - **Kimi Code CLI 适配**：新增 `Client::KimiCode`（别名 `kimicode` / `kimi-code` / `kimi_code` / `kimi`），协议与 Claude Code 同构，工具识别覆盖 `Read` / `Grep` / `Bash`，输出三字段 `hookSpecificOutput` 结构化决策。
+  - **ZCode 适配**：新增 `Client::ZCode`（别名 `zcode` / `z-code` / `zai`），协议与 Claude Code 同构，输出三字段 `hookSpecificOutput` 结构化决策。
+  - **OpenCode 插件桥接**：新增 `Client::OpenCode`（别名 `opencode`），输出扁平 `{"decision":"deny","reason":...}`；提供 `.opencode/plugins/astrolabe-guard.ts` TS 插件模板，通过 `tool.execute.before` 钩子拦截并抛出错误。
+
 ## [0.7.0] - 2026-10-07
 
 ### Fixed
