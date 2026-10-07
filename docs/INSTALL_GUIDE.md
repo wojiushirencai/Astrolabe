@@ -1,6 +1,6 @@
 # Astrolabe 多平台安装与 AI 工具配置指南
 
-本指南专为开发者及 AI 编程工具（Claude Code、Cursor、Windsurf、Codex、OpenCode 等）自动化配置而设计。您可以直接把本文档或配置 JSON 喂给 AI 工具完成一键部署。
+本指南专为开发者及 AI 编程工具（Claude Code、Cursor、Windsurf、Codex、Codebuddy、Grok、OpenCode 等）自动化配置而设计。您可以直接把本文档或配置 JSON 喂给 AI 工具完成一键部署。
 
 ---
 
@@ -150,6 +150,23 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 
 ---
 
+### 4. Codebuddy / Grok 等 CLI 配置与 Hook
+
+- **MCP 服务接入**：作为标准 stdio MCP 启动，无需指定特殊 context 参数（默认回退 `default` 温和级）：
+  ```json
+  {
+    "mcpServers": {
+      "astrolabe": {
+        "command": "astrolabe",
+        "args": ["."]
+      }
+    }
+  }
+  ```
+- **防漂移 Hook 接入**：若宿主支持 Claude Code 兼容的 hooks，将 PreToolUse 命令指定为 `astrolabe hooks remind --client=codebuddy` 或 `astrolabe hooks remind --client=grok`（Grok 别名 `grokbuild`、`grok-build` 均已内置支持）。
+
+---
+
 ## 四、直接给 AI 工具执行的一键安装提示词模板
 
 如果您正在打开新的 Claude Code / Cursor / Windsurf 窗口，可以直接把下面这段话复制发给 AI：
@@ -180,7 +197,21 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 | `ASTROLABE_CACHE_MB` | `256` | 内存文件缓存上限（MB），设为 `0` 关闭内存缓存 |
 | `ASTROLABE_WATCH_SECS` | 未设置 | 后台文件监听模式：未设置使用原生事件（空闲 0% CPU）；设为 `0` 关闭监听；正整数 `N` 强制 `N` 秒轮询兜底 |
 | `ASTROLABE_LSP_TIMEOUT` | `300` | LSP 语言服务器单次请求最大超时时间（秒） |
-| `ASTROLABE_CONTEXT` | `default` | 客户端上下文预设（`claude-code`, `cursor`, `codex`, `readonly` 等） |
+| `ASTROLABE_CONTEXT` | `default` | 客户端上下文预设（`claude-code`, `cursor`, `codex`, `readonly` 等；codebuddy 与 grok 走 `default` 温和级） |
 | `ASTROLABE_SLICE_READ_MAX` | `200` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为合法精读，不计入滥用 |
 | `ASTROLABE_READ_THRESHOLD` | `3` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） |
 | `ASTROLABE_DENY_SILENCE_SECS` | `15` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） |
+
+### 客户端与 Hook 支持矩阵
+
+| 客户端 (`--client`) | 工具识别规则 | Deny 决策格式 | 上下文预设 (`--context`) | 状态与说明 |
+|---|---|---|---|---|
+| `claude-code` | CC 规范 `grep` / `read` / shell 命令 | 结构化 `hookSpecificOutput` | `claude-code` | 官方支持 |
+| `codebuddy` | CC 同构工具名识别（`grep`、`read`、`read_file` 等） | 结构化 `hookSpecificOutput` | `default`（温和级） | 内置支持（适用于支持 CC 兼容 hooks 的宿主） |
+| `grok` | `grep` / `read_file` / shell 命令 | 扁平 `{"decision":"deny","reason":...}` | `default`（温和级） | 内置支持（别名：`grokbuild`、`grok-build`） |
+| `cursor` | 原生 `Shell`/`Read`/`Grep`/`Task` 及 shell 命令 | 原生扁平 `{"permission":"deny",...}` | `default`（MCP 可选 `cursor`） | 内置支持（Cursor CLI hooks.json，别名 cursor-agent/cursor_agent/cursor-cli；兼容 conversation_id） |
+| `kimicode` | CC 同构识别（`Read` / `Grep` / `Bash` 及 shell 命令） | 结构化 `hookSpecificOutput` | `default`（温和级） | 内置支持（别名：kimi-code/kimi_code/kimi） |
+| `zcode` | CC 同构识别（`Read` / `Grep` / `Bash` 及 shell 命令） | 结构化 `hookSpecificOutput` | `default`（温和级） | 内置支持（别名：z-code/zai） |
+| `opencode` | 宿主传入 tool 名称及 shell 命令 | 扁平 `{"decision":"deny","reason":...}` | `default`（温和级） | 插件桥接（.opencode/plugins/astrolabe-guard.ts TS 插件拦截） |
+| `codex` | shell grep/read 命令 | 结构化 `permissionDecision` | `codex` | 官方支持 |
+| `vscode` / `other` | 通用子串包含匹配 | 结构化 `hookSpecificOutput` | `default` | 通用回退 |
