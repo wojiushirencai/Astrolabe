@@ -58,7 +58,7 @@
   - 连续 3 次全量 `Read` 代码文件
   - 连续 4 次混合无脑探索
   - 👉 **Hook 会直接截断并返回 Deny**，强制注入提示词，引导模型改用 Astrolabe 的 `search_code` / `find_symbol` / `resolve_context` 等低 Token 消耗工具。
-- **优雅放行切片精读**：我们深刻理解开发者的排查需求，因此 hook 做了精细化放行 —— **只要 Agent 使用带有 `limit <= 200` 的 offset/limit 切片读取，完全视为合法精准排查，绝不计入滥用计数！**（可通过 `ASTROLABE_SLICE_READ_MAX` 环境变量调整阈值）
+- **切片精读额度制**：我们深刻理解开发者的排查需求——**带有 `limit <= 200` 的 offset/limit 切片读取依然随时可用**，但它不再是可以无限刷的豁免通道：连续 10 次切片读且期间没调用过任何 Astrolabe 工具时，会收到一次提醒式拦截（引导先用 `search_code` / `find_symbol` 定位再精读）；任何一次 Astrolabe 工具调用都会把该额度清零。（切片上限 `ASTROLABE_SLICE_READ_MAX`、连续次数 `ASTROLABE_SLICE_READ_THRESHOLD` 均可通过环境变量调整）
 - **15 秒静默保护**：拦截后自动给予 15 秒冷却期，绝不打断紧急的调试节奏。（可通过 `ASTROLABE_DENY_SILENCE_SECS` 环境变量调整）
 
 ---

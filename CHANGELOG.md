@@ -6,6 +6,14 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-08
+
+### Changed
+
+- **防漂移 Hook 切片读从"无限豁免"改为"连续额度制"，deny 文案收紧为直接切换指令。**
+  - 带 `limit ≤ ASTROLABE_SLICE_READ_MAX`（默认 200）的 Read 切片读不再零计数完全放行（实测漂移会话出现过 259 次切片读零拦截，计数器被架空），改为连续额度制：连续 10 次（新环境变量 `ASTROLABE_SLICE_READ_THRESHOLD` 可调）**代码文件**切片读且期间无任何 Astrolabe 工具调用即触发新增的 `DenyKind::Slice` 提醒式拦截；非代码文件（未索引语言 / markdown 等）切片保持中立不计数（与全量读口径一致，把它们推向 search_code 没有意义）；任何 Astrolabe 工具调用（含 `search_code` / `get_diagnostics` 等非符号工具，新增 `ToolKind::AstrolabeNonSymbolic` 分类，只清零切片额度、不动 grep/read 计数）都会清零该额度；调用间隔超 2000 秒自动重置；`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片 shell 打印保持中立不计数。计数状态新增 `n_slice` / `last_slice_ts` 字段（serde 兼容旧 counter.json）。
+  - Grep / Read / Mixed 三类 deny 的 reason 与 additionalContext 删除 "You can continue using ... the counter was reset" 软口径，替换为明确切换指令 "Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe)."；共用只读声明同步改为切片额度制准确口径（slice reads 仍可用，连续超阈值触发提醒，未索引语言逃生口保留）。
+
 ## [0.8.0] - 2026-10-07
 
 ### Added

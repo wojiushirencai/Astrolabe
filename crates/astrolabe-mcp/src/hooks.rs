@@ -3,6 +3,7 @@
 //!
 //! 可通过环境变量覆盖默认阈值：
 //! - `ASTROLABE_SLICE_READ_MAX`: 切片精读最大行数（默认 200）
+//! - `ASTROLABE_SLICE_READ_THRESHOLD`: 连续切片读提醒阈值（默认 10，期间无任何 astrolabe 工具调用）
 //! - `ASTROLABE_READ_THRESHOLD`: 连续全文件 Read deny 阈值（默认 3）
 //! - `ASTROLABE_DENY_SILENCE_SECS`: deny 后静默窗口秒数（默认 15）
 //!
@@ -29,22 +30,30 @@ use serde::{Deserialize, Serialize};
 pub(crate) const GREP_THRESHOLD: u32 = 3;
 pub(crate) const DEFAULT_READ_THRESHOLD: u32 = 3;
 pub(crate) const NON_SYMBOLIC_THRESHOLD: u32 = 4;
+/// 连续切片读提醒阈值默认值：连续 N 次切片读且期间无任何 astrolabe 工具调用 → deny 提醒。
+/// 实测漂移会话出现过 259 次切片读零拦截（旧实现完全豁免），故切片读改为连续额度制。
+pub(crate) const DEFAULT_SLICE_READ_THRESHOLD: u32 = 10;
 
 /// 重置周期（秒）：两次同类调用间隔超过该值才重置计数
 pub(crate) const GREP_RESET_PERIOD_SECONDS: f64 = 1000.0;
 pub(crate) const READ_RESET_PERIOD_SECONDS: f64 = 1000.0;
 pub(crate) const NON_SYMBOLIC_RESET_PERIOD_SECONDS: f64 = 2000.0;
+/// 切片读额度重置周期（秒）：与 non_symbolic 同档
+pub(crate) const SLICE_RESET_PERIOD_SECONDS: f64 = 2000.0;
 
 /// deny 后静默窗口（秒）默认值：窗口内整个 hook 变为 no-op（不增计数、不发 deny）
 pub(crate) const DEFAULT_MIN_DENY_INTERVAL_SECONDS: f64 = 15.0;
 
-/// 切片精读（slice read）最大 limit 默认值：显式带 limit 且 limit<=200 的局部阅读视为合法精读，
-/// 不计 read 滥用（Serena 哲学："read a few lines" 时内置 Read 完全正当）。
+/// 切片精读（slice read）最大 limit 默认值：显式带 limit 且 limit<=200 的局部阅读视为切片读。
+/// 切片读不再无限豁免：Read 工具切片计入连续切片额度（`DEFAULT_SLICE_READ_THRESHOLD`），
+/// 连续 10 次且期间无任何 astrolabe 工具调用即触发提醒式 deny；
+/// shell 切片打印（sed -n / head -n / tail -n）保持中立不计数。
 /// 注意：仅有 offset 而无合法 limit 时不算切片精读（Claude Code 默认会读约 2000 行）。
 pub(crate) const DEFAULT_SLICE_READ_MAX_LIMIT: u64 = 200;
 
 /// 环境变量名称
 pub(crate) const ENV_SLICE_READ_MAX: &str = "ASTROLABE_SLICE_READ_MAX";
+pub(crate) const ENV_SLICE_READ_THRESHOLD: &str = "ASTROLABE_SLICE_READ_THRESHOLD";
 pub(crate) const ENV_READ_THRESHOLD: &str = "ASTROLABE_READ_THRESHOLD";
 pub(crate) const ENV_DENY_SILENCE_SECS: &str = "ASTROLABE_DENY_SILENCE_SECS";
 
@@ -52,6 +61,7 @@ pub(crate) const ENV_DENY_SILENCE_SECS: &str = "ASTROLABE_DENY_SILENCE_SECS";
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HooksConfig {
     pub slice_read_max_limit: u64,
+    pub slice_read_threshold: u32,
     pub read_threshold: u32,
     pub min_deny_interval_seconds: f64,
 }
@@ -60,6 +70,7 @@ impl Default for HooksConfig {
     fn default() -> Self {
         Self {
             slice_read_max_limit: DEFAULT_SLICE_READ_MAX_LIMIT,
+            slice_read_threshold: DEFAULT_SLICE_READ_THRESHOLD,
             read_threshold: DEFAULT_READ_THRESHOLD,
             min_deny_interval_seconds: DEFAULT_MIN_DENY_INTERVAL_SECONDS,
         }
@@ -81,6 +92,19 @@ impl HooksConfig {
                 })
             })
             .unwrap_or(DEFAULT_SLICE_READ_MAX_LIMIT);
+
+        let slice_read_threshold = std::env::var(ENV_SLICE_READ_THRESHOLD)
+            .ok()
+            .and_then(|s| {
+                s.trim().parse::<u32>().ok().or_else(|| {
+                    tracing::warn!(
+                        "invalid {ENV_SLICE_READ_THRESHOLD}={s:?}; using default {}",
+                        DEFAULT_SLICE_READ_THRESHOLD
+                    );
+                    None
+                })
+            })
+            .unwrap_or(DEFAULT_SLICE_READ_THRESHOLD);
 
         let read_threshold = std::env::var(ENV_READ_THRESHOLD)
             .ok()
@@ -110,6 +134,7 @@ impl HooksConfig {
 
         Self {
             slice_read_max_limit,
+            slice_read_threshold,
             read_threshold,
             min_deny_interval_seconds,
         }
@@ -209,15 +234,18 @@ impl Client {
 }
 
 /// 计数状态持久化结构体（保存在 ~/.astrolabe/hook_data/<session_id>/counter.json）
+/// `#[serde(default)]` 兼容旧版 counter.json（缺 n_slice/last_slice_ts 字段时取默认值）
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct CounterState {
     pub(crate) n_grep: u32,
     pub(crate) n_read: u32,
     pub(crate) n_non_symbolic: u32,
+    pub(crate) n_slice: u32,
     pub(crate) last_grep_ts: Option<f64>,
     pub(crate) last_read_ts: Option<f64>,
     pub(crate) last_non_symbolic_ts: Option<f64>,
+    pub(crate) last_slice_ts: Option<f64>,
     pub(crate) last_deny_ts: Option<f64>,
 }
 
@@ -227,9 +255,11 @@ impl CounterState {
         self.n_grep = 0;
         self.n_read = 0;
         self.n_non_symbolic = 0;
+        self.n_slice = 0;
         self.last_grep_ts = None;
         self.last_read_ts = None;
         self.last_non_symbolic_ts = None;
+        self.last_slice_ts = None;
     }
 
     /// 判定当前是否处于静默窗口之外（可正常触发 hook）
@@ -246,11 +276,17 @@ impl CounterState {
 pub(crate) enum ToolKind {
     /// Astrolabe 符号工具（find_symbol, find_references 等，重置计数）
     AstrolabeSymbolic,
+    /// Astrolabe 非符号工具（search_code / diagnostics / instructions 等）：
+    /// 只清零切片读额度，不清零 grep/read/non_symbolic 计数
+    AstrolabeNonSymbolic,
     /// grep 类工具
     Grep,
     /// read 类工具，附带是否为代码文件判定
     Read { is_code_file: bool },
-    /// 中立工具（Edit, Write, Bash 等非 grep/read 工具，不增不减计数）
+    /// Read 工具切片读（显式 limit <= slice_read_max_limit）：计入连续切片额度
+    SliceRead,
+    /// 中立工具（Edit, Write, Bash 等非 grep/read 工具，不增不减计数；
+    /// shell 切片打印 sed -n / head -n / tail -n 亦归此类）
     Neutral,
 }
 
@@ -260,6 +296,8 @@ pub(crate) enum DenyKind {
     Grep,
     Read,
     Mixed,
+    /// 连续切片读超额度（期间无任何 astrolabe 工具调用）
+    Slice,
 }
 
 /// 决策结果
@@ -269,9 +307,11 @@ pub(crate) enum Decision {
     Silenced,
     /// 符号工具，计数清零并保存，无输出
     ResetSymbolic,
+    /// 非符号 astrolabe 工具，切片读额度清零并保存，无输出
+    ResetSlice,
     /// 中立工具，直接放行不写盘
     NeutralAllow,
-    /// grep/read 调用未超阈值，更新计数并保存，无输出
+    /// grep/read/slice 调用未超阈值，更新计数并保存，无输出
     Allow,
     /// 达到阈值 deny，计数清零并记录 last_deny_ts，输出对应 deny JSON
     Deny(DenyKind),
@@ -626,12 +666,14 @@ fn is_sed_slice_print(args_str: &str) -> bool {
     has_quiet && has_print_script
 }
 
-/// 判定调用是否为局部切片阅读（slice read）——合法精读，不应计入 read 滥用
+/// 判定调用是否为局部切片阅读（slice read）
 ///
 /// - 直接 read 类工具（tool_name 为 "read" 或含 "read_file"）：
-///   - 必须显式带 limit 且 limit <= slice_read_max_limit（默认 200）→ 切片精读；
+///   - 必须显式带 limit 且 limit <= slice_read_max_limit（默认 200）→ 切片读；
+///     Read 工具切片计入连续切片额度（见 `DEFAULT_SLICE_READ_THRESHOLD`），
+///     连续超阈值且期间无任何 astrolabe 工具调用触发 Slice deny；
 ///   - 仅有 offset、无合法 limit 时不算切片精读；
-/// - shell 命令：
+/// - shell 命令（保持中立不计数，避免 shell 场景复杂化）：
 ///   - `sed -n 'Np'` / `sed -n 'A,Bp'`（纯数字地址，不含 -i）→ 切片打印；
 ///   - `head -n N` / `tail -n N` 当 N <= slice_read_max_limit（默认 200）→ 切片打印。
 pub(crate) fn is_slice_read(
@@ -733,6 +775,12 @@ pub(crate) fn classify_tool(
         return ToolKind::AstrolabeSymbolic;
     }
 
+    // 1.5 非符号 astrolabe 工具（search_code / diagnostics / instructions 等）：
+    // 只清零切片读额度（decide 中处理），不清零 grep/read/non_symbolic 计数
+    if tool_name.contains("astrolabe") {
+        return ToolKind::AstrolabeNonSymbolic;
+    }
+
     // 2. 检查是否为 grep 类工具
     // KimiCode / ZCode / Cursor / OpenCode 协议与 CC 同构：工具名 read/grep/search_for_pattern
     // （lowercase 后命中），命令型工具的 tool_input 带 command 字段（cmd/command 提取已覆盖）；
@@ -798,9 +846,21 @@ pub(crate) fn classify_tool(
     };
 
     if is_read {
-        // 切片精读（slice read）：带合法 limit 的局部读取，或 head -n / sed -n 切片打印
-        // 视为合法精读（中立），不计 read 滥用、不计 non_symbolic、不触发 deny
+        // 切片精读（slice read）：Read 工具带合法 limit 的局部读取计入连续切片额度；
+        // 非代码文件（未索引语言/markdown 等）的切片保持中立——与全量读口径一致
+        // （Read{is_code_file:false} 不计 n_read），把它们推向 search_code 没有意义；
+        // shell 切片打印（head -n / tail -n / sed -n）同样保持中立，不计任何计数
         if is_slice_read(tool_name, command_name, command_args_str, limit, offset) {
+            let lower_name = tool_name.to_ascii_lowercase();
+            let is_read_tool_slice = lower_name == "read" || lower_name.contains("read_file");
+            if is_read_tool_slice {
+                let is_code = is_read_code_file_call(true, file_path, client, command_args_str);
+                return if is_code {
+                    ToolKind::SliceRead
+                } else {
+                    ToolKind::Neutral
+                };
+            }
             return ToolKind::Neutral;
         }
 
@@ -828,10 +888,42 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
         return Decision::Silenced;
     }
 
-    // 2. astrolabe 符号工具 → 重置 burst 计数，保留 last_deny_ts
+    // 2. astrolabe 符号工具 → 重置 burst 计数（含切片额度），保留 last_deny_ts
     if tool_kind == ToolKind::AstrolabeSymbolic {
         counter.reset_burst();
         return Decision::ResetSymbolic;
+    }
+
+    // 2.5 非符号 astrolabe 工具 → 只清零切片读额度；
+    // 不清零 n_grep/n_read/n_non_symbolic（维持既有符号重置语义不变）
+    if tool_kind == ToolKind::AstrolabeNonSymbolic {
+        counter.n_slice = 0;
+        counter.last_slice_ts = None;
+        return Decision::ResetSlice;
+    }
+
+    // 2.7 切片读（Read 带 limit<=max）→ 连续额度制：
+    // 不并入 n_non_symbolic（保持 mixed 语义不变）、不计 read/grep；
+    // 间隔超 SLICE_RESET_PERIOD_SECONDS 则重置为 1 否则 +1；
+    // 连续达阈值且期间无任何 astrolabe 工具调用（额度未被清零）→ Slice deny
+    if tool_kind == ToolKind::SliceRead {
+        if let Some(last_ts) = counter.last_slice_ts {
+            if (now - last_ts) <= SLICE_RESET_PERIOD_SECONDS {
+                counter.n_slice += 1;
+            } else {
+                counter.n_slice = 1;
+            }
+        } else {
+            counter.n_slice = 1;
+        }
+        counter.last_slice_ts = Some(now);
+
+        if counter.n_slice >= config().slice_read_threshold {
+            counter.reset_burst();
+            counter.last_deny_ts = Some(now);
+            return Decision::Deny(DenyKind::Slice);
+        }
+        return Decision::Allow;
     }
 
     // 3. 非追踪工具（既非 grep 类也非 read 类）→ 中立：不增不重置，直接 allow
@@ -921,26 +1013,37 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
 /// additionalContext 末尾统一带一句只读声明（实测：只读探索代理被拦时会把
 /// 提醒误读为"与我只读任务冲突"而选择绕过——讲清楚 astrolabe 本身只读，
 /// 就不是禁止探索而是给出更省 token 的探索方式）。
+/// 文案口径：直接给出切换指令（Stop using ... Call ... now），不再出现
+/// "You can continue using ... the counter was reset" 软口径。
 pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let max_limit = config().slice_read_max_limit;
-    let readonly_note = format!(" Note: all Astrolabe tools except apply_rename are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} (e.g. Read with offset and limit) are permitted and not counted as abuses.");
+    let slice_threshold = config().slice_read_threshold;
+    let readonly_note = format!(" Note: all Astrolabe tools except apply_rename are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
     let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_languages tool), grep is the correct tool for them — ignore this reminder.";
+    let switch_instruction =
+        "Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).";
     let (reason, ctx) = match deny_kind {
         DenyKind::Grep => (
-            "Too many consecutive grep calls without using symbolic tools. You can continue using grep now if needed, the counter was reset.",
+            "Too many consecutive grep calls without using symbolic tools. Stop using grep for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).",
             format!(
-                "You were using many grep calls recently. Consider using Astrolabe's symbolic mcp tools instead for more code-centric search (search_code / find_references are read-only and return path:line anchors). You can continue using grep now if needed, the counter was reset.{unindexed_lang_note}"
+                "You were using many grep calls recently. Use Astrolabe's symbolic mcp tools instead for more code-centric search (search_code / find_references are read-only and return path:line anchors). {switch_instruction}{unindexed_lang_note}"
             ),
         ),
         DenyKind::Read => (
-            "Too many consecutive read calls of files without using symbolic tools. You can continue using read now if needed, the counter was reset.",
-            "You were using many read calls on files recently. Consider using Astrolabe's symbolic mcp tools instead for more targeted reads (read-only exploration included: find_symbol / search_code return exact bodies and path:line anchors without whole-file reads). You can continue using read now if needed, the counter was reset.".to_string(),
+            "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).",
+            format!(
+                "You were using many read calls on files recently. Use Astrolabe's symbolic mcp tools instead for more targeted reads (read-only exploration included: find_symbol / search_code return exact bodies and path:line anchors without whole-file reads). {switch_instruction}"
+            ),
         ),
         DenyKind::Mixed => (
-            "Too many consecutive non-symbolic tool calls (mixed grep and read). You can continue using these tools now if needed, the counter was reset.",
+            "Too many consecutive non-symbolic tool calls (mixed grep and read). Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).",
             format!(
-                "You were alternating between grep and read file calls recently without using Astrolabe's symbolic mcp tools. Consider using symbolic search and targeted symbol reads instead for more code-centric exploration. You can continue using these tools now if needed, the counter was reset.{unindexed_lang_note}"
+                "You were alternating between grep and read file calls recently without using Astrolabe's symbolic mcp tools. Use symbolic search and targeted symbol reads instead for more code-centric exploration. {switch_instruction}{unindexed_lang_note}"
             ),
+        ),
+        DenyKind::Slice => (
+            "Too many consecutive file-slice reads without using any Astrolabe tool. Call search_code or find_symbol now — they are read-only and return exact bodies with path:line anchors.",
+            "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: mcp__astrolabe__search_code or mcp__astrolabe__find_symbol are read-only and return exact bodies with path:line anchors, usually cheaper than repeated slice reads. Call them now (read-only, safe).".to_string(),
         ),
     };
     let ctx = format!("{ctx}{readonly_note}");
@@ -1173,7 +1276,10 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
             let decision = decide(&mut counter, tool_kind, now_ts);
             let should_save = matches!(
                 decision,
-                Decision::ResetSymbolic | Decision::Allow | Decision::Deny(_)
+                Decision::ResetSymbolic
+                    | Decision::ResetSlice
+                    | Decision::Allow
+                    | Decision::Deny(_)
             );
             (counter, should_save, decision)
         }),
@@ -1190,6 +1296,10 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
         }
         Decision::ResetSymbolic => {
             // 符号工具：已清零 burst 计数并保存，无输出
+            0
+        }
+        Decision::ResetSlice => {
+            // 非符号 astrolabe 工具：已清零切片读额度并保存，无输出
             0
         }
         Decision::Allow => {
@@ -1397,18 +1507,23 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(kind, ToolKind::Neutral);
+        assert_eq!(kind, ToolKind::AstrolabeNonSymbolic);
 
         let mut counter = CounterState {
             n_grep: 2,
+            n_slice: 5,
             last_grep_ts: Some(100.0),
+            last_slice_ts: Some(100.5),
             ..CounterState::default()
         };
 
-        // 调用 search_code，计数不重置
+        // 调用 search_code：grep 计数不重置（维持既有符号重置语义），
+        // 但切片读额度清零（任何 astrolabe 工具调用都清零切片额度）
         let d = decide(&mut counter, kind, 101.0);
-        assert_eq!(d, Decision::NeutralAllow);
+        assert_eq!(d, Decision::ResetSlice);
         assert_eq!(counter.n_grep, 2);
+        assert_eq!(counter.n_slice, 0);
+        assert_eq!(counter.last_slice_ts, None);
     }
 
     #[test]
@@ -2461,7 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_code_read_with_limit_is_neutral() {
+    fn test_claude_code_read_with_slice_quota_denies_on_10th() {
         let rand_id = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -2469,7 +2584,7 @@ mod tests {
         let temp_home = std::env::temp_dir().join(format!("astrolabe_cc_read_slice_{rand_id}"));
         let sess_id = "cc_read_slice_sess";
 
-        // 单元层：Read + offset/limit 局部切片 → Neutral
+        // 单元层：Read + offset/limit 局部切片 → SliceRead（计入连续切片额度，不再 Neutral）
         let kind = classify_tool(
             "read",
             Client::ClaudeCode,
@@ -2479,9 +2594,26 @@ mod tests {
             Some(40),
             Some(300),
         );
-        assert_eq!(kind, ToolKind::Neutral);
+        assert_eq!(kind, ToolKind::SliceRead);
 
-        // e2e：连续 5 次 Read(offset=300, limit=40) 全部 NeutralAllow，无 deny 输出
+        // 单元层：非代码文件（未索引语言/markdown）的切片 → Neutral（与全量读口径一致）
+        for non_code in ["src/Main.kt", "README.md", "notes.txt"] {
+            assert_eq!(
+                classify_tool(
+                    "read",
+                    Client::ClaudeCode,
+                    Some(non_code),
+                    None,
+                    None,
+                    Some(40),
+                    Some(300)
+                ),
+                ToolKind::Neutral,
+                "非代码文件切片应保持中立: {non_code}"
+            );
+        }
+
+        // e2e：前 9 次 Read(offset=300, limit=40) 无输出，第 10 次触发 Slice deny
         let payload = serde_json::json!({
             "session_id": sess_id,
             "tool_name": "Read",
@@ -2496,7 +2628,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        for i in 0..5 {
+        for i in 0..9 {
             out.clear();
             let code = run_remind_impl(
                 "claude-code",
@@ -2514,14 +2646,330 @@ mod tests {
             );
         }
 
-        // 计数不增加：NeutralAllow 不写盘，counter.json 保持缺省（全 0、无 deny）
+        out.clear();
+        let code10 = run_remind_impl(
+            "claude-code",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(109.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code10, 0);
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(out_str.contains("\"permissionDecision\":\"deny\""));
+        assert!(out_str.contains("file-slice reads"));
+
+        // 触发后额度清零并记录 last_deny_ts（进入静默窗）
         let counter_path = get_hook_data_dir(&temp_home, sess_id, None)
             .unwrap()
             .join("counter.json");
         let counter = load_counter(&counter_path);
-        assert_eq!(counter, CounterState::default());
+        assert_eq!(counter.n_slice, 0);
+        assert_eq!(counter.last_slice_ts, None);
+        assert_eq!(counter.last_deny_ts, Some(109.0));
 
         let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_slice_quota_triggers_on_10th_and_resets_by_any_astrolabe_tool() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_slice_quota_{rand_id}"));
+        let sess_id = "slice_quota_sess";
+
+        let slice_payload = serde_json::json!({
+            "session_id": sess_id,
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/a.rs", "offset": 10, "limit": 50 }
+        })
+        .to_string();
+        // 非符号 astrolabe 工具（AstrolabeNonSymbolic）：同样清零切片额度
+        let search_payload = serde_json::json!({
+            "session_id": sess_id,
+            "tool_name": "mcp__astrolabe__search_code",
+            "tool_input": { "query": "foo" }
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut now = 1000.0;
+
+        // 前 9 次切片读：无输出
+        for i in 0..9 {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                slice_payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0, "第 {} 次切片读应正常放行", i + 1);
+            assert!(out.is_empty(), "第 {} 次切片读不应有输出", i + 1);
+            now += 1.0;
+        }
+
+        // 第 10 次：触发 Slice deny
+        out.clear();
+        let code10 = run_remind_impl(
+            "claude-code",
+            slice_payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(now),
+            Some(&temp_home),
+        );
+        assert_eq!(code10, 0);
+        let denied = String::from_utf8_lossy(&out);
+        assert!(
+            denied.contains("\"permissionDecision\":\"deny\""),
+            "第 10 次切片读应触发 deny，got: {denied}"
+        );
+        assert!(denied.contains("file-slice reads"));
+        now += 1.0;
+
+        // 跳出 deny 后 15s 静默窗
+        now += 100.0;
+
+        // 累计 5 次切片读（额度=5，未达阈值）
+        for i in 0..5 {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                slice_payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            assert!(out.is_empty(), "静默窗后第 {} 次切片读不应有输出", i + 1);
+            now += 1.0;
+        }
+
+        // 1 次 mcp__astrolabe__search_code（AstrolabeNonSymbolic）→ 切片额度清零
+        out.clear();
+        let code_search = run_remind_impl(
+            "claude-code",
+            search_payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(now),
+            Some(&temp_home),
+        );
+        assert_eq!(code_search, 0);
+        assert!(out.is_empty(), "astrolabe 非符号工具调用本身不应有输出");
+        let counter_path = get_hook_data_dir(&temp_home, sess_id, None)
+            .unwrap()
+            .join("counter.json");
+        let counter = load_counter(&counter_path);
+        assert_eq!(counter.n_slice, 0, "search_code 调用后切片额度应清零");
+        assert_eq!(counter.last_slice_ts, None);
+        now += 1.0;
+
+        // 再 9 次切片读：无输出（若额度未清零，其中第 5 次即达 10 阈值触发 deny）
+        for i in 0..9 {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                slice_payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(now),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            assert!(
+                out.is_empty(),
+                "清零后第 {} 次切片读不应有输出（额度应已被 search_code 清零）",
+                i + 1
+            );
+            now += 1.0;
+        }
+
+        // 清零后的第 10 次：再次触发 Slice deny
+        out.clear();
+        let code_again = run_remind_impl(
+            "claude-code",
+            slice_payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(now),
+            Some(&temp_home),
+        );
+        assert_eq!(code_again, 0);
+        assert!(String::from_utf8_lossy(&out).contains("\"permissionDecision\":\"deny\""));
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_non_code_file_slices_never_deny() {
+        // 非代码文件（未索引语言/markdown）切片与全量读口径一致：不计数、不触发 Slice deny
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_kt_slice_{rand_id}"));
+
+        let payload = serde_json::json!({
+            "session_id": "kt_slice_sess",
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/Main.kt", "offset": 1, "limit": 50 }
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        for i in 0..15 {
+            out.clear();
+            let code = run_remind_impl(
+                "claude-code",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(100.0 + i as f64),
+                Some(&temp_home),
+            );
+            assert_eq!(code, 0);
+            assert!(out.is_empty(), "第 {} 次 .kt 切片读不应有输出", i + 1);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn test_old_counter_json_without_slice_fields_deserializes() {
+        // 旧版 counter.json（无 n_slice/last_slice_ts 字段）反序列化落到默认值，不 panic
+        let old = r#"{"n_grep":2,"n_read":1,"n_non_symbolic":3,"last_grep_ts":1.0,"last_read_ts":1.0,"last_non_symbolic_ts":1.0,"last_deny_ts":null}"#;
+        let c: CounterState = serde_json::from_str(old).expect("旧 counter.json 应可反序列化");
+        assert_eq!(c.n_slice, 0);
+        assert_eq!(c.last_slice_ts, None);
+        assert_eq!(c.n_grep, 2);
+    }
+
+    #[test]
+    fn test_slice_counter_semantics_edges() {
+        // decide() 纯逻辑层：静默窗内不计数、2000s 间隔重置、符号工具清零 n_slice、
+        // 阈值默认从 config() 读取
+        // 1. Slice deny 后 15s 静默窗内再切片 → Silenced 且计数不变
+        let mut counter = CounterState {
+            n_slice: 9,
+            last_slice_ts: Some(100.0),
+            last_deny_ts: Some(99.0),
+            ..CounterState::default()
+        };
+        let d = decide(&mut counter, ToolKind::SliceRead, 105.0);
+        assert_eq!(d, Decision::Silenced);
+        assert_eq!(counter.n_slice, 9, "静默窗内不应累加切片计数");
+
+        // 2. 间隔 > SLICE_RESET_PERIOD_SECONDS(2000s) → 重置为 1
+        let mut counter = CounterState {
+            n_slice: 8,
+            last_slice_ts: Some(100.0),
+            ..CounterState::default()
+        };
+        let d = decide(&mut counter, ToolKind::SliceRead, 2101.5);
+        assert_eq!(d, Decision::Allow);
+        assert_eq!(counter.n_slice, 1, "超 2000s 间隔应重置为 1");
+
+        // 3. 符号工具 reset_burst 清零 n_slice
+        let mut counter = CounterState {
+            n_slice: 7,
+            last_slice_ts: Some(100.0),
+            ..CounterState::default()
+        };
+        let d = decide(&mut counter, ToolKind::AstrolabeSymbolic, 101.0);
+        assert_eq!(d, Decision::ResetSymbolic);
+        assert_eq!(counter.n_slice, 0, "符号工具应清零切片额度");
+        assert_eq!(counter.last_slice_ts, None);
+    }
+
+    #[test]
+    fn test_slice_threshold_env_override() {
+        // 只测 HooksConfig::from_env 解析；全局 CONFIG OnceLock 已在其它测试中初始化，
+        // 环境变量覆盖对 config() 不生效，故不做依赖新阈值的 e2e 断言
+        let orig = std::env::var(ENV_SLICE_READ_THRESHOLD).ok();
+
+        std::env::set_var(ENV_SLICE_READ_THRESHOLD, "3");
+        let cfg = HooksConfig::from_env();
+        assert_eq!(cfg.slice_read_threshold, 3);
+
+        // 无效值回退默认
+        std::env::set_var(ENV_SLICE_READ_THRESHOLD, "not_a_number");
+        let cfg2 = HooksConfig::from_env();
+        assert_eq!(cfg2.slice_read_threshold, DEFAULT_SLICE_READ_THRESHOLD);
+
+        // 恢复原始环境变量
+        match orig {
+            Some(v) => std::env::set_var(ENV_SLICE_READ_THRESHOLD, v),
+            None => std::env::remove_var(ENV_SLICE_READ_THRESHOLD),
+        }
+    }
+
+    #[test]
+    fn test_deny_texts_direct_switch_instruction() {
+        // Grep/Read/Mixed 三种 DenyKind：输出必须给出直接切换指令，
+        // 不得残留 "You can continue using ... the counter was reset" 软口径
+        for kind in [DenyKind::Grep, DenyKind::Read, DenyKind::Mixed] {
+            let out = build_output(Client::ClaudeCode, kind);
+            assert!(
+                out.contains("search_code"),
+                "{kind:?} deny 输出应含 search_code 切换指令: {out}"
+            );
+            assert!(
+                out.contains("Stop using grep/read for code discovery"),
+                "{kind:?} deny 输出应含明确停止+切换指令: {out}"
+            );
+            assert!(
+                !out.contains("You can continue using"),
+                "{kind:?} deny 输出不应残留软口径: {out}"
+            );
+            assert!(
+                !out.contains("the counter was reset"),
+                "{kind:?} deny 输出不应残留计数重置软话术: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_slice_deny_client_output_formats() {
+        // Claude Code：三字段 hookSpecificOutput
+        let cc_out = build_output(Client::ClaudeCode, DenyKind::Slice);
+        let cc_val: serde_json::Value = serde_json::from_str(&cc_out).unwrap();
+        assert_eq!(cc_val["hookSpecificOutput"]["permissionDecision"], "deny");
+        let cc_reason = cc_val["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(cc_reason.contains("file-slice reads"));
+        assert!(cc_reason.contains("search_code"));
+        assert!(!cc_out.contains("You can continue using"));
+        let cc_ctx = cc_val["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(cc_ctx.contains("ASTROLABE_SLICE_READ_THRESHOLD"));
+        assert!(cc_ctx.contains("read-only"));
+
+        // Cursor：扁平 permission/user_message/agent_message
+        let cur_out = build_output(Client::Cursor, DenyKind::Slice);
+        let cur_val: serde_json::Value = serde_json::from_str(&cur_out).unwrap();
+        assert_eq!(cur_val["permission"], "deny");
+        assert!(cur_val["user_message"].is_string());
+        assert!(cur_val["agent_message"].is_string());
+        assert!(cur_val.get("hookSpecificOutput").is_none());
+
+        // Grok：扁平 decision/reason
+        let grok_out = build_output(Client::Grok, DenyKind::Slice);
+        let grok_val: serde_json::Value = serde_json::from_str(&grok_out).unwrap();
+        assert_eq!(grok_val["decision"], "deny");
+        assert!(grok_val["reason"].is_string());
+        assert!(grok_val.get("hookSpecificOutput").is_none());
     }
 
     #[test]
@@ -2810,6 +3258,7 @@ mod tests {
         // 验证默认配置值
         let default_cfg = HooksConfig::default();
         assert_eq!(default_cfg.slice_read_max_limit, 200);
+        assert_eq!(default_cfg.slice_read_threshold, 10);
         assert_eq!(default_cfg.read_threshold, 3);
         assert_eq!(default_cfg.min_deny_interval_seconds, 15.0);
     }
