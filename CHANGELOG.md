@@ -6,6 +6,14 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Added
+
+- **`astrolabe hooks gc` 与 remind 内置过期会话 GC。** 删除 `~/.astrolabe/hook_data/` 下超过 24 小时（`ASTROLABE_HOOK_GC_HOURS` 可调；`0` 关闭 remind 中的机会式 GC）未活动的会话目录（以目录树内文件最新 mtime 判定，当前会话永不删除）。`hooks remind` 借助 `~/.astrolabe/hook_gc.stamp` 节流，每小时至多扫描一次。用于无 `SessionEnd` 事件的宿主（ZCode）与会话异常退出的兜底清理。
+
+### Fixed
+
+- **ZCode 接入文档纠正**（Refs #30）。ZCode 仅支持 7 个 hook 事件且严格校验，配置 `SessionEnd` 会导致整段 hooks 加载失败；README 与 `docs/CLIENT_ALIGNMENT.md` 改为给出 `~/.zcode/cli/config.json`（Windows `%USERPROFILE%\.zcode\cli\config.json`）的正确结构（`enabled: true` + `events` 包装层，`PreToolUse` 调用 `astrolabe hooks remind --client=zcode`），明确不配 `SessionEnd`、不在 `Stop` 上挂 cleanup，清理交由过期 GC。
+
 ## [0.9.0] - 2026-10-08
 
 ### Changed

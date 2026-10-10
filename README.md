@@ -281,8 +281,32 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
     command = "astrolabe hooks cleanup"
     ```
 - **ZCode**（智谱 Z.ai，仓库 `zai-org/ZCode`）：
-  - Hook 协议与 Claude Code 完全同构（支持 `PreToolUse` 事件、`session_id` 状态管理以及 `hookSpecificOutput` 结构化决策输出）；
-  - PreToolUse 命令参数使用 `--client=zcode`（别名：`z-code`、`zai`），输出兼容 CC 的三字段结构；SessionEnd 调用 `astrolabe hooks cleanup`。
+  - **事件集与 Claude Code 不同**：ZCode 仅支持 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`PostToolUseFailure`、`Stop` 七个事件，且对事件名做严格校验——**配置中出现 `SessionEnd` 等未知事件会导致整段 hooks 加载失败**（PreToolUse 也随之失效，见 issue #30）。
+  - **配置文件**：用户级 `~/.zcode/cli/config.json`（Windows：`%USERPROFILE%\.zcode\cli\config.json`）的 `hooks` 字段。注意必须有 `"enabled": true`，且事件写在 `events` 包装层内（与 CC 的 `hooks.PreToolUse` 直挂不同）。ZCode 读到的 `~/.claude/settings.json` 等 CC 旧配置默认是禁用、只读的，不能依赖。
+  - **不要**把 `astrolabe hooks cleanup` 挂到 `Stop` 上：`Stop` 每轮回答结束都会触发，会把防漂移计数每轮清零。ZCode 无 `SessionEnd`，状态目录由 `astrolabe hooks remind` 内置的过期 GC 自动清理（超过 24 小时未活动的会话，可用 `ASTROLABE_HOOK_GC_HOURS` 调整），也可手动执行 `astrolabe hooks gc`。
+  - 配置示例（合并进已有 `config.json`，保留其它字段）：
+    ```json
+    {
+      "hooks": {
+        "enabled": true,
+        "events": {
+          "PreToolUse": [
+            {
+              "matcher": "*",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "astrolabe hooks remind --client=zcode",
+                  "timeout": 10
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+    ```
+  - `--client=zcode`（别名：`z-code`、`zai`）：已对照 ZCode 3.14.1 源码核实，stdin 为 CC 同构 payload（`session_id`、`hook_event_name`、`tool_name`、`tool_input`、`tool_use_id`、`cwd`、`transcript_path` 等，另附 camelCase 副本）；内置工具名 `Read`（`file_path`/`offset`/`limit`）、`Grep`、`Glob`、`Bash`（`command`），MCP 工具名为 `mcp__<server>__<tool>`；stdout JSON 的 `hookSpecificOutput.permissionDecision: "deny"` 生效，exit 2 亦视为 deny（以 stderr 为原因），其它非零退出码视为 hook 执行失败。matcher 使用 `*`：remind 需要同时看到 `mcp__astrolabe__*` 调用才能清零计数，非相关工具由 Astrolabe 自行放行。
 
 ##### 4. OpenCode
 
@@ -475,7 +499,7 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 - **切片精读额度制**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 切片调用仍可正常使用，但不再无限豁免——连续 10 次切片读且期间无任何 Astrolabe 工具调用时触发提醒式拦截，任何 Astrolabe 工具调用（含 `search_code` 等非符号工具）都会清零该额度。`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片 shell 命令仍完全放行、不计数。
 - **计数重置**：AI 调用任意 Astrolabe 符号工具（如 `resolve_context`、`find_symbol` 等）时，全部连续计数立即清零；`search_code` 等非符号 Astrolabe 工具调用只清零切片读额度（不影响 grep/read 计数）；若连续调用间隔超过设定时间，亦自动重置。
 - **智能放行窗口**：触发 Deny 后进入 15 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。
-- **状态存储与清理**：会话状态持久化于 `~/.astrolabe/hook_data/<session_id>/counter.json`；子代理调用时（payload 携带 `agent_id` / `agentId` 字段）按 `~/.astrolabe/hook_data/<session_id>/<agent_id>/counter.json` 分片，并发子代理各自独立计数、互不清零互不消音；会话结束时通过 `SessionEnd` 自动清理（含子代理分片目录），不留垃圾。
+- **状态存储与清理**：会话状态持久化于 `~/.astrolabe/hook_data/<session_id>/counter.json`；子代理调用时（payload 携带 `agent_id` / `agentId` 字段）按 `~/.astrolabe/hook_data/<session_id>/<agent_id>/counter.json` 分片，并发子代理各自独立计数、互不清零互不消音；会话结束时通过 `SessionEnd` 自动清理（含子代理分片目录）；无 `SessionEnd` 的宿主（如 ZCode）或会话异常退出时，`hooks remind` 每小时至多一次机会式清理超过 24 小时未活动的会话目录（`ASTROLABE_HOOK_GC_HOURS` 调整，`0` 关闭），亦可手动 `astrolabe hooks gc`，不留垃圾。
 
 ---
 

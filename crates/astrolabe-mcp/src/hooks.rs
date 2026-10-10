@@ -1099,6 +1099,165 @@ pub(crate) fn cleanup_session(home: &Path, session_id: &str) -> std::io::Result<
     Ok(())
 }
 
+/// 过期会话 GC 默认阈值（小时）：会话目录内最新 mtime 早于该阈值即视为陈旧并删除。
+/// 用于不提供 SessionEnd 事件的宿主（如 ZCode），以及 SessionEnd 未触发（崩溃/强退）的兜底。
+pub(crate) const DEFAULT_GC_MAX_AGE_HOURS: u64 = 24;
+/// remind 中机会式 GC 的最小间隔（秒）：避免每次 PreToolUse 都扫描目录
+pub(crate) const GC_MIN_INTERVAL_SECONDS: u64 = 3600;
+/// GC 阈值环境变量（小时；0 表示禁用 remind 中的机会式 GC）
+pub(crate) const ENV_GC_HOURS: &str = "ASTROLABE_HOOK_GC_HOURS";
+/// 机会式 GC 节流戳文件名（放在 `~/.astrolabe/` 下，不混入 hook_data 会话目录）
+const GC_STAMP_FILE: &str = "hook_gc.stamp";
+
+/// 解析 GC 阈值（小时）：无效值回退默认
+pub(crate) fn gc_max_age_hours_from_env() -> u64 {
+    match std::env::var(ENV_GC_HOURS) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "invalid {ENV_GC_HOURS}={s:?}; using default {}",
+                DEFAULT_GC_MAX_AGE_HOURS
+            );
+            DEFAULT_GC_MAX_AGE_HOURS
+        }),
+        Err(_) => DEFAULT_GC_MAX_AGE_HOURS,
+    }
+}
+
+/// 递归求目录树内文件的最新 mtime（活动以 counter.json 等文件写入为准）；
+/// 目录内无任何文件时回退目录自身 mtime。
+fn newest_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fn newest_file(path: &Path) -> Option<std::time::SystemTime> {
+        let mut newest: Option<std::time::SystemTime> = None;
+        for entry in std::fs::read_dir(path).ok()?.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let t = if ft.is_dir() {
+                newest_file(&entry.path())
+            } else {
+                entry.metadata().ok().and_then(|m| m.modified().ok())
+            };
+            if let Some(t) = t {
+                if newest.is_none_or(|n| t > n) {
+                    newest = Some(t);
+                }
+            }
+        }
+        newest
+    }
+    newest_file(path).or_else(|| std::fs::metadata(path).ok()?.modified().ok())
+}
+
+/// 删除 `~/.astrolabe/hook_data/` 下最新 mtime 早于 `now - max_age` 的会话目录。
+///
+/// `keep` 指定的会话目录（当前会话）永不删除。返回删除的目录数。
+/// 单个目录删除失败不中断整体扫描（尽力而为）。
+pub(crate) fn gc_stale_sessions(
+    home: &Path,
+    now: std::time::SystemTime,
+    max_age: std::time::Duration,
+    keep: Option<&str>,
+) -> std::io::Result<usize> {
+    let root = home.join(".astrolabe").join("hook_data");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    let Some(cutoff) = now.checked_sub(max_age) else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        if keep.is_some_and(|k| entry.file_name().to_str() == Some(k)) {
+            continue;
+        }
+        let Some(mtime) = newest_mtime(&path) else {
+            continue;
+        };
+        if mtime < cutoff {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), error = %err, "hook GC 删除失败")
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// remind 中的机会式 GC：按节流戳每小时至多扫描一次；任何错误静默忽略。
+fn maybe_gc_opportunistic(home: &Path, now: std::time::SystemTime, keep: &str, max_age_hours: u64) {
+    if max_age_hours == 0 {
+        return;
+    }
+    let stamp = home.join(".astrolabe").join(GC_STAMP_FILE);
+    if let Some(last) = std::fs::metadata(&stamp)
+        .ok()
+        .and_then(|m| m.modified().ok())
+    {
+        if now
+            .duration_since(last)
+            .is_ok_and(|d| d.as_secs() < GC_MIN_INTERVAL_SECONDS)
+        {
+            return;
+        }
+    }
+    if let Some(parent) = stamp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 先写戳再扫描：并发 remind 下尽量只有一个进程扫描
+    let _ = std::fs::write(&stamp, b"");
+    let max_age = std::time::Duration::from_secs(max_age_hours.saturating_mul(3600));
+    match gc_stale_sessions(home, now, max_age, Some(keep)) {
+        Ok(n) if n > 0 => tracing::debug!(removed = n, "hook GC 清理过期会话"),
+        _ => {}
+    }
+}
+
+/// `astrolabe hooks gc` 纯实现：不读 stdin，按阈值清理过期会话目录。
+pub(crate) fn run_gc_impl<W: Write, E: Write>(
+    mut stdout: W,
+    mut stderr: E,
+    now: std::time::SystemTime,
+    max_age_hours: u64,
+    home_override: Option<&Path>,
+) -> i32 {
+    let Some(home) = home_override.map(PathBuf::from).or_else(get_user_home) else {
+        let _ = writeln!(stderr, "Cannot locate home directory");
+        return 2;
+    };
+    let max_age = std::time::Duration::from_secs(max_age_hours.saturating_mul(3600));
+    match gc_stale_sessions(&home, now, max_age, None) {
+        Ok(n) => {
+            let _ = writeln!(
+                stdout,
+                "removed {n} stale hook session dir(s) older than {max_age_hours}h"
+            );
+            0
+        }
+        Err(err) => {
+            let _ = writeln!(stderr, "Failed to gc hook data: {err}");
+            2
+        }
+    }
+}
+
+/// `astrolabe hooks gc`：清理超过阈值（默认 24h，`ASTROLABE_HOOK_GC_HOURS` 可调）未活动的会话目录。
+pub fn run_gc() -> i32 {
+    run_gc_impl(
+        std::io::stdout().lock(),
+        std::io::stderr().lock(),
+        std::time::SystemTime::now(),
+        gc_max_age_hours_from_env(),
+        None,
+    )
+}
+
 /// PreToolUse remind hook 纯实现（支持依赖注入方便测试）
 pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
     client_name: &str,
@@ -1256,6 +1415,18 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
     );
 
     let now_ts = now.unwrap_or_else(current_timestamp);
+
+    // 机会式 GC：仅真实运行（未注入 now）时执行，避免测试受环境影响
+    if now.is_none() {
+        if let Some(h) = home_override.map(PathBuf::from).or_else(get_user_home) {
+            maybe_gc_opportunistic(
+                &h,
+                std::time::SystemTime::now(),
+                &session_id,
+                gc_max_age_hours_from_env(),
+            );
+        }
+    }
 
     // 计算持久化路径（session_id 已 sanitize；agent 分量由 sanitize_agent_component 收敛）
     let home = home_override.map(PathBuf::from).or_else(get_user_home);
@@ -4350,5 +4521,138 @@ mod tests {
         assert!(val.get("hookSpecificOutput").is_none());
 
         let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    struct GcTmp(PathBuf);
+    impl GcTmp {
+        fn new(tag: &str) -> Self {
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!("astrolabe_gc_{tag}_{n}"));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for GcTmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn set_tree_mtime(path: &Path, t: std::time::SystemTime) {
+        for e in std::fs::read_dir(path).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                set_tree_mtime(&p, t);
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&p)
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_gc_removes_only_stale_sessions_and_keeps_current() {
+        use std::time::{Duration, SystemTime};
+        let tmp = GcTmp::new("a");
+        let home = tmp.path();
+        let root = home.join(".astrolabe").join("hook_data");
+        for sid in ["old", "fresh", "keepme", "old_with_fresh_agent"] {
+            std::fs::create_dir_all(root.join(sid).join("agent")).unwrap();
+            std::fs::write(root.join(sid).join("counter.json"), b"{}").unwrap();
+            std::fs::write(root.join(sid).join("agent").join("counter.json"), b"{}").unwrap();
+        }
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(48 * 3600);
+        set_tree_mtime(&root.join("old"), old);
+        set_tree_mtime(&root.join("keepme"), old);
+        // 会话根旧、子代理分片新：整体仍视为活跃
+        set_tree_mtime(&root.join("old_with_fresh_agent"), old);
+        std::fs::write(
+            root.join("old_with_fresh_agent")
+                .join("agent")
+                .join("counter.json"),
+            b"{}",
+        )
+        .unwrap();
+        // hook_data 根下的散文件不被当作会话目录
+        std::fs::write(root.join("stray.txt"), b"x").unwrap();
+
+        let n =
+            gc_stale_sessions(home, now, Duration::from_secs(24 * 3600), Some("keepme")).unwrap();
+        assert_eq!(n, 1);
+        assert!(!root.join("old").exists());
+        assert!(root.join("fresh").exists());
+        assert!(root.join("keepme").exists());
+        assert!(root.join("old_with_fresh_agent").exists());
+        assert!(root.join("stray.txt").exists());
+    }
+
+    #[test]
+    fn test_gc_missing_hook_data_is_ok() {
+        let tmp = GcTmp::new("b");
+        let n = gc_stale_sessions(
+            tmp.path(),
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(3600),
+            None,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_run_gc_impl_reports_and_removes() {
+        use std::time::{Duration, SystemTime};
+        let tmp = GcTmp::new("c");
+        let root = tmp.path().join(".astrolabe").join("hook_data");
+        std::fs::create_dir_all(root.join("s1")).unwrap();
+        std::fs::write(root.join("s1").join("counter.json"), b"{}").unwrap();
+        let now = SystemTime::now() + Duration::from_secs(25 * 3600);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_gc_impl(&mut out, &mut err, now, 24, Some(tmp.path()));
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        assert!(String::from_utf8_lossy(&out).contains("removed 1"));
+        assert!(!root.join("s1").exists());
+    }
+
+    #[test]
+    fn test_opportunistic_gc_throttled_by_stamp_and_disabled_by_zero() {
+        use std::time::{Duration, SystemTime};
+        let tmp = GcTmp::new("d");
+        let home = tmp.path();
+        let root = home.join(".astrolabe").join("hook_data");
+        let mk = |sid: &str| {
+            std::fs::create_dir_all(root.join(sid)).unwrap();
+            std::fs::write(root.join(sid).join("counter.json"), b"{}").unwrap();
+        };
+        let now = SystemTime::now() + Duration::from_secs(48 * 3600);
+        mk("a");
+        // 0 小时 = 禁用
+        maybe_gc_opportunistic(home, now, "cur", 0);
+        assert!(root.join("a").exists());
+        assert!(!home.join(".astrolabe").join(GC_STAMP_FILE).exists());
+        // 首次运行：清理并写戳
+        maybe_gc_opportunistic(home, now, "cur", 24);
+        assert!(!root.join("a").exists());
+        assert!(home.join(".astrolabe").join(GC_STAMP_FILE).exists());
+        // 戳仍新鲜（相对真实时钟）：在 now=真实时间 下再次调用应被节流
+        mk("b");
+        set_tree_mtime(
+            &root.join("b"),
+            SystemTime::now() - Duration::from_secs(48 * 3600),
+        );
+        maybe_gc_opportunistic(home, SystemTime::now(), "cur", 24);
+        assert!(root.join("b").exists(), "节流窗口内不应扫描");
     }
 }
