@@ -177,7 +177,10 @@ listed_tools:
   - 工具分类：走与 Claude Code 同构的工具名识别规则；
   - 输出格式：输出与 Claude Code 同构的 `hookSpecificOutput` 结构化决策；
   - Context：走 `default` 温和级；
-  - 接线方式：配置宿主 hooks 执行 `astrolabe hooks remind --client=zcode`，stdin 传入 CC 同构 payload。
+  - 接线方式：在 `~/.zcode/cli/config.json`（Windows：`%USERPROFILE%\.zcode\cli\config.json`）的 `hooks` 中配置，结构为 `{"enabled": true, "events": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "astrolabe hooks remind --client=zcode"}]}]}}`；`enabled: true` 与 `events` 包装层必需；
+  - 事件限制：ZCode 仅支持 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `PostToolUseFailure` / `Stop`，且严格校验，**不得配置 `SessionEnd`**（会令整段 hooks 加载失败，issue #30）；也**不要**在 `Stop` 上挂 cleanup（每轮触发会清零计数）；
+  - 状态清理：由 `hooks remind` 内置的过期会话 GC（默认 24h，`ASTROLABE_HOOK_GC_HOURS`）兜底，或手动 `astrolabe hooks gc`；
+  - 待核实：ZCode 实际 stdin 字段与 deny 输出格式目前按 CC 同构假设处理，尚未逐项验证。
 - **OpenCode**：
   - 枚举：`Client::OpenCode`（别名 `opencode`）；
   - 工具分类：识别宿主传入的 tool 名称及 shell 命令；

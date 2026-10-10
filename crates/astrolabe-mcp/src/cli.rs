@@ -32,6 +32,9 @@ ROOT 优先级：位置参数 → ASTROLABE_ROOT → .（从 cwd 探测）
                                 kimi-code/kimi_code/kimi→kimicode，z-code/zai→zcode，
                                 cursor-agent/cursor_agent/cursor-cli→cursor）
   hooks cleanup                SessionEnd hook：按 stdin session_id 清理状态目录
+  hooks gc                     清理超过 24h（ASTROLABE_HOOK_GC_HOURS 可调）未活动的
+                               会话状态目录；remind 也会每小时机会式执行一次
+                               （适用于 ZCode 等无 SessionEnd 事件的宿主）
   print-cc-system-prompt-override
                                输出 Claude Code --system-prompt 整体替换文本
 ";
@@ -44,6 +47,8 @@ pub enum Launch {
         client: String,
     },
     HooksCleanup,
+    /// `hooks gc`：清理过期会话状态目录
+    HooksGc,
     PrintCcSystemPromptOverride,
     Run {
         requested_root: PathBuf,
@@ -154,7 +159,7 @@ where
     })
 }
 
-/// `astrolabe hooks <remind|cleanup> [--client=NAME]`：hook 协议入口不索引仓库，
+/// `astrolabe hooks <remind|cleanup|gc> [--client=NAME]`：hook 协议入口不索引仓库，
 /// 由 main 直接分发到 hooks 模块。
 fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
     // `hooks -h` / `hooks remind --help` should show usage, not "unknown …".
@@ -165,7 +170,7 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
         }
     }
     let Some(sub) = rest.first() else {
-        anyhow::bail!("hooks requires a subcommand: remind | cleanup\n{USAGE}");
+        anyhow::bail!("hooks requires a subcommand: remind | cleanup | gc\n{USAGE}");
     };
     match sub.to_string_lossy().as_ref() {
         "remind" => {
@@ -196,6 +201,15 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
                 );
             }
             Ok(Launch::HooksCleanup)
+        }
+        "gc" => {
+            if rest.len() > 1 {
+                anyhow::bail!(
+                    "unexpected extra argument: {}\n{USAGE}",
+                    rest[1].to_string_lossy()
+                );
+            }
+            Ok(Launch::HooksGc)
         }
         other => anyhow::bail!("unknown hooks subcommand: {other}\n{USAGE}"),
     }
@@ -239,6 +253,16 @@ mod tests {
             parse(&["astrolabe", "hooks", "cleanup"]),
             Launch::HooksCleanup
         ));
+        assert!(matches!(
+            parse(&["astrolabe", "hooks", "gc"]),
+            Launch::HooksGc
+        ));
+        assert!(parse_launch_from(
+            ["astrolabe", "hooks", "gc", "x"].iter().copied(),
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]

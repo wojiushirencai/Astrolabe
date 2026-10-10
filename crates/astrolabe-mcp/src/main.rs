@@ -65,6 +65,9 @@ async fn main() -> anyhow::Result<()> {
         Launch::HooksCleanup => {
             std::process::exit(astrolabe_mcp::hooks::run_cleanup());
         }
+        Launch::HooksGc => {
+            std::process::exit(astrolabe_mcp::hooks::run_gc());
+        }
         Launch::PrintCcSystemPromptOverride => {
             print!(
                 "{}",
