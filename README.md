@@ -306,7 +306,7 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
       }
     }
     ```
-  - `--client=zcode`（别名：`z-code`、`zai`）目前按 Claude Code 同构协议处理 stdin（`session_id` / `tool_name` / `tool_input`）并输出 CC 三字段 `hookSpecificOutput` 决策；ZCode 实际的 stdin 字段与 deny 输出格式尚待逐项核实，如遇不生效请提 issue 并附上 hook 的 stdin 样例。matcher 暂用 `*`（ZCode 内置工具名未核实；中立工具由 Astrolabe 自行放行）。
+  - `--client=zcode`（别名：`z-code`、`zai`）：已对照 ZCode 3.14.1 源码核实，stdin 为 CC 同构 payload（`session_id`、`hook_event_name`、`tool_name`、`tool_input`、`tool_use_id`、`cwd`、`transcript_path` 等，另附 camelCase 副本）；内置工具名 `Read`（`file_path`/`offset`/`limit`）、`Grep`、`Glob`、`Bash`（`command`），MCP 工具名为 `mcp__<server>__<tool>`；stdout JSON 的 `hookSpecificOutput.permissionDecision: "deny"` 生效，exit 2 亦视为 deny（以 stderr 为原因），其它非零退出码视为 hook 执行失败。matcher 使用 `*`：remind 需要同时看到 `mcp__astrolabe__*` 调用才能清零计数，非相关工具由 Astrolabe 自行放行。
 
 ##### 4. OpenCode
 

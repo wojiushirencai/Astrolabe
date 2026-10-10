@@ -180,7 +180,7 @@ listed_tools:
   - 接线方式：在 `~/.zcode/cli/config.json`（Windows：`%USERPROFILE%\.zcode\cli\config.json`）的 `hooks` 中配置，结构为 `{"enabled": true, "events": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "astrolabe hooks remind --client=zcode"}]}]}}`；`enabled: true` 与 `events` 包装层必需；
   - 事件限制：ZCode 仅支持 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `PostToolUseFailure` / `Stop`，且严格校验，**不得配置 `SessionEnd`**（会令整段 hooks 加载失败，issue #30）；也**不要**在 `Stop` 上挂 cleanup（每轮触发会清零计数）；
   - 状态清理：由 `hooks remind` 内置的过期会话 GC（默认 24h，`ASTROLABE_HOOK_GC_HOURS`）兜底，或手动 `astrolabe hooks gc`；
-  - 待核实：ZCode 实际 stdin 字段与 deny 输出格式目前按 CC 同构假设处理，尚未逐项验证。
+  - 格式核实（ZCode 3.14.1 `Resources/glm/zcode.cjs`）：stdin 含 `session_id` / `hook_event_name` / `tool_name` / `tool_input` / `tool_use_id` / `transcript_path`（及 camelCase 副本）；内置工具 `Read`(`file_path`/`offset`/`limit`) / `Grep` / `Glob` / `Bash`(`command`)，MCP 工具 `mcp__<server>__<tool>`；`hookSpecificOutput.permissionDecision=deny` 与 exit 2 均为拦截；`Stop` 每轮回答结束触发（payload 带 `turnId`、`responseText`），非会话结束。
 - **OpenCode**：
   - 枚举：`Client::OpenCode`（别名 `opencode`）；
   - 工具分类：识别宿主传入的 tool 名称及 shell 命令；
