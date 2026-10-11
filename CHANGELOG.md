@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Fixed
+
+- C# symbol extraction now covers fields, `const` fields, enum members, events, indexers, operators, conversion operators, destructors, delegates and nested local functions (find_symbol recall on Newtonsoft.Json 85.7% → 99.9%, Serilog 84.9% → 99.9%, Polly 88.3% → 100%).
+
 ## [0.10.0] - 2026-10-11
 
 ### Added
