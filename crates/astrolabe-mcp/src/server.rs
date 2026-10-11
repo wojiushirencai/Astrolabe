@@ -4064,6 +4064,50 @@ mod tests {
     }
 
     #[test]
+    fn search_code_text_only_covers_common_config_types() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("main.py"), "x = 1\n").unwrap();
+        let files = [
+            "Cargo.toml",
+            "pyproject.toml",
+            "config.toml",
+            "setup.cfg",
+            "app.ini",
+            "nginx.conf",
+            "app.properties",
+            ".env",
+            ".env.local",
+            "ci.yml",
+            "build.gradle.kts",
+            "Dockerfile",
+            "Makefile",
+            "run.sh",
+            "api.proto",
+            "schema.graphql",
+            "data.csv",
+        ];
+        for name in files {
+            std::fs::write(dir.join(name), "marker_value_42\n").unwrap();
+        }
+        std::fs::write(dir.join("Cargo.lock"), "marker_value_42\n").unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = true;
+        let (text, _) = search_text(&server, "marker_value_42", false, None);
+        for name in files {
+            let anchor = format!("@{name}:1");
+            assert!(text.contains(&anchor), "missing {anchor}: {text}");
+        }
+        assert!(text.contains("@Cargo.toml:1 [text-only]"), "{text}");
+        assert!(
+            !text.contains("Cargo.lock"),
+            "Cargo.lock must be skipped: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn search_code_case_rules_and_override() {
         let dir = unique_temp_dir();
         std::fs::write(dir.join("main.py"), "def LoadUser():\n    pass\n").unwrap();
