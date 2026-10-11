@@ -264,6 +264,12 @@ fn extract_symbols(
         if name.is_empty() {
             continue;
         }
+        if matches!(lang, Language::TypeScript | Language::Tsx)
+            && queries::ts_inline_object_member(definition_node)
+        {
+            // Inline object type (parameter annotation, cast, generic arg).
+            continue;
+        }
         let (name, kind) = if lang == Language::CSharp {
             csharp_symbol_name(definition_node, name, kind, source)
         } else {
@@ -893,6 +899,45 @@ public partial class Money(decimal amount)
         let after = parse_src(Language::CSharp, "Money.cs", &edited);
         assert_eq!(named(&after, "Rate").kind, SymbolKind::Field);
         assert_eq!(named(&after, "Scale").kind, SymbolKind::Const);
+    }
+
+    #[test]
+    fn typescript_alias_members_enum_members_and_string_methods() {
+        let src = "type TabBlock = { value: string; line: number };\n\
+type LinkedList = null | { value: number; next: LinkedList };\n\
+type Responses = { 200: string };\n\
+class Std { \"~standard\": number = 1; }\n\
+export enum Color { Red, Green = 2 }\n\
+const bench = { \"no rest (valid)\"() {} };\n\
+interface I { \"quoted-key\": string }\n\
+function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\n";
+        for (lang, path) in [(Language::TypeScript, "a.ts"), (Language::Tsx, "a.tsx")] {
+            let parsed = parse_src(lang, path, src);
+            let names: Vec<_> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+            for want in [
+                "line",
+                "next",
+                "200",
+                "~standard",
+                "Red",
+                "Green",
+                "no rest (valid)",
+                "quoted-key",
+            ] {
+                assert!(names.contains(&want), "{lang:?} missing {want}: {names:?}");
+            }
+            assert_eq!(named(&parsed, "Green").kind, SymbolKind::Field);
+            assert_eq!(named(&parsed, "next").start_line, 2);
+            let edited = format!("{src}type Added = {{ freshMember: string }};\n");
+            let reparsed = parse_src(lang, path, &edited);
+            assert!(
+                reparsed.symbols.iter().any(|s| s.name == "freshMember"),
+                "{lang:?}: edit then reparse"
+            );
+            for unwanted in ["inlineParam", "castOnly"] {
+                assert!(!names.contains(&unwanted), "{lang:?} kept {unwanted}");
+            }
+        }
     }
 
     #[test]

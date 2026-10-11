@@ -95,6 +95,25 @@ pub fn for_language(lang: Language) -> Option<LanguageQueries> {
 
 /// Map a `@definition.<kind>` capture name to a [`SymbolKind`]. Returns `None`
 /// for anything that is not a definition capture (`name`, `_scope`, ...).
+/// TypeScript object-type members are definitions only inside a `type X = …`
+/// alias (interfaces use `interface_body`, not `object_type`). Members of
+/// inline object types — parameter annotations, `as { x }` casts, generic
+/// arguments — are dropped by the symbol extractor via this predicate.
+pub(crate) fn ts_inline_object_member(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() != "property_signature" || node.parent().map(|p| p.kind()) != Some("object_type")
+    {
+        return false;
+    }
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        if parent.kind() == "type_alias_declaration" {
+            return false;
+        }
+        cur = parent;
+    }
+    true
+}
+
 pub fn symbol_kind_for_capture(capture: &str) -> Option<SymbolKind> {
     Some(match capture.strip_prefix(DEFINITION_PREFIX)? {
         "function" | "macro" => SymbolKind::Function,
@@ -195,6 +214,12 @@ mod tests {
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
         let mut out = Vec::new();
         while let Some(m) = matches.next() {
+            if m.captures()
+                .iter()
+                .any(|c| super::ts_inline_object_member(c.node))
+            {
+                continue;
+            }
             let mut row = BTreeMap::new();
             for c in m.captures() {
                 let name = names[c.index as usize];
@@ -1081,6 +1106,8 @@ new ns.Widget();
         ("variable", "counter"),
         ("type", "ID"),
         ("enum", "Color"),
+        ("field", "Red"),
+        ("field", "Green"),
         ("module", "NS"),
         ("module", "ext"),
         ("const", "cp"),
