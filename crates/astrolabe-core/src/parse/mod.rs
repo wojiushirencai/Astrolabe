@@ -265,6 +265,20 @@ fn extract_symbols(
             continue;
         }
 
+        // Java/C#/VB 的注解/特性（`@Override`、`[HttpGet]`、`<Fact>`）属于
+        // 定义节点，但锚点与签名应落在声明名字所在行，否则 find_symbol
+        // 给出的是注解行而非真正的声明。
+        let def_row = definition_node.start_position().row;
+        let name_row = name_node.start_position().row;
+        let anchor_on_name = matches!(
+            lang,
+            Language::Java | Language::CSharp | Language::VisualBasic
+        ) && name_row > def_row;
+        let (sig, start_row) = if anchor_on_name {
+            (signature_from_row(source, name_row), name_row)
+        } else {
+            (signature(definition_node, source), def_row)
+        };
         symbols.push(CodeSymbol {
             // Stable IDs are assigned by the graph builder after all files
             // have been parsed; this layer has no FileId allocation context.
@@ -272,8 +286,8 @@ fn extract_symbols(
             file: FileId(0),
             name: name.to_owned(),
             kind,
-            signature: signature(definition_node, source),
-            start_line: line_number(definition_node.start_position().row),
+            signature: sig,
+            start_line: line_number(start_row),
             end_line: line_number(definition_node.end_position().row),
             exported: is_exported(lang, name, definition_node, source),
         });
@@ -717,6 +731,17 @@ fn signature(node: tree_sitter::Node<'_>, source: &str) -> String {
     result
 }
 
+/// 取源码第 `row` 行（0-based）在 `{` 之前的部分作为签名。
+fn signature_from_row(source: &str, row: usize) -> String {
+    let line = source.lines().nth(row).unwrap_or_default();
+    let before_body = line.split('{').next().unwrap_or(line).trim();
+    let mut result: String = before_body.chars().take(MAX_SIGNATURE_CHARS).collect();
+    if before_body.chars().count() > MAX_SIGNATURE_CHARS {
+        result.push('…');
+    }
+    result
+}
+
 fn unquote(value: &str) -> &str {
     if value.len() >= 2 {
         let bytes = value.as_bytes();
@@ -826,6 +851,36 @@ mod tests {
         let symbol = named(&parsed, "second_line");
         assert_eq!(symbol.start_line, 2);
         assert_eq!(symbol.end_line, 2);
+    }
+
+    #[test]
+    fn annotated_java_and_csharp_symbols_anchor_on_name_line() {
+        let java = parse_src(
+            Language::Java,
+            "A.java",
+            "class A {\n    @Override\n    @Deprecated\n    public String toString() { return \"\"; }\n}\n",
+        );
+        let sym = named(&java, "toString");
+        assert_eq!(sym.start_line, 4);
+        assert!(
+            sym.signature.contains("public String toString()"),
+            "{}",
+            sym.signature
+        );
+        assert!(!sym.signature.contains('@'), "{}", sym.signature);
+
+        let cs = parse_src(
+            Language::CSharp,
+            "A.cs",
+            "class A {\n    [HttpGet]\n    public int Get() { return 1; }\n}\n",
+        );
+        let sym = named(&cs, "Get");
+        assert_eq!(sym.start_line, 3);
+        assert!(
+            sym.signature.starts_with("public int Get()"),
+            "{}",
+            sym.signature
+        );
     }
 
     #[test]

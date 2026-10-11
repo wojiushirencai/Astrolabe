@@ -228,10 +228,10 @@ pub(crate) struct ResolveContextParams {
     pub budget_tokens: usize,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct QueryParams {
     #[schemars(
-        description = "Symbol name, substring, or hierarchical path like 'Class/method' ('/Abs/Path' anchors at file top level)"
+        description = "Symbol name, substring, or hierarchical path like 'Class/method', 'Type.method', 'A::b' or 'pkg.Func' ('/Abs/Path' anchors at file top level). Results rank exact name > prefix > substring."
     )]
     pub query: String,
     /// 对展示列表前 5 个命中符号附带源码体（include_body，对齐 Serena）。
@@ -240,14 +240,25 @@ pub(crate) struct QueryParams {
         description = "Include source bodies for up to 5 displayed matches (Serena include_body equivalent; bodies count against budget_tokens)"
     )]
     pub include_body: bool,
-    /// 路径查询（含 /）时的最后段子串开关（Serena substring_matching）。
+    /// 子串开关。名称查询：省略=子串匹配（精确名优先排序），false=只要精确名，
+    /// true=子串；路径查询：最后段子串匹配（省略/false=精确）。
     #[serde(default)]
-    #[schemars(description = "Path queries: substring-match the last segment (default exact)")]
-    pub substring: bool,
-    /// 路径查询：kind 过滤（Function/Method/Class/Struct/Trait/...）。
+    #[schemars(
+        description = "Name queries: omit = substring match ranked exact>prefix>substring; false = exact name only; true = substring. Path queries: substring-match the last segment (default exact)"
+    )]
+    pub substring: Option<bool>,
+    /// kind 过滤（Function/Method/Class/Struct/Trait/...），名称与路径查询均生效。
     #[serde(default)]
-    #[schemars(description = "Path queries: filter results by SymbolKind name")]
+    #[schemars(
+        description = "Filter results by SymbolKind name (function, method, class, interface, struct, enum, trait, type, const, module, field)"
+    )]
     pub kind: Option<String>,
+    /// 仓库相对路径子串过滤（与 search_code 相同语义）。
+    #[serde(default)]
+    #[schemars(
+        description = "Optional case-sensitive substring of the repo-relative path (e.g. src/server). Not a glob. A filter matching no indexed path is an error that lists the closest indexed paths."
+    )]
+    pub path_filter: Option<String>,
     /// 路径查询：展开匹配者的嵌套子符号层数（0=不展开）。
     #[serde(default)]
     #[schemars(
@@ -918,7 +929,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart — other source files are invisible to this tool; use Grep/Read for them."
+        description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn resolve_context(
         &self,
@@ -1103,45 +1114,92 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart — other source files are invisible to this tool; use Grep/Read for them."
+        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn find_symbol(
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> CallToolResult {
         let signature = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
-            params.query, params.include_body, params.substring, params.kind, params.depth
+            "{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}",
+            params.query,
+            params.include_body,
+            params.substring,
+            params.kind,
+            params.depth,
+            params.path_filter.as_deref().unwrap_or("")
         );
         self.guarded("find_symbol", &signature, || self.find_symbol_inner(params))
     }
 
     fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
         self.with_fresh_index(&params.query, |session, index| {
-            // "Class/method" 路径查询（含 "/"）走层级匹配器（Serena
-            // NamePathMatcher 对应物：后缀匹配/绝对路径/kind 过滤/depth 展开）。
-            if params.query.contains('/') {
-                return self.find_symbol_by_path(&session.root, index, &params);
+            if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
+                return self.finish_at(&session.root, text_error(message));
             }
-            let needle = params.query.to_lowercase();
+            let kind = match params.kind.as_deref() {
+                None => None,
+                Some(name) => match kind_from_name(name) {
+                    Ok(kind) => Some(kind),
+                    Err(message) => return self.finish_at(&session.root, text_error(message)),
+                },
+            };
+            let normalized = normalize_symbol_query(&params.query);
+            // "Class/method"（及 Type.method / A::b / pkg.Func）路径查询走层级
+            // 匹配器（Serena NamePathMatcher 对应物）。
+            if normalized.query.contains('/') {
+                let mut params = params.clone();
+                params.query = normalized.query;
+                return self.find_symbol_by_path(
+                    &session.root,
+                    index,
+                    &params,
+                    normalized.ignored.as_deref(),
+                );
+            }
+            let needle = normalized.query.to_lowercase();
             // 命中对先收集 (锚点行, symbol 下标)，与展示列表同一排序源——
             // include_body 只对"用户实际看到的" kept 前几个附体（审查 major：
             // 原实现按 graph 构建序取前 5，可能对应被 budget 裁掉的符号）。
-            let mut hits: Vec<(String, usize)> = Vec::new();
+            // 排序：精确名 > 前缀 > 子串，同档再按锚点行——避免真正的定义
+            // 因按路径排序排在后面而被 budget 截掉。
+            let exact_only = params.substring == Some(false);
+            let mut ranked: Vec<(u8, String, usize)> = Vec::new();
             for (idx, symbol) in index.graph().symbols.iter().enumerate() {
-                if symbol.name.to_lowercase().contains(&needle) {
-                    if let Some(file) = index.file(symbol.file) {
-                        hits.push((symbol_line(symbol, &file.path), idx));
+                let Some(tier) = name_match_tier(&symbol.name, &needle) else {
+                    continue;
+                };
+                if exact_only && tier > 0 {
+                    continue;
+                }
+                if kind.is_some_and(|k| symbol.kind != k) {
+                    continue;
+                }
+                if let Some(file) = index.file(symbol.file) {
+                    if params
+                        .path_filter
+                        .as_deref()
+                        .is_some_and(|f| !file.path.as_str().contains(f))
+                    {
+                        continue;
                     }
+                    ranked.push((tier, symbol_line(symbol, &file.path), idx));
                 }
             }
-            hits.sort_by(|a, b| a.0.cmp(&b.0));
+            ranked.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            let hits: Vec<(String, usize)> = ranked
+                .into_iter()
+                .map(|(_, line, idx)| (line, idx))
+                .collect();
             let lines: Vec<String> = hits.iter().map(|(line, _)| line.clone()).collect();
             let (kept, omitted) =
                 truncate_ranked(&lines, params.budget_tokens, |line| format!("{line}\n"));
             let kept_count = kept.len();
             let truncated = omitted > 0;
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
+            if let Some(ignored) = &normalized.ignored {
+                body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
+            }
             body.push_str(&render_budget_status(
                 kept_count,
                 omitted,
@@ -1155,6 +1213,7 @@ impl AstrolabeServer {
             // include_body 附加，避免误导性的"无可提取的符号体"。
             if hits.is_empty() {
                 body.push_str("(未找到匹配的符号)\n");
+                body.push_str(&symbol_suggestions(index, &needle));
                 let unindexed = index.unindexed_code_exts(None);
                 if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
                     body.push_str(&hint);
@@ -1188,7 +1247,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search indexed source for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart — other source files are invisible to this tool; use Grep/Read for them."
+        description = "Search indexed source for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn search_code(
         &self,
@@ -1207,6 +1266,9 @@ impl AstrolabeServer {
         self.with_fresh_index(
             &Self::join_hint(&[params.path_filter.as_deref().unwrap_or(""), &params.query]),
             |session, index| {
+                if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
+                    return text_error(message);
+                }
                 let regex = if params.regex {
                     match regex::Regex::new(&params.query) {
                         Ok(regex) => Some(regex),
@@ -1792,6 +1854,7 @@ impl AstrolabeServer {
         root: &Path,
         index: &RepoIndex,
         params: &QueryParams,
+        ignored: Option<&str>,
     ) -> CallToolResult {
         let kind = match params.kind.as_deref() {
             None => None,
@@ -1800,25 +1863,66 @@ impl AstrolabeServer {
                 Err(message) => return self.finish_at(root, text_error(message)),
             },
         };
-        let kind = astrolabe_core::name_path::KindFilter(kind);
-        let matches = astrolabe_core::name_path::match_name_path(
-            &index.graph().symbols,
+        let symbols = &index.graph().symbols;
+        let mut matches = astrolabe_core::name_path::match_name_path(
+            symbols,
             &params.query,
-            params.substring,
-            kind,
+            params.substring.unwrap_or(false),
+            astrolabe_core::name_path::KindFilter(kind),
             params.depth,
         );
+        // 行范围嵌套推不出的层级（Go 方法挂在接收者类型上、pkg.Func 的包是
+        // 目录）：最后一段精确名 + 父段出现在签名词或路径段中。
+        let mut receiver_fallback = false;
+        if matches.is_empty() && params.depth == 0 {
+            let segments: Vec<&str> = params
+                .query
+                .split('/')
+                .filter(|seg| !seg.is_empty())
+                .collect();
+            if let [.., parent, last] = segments.as_slice() {
+                let mut impl_sources = std::collections::HashMap::new();
+                for symbol in symbols {
+                    if !symbol.name.eq_ignore_ascii_case(last)
+                        || kind.is_some_and(|k| symbol.kind != k)
+                    {
+                        continue;
+                    }
+                    let Some(file) = index.file(symbol.file) else {
+                        continue;
+                    };
+                    if signature_mentions(&symbol.signature, parent)
+                        || path_has_component(file.path.as_str(), parent)
+                        || enclosing_impl_mentions(
+                            &mut impl_sources,
+                            root,
+                            file.path.as_str(),
+                            symbol.start_line,
+                            parent,
+                        )
+                    {
+                        matches.push(astrolabe_core::name_path::NamePathMatch {
+                            symbol: symbol.id,
+                            depth: 0,
+                        });
+                    }
+                }
+                receiver_fallback = !matches.is_empty();
+            }
+        }
         // 命中对先收集 (锚点行, symbol 下标)，与名称分支同一 include_body 排序源。
         let mut hits: Vec<(String, usize)> = Vec::new();
         for m in &matches {
-            if let Some((idx, symbol)) = index
-                .graph()
-                .symbols
-                .iter()
-                .enumerate()
-                .find(|(_, s)| s.id == m.symbol)
+            if let Some((idx, symbol)) = symbols.iter().enumerate().find(|(_, s)| s.id == m.symbol)
             {
                 if let Some(file) = index.file(symbol.file) {
+                    if params
+                        .path_filter
+                        .as_deref()
+                        .is_some_and(|f| !file.path.as_str().contains(f))
+                    {
+                        continue;
+                    }
                     let depth_note = if m.depth > 0 {
                         format!(" (嵌套层 d{})", m.depth)
                     } else {
@@ -1839,6 +1943,12 @@ impl AstrolabeServer {
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
                 .to_string();
+        if let Some(ignored) = ignored {
+            body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
+        }
+        if receiver_fallback {
+            body.push_str("注意：层级由接收者类型/签名/路径段推断（非行范围嵌套）\n");
+        }
         body.push_str(&render_budget_status(
             kept_count,
             omitted,
@@ -1851,6 +1961,13 @@ impl AstrolabeServer {
         // 零命中时显式声明，避免只剩 confidence 元信息的歧义输出。
         if hits.is_empty() {
             body.push_str("(未找到匹配的符号)\n");
+            let last = params
+                .query
+                .rsplit('/')
+                .find(|seg| !seg.is_empty())
+                .unwrap_or_default()
+                .to_lowercase();
+            body.push_str(&symbol_suggestions(index, &last));
             let unindexed = index.unindexed_code_exts(None);
             if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
                 body.push_str(&hint);
@@ -2315,6 +2432,231 @@ fn resource_preview(body: &str) -> String {
     preview.trim_end().to_string()
 }
 
+/// find_symbol 查询归一化结果。
+struct NormalizedQuery {
+    query: String,
+    /// 被剥掉的语言关键字（如 `struct`），用于在结果中提示。
+    ignored: Option<String>,
+}
+
+const QUERY_KEYWORDS: &[&str] = &[
+    "struct",
+    "class",
+    "func",
+    "fn",
+    "def",
+    "function",
+    "method",
+    "interface",
+    "enum",
+    "trait",
+    "type",
+    "impl",
+    "record",
+];
+
+/// 剥掉 `Proc struct` / `func Foo` 中的关键字，并把 `::`、`.` 视作层级
+/// 分隔符（`Type.method`、`A::b`、`pkg.Func` → `Type/method`）。
+fn normalize_symbol_query(raw: &str) -> NormalizedQuery {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut ignored = Vec::new();
+    let mut kept = Vec::new();
+    if tokens.len() > 1 {
+        for token in &tokens {
+            if QUERY_KEYWORDS.contains(&token.to_ascii_lowercase().as_str()) {
+                ignored.push(*token);
+            } else {
+                kept.push(*token);
+            }
+        }
+        if kept.is_empty() {
+            kept = tokens.clone();
+            ignored.clear();
+        }
+    } else {
+        kept = tokens.clone();
+    }
+    let mut query = kept.join(" ");
+    if !query.contains('/') && (query.contains("::") || query.contains('.')) {
+        let leading = query.starts_with("::");
+        let replaced: Vec<&str> = query
+            .split("::")
+            .flat_map(|part| part.split('.'))
+            .filter(|seg| !seg.is_empty())
+            .collect();
+        if replaced.len() > 1 {
+            query = format!("{}{}", if leading { "/" } else { "" }, replaced.join("/"));
+        }
+    }
+    NormalizedQuery {
+        query,
+        ignored: (!ignored.is_empty()).then(|| format!("`{}`", ignored.join(" "))),
+    }
+}
+
+/// 名称匹配档位：0 精确、1 前缀、2 子串（needle 已小写）。
+fn name_match_tier(name: &str, needle: &str) -> Option<u8> {
+    let lower = name.to_lowercase();
+    if lower == needle {
+        Some(0)
+    } else if lower.starts_with(needle) {
+        Some(1)
+    } else if lower.contains(needle) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// 签名中是否以完整标识符出现 `word`（Go 接收者 `(c *Command)` 等）。
+fn signature_mentions(signature: &str, word: &str) -> bool {
+    signature
+        .split(|c: char| !is_ident_char(c))
+        .any(|token| token == word)
+}
+
+/// 路径中是否有目录段或文件名主干等于 `component`（pkg.Func 的 pkg）。
+fn path_has_component(path: &str, component: &str) -> bool {
+    path.split('/')
+        .any(|seg| seg == component || seg.split('.').next().is_some_and(|stem| stem == component))
+}
+
+/// Rust `impl Type { fn m() }` / `impl Trait for Type`：向上找最近的
+/// 顶格 `impl` 行，判断它是否提到父段名（impl 块本身不是索引符号）。
+fn enclosing_impl_mentions(
+    cache: &mut std::collections::HashMap<String, Option<String>>,
+    root: &Path,
+    path: &str,
+    start_line: u32,
+    parent: &str,
+) -> bool {
+    if !path.ends_with(".rs") {
+        return false;
+    }
+    let source = cache
+        .entry(path.to_string())
+        .or_insert_with(|| std::fs::read_to_string(root.join(path)).ok());
+    let Some(source) = source else {
+        return false;
+    };
+    let before = usize::try_from(start_line.saturating_sub(1)).unwrap_or(0);
+    source
+        .lines()
+        .take(before)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .find(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("impl") && trimmed.len() == line.len()
+        })
+        .is_some_and(|line| signature_mentions(line, parent))
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// 零命中时给出相近符号名（编辑距离 ≤2 或共享 4 字符前缀），最多 5 个。
+fn symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
+    if needle.is_empty() {
+        return String::new();
+    }
+    let prefix: String = needle.chars().take(4).collect();
+    let mut scored: BTreeMap<(usize, String), ()> = BTreeMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for symbol in &index.graph().symbols {
+        let lower = symbol.name.to_lowercase();
+        if !seen.insert(lower.clone()) {
+            continue;
+        }
+        let distance = edit_distance(&lower, needle);
+        if distance <= 2 || (prefix.chars().count() >= 4 && lower.starts_with(&prefix)) {
+            scored.insert((distance, symbol.name.clone()), ());
+        }
+    }
+    if scored.is_empty() {
+        return "建议：确认名字拼写；带限定的写法可用 Type/method、Type.method 或 A::b；也可改用 search_code 做全文检索。\n".to_string();
+    }
+    let names: Vec<String> = scored.into_keys().take(5).map(|(_, name)| name).collect();
+    format!(
+        "相近的符号名：{}（可直接用这些名字重查，或改用 search_code）\n",
+        names.join(", ")
+    )
+}
+
+/// path_filter 不匹配任何已索引路径（也不匹配未入索引的代码文件）时返回
+/// 显式错误，列出最接近的已索引路径，而不是静默返回 0 条。
+fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> {
+    let filter = filter.filter(|f| !f.is_empty())?;
+    let files = &index.graph().files;
+    if files.iter().any(|file| file.path.as_str().contains(filter)) {
+        return None;
+    }
+    if !index.unindexed_code_exts(Some(filter)).is_empty() {
+        return None;
+    }
+    let cleaned = filter.trim_start_matches("./").trim_start_matches('/');
+    let segments: Vec<String> = cleaned
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let mut candidates: BTreeMap<String, ()> = BTreeMap::new();
+    for file in files {
+        let path = file.path.as_str();
+        candidates.insert(path.to_string(), ());
+        let mut dir = path;
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            candidates.insert(format!("{parent}/"), ());
+            dir = parent;
+        }
+    }
+    let mut scored: Vec<(usize, usize, usize, String)> = candidates
+        .into_keys()
+        .map(|candidate| {
+            let lower = candidate.to_lowercase();
+            let hits = segments
+                .iter()
+                .filter(|seg| lower.contains(seg.as_str()))
+                .count();
+            let tail = lower
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let distance = segments
+                .last()
+                .map_or(usize::MAX, |seg| edit_distance(&tail, seg));
+            (usize::MAX - hits, distance, candidate.len(), candidate)
+        })
+        .collect();
+    scored.sort();
+    let closest: Vec<String> = scored.into_iter().take(5).map(|entry| entry.3).collect();
+    let mut message = format!(
+        "path_filter '{filter}' 不匹配任何已索引路径（区分大小写的仓库相对路径子串，不是 glob，不要带绝对路径或 ./ 前缀）。"
+    );
+    if !closest.is_empty() {
+        message.push_str(&format!("最接近的已索引路径：{}", closest.join(", ")));
+    }
+    Some(message)
+}
+
 fn text_error(message: impl Into<String>) -> CallToolResult {
     let message = message.into();
     CallToolResult::error(vec![ContentBlock::text(if message.trim().is_empty() {
@@ -2518,7 +2860,8 @@ mod tests {
         assert_first_text(server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 100,
@@ -2550,7 +2893,8 @@ mod tests {
         let result = server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 0,
@@ -3203,6 +3547,161 @@ mod tests {
         assert!(tool_desc.contains("no pagination"), "{tool_desc}");
     }
 
+    fn server_on_files(files: &[(&str, &str)]) -> (AstrolabeServer, PathBuf) {
+        let dir = unique_temp_dir();
+        for (path, body) in files {
+            let full = dir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        }
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+        (server, dir)
+    }
+
+    fn fs_query(query: &str) -> QueryParams {
+        QueryParams {
+            query: query.into(),
+            include_body: false,
+            substring: None,
+            path_filter: None,
+            kind: None,
+            depth: 0,
+            budget_tokens: 2500,
+        }
+    }
+
+    fn fs_text(result: &CallToolResult) -> String {
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
+    #[test]
+    fn find_symbol_ranks_exact_name_before_substring_and_survives_truncation() {
+        let mut many = String::new();
+        for i in 0..60 {
+            many.push_str(&format!("def handle_widget_{i}():\n    pass\n"));
+        }
+        let (server, dir) = server_on_files(&[
+            ("aaa/noise.py", &many),
+            ("zzz/real.py", "def widget():\n    pass\n"),
+        ]);
+        let mut params = fs_query("widget");
+        params.budget_tokens = 120;
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        let first = text.lines().find(|l| l.contains('@')).unwrap_or_default();
+        assert!(first.contains("zzz/real.py"), "{text}");
+
+        // 编辑文件后重建索引再查：新增的精确同名定义同样排在最前。
+        std::fs::write(
+            dir.join("aaa/exact.py"),
+            "def handle_widget_5x():\n    pass\nclass Gadget:\n    pass\n",
+        )
+        .unwrap();
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        let mut params = fs_query("gadget");
+        params.substring = Some(false);
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(text.contains("aaa/exact.py"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_exact_only_kind_and_path_filter_apply_to_name_queries() {
+        let (server, dir) = server_on_files(&[
+            (
+                "src/a.py",
+                "class Item:\n    pass\ndef item():\n    pass\ndef items_all():\n    pass\n",
+            ),
+            ("lib/b.py", "def item():\n    pass\n"),
+        ]);
+        let mut params = fs_query("item");
+        params.substring = Some(false);
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(!text.contains("items_all"), "{text}");
+
+        let mut params = fs_query("item");
+        params.kind = Some("class".into());
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(text.contains("class Item"), "{text}");
+        assert!(!text.contains("def item"), "{text}");
+
+        let mut params = fs_query("item");
+        params.path_filter = Some("lib/".into());
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(text.contains("lib/b.py"), "{text}");
+        assert!(!text.contains("src/a.py"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_accepts_dot_and_colon_paths_and_go_receivers() {
+        let (server, dir) = server_on_files(&[
+            (
+                "cmd/command.go",
+                "package cmd\n\ntype Command struct {\n\tName string\n}\n\nfunc (c *Command) ExecuteC() error {\n\treturn nil\n}\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Pool;\nimpl Pool {\n    pub fn spawn(&self) {}\n}\n",
+            ),
+        ]);
+        for query in ["Command.ExecuteC", "Command/ExecuteC", "cmd.ExecuteC"] {
+            let text = fs_text(&server.find_symbol(Parameters(fs_query(query))));
+            assert!(text.contains("cmd/command.go:7"), "{query}: {text}");
+        }
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("Pool::spawn"))));
+        assert!(text.contains("src/lib.rs:3"), "{text}");
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("Command struct"))));
+        assert!(text.contains("cmd/command.go:3"), "{text}");
+        assert!(text.contains("已忽略查询中的关键字"), "{text}");
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("ExecuteX"))));
+        assert!(
+            text.contains("相近的符号名") && text.contains("ExecuteC"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unmatched_path_filter_is_an_explicit_error_with_closest_paths() {
+        let (server, dir) =
+            server_on_files(&[("relay/channel/openai.py", "def send():\n    pass\n")]);
+        let mut params = fs_query("send");
+        params.path_filter = Some("relay/chanel".into());
+        let result = server.find_symbol(Parameters(params));
+        assert_eq!(result.is_error, Some(true));
+        let text = fs_text(&result);
+        assert!(text.contains("relay/channel"), "{text}");
+
+        let result = server.search_code(Parameters(SearchParams {
+            query: "send".into(),
+            regex: false,
+            path_filter: Some("./relay/channel".into()),
+            budget_tokens: 2500,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            fs_text(&result).contains("relay/channel/"),
+            "{}",
+            fs_text(&result)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_symbol_query_handles_separators_and_keywords() {
+        assert_eq!(normalize_symbol_query("Type.method").query, "Type/method");
+        assert_eq!(normalize_symbol_query("A::b::c").query, "A/b/c");
+        assert_eq!(normalize_symbol_query("::A::b").query, "/A/b");
+        let n = normalize_symbol_query("Proc struct");
+        assert_eq!(n.query, "Proc");
+        assert!(n.ignored.is_some());
+        assert_eq!(normalize_symbol_query("struct").query, "struct");
+    }
+
     #[test]
     fn find_symbol_empty_result_states_no_match_explicitly() {
         let (server, dir) = ready_server_with_disk();
@@ -3211,7 +3710,8 @@ mod tests {
         let named = server.find_symbol(Parameters(QueryParams {
             query: "NoSuchSymbolAnywhere".into(),
             include_body: true,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 1000,
@@ -3224,7 +3724,8 @@ mod tests {
         let by_path = server.find_symbol(Parameters(QueryParams {
             query: "NoSuch/Path".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 1000,
@@ -3254,7 +3755,8 @@ mod tests {
         let result = server.find_symbol(Parameters(QueryParams {
             query: "spacious".into(),
             include_body: true,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 300,
@@ -3396,7 +3898,8 @@ mod tests {
             text = first_text(server.find_symbol(Parameters(QueryParams {
                 query: "during_build_xyz".into(),
                 include_body: false,
-                substring: false,
+                substring: None,
+                path_filter: None,
                 kind: None,
                 depth: 0,
                 budget_tokens: 500,
@@ -3426,7 +3929,8 @@ mod tests {
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 500,
@@ -3459,7 +3963,8 @@ mod tests {
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             query: "alpha_v2".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 500,
@@ -3488,7 +3993,8 @@ mod tests {
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 500,
@@ -3502,7 +4008,8 @@ mod tests {
             let probe = first_text(server.find_symbol(Parameters(QueryParams {
                 query: "alpha_v3".into(),
                 include_body: false,
-                substring: false,
+                substring: None,
+                path_filter: None,
                 kind: None,
                 depth: 0,
                 budget_tokens: 500,
@@ -3555,7 +4062,8 @@ mod tests {
         let _ = server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 500,
@@ -3603,7 +4111,8 @@ mod tests {
         let priming = server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 500,
@@ -3628,7 +4137,8 @@ mod tests {
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 500,
@@ -3680,7 +4190,8 @@ mod tests {
         let _ = server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 200,
@@ -3707,7 +4218,8 @@ mod tests {
         let _ = server.find_symbol(Parameters(QueryParams {
             query: "beta".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 200,
@@ -3752,7 +4264,8 @@ mod tests {
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             query: "compare alpha and beta".into(),
             include_body: false,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             depth: 0,
             budget_tokens: 500,
@@ -3865,7 +4378,8 @@ mod tests {
             query: "NonExistentSymbol".into(),
             budget_tokens: 2500,
             depth: 0,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             include_body: false,
         }));
@@ -3973,7 +4487,8 @@ mod tests {
             query: "NonExistent".into(),
             budget_tokens: 2500,
             depth: 0,
-            substring: false,
+            substring: None,
+            path_filter: None,
             kind: None,
             include_body: false,
         }));

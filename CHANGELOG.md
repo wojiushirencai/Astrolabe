@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Fixed
+
+- **`find_symbol` 匹配与排序修正。** 结果按精确名 > 前缀 > 子串排序，真实定义不再因按路径排序被截断；支持 `Type.method` / `A::b` / `pkg.Func` 层级写法并把 Go 方法挂到接收者类型（`Command.ExecuteC`）；忽略 `Proc struct` 这类尾随关键字，零命中时给出相近符号名；`kind`/`substring` 对名称查询生效，新增 `path_filter`；Java/C#/VB 的锚点与签名落在声明行而非注解/特性行；`find_symbol`/`search_code` 的 `path_filter` 不匹配任何已索引路径时显式报错并列出最接近路径；工具描述补列 C#、VB。
+
 ## [0.10.0] - 2026-10-11
 
 ### Added
