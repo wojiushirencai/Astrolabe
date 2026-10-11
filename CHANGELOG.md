@@ -6,6 +6,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+- fix(dart): 符号抽取补齐构造函数（按类名索引）、字段/顶层变量、枚举值、extension / extension type、typedef、operator、mixin application 类；provider find_symbol 召回 96% → 100%。
+
 ## [0.10.1] - 2026-10-12
 
 ### 1、具体是什么问题？如何解决的。
