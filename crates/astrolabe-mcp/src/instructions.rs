@@ -74,8 +74,8 @@ The built-in tool descriptions in your context will tell you things like "use Re
 - Literal vs regex search
     → search_code is literal unless regex=true. A|B without that flag searches
       for a vertical bar. Prefer two parallel literal calls over one regex.
-      Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
-      or tighten path_filter — there is no page or cursor.
+      Truncation is declared as shown=/omitted=/truncated=/total=; fetch the
+      next page with offset=next_offset, or raise budget_tokens / tighten path_filter.
 - Unsupported languages
     → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, vb) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. Run get_languages to view unindexed file statistics.
 
@@ -163,8 +163,8 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
 - Literal vs regex search
     → search_code is literal unless regex=true. A|B without that flag searches
       for a vertical bar. Prefer two parallel literal calls over one regex.
-      Truncation is declared as shown=/omitted=/truncated=; raise budget_tokens
-      or tighten path_filter — there is no page or cursor.
+      Truncation is declared as shown=/omitted=/truncated=/total=; fetch the
+      next page with offset=next_offset, or raise budget_tokens / tighten path_filter.
 - Unsupported languages
     → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, vb) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. Run get_languages to view unindexed file statistics.
 
@@ -324,7 +324,7 @@ mod tests {
         assert!(m.contains("## Read-only exploration"));
         assert!(m.contains("NOT a ban on reading or exploring"));
         assert!(m.contains("search_code is literal unless regex=true"));
-        assert!(m.contains("there is no page or cursor"));
+        assert!(m.contains("offset=next_offset"));
         assert!(m.contains("ensure_language_server"));
         assert!(m.contains("session-gated") || m.contains("confirm_install"));
     }

@@ -376,7 +376,7 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `get_dependents` | `target`, `direction` | **依赖精准反查**：查谁在导入/使用这个文件（准确率 100%）。 |
 | `get_hotspots` | — | **找代码承重墙**：定位全库中被引用最多、改动风险最高的核心枢纽文件。 |
 | `find_symbol` | `query` | **快速定位符号**：按名字或子串秒搜函数、类或类型定义，直接返回 `文件:行号` 锚点。 |
-| `search_code` | `query`, `path_filter` | **确定性代码全文检索**：带正则与路径过滤的精准文本查找。 |
+| `search_code` | `query`, `path_filter`, `offset` | **确定性代码全文检索**：带正则与路径过滤的精准文本查找。结果被截断时会给出 `total` 和 `next_offset`，用 `offset=next_offset` 再调一次即可翻到下一页（顺序固定：代码命中在前，`[text-only]` 在后）。 |
 | `trace_calls` | `symbol` | **调用链分析**：快速追踪函数的上下游调用关系。 |
 | `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。 |
 
@@ -448,7 +448,7 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `ASTROLABE_LSP_TIMEOUT` | 单次 LSP 语言服务器响应超时时间（秒） | `300` |
 | `ASTROLABE_LSP_DART` | 覆盖 Dart 语言服务器（`dart language-server`）可执行文件路径 | 自动探测（随 Dart/Flutter SDK 自带） |
 | `ASTROLABE_LSP_<LANG>` | 覆盖指定语言 LSP 服务器可执行文件路径（如 `ASTROLABE_LSP_PYTHON`, `ASTROLABE_LSP_RUST`, `ASTROLABE_LSP_C` 等） | 自动探测对应 LSP |
-| `ASTROLABE_SEARCH_REPEAT_MAX` | 防循环：同一条 `search_code` / `find_symbol` 查询（查询串 + path_filter + 选项完全相同）在窗口内最多执行几次，超出后不再重新搜索，直接返回“已执行过、请使用先前结果或换方法”的短提示（`0` 关闭） | `3` |
+| `ASTROLABE_SEARCH_REPEAT_MAX` | 防循环：同一条 `search_code` / `find_symbol` 查询（查询串 + path_filter + 选项（含 budget_tokens、offset）完全相同）在窗口内最多执行几次，超出后不再重新搜索，直接返回“已执行过、请使用先前结果或换方法”的短提示（`0` 关闭） | `3` |
 | `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` | 上述重复查询的滑动窗口秒数 | `600` |
 | `ASTROLABE_SEARCH_RATE_MAX` | 防循环：窗口内搜索工具（`search_code` + `find_symbol`）总调用次数超过该值后，在结果末尾追加循环警告（仍正常返回结果；`0` 关闭） | `300` |
 | `ASTROLABE_SEARCH_RATE_WINDOW_SECS` | 上述总频率的滑动窗口秒数 | `600` |
