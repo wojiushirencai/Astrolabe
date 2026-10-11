@@ -49,8 +49,9 @@
   name: (type_identifier) @name) @definition.type
 
 ;; --------------------------------------------------- package-level values
-;; Local `const`/`var` inside function bodies are skipped, matching what gopls
-;; reports as document symbols.
+;; Local `var`s inside function bodies are skipped (too noisy); local
+;; `const`s are kept: they are named, rarely shadowed, and `find_symbol` on
+;; them must not come back empty.
 (source_file
   (const_declaration
     (const_spec
@@ -105,3 +106,9 @@
         name: (type_identifier) @name)
     ]
     .) @definition.field)
+
+;; Function-local constants (any nesting depth inside a block).
+(statement_list
+  (const_declaration
+    (const_spec
+      name: (identifier) @name) @definition.const))
