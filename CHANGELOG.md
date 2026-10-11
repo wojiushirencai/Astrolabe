@@ -8,6 +8,9 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ### Fixed
 
+- loop guard（search_code/find_symbol 重复查询上限）不再误拦：签名包含全部参数（含 budget_tokens）和索引代数，索引变化即重置；只统计成功执行的查询；被拦时返回上一次缓存结果并标注 `blocked: true`。
+- **修复 TS `outDir` 误排除源码。** tsconfig `outDir` 等于/包含配置目录或 `rootDir`、或其中仍有 `.ts` 源文件时不再当作构建产物排除（zod 的 `"outDir": "."` 曾让 332 个源文件从索引消失）；被构建输出规则排除的源文件会在 `get_languages` 中列出，不再显示 `unindexed source files: none`。
+- 索引覆盖：`build`/`dist`/`target`/`obj` 仅在仓库根与项目根下排除；GBK/Latin-1 等非 UTF-8 文件解码后入索引；解析失败/超时/超大文件在查询结果中提示并在 get_languages 列出；扩展名大小写不敏感并补齐 C++ 扩展名、含 C++ 语法的 `.h` 按 C++ 解析；Dart 命名构造函数与 Go 函数内常量可被 find_symbol 查到。
 - C# symbol extraction now covers fields, `const` fields, enum members, events, indexers, operators, conversion operators, destructors, delegates and nested local functions (find_symbol recall on Newtonsoft.Json 85.7% → 99.9%, Serilog 84.9% → 99.9%, Polly 88.3% → 100%).
 
 ## [0.10.0] - 2026-10-11

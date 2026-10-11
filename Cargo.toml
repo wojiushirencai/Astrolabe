@@ -24,6 +24,8 @@ ignore = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 memchr = "2.7"
+encoding_rs = "0.8"
+chardetng = "1.0"
 notify = "8"
 rayon = "1.10"
 moka = { version = "0.12", features = ["sync"] }

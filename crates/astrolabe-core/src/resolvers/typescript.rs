@@ -160,10 +160,12 @@ impl ModuleResolver for TypeScriptResolver {
                     .push(alias_unit(&cfg.dir, "*", &join_dir(base, "*")));
             }
             if let Some(out) = &cfg.out_dir {
-                excludes.insert(out.clone());
+                if out_dir_is_excludable(cfg, out, files) {
+                    excludes.insert(out.clone());
+                }
             }
             for e in &cfg.exclude {
-                if is_output_dir_path(e) {
+                if is_output_dir_path(e) && !dir_has_authored_ts(files, e) {
                     excludes.insert(e.clone());
                 }
             }
@@ -556,6 +558,51 @@ fn in_node_modules(path: &str) -> bool {
     path.starts_with("node_modules/") || path.contains("/node_modules/")
 }
 
+/// `true` when `dir` is `ancestor` itself or lies below it (`""` = repo root).
+fn dir_within(dir: &str, ancestor: &str) -> bool {
+    let a = ancestor.trim_end_matches('/');
+    let d = dir.trim_end_matches('/');
+    a.is_empty() || a == "." || d == a || d.starts_with(&format!("{a}/"))
+}
+
+/// Authored TypeScript (not a `.d.ts` declaration emitted next to JS output).
+pub fn is_authored_ts(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    let is_decl = [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|s| file.ends_with(s))
+        || file.contains(".d.");
+    !is_decl
+        && [".ts", ".tsx", ".mts", ".cts"]
+            .iter()
+            .any(|s| lower.ends_with(s))
+}
+
+/// Does `dir` (or anything below it) contain authored TS sources? A real
+/// build directory only holds emitted `.js`/`.d.ts`, so sources there mean
+/// the directory is not (only) build output.
+fn dir_has_authored_ts(files: &FileIndex, dir: &str) -> bool {
+    files
+        .iter()
+        .any(|p| dir_within(p.dir(), dir) && is_authored_ts(p.as_str()))
+}
+
+/// `outDir` is only excluded when it is a distinct directory holding no
+/// sources. `"outDir": "."` (zod) or an `outDir` that is an ancestor of the
+/// config / `rootDir` would otherwise drop the whole package from the index.
+fn out_dir_is_excludable(cfg: &TsConfig, out: &str, files: &FileIndex) -> bool {
+    if dir_within(&cfg.dir, out) {
+        return false;
+    }
+    if let Some(root) = &cfg.root_dir {
+        if dir_within(root, out) {
+            return false;
+        }
+    }
+    !dir_has_authored_ts(files, out)
+}
+
 fn is_output_dir_path(path: &str) -> bool {
     let last = path.rsplit('/').next().unwrap_or(path);
     OUTPUT_EXCLUDE_NAMES.contains(&last)
@@ -762,6 +809,8 @@ struct TsConfig {
     /// `(directory of the config that defines `paths`, raw `paths` map)`.
     paths: Option<(String, RawPaths)>,
     out_dir: Option<String>,
+    /// Repo-relative `rootDir`, resolved against its defining config.
+    root_dir: Option<String>,
     exclude: Vec<String>,
 }
 
@@ -775,6 +824,9 @@ impl TsConfig {
         }
         if parent.out_dir.is_some() {
             self.out_dir = parent.out_dir.clone();
+        }
+        if parent.root_dir.is_some() {
+            self.root_dir = parent.root_dir.clone();
         }
         if !parent.exclude.is_empty() {
             self.exclude = parent.exclude.clone();
@@ -856,6 +908,11 @@ impl ConfigLoader<'_> {
         if let Some(o) = option("outDir").and_then(Value::as_str) {
             if let Some(abs) = join_rel(&dir, &expand_config_dir(o)) {
                 cfg.out_dir = Some(abs);
+            }
+        }
+        if let Some(r) = option("rootDir").and_then(Value::as_str) {
+            if let Some(abs) = join_rel(&dir, &expand_config_dir(r)) {
+                cfg.root_dir = Some(abs);
             }
         }
         if let Some(ex) = json.get("exclude").and_then(Value::as_array) {
@@ -1343,6 +1400,66 @@ mod tests {
             Some("src/thing.ts")
         );
         assert!(meta.excludes.contains(&"packages/app/dist".to_string()));
+    }
+
+    #[test]
+    fn out_dir_containing_sources_is_never_excluded() {
+        let (_d, _files, meta) = fixture(
+            &[
+                // zod: `"outDir": "."` in a build tsconfig.
+                (
+                    "packages/zod/tsconfig.build.json",
+                    r#"{"compilerOptions": {"outDir": "."}}"#,
+                ),
+                // outDir is an ancestor of the config dir.
+                (
+                    "pkg/sub/tsconfig.json",
+                    r#"{"compilerOptions": {"outDir": ".."}}"#,
+                ),
+                // outDir equals rootDir's parent.
+                (
+                    "lib/tsconfig.json",
+                    r#"{"compilerOptions": {"rootDir": "src/core", "outDir": "src"}}"#,
+                ),
+                // Distinct subdir that holds sources (not pure build output).
+                (
+                    "gen/tsconfig.json",
+                    r#"{"compilerOptions": {"outDir": "out"}}"#,
+                ),
+                // Regular dist with only emitted output: still excluded.
+                (
+                    "app/tsconfig.json",
+                    r#"{"compilerOptions": {"outDir": "dist"}}"#,
+                ),
+            ],
+            &[
+                "packages/zod/src/v4/classic/errors.ts",
+                "pkg/sub/a.ts",
+                "lib/src/core/x.ts",
+                "gen/out/handwritten.ts",
+                "app/src/main.ts",
+                "app/dist/main.js",
+                "app/dist/main.d.ts",
+            ],
+        );
+        for dir in ["packages/zod", "pkg", "lib/src", "gen/out"] {
+            assert!(
+                !meta.excludes.iter().any(|e| e == dir),
+                "{dir} must not be excluded: {:?}",
+                meta.excludes
+            );
+        }
+        assert!(meta.excludes.contains(&"app/dist".to_string()));
+    }
+
+    #[test]
+    fn authored_ts_excludes_declarations() {
+        assert!(is_authored_ts("a/b.ts"));
+        assert!(is_authored_ts("a/b.tsx"));
+        assert!(is_authored_ts("a.d/b.ts"));
+        assert!(!is_authored_ts("a/b.d.ts"));
+        assert!(!is_authored_ts("a/b.d.mts"));
+        assert!(!is_authored_ts("a/b.js"));
     }
 
     #[test]

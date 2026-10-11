@@ -407,7 +407,7 @@ pub struct AstrolabeServer {
     cache_budget_bytes: u64,
     context: ClientContext,
     structured_output: bool,
-    loop_guard: Arc<Mutex<LoopGuard>>,
+    loop_guard: Arc<Mutex<LoopGuard<CallToolResult>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -604,7 +604,13 @@ impl AstrolabeServer {
                 &session.root,
                 text_error(format!("索引构建失败：{error}\nconfidence: unknown")),
             ),
-            IndexState::Ready(index) => f(&session, index),
+            IndexState::Ready(index) => {
+                let result = f(&session, index);
+                match index.coverage_note() {
+                    Some(note) if result.is_error != Some(true) => append_stale_note(result, &note),
+                    _ => result,
+                }
+            }
         };
         match effect {
             BarrierEffect::None => result,
@@ -651,34 +657,66 @@ impl AstrolabeServer {
         tools
     }
 
+    /// Current index generation for the session `hint` routes to, after the
+    /// freshness barrier has absorbed pending edits. `None` when the index is
+    /// not ready (the call then just runs and is never counted).
+    fn index_stamp(&self, hint: &str) -> Option<u64> {
+        let session = self.session_for(hint).ok()?;
+        let _ = run_barrier(&session);
+        let state = session.state.read().expect("index state lock poisoned");
+        match &*state {
+            IndexState::Ready(index) => Some(index.generation()),
+            _ => None,
+        }
+    }
+
     /// Run a search tool through the per-connection [`LoopGuard`].
+    ///
+    /// Only successful executions are counted; the key includes every
+    /// argument and the index generation, so edits reset the count. A blocked
+    /// call returns the cached previous result (index unchanged) with a
+    /// `blocked: true` marker.
     fn guarded(
         &self,
         tool: &str,
+        hint: &str,
         signature: &str,
         run: impl FnOnce() -> CallToolResult,
     ) -> CallToolResult {
+        let Some(stamp) = self.index_stamp(hint) else {
+            return run();
+        };
         let verdict = self
             .loop_guard
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .check(tool, signature);
-        match verdict {
-            Verdict::Run => run(),
-            Verdict::Block(text) => {
+            .check(tool, signature, stamp);
+        let note = match verdict {
+            Verdict::Block { note, cached } => {
                 tracing::warn!(tool, "loop guard blocked repeated query");
-                self.finish(CallToolResult::success(vec![ContentBlock::text(text)]))
+                return mark_blocked(cached, &note);
             }
-            Verdict::RunWithWarning(note) => {
-                let mut result = run();
-                if let Some(first) = result.content.first_mut() {
-                    if let Some(t) = first.as_text() {
-                        *first = ContentBlock::text(format!("{}\n\n{note}", t.text));
-                    }
-                }
-                result
+            Verdict::Run => None,
+            Verdict::RunWithWarning(note) => Some(note),
+        };
+        let mut result = run();
+        if result.is_error != Some(true) {
+            // Re-read the stamp: the run itself may have absorbed edits.
+            if let Some(after) = self.index_stamp(hint) {
+                self.loop_guard
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record(tool, signature, after, result.clone());
             }
         }
+        if let Some(note) = note {
+            if let Some(first) = result.content.first_mut() {
+                if let Some(t) = first.as_text() {
+                    *first = ContentBlock::text(format!("{}\n\n{note}", t.text));
+                }
+            }
+        }
+        result
     }
 
     fn finish(&self, result: CallToolResult) -> CallToolResult {
@@ -1109,11 +1147,11 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> CallToolResult {
-        let signature = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
-            params.query, params.include_body, params.substring, params.kind, params.depth
-        );
-        self.guarded("find_symbol", &signature, || self.find_symbol_inner(params))
+        let signature = format!("{params:?}");
+        let hint = params.query.clone();
+        self.guarded("find_symbol", &hint, &signature, || {
+            self.find_symbol_inner(params)
+        })
     }
 
     fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
@@ -1194,13 +1232,11 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> CallToolResult {
-        let signature = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            params.query,
-            params.path_filter.as_deref().unwrap_or(""),
-            params.regex
-        );
-        self.guarded("search_code", &signature, || self.search_code_inner(params))
+        let signature = format!("{params:?}");
+        let hint = Self::join_hint(&[params.path_filter.as_deref().unwrap_or(""), &params.query]);
+        self.guarded("search_code", &hint, &signature, || {
+            self.search_code_inner(params)
+        })
     }
 
     fn search_code_inner(&self, params: SearchParams) -> CallToolResult {
@@ -2110,9 +2146,25 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 种语言因 budget_tokens 被省略。\n"));
             }
+            body.push_str(&index.coverage_detail(50));
             let unindexed = index.unindexed_code_exts(None);
-            if unindexed.is_empty() {
+            let excluded = index.excluded_source_paths();
+            if !excluded.is_empty() {
+                let sample = excluded
+                    .iter()
+                    .take(3)
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                body.push_str(&format!(
+                    "build-output-excluded source files: {} (e.g. {sample}; 被构建输出排除规则排除，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
+                    excluded.len()
+                ));
+            }
+            if unindexed.is_empty() && excluded.is_empty() {
                 body.push_str("unindexed source files: none\n");
+            } else if unindexed.is_empty() {
+                body.push_str("unindexed source files: none in unsupported languages\n");
             } else {
                 let mut list: Vec<(&String, &u32)> = unindexed.iter().collect();
                 list.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -2313,6 +2365,23 @@ fn resource_preview(body: &str) -> String {
         preview.push_str("…（前瞻摘要已截断，完整内容见资源）\n");
     }
     preview.trim_end().to_string()
+}
+
+/// Prepend the loop-guard note to a cached result and flag it `blocked: true`.
+fn mark_blocked(mut result: CallToolResult, note: &str) -> CallToolResult {
+    match result.content.first_mut() {
+        Some(first) if first.as_text().is_some() => {
+            let text = first.as_text().map(|t| t.text.clone()).unwrap_or_default();
+            *first = ContentBlock::text(format!("{note}\n\n--- 上一次执行结果 ---\n{text}"));
+        }
+        _ => result
+            .content
+            .insert(0, ContentBlock::text(note.to_string())),
+    }
+    if let Some(Value::Object(obj)) = result.structured_content.as_mut() {
+        obj.insert("blocked".into(), json!(true));
+    }
+    result
 }
 
 fn text_error(message: impl Into<String>) -> CallToolResult {
@@ -3065,31 +3134,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn search_code_loop_guard_short_circuits_repeated_query() {
+    fn loop_guard_server(repeat_max: usize) -> (AstrolabeServer, PathBuf) {
         let (server, dir) = ready_server_with_disk();
         *server.loop_guard.lock().unwrap() = LoopGuard::new(crate::loop_guard::LoopGuardConfig {
-            repeat_max: 2,
+            repeat_max,
             ..crate::loop_guard::LoopGuardConfig::default()
         });
-        let call = |q: &str| {
-            let result = server.search_code(Parameters(SearchParams {
-                query: q.into(),
-                regex: false,
-                path_filter: None,
-                budget_tokens: 1000,
-            }));
-            result.content[0].as_text().unwrap().text.clone()
-        };
+        (server, dir)
+    }
+
+    fn guarded_search(server: &AstrolabeServer, q: &str, budget: usize) -> String {
+        let result = server.search_code(Parameters(SearchParams {
+            query: q.into(),
+            regex: false,
+            path_filter: None,
+            budget_tokens: budget,
+        }));
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
+    #[test]
+    fn search_code_loop_guard_short_circuits_repeated_query() {
+        let (server, dir) = loop_guard_server(2);
+        let call = |q: &str| guarded_search(&server, q, 1000);
         assert!(call("needle-a").contains("confidence: exact"));
         assert!(call("needle-b").contains("confidence: exact"));
-        assert!(call("needle-a").contains("confidence: exact"));
+        let first = call("needle-a");
+        assert!(first.contains("confidence: exact"));
         let blocked = call("needle-a");
         assert!(blocked.contains("loop guard"), "{blocked}");
-        assert!(!blocked.contains("confidence: exact"), "{blocked}");
+        assert!(blocked.contains("blocked: true"), "{blocked}");
+        assert!(!blocked.contains("结果与之前相同"), "{blocked}");
+        // the cached previous result is returned, not a bare note
+        assert!(blocked.contains(&first), "{blocked}");
         assert!(call("needle-b").contains("confidence: exact"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loop_guard_budget_tokens_is_part_of_signature() {
+        let (server, dir) = loop_guard_server(1);
+        assert!(!guarded_search(&server, "needle-a", 1000).contains("blocked: true"));
+        // "truncated, raise budget_tokens" retry must execute
+        assert!(!guarded_search(&server, "needle-a", 4000).contains("blocked: true"));
+        assert!(guarded_search(&server, "needle-a", 4000).contains("blocked: true"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loop_guard_does_not_count_index_building_responses() {
+        let (server, dir) = loop_guard_server(1);
+        let ready = std::mem::replace(
+            &mut *server.primary.state.write().unwrap(),
+            IndexState::Building,
+        );
+        for _ in 0..5 {
+            let text = guarded_search(&server, "needle-a", 1000);
+            assert!(!text.contains("blocked: true"), "{text}");
+        }
+        *server.primary.state.write().unwrap() = ready;
+        let text = guarded_search(&server, "needle-a", 1000);
+        assert!(text.contains("confidence: exact"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loop_guard_does_not_count_error_responses() {
+        let (server, dir) = loop_guard_server(1);
+        let bad = |s: &AstrolabeServer| {
+            s.search_code(Parameters(SearchParams {
+                query: "(".into(),
+                regex: true,
+                path_filter: None,
+                budget_tokens: 1000,
+            }))
+        };
+        for _ in 0..3 {
+            let r = bad(&server);
+            let text = r.content[0].as_text().unwrap().text.clone();
+            assert!(!text.contains("blocked: true"), "{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loop_guard_reexecutes_after_index_changes() {
+        // edit-then-requery: a new index generation means a fresh count and
+        // fresh results, never the stale cached text.
+        let (server, dir) = loop_guard_server(1);
+        assert!(!guarded_search(&server, "needle-a", 1000).contains("blocked: true"));
+        assert!(guarded_search(&server, "needle-a", 1000).contains("blocked: true"));
+        std::fs::write(
+            dir.join("hello.py"),
+            "def greet():\n    return 'needle-a'\n",
+        )
+        .unwrap();
+        let rebuilt = Arc::new(crate::index::build(&dir).expect("index"));
+        *server.primary.state.write().unwrap() = IndexState::Ready(rebuilt);
+        let text = guarded_search(&server, "needle-a", 1000);
+        assert!(!text.contains("blocked: true"), "{text}");
+        assert!(text.contains("hello.py"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loop_guard_marks_structured_blocked() {
+        let blocked = mark_blocked(
+            {
+                let mut r = CallToolResult::success(vec![ContentBlock::text("prev")]);
+                r.structured_content = Some(json!({"text": "prev"}));
+                r
+            },
+            "blocked: true\nnote",
+        );
+        assert_eq!(blocked.structured_content.unwrap()["blocked"], json!(true));
+        let text = blocked.content[0].as_text().unwrap().text.clone();
+        assert!(
+            text.starts_with("blocked: true") && text.ends_with("prev"),
+            "{text}"
+        );
     }
 
     #[test]

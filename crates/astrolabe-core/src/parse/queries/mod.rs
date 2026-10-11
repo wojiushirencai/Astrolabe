@@ -641,6 +641,7 @@ func main() {
                 ("const", "Max"),
                 ("const", "A"),
                 ("const", "B"),
+                ("const", "local"),
                 ("variable", "Global"),
                 ("variable", "V1"),
                 ("variable", "V2"),
@@ -1655,6 +1656,45 @@ void topLevelFunction() {
         assert_eq!(by_name.get("topLevelFunction"), Some(&"function"));
         assert_eq!(by_name.get("myGetter"), Some(&"method"));
         assert_eq!(by_name.get("mySetter"), Some(&"method"));
+    }
+
+    #[test]
+    fn dart_named_constructors_are_symbols() {
+        let src = "class Point {\n  final int x;\n  Point(this.x);\n  Point.origin() : x = 0;\n  const Point.fixed(this.x);\n  factory Point.parse(String s) => Point(int.parse(s));\n  factory Point.alias(int x) = Point;\n}\n";
+        let got = symbols(Language::Dart, src);
+        let names: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(k, n, _)| (n.as_str(), k.as_str()))
+            .collect();
+        for need in ["origin", "fixed", "parse", "alias"] {
+            assert!(
+                names.contains(&(need, "method")),
+                "missing ctor {need} in {names:?}"
+            );
+        }
+        assert_eq!(
+            names.iter().filter(|(n, _)| *n == "Point").count(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn go_function_local_consts_are_symbols() {
+        let src = "package p\n\nconst Top = 1\n\nfunc f() int {\n\tconst limit = 3\n\tif true {\n\t\tconst (\n\t\t\tinner = 1\n\t\t)\n\t\t_ = inner\n\t}\n\tvar skipped = 2\n\treturn limit + skipped\n}\n";
+        let got = symbols(Language::Go, src);
+        let names: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(k, n, _)| (n.as_str(), k.as_str()))
+            .collect();
+        for need in ["Top", "limit", "inner"] {
+            assert!(
+                names.contains(&(need, "const")),
+                "missing {need} in {names:?}"
+            );
+        }
+        assert!(!names.iter().any(|(n, _)| *n == "skipped"), "{names:?}");
+        assert_eq!(names.iter().filter(|(n, _)| *n == "Top").count(), 1);
     }
 
     #[test]
