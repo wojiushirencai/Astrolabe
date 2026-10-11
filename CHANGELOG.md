@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Fixed
+
+- loop guard（search_code/find_symbol 重复查询上限）不再误拦：签名包含全部参数（含 budget_tokens）和索引代数，索引变化即重置；只统计成功执行的查询；被拦时返回上一次缓存结果并标注 `blocked: true`。
+
 ## [0.10.0] - 2026-10-11
 
 ### Added
