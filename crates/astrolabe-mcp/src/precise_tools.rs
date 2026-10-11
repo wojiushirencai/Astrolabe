@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked},
-    lsp::{Diagnostic, Location, Precise, Severity},
+    lsp::{Diagnostic, Location, Position, Precise, Severity},
     render::{anchor, confidence_note},
     rewrite::{
         transaction::{self, ApplyReport},
@@ -67,6 +67,14 @@ pub(crate) struct FindReferencesParams {
     #[serde(default)]
     #[schemars(description = "Optional repo-relative file that scopes the query")]
     pub path: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional 0-based LSP line of the symbol's name token in path; use with character to skip name-based anchoring"
+    )]
+    pub line: Option<u32>,
+    #[serde(default)]
+    #[schemars(description = "Optional 0-based UTF-16 column; use together with line")]
+    pub character: Option<u32>,
     #[serde(default = "default_budget")]
     #[schemars(description = "Maximum approximate tokens in the rendered result")]
     pub budget_tokens: usize,
@@ -146,7 +154,12 @@ pub(crate) struct ApplyRenameParams {
 /// Production uses `LiveBackend` (on-demand language-server pool). Tests
 /// inject fakes for the missing-server path.
 pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
-    fn references(&self, symbol: &str, path: Option<&str>) -> Precise<Vec<Location>>;
+    fn references(
+        &self,
+        symbol: &str,
+        path: Option<&str>,
+        position: Option<Position>,
+    ) -> Precise<Vec<Location>>;
     fn definition(
         &self,
         path: &str,
@@ -172,7 +185,12 @@ struct Unwired;
 
 #[cfg(test)]
 impl PreciseCapability for Unwired {
-    fn references(&self, symbol: &str, path: Option<&str>) -> Precise<Vec<Location>> {
+    fn references(
+        &self,
+        symbol: &str,
+        path: Option<&str>,
+        _position: Option<Position>,
+    ) -> Precise<Vec<Location>> {
         Precise::unknown(
             Vec::new(),
             format!(
@@ -345,7 +363,11 @@ pub(crate) fn run_find_references(
         );
     }
 
-    let result = backend.references(&params.symbol, params.path.as_deref());
+    let position = match (params.line, params.character) {
+        (Some(line), Some(character)) => Some(Position { line, character }),
+        _ => None,
+    };
+    let result = backend.references(&params.symbol, params.path.as_deref(), position);
     let mut locations = result.value;
     locations.sort_by(|a, b| a.path.cmp(&b.path).then(a.range.cmp(&b.range)));
 
@@ -385,6 +407,9 @@ pub(crate) fn run_find_references(
             "confidence": confidence_json(result.confidence),
             "budget_tokens": params.budget_tokens,
             "matches": locations.len(),
+            "returned": locations.len() - omitted,
+            "omitted": omitted,
+            "truncated": omitted > 0,
         }),
     )
 }
@@ -539,6 +564,9 @@ pub(crate) fn run_goto_definition(
             "confidence": confidence_json(result.confidence),
             "budget_tokens": params.budget_tokens,
             "matches": locations.len(),
+            "returned": locations.len() - omitted,
+            "omitted": omitted,
+            "truncated": omitted > 0,
         }),
     )
 }
@@ -1178,7 +1206,12 @@ mod tests {
     }
 
     impl PreciseCapability for Fake {
-        fn references(&self, _symbol: &str, _path: Option<&str>) -> Precise<Vec<Location>> {
+        fn references(
+            &self,
+            _symbol: &str,
+            _path: Option<&str>,
+            _position: Option<Position>,
+        ) -> Precise<Vec<Location>> {
             self.references.clone()
         }
         fn info(&self, _symbol: &str, _path: Option<&str>) -> Precise<Option<String>> {
@@ -1367,6 +1400,8 @@ mod tests {
         assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             symbol: "Handler".into(),
             path: None,
+            line: None,
+            character: None,
             budget_tokens: 800,
         })));
         assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
@@ -1401,6 +1436,8 @@ mod tests {
         let refs = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             symbol: "Handler".into(),
             path: Some("pkg/server.go".into()),
+            line: None,
+            character: None,
             budget_tokens: 800,
         })));
         let text = first_text(&refs);
@@ -1524,11 +1561,20 @@ mod tests {
         let refs = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             symbol: "x".into(),
             path: None,
+            line: None,
+            character: None,
             budget_tokens: 0,
         })));
         let text = first_text(&refs);
         assert!(text.contains("因 budget_tokens 被省略"), "{text}");
-        assert_eq!(refs.structured_content.unwrap()["budget_tokens"], json!(0));
+        let structured = refs.structured_content.unwrap();
+        assert_eq!(structured["budget_tokens"], json!(0));
+        assert_eq!(structured["truncated"], json!(true));
+        assert!(structured["omitted"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            structured["returned"].as_u64().unwrap() + structured["omitted"].as_u64().unwrap(),
+            structured["matches"].as_u64().unwrap()
+        );
 
         let diags = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
             path: "src/lib.rs".into(),
@@ -1559,6 +1605,8 @@ mod tests {
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             symbol: "x".into(),
             path: None,
+            line: None,
+            character: None,
             budget_tokens: 800,
         })));
         let text = first_text(&result);
@@ -1612,6 +1660,8 @@ mod tests {
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             symbol: "neverDefined".into(),
             path: None,
+            line: None,
+            character: None,
             budget_tokens: 100,
         })));
         let text = first_text(&result);

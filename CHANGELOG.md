@@ -6,6 +6,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+- **fix: `find_references` / `goto_definition` / hover 按名字查询时不再锚定到注释、字符串或 import。** 用 tree-sitter 定位文件内该名字的声明 token（跳过注释/字符串），多个定义（重载、多个 impl）全部查询后合并；名字只出现在注释/字符串里、或语言服务器返回空结果时置信度改为 `unknown` 并说明原因；`find_references` 新增可选 `line`/`character` 参数，结构化输出新增 `returned`/`omitted`/`truncated`。cobra 上 16/50 个原先报错的符号全部恢复，Rust `LspPool` 引用从 1 条变为 30 条。
+
 ## [0.10.0] - 2026-10-11
 
 ### Added

@@ -200,7 +200,7 @@ fn language_index(lang: Language) -> Option<usize> {
     })
 }
 
-fn grammar(lang: Language) -> Option<tree_sitter::Language> {
+pub(crate) fn grammar(lang: Language) -> Option<tree_sitter::Language> {
     Some(match lang {
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
