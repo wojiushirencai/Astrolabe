@@ -18,6 +18,7 @@ pub mod hooks;
 mod index;
 pub mod instructions;
 mod live_backend;
+mod loop_guard;
 mod memory;
 mod openai_schema;
 mod precise_tools;

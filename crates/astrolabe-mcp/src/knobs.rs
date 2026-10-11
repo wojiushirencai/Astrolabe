@@ -37,6 +37,7 @@ pub(crate) struct McpKnobs {
     pub resident_roots: usize,
     pub parse_cache_bytes: u64,
     pub reindex_throttle: Duration,
+    pub loop_guard: crate::loop_guard::LoopGuardConfig,
 }
 
 impl Default for McpKnobs {
@@ -50,6 +51,7 @@ impl Default for McpKnobs {
             resident_roots: DEFAULT_RESIDENT_ROOTS,
             parse_cache_bytes: DEFAULT_PARSE_CACHE_BYTES,
             reindex_throttle: DEFAULT_REINDEX_THROTTLE,
+            loop_guard: crate::loop_guard::LoopGuardConfig::default(),
         }
     }
 }
@@ -83,6 +85,7 @@ impl McpKnobs {
             ),
             parse_cache_bytes: parse_cache_bytes_from_env(),
             reindex_throttle: reindex_throttle_from_env(),
+            loop_guard: crate::loop_guard::LoopGuardConfig::from_env(),
         }
     }
 }
