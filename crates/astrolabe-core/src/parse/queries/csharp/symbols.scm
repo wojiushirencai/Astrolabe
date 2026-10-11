@@ -36,10 +36,51 @@
 (file_scoped_namespace_declaration
   name: (_) @name) @definition.module
 
-;; Top-level local functions (C# scripts and file-level statements).
-;; The grammar already has `local_function_statement` under `global_statement`.
-;; Nested local functions inside methods are not matched.
-(compilation_unit
-  (global_statement
-    (local_function_statement
-      name: (identifier) @name) @definition.function))
+;; Destructors (`~Foo()`) keep the type name, like constructors.
+(destructor_declaration
+  name: (identifier) @name) @definition.method
+
+;; Local functions at any depth: top-level statements, scripts, and nested
+;; helpers inside methods / accessors / lambdas.
+(local_function_statement
+  name: (identifier) @name) @definition.function
+
+;; ------------------------------------------------------------ type members
+;; Fields: one match per declarator (`int a, b;`). `const` fields are
+;; reported as Const by the extractor (it inspects the `modifier` children,
+;; which a query predicate cannot do without per-modifier duplicate matches).
+(field_declaration
+  (variable_declaration
+    (variable_declarator
+      name: (identifier) @name))) @definition.field
+
+;; `public event EventHandler Changed, Closed;`
+(event_field_declaration
+  (variable_declaration
+    (variable_declarator
+      name: (identifier) @name))) @definition.field
+
+;; `public event EventHandler Changed { add; remove; }`
+(event_declaration
+  name: (identifier) @name) @definition.field
+
+;; Indexers are named `this`, as in C# language servers.
+(indexer_declaration
+  "this" @name) @definition.method
+
+;; `public static Foo operator +(Foo a, Foo b)`; the extractor renders the
+;; name as `operator +`.
+(operator_declaration
+  operator: _ @name) @definition.method
+
+;; `public static implicit operator string(Foo f)`; rendered as
+;; `implicit operator string` by the extractor.
+(conversion_operator_declaration
+  type: (_) @name) @definition.method
+
+(enum_member_declaration
+  name: (identifier) @name) @definition.const
+
+;; `public delegate void Handler(object sender);`
+(delegate_declaration
+  name: (identifier) @name) @definition.type
