@@ -6,6 +6,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+- search_code 支持分页：新增 `offset` 参数；截断时正文给出 `total`、本页范围和下一页的 `next_offset`（structuredContent 同步提供 `total` / `offset` / `next_offset`），顺序稳定（代码命中在前、[text-only] 在后）；loop guard 签名包含 offset，翻页不会被拦。
+
 - TS/TSX 符号抽取补全：`type X = {…}` 别名里的成员、enum 成员、字符串/数字键的方法与字段（`"~standard"`、`"name"() {}`、`200:`）现在可被 find_symbol 查到；参数注解、`as {…}` 断言、泛型实参里的内联对象类型成员不计入。
 - fix(dart): 符号抽取补齐构造函数（按类名索引）、字段/顶层变量、枚举值、extension / extension type、typedef、operator、mixin application 类；provider find_symbol 召回 96% → 100%。
 

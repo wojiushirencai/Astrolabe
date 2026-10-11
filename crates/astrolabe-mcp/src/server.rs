@@ -127,6 +127,47 @@ fn render_budget_status(shown: usize, omitted: usize, budget_tokens: usize) -> S
     status
 }
 
+/// search_code 的分页状态行：保留 `shown= omitted= truncated=` 机器可读格式，
+/// 另给出总数、本页范围和下一页的精确 offset。
+fn render_search_page_status(
+    total: usize,
+    offset: usize,
+    shown: usize,
+    omitted: usize,
+    budget_tokens: usize,
+    requested_offset: usize,
+) -> String {
+    let truncated = omitted > 0;
+    let mut status = format!(
+        "shown={shown} omitted={omitted} truncated={truncated} total={total} offset={offset}\n"
+    );
+    if requested_offset > total {
+        status.push_str(&format!(
+            "offset={requested_offset} 超出总数 {total}，本页为空。\n"
+        ));
+    }
+    if shown > 0 && (offset > 0 || truncated) {
+        status.push_str(&format!(
+            "本页为第 {}–{} 条，共 {total} 条。\n",
+            offset + 1,
+            offset + shown
+        ));
+    }
+    if truncated {
+        let next = offset + shown;
+        if shown == 0 {
+            status.push_str(&format!(
+                "这不是全集：剩余 {omitted} 条中首条结果单项超过 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查。\n"
+            ));
+        } else {
+            status.push_str(&format!(
+                "这不是全集：还有 {omitted} 条未显示。用相同参数加 offset={next} 获取下一页（next_offset={next}）。\n"
+            ));
+        }
+    }
+    status
+}
+
 /// Parse `ASTROLABE_CACHE_MB` (whole megabytes). Invalid values fall back to
 /// the core default so a typo cannot silently disable the ceiling.
 fn parse_cache_budget_mb(raw: Option<&str>) -> u64 {
@@ -317,9 +358,14 @@ pub(crate) struct SearchParams {
     pub case_sensitive: Option<bool>,
     #[serde(default = "default_budget")]
     #[schemars(
-        description = "Maximum approximate tokens in the rendered result (default 2500). Overflow drops later hits and sets truncated=true; raise this or tighten path_filter — there is no page or cursor."
+        description = "Maximum approximate tokens in the rendered result (default 2500). Overflow drops later hits and sets truncated=true; call again with offset=next_offset to fetch the next page, or raise this / tighten path_filter."
     )]
     pub budget_tokens: usize,
+    #[serde(default)]
+    #[schemars(
+        description = "0-based index of the first match to return (default 0). When a result is truncated it reports total and next_offset; pass that value here to fetch the next page. Ordering is stable: code hits (index file order) then [text-only] hits."
+    )]
+    pub offset: usize,
 }
 
 fn default_direction() -> String {
@@ -1285,7 +1331,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, kt, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references."
+        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, kt, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
     )]
     pub(crate) fn search_code(
         &self,
@@ -1399,16 +1445,26 @@ impl AstrolabeServer {
                 // 扣除，保证整个 body 不会在阈值边界处溢出。
                 let clamped_budget = clamp_budget(params.budget_tokens);
                 let remaining = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS);
+                let total = matches.len();
+                let offset = params.offset.min(total);
                 let (kept, omitted) =
-                    truncate_ranked(&matches, remaining, |line| format!("{line}\n"));
+                    truncate_ranked(&matches[offset..], remaining, |line| format!("{line}\n"));
                 let shown = kept.len();
                 let truncated = omitted > 0;
+                let next_offset = truncated.then_some(offset + shown);
                 let mode = if params.regex { "regex" } else { "literal" };
                 let mut body = format!(
                     "confidence: exact (磁盘源码字面匹配)\n{}",
                     render_search_mode_header(params.regex, &params.query)
                 );
-                body.push_str(&render_budget_status(shown, omitted, clamped_budget));
+                body.push_str(&render_search_page_status(
+                    total,
+                    offset,
+                    shown,
+                    omitted,
+                    clamped_budget,
+                    params.offset,
+                ));
                 for line in kept {
                     body.push_str(line);
                     body.push('\n');
@@ -1434,6 +1490,9 @@ impl AstrolabeServer {
                         "confidence": "exact",
                         "mode": mode,
                         "matches": matches.len(),
+                        "total": total,
+                        "offset": offset,
+                        "next_offset": next_offset,
                         "shown": shown,
                         "omitted": omitted,
                         "truncated": truncated,
@@ -2998,6 +3057,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 100,
+            offset: 0,
         })));
         assert_first_text(server.get_dependents(Parameters(DependentsParams {
             target: "src/lib.rs".into(),
@@ -3255,6 +3315,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 2_500,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         let rendered = text
@@ -3291,6 +3352,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 1,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("shown=0"), "{text}");
@@ -3299,7 +3361,7 @@ mod tests {
             text.contains("首条结果单项超过 budget_tokens=1 被省略"),
             "{text}"
         );
-        assert!(text.contains("本工具没有翻页"), "{text}");
+        assert!(text.contains("加大 budget_tokens"), "{text}");
         // 一条都没展示时，正文绝不能出现匹配行内容本身。
         assert!(!text.contains("@hits.py:1 "), "{text}");
 
@@ -3449,6 +3511,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 1000,
+            offset: 0,
         };
 
         let first = server.search_code(Parameters(params.clone()));
@@ -3495,6 +3558,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 200,
+            offset: 0,
         }));
 
         let weighted = server.primary.file_cache.weighted_size();
@@ -3519,6 +3583,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 1000,
+            offset: 0,
         }));
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3534,6 +3599,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 1000,
+            offset: 0,
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("fresh-content"), "{text}");
@@ -3558,8 +3624,105 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: budget,
+            offset: 0,
         }));
         result.content[0].as_text().unwrap().text.clone()
+    }
+
+    #[test]
+    fn search_code_pages_concatenate_to_full_match_set() {
+        let dir = unique_temp_dir();
+        let mut expected = std::collections::BTreeSet::new();
+        for f in 0..4 {
+            let mut src = String::new();
+            for i in 0..40 {
+                src.push_str(&format!("needle_{f}_{i} = {i}\n"));
+                expected.insert(format!("@m{f}.py:{}", i + 1));
+            }
+            std::fs::write(dir.join(format!("m{f}.py")), src).unwrap();
+        }
+        let mut notes = String::new();
+        for i in 0..30 {
+            notes.push_str(&format!("needle note {i}\n"));
+            expected.insert(format!("@notes.md:{}", i + 1));
+        }
+        std::fs::write(dir.join("notes.md"), notes).unwrap();
+        let (mut server, _) = (
+            AstrolabeServer::new_with_cache_budget(dir.clone(), 8 << 20),
+            (),
+        );
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+        let page = |offset: usize| {
+            let r = server.search_code(Parameters(SearchParams {
+                query: "needle".into(),
+                regex: false,
+                path_filter: None,
+                case_sensitive: None,
+                budget_tokens: 300,
+                offset,
+            }));
+            r.content[0].as_text().unwrap().text.clone()
+        };
+        let mut got = Vec::new();
+        let mut offset = 0;
+        let mut pages = 0;
+        loop {
+            let text = page(offset);
+            pages += 1;
+            assert!(text.contains("total=190"), "{text}");
+            assert!(
+                !text.contains("blocked: true"),
+                "paging must not trip loop guard: {text}"
+            );
+            for line in text.lines().filter(|l| l.starts_with('@')) {
+                got.push(line.split(' ').next().unwrap().to_string());
+            }
+            let Some(next) = text
+                .split("next_offset=")
+                .nth(1)
+                .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                assert!(text.contains("truncated=false"), "{text}");
+                break;
+            };
+            assert!(next > offset, "{text}");
+            offset = next;
+            assert!(pages < 100);
+        }
+        assert!(pages > 2, "fixture should need several pages");
+        let unique: std::collections::BTreeSet<_> = got.iter().cloned().collect();
+        assert_eq!(unique.len(), got.len(), "pages overlap");
+        assert_eq!(unique, expected);
+        // code hits come before [text-only] hits across pages
+        let first_text = got.iter().position(|l| l.starts_with("@notes.md")).unwrap();
+        assert!(got[first_text..].iter().all(|l| l.starts_with("@notes.md")));
+        // deterministic ordering
+        assert_eq!(page(0), page(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loop_guard_offset_is_part_of_signature() {
+        let (server, dir) = loop_guard_server(1);
+        let at = |offset: usize| {
+            let r = server.search_code(Parameters(SearchParams {
+                query: "needle-a".into(),
+                regex: false,
+                path_filter: None,
+                case_sensitive: None,
+                budget_tokens: 1000,
+                offset,
+            }));
+            r.content[0].as_text().unwrap().text.clone()
+        };
+        for offset in 0..4 {
+            assert!(!at(offset).contains("blocked: true"));
+        }
+        assert!(at(0).contains("blocked: true"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3618,6 +3781,7 @@ mod tests {
                 path_filter: None,
                 case_sensitive: None,
                 budget_tokens: 1000,
+                offset: 0,
             }))
         };
         for _ in 0..3 {
@@ -3675,6 +3839,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 1000,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         // 零命中必须显式声明，避免"只剩元信息、疑似服务故障"的歧义输出。
@@ -3699,6 +3864,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 1000,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -3732,12 +3898,13 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 20,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
         assert!(text.contains("truncated=true"), "{text}");
         assert!(text.contains("这不是全集"), "{text}");
-        assert!(text.contains("本工具没有翻页"), "{text}");
+        assert!(text.contains("加大 budget_tokens"), "{text}");
         assert!(!text.contains("regex=false，已按字面搜索"), "{text}");
         let structured = result.structured_content.expect("opt-in structured");
         assert_eq!(structured["truncated"], json!(true));
@@ -3773,11 +3940,11 @@ mod tests {
             "{path_filter}"
         );
         assert!(
-            budget.as_str().unwrap().contains("no page or cursor"),
+            budget.as_str().unwrap().contains("offset=next_offset"),
             "{budget}"
         );
         assert!(tool_desc.contains("regex=true"), "{tool_desc}");
-        assert!(tool_desc.contains("no pagination"), "{tool_desc}");
+        assert!(tool_desc.contains("offset=next_offset"), "{tool_desc}");
     }
 
     fn server_on_files(files: &[(&str, &str)]) -> (AstrolabeServer, PathBuf) {
@@ -3915,6 +4082,7 @@ mod tests {
             path_filter: Some("./relay/channel".into()),
             case_sensitive: None,
             budget_tokens: 2500,
+            offset: 0,
         }));
         assert_eq!(result.is_error, Some(true));
         assert!(
@@ -4543,6 +4711,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 2500,
+            offset: 0,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
@@ -4570,6 +4739,7 @@ mod tests {
             path_filter: Some(".kt".into()),
             case_sensitive: None,
             budget_tokens: 2500,
+            offset: 0,
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
             .as_text()
@@ -4593,6 +4763,7 @@ mod tests {
             path_filter: Some("A.kt".into()),
             case_sensitive: None,
             budget_tokens: 2500,
+            offset: 0,
         }));
         let filter_miss_text = search_filter_miss.content[0]
             .as_text()
@@ -4684,6 +4855,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 2500,
+            offset: 0,
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
         assert!(dart_text.contains("@service.dart:2"), "{dart_text}");
@@ -4706,6 +4878,7 @@ mod tests {
             path_filter: None,
             case_sensitive: cs,
             budget_tokens: 2500,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         (text, result.structured_content.expect("structured"))
@@ -4865,6 +5038,7 @@ mod tests {
             path_filter: None,
             case_sensitive: None,
             budget_tokens: 2500,
+            offset: 0,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
