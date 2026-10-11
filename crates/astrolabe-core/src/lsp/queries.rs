@@ -13,20 +13,22 @@ use serde_json::{json, Value};
 
 use crate::types::{Confidence, Language, RelPath};
 
+use super::anchor::{self, Anchor, MAX_DEFINITION_ANCHORS};
 use super::{LanguageServer, Location, LspError, Position, Precise};
 
 /// How a caller identifies the symbol to query.
 ///
 /// Language-server requests are position-based. When the caller only has a
-/// name, we take the first identifier-token occurrence in the file and, when
-/// that resolves to a single in-repo definition, continue from there. That is
-/// a deliberate trade-off: overloads and shadowed names can land on the wrong
-/// binding. Callers who already know the cursor should pass [`SymbolAt::Position`].
+/// name, [`anchor::locate`] parses the file and anchors on the name token of
+/// every declaration of it (comments, strings and docstrings are skipped);
+/// with no declaration in the file it uses the first code occurrence and
+/// follows `definition` from there. Several definitions are all queried and
+/// merged. Callers who already know the cursor should pass [`SymbolAt::Position`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SymbolAt<'a> {
     /// Zero-based line and UTF-16 column, matching the LSP position encoding.
     Position(Position),
-    /// First identifier occurrence of this name in the file.
+    /// Declarations of this name in the file (else its first code use).
     Name(&'a str),
 }
 
@@ -55,14 +57,124 @@ pub fn find_references(
     let Some(server) = server else {
         return unavailable_without_server(path);
     };
-    let (query_path, query_pos) = match resolve_query_site(server, repo_root, path, target) {
-        Ok(site) => site,
-        Err(failed) => return failed,
+    let sites = match resolve_query_site(server, repo_root, path, target) {
+        Ok(sites) => sites,
+        // The name→declaration hop can time out too: answer by text search.
+        Err(SiteError::Lsp(err)) => return references_failed(repo_root, path, target, &err),
+        Err(SiteError::Failed(failed)) => return failed,
     };
-    match server.references(&query_path, query_pos) {
-        Ok(hits) => guard_cold_index(finalize_hits(hits, repo_root, path), server),
-        Err(err) => degrade(&err),
+    let mut hits = Vec::new();
+    let mut errors = Vec::new();
+    for (query_path, query_pos) in &sites.sites {
+        match server.references(query_path, *query_pos) {
+            Ok(found) => hits.extend(found),
+            Err(err) => errors.push(err),
+        }
     }
+    if errors.len() == sites.sites.len() {
+        return references_failed(repo_root, path, target, &errors[0]);
+    }
+    let mut result = guard_cold_index(finalize_hits(hits, repo_root, path), server);
+    let all_external = result.value.is_empty() && result.note.is_some();
+    let mut notes: Vec<String> = result.note.take().into_iter().collect();
+    if let Some(note) = sites.note {
+        notes.push(note);
+    }
+    if !errors.is_empty() {
+        result.confidence = Confidence::Unknown;
+        notes.push(format!(
+            "{} of {} anchor queries failed ({}); results may be incomplete",
+            errors.len(),
+            sites.sites.len(),
+            errors[0]
+        ));
+    }
+    if sites.in_comment {
+        result.confidence = Confidence::Unknown;
+        notes.push(
+            "the given position is inside a comment or string, not on a code identifier; \
+             pass the line/character of the symbol's name token"
+                .to_string(),
+        );
+    }
+    if result.value.is_empty() && !all_external && result.confidence == Confidence::Exact {
+        // `includeDeclaration` is set, so a correctly anchored symbol always
+        // yields at least its own declaration. Empty means a bad anchor.
+        result.confidence = Confidence::Unknown;
+        notes.push(format!(
+            "language server returned no references (not even the declaration) at {}; \
+             the anchor is probably not on the symbol. Retry with line/character of the \
+             declaration, or use search_code. {TEXT_SEARCH_HINT}",
+            describe_sites(&sites.sites)
+        ));
+    }
+    result.note = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("; "))
+    };
+    result
+}
+
+fn describe_sites(sites: &[(RelPath, Position)]) -> String {
+    sites
+        .iter()
+        .map(|(p, pos)| format!("{}:{}:{}", p.as_str(), pos.line + 1, pos.character + 1))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Positions a references query should be issued at, plus anything the
+/// caller must be told about how they were chosen.
+struct QuerySites {
+    sites: Vec<(RelPath, Position)>,
+    note: Option<String>,
+    /// A caller-given position that sits inside a comment / string.
+    in_comment: bool,
+}
+
+/// Why no references query site could be produced.
+enum SiteError {
+    /// The language server itself failed (e.g. the name→declaration hop);
+    /// kept structured so timeouts can fall back to text search.
+    Lsp(LspError),
+    /// Already-rendered Unknown result (name not found, only in comments…).
+    Failed(Precise<Vec<Location>>),
+}
+
+/// Answer for a references query whose LSP request failed: text search on
+/// timeout (when the name is known), otherwise an Unknown degrade.
+fn references_failed(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    err: &LspError,
+) -> Precise<Vec<Location>> {
+    if matches!(err, LspError::Timeout(_)) {
+        if let Some(fallback) = timeout_fallback(repo_root, path, target, &err.to_string()) {
+            return fallback;
+        }
+    }
+    degrade(err)
+}
+
+/// Text-search answer for a timed-out references query, when we can tell
+/// which name was asked about.
+fn timeout_fallback(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    reason: &str,
+) -> Option<Precise<Vec<Location>>> {
+    let name = match target {
+        SymbolAt::Name(name) if !name.is_empty() => name.to_string(),
+        SymbolAt::Name(_) => return None,
+        SymbolAt::Position(pos) => super::fallback::identifier_at(repo_root, path, pos)?,
+    };
+    let reason = reason.split(';').next().unwrap_or(reason);
+    Some(super::fallback::text_references(
+        repo_root, path, &name, reason,
+    ))
 }
 
 /// Refuse to call an empty result authoritative while the server is still
@@ -74,8 +186,13 @@ pub fn find_references(
 /// live code. A non-empty result is kept as-is: those hits are real, they may
 /// merely be incomplete.
 fn guard_cold_index<T>(result: Precise<Vec<T>>, server: &dyn LanguageServer) -> Precise<Vec<T>> {
-    if !result.value.is_empty() || !server.is_busy() {
+    if !server.is_busy() {
         return result;
+    }
+    if !result.value.is_empty() {
+        // The hits are real but a half-built index can miss some; never
+        // let a caller treat this list as the complete set.
+        return downgrade_incomplete(result);
     }
     const COLD: &str = "语言服务器仍在建立索引，返回的空结果不可信。\
          请在索引完成后重试。";
@@ -125,36 +242,12 @@ fn resolve_definition_position(
 ) -> Result<Position, Precise<Vec<Location>>> {
     match target {
         SymbolAt::Position(position) => Ok(position),
-        SymbolAt::Name(name) => {
-            if name.is_empty() {
-                return Err(Precise::unknown(
-                    Vec::new(),
-                    "empty symbol name; cannot provide precise definitions",
-                ));
-            }
-            let source = match std::fs::read_to_string(repo_root.join(path.as_str())) {
-                Ok(s) => s,
-                Err(err) => {
-                    return Err(Precise::unknown(
-                        Vec::new(),
-                        format!(
-                            "could not read {} to locate `{name}` ({err}); cannot provide precise definitions",
-                            path.as_str()
-                        ),
-                    ));
-                }
-            };
-            match first_identifier_position(&source, name) {
-                Some(position) => Ok(position),
-                None => Err(Precise::unknown(
-                    Vec::new(),
-                    format!(
-                        "symbol `{name}` not found in {}; cannot provide precise definitions",
-                        path.as_str()
-                    ),
-                )),
-            }
-        }
+        SymbolAt::Name(name) => match locate_named(repo_root, path, name, "definitions") {
+            Ok(Anchor::Definitions(defs)) => Ok(defs[0]),
+            Ok(Anchor::Usage(position)) => Ok(position),
+            Ok(_) => unreachable!("mapped to Err"),
+            Err(reason) => Err(Precise::unknown(Vec::new(), reason)),
+        },
     }
 }
 
@@ -240,21 +333,12 @@ fn resolve_named_hover_site(
         ));
     }
 
-    let source = match std::fs::read_to_string(repo_root.join(path.as_str())) {
-        Ok(s) => s,
-        Err(err) => {
-            return Err(hover_locate_failed(format!(
-                "could not read {} to locate `{name}` ({err}); cannot provide precise hover information",
-                path.as_str()
-            )));
-        }
-    };
-
-    let Some(position) = first_identifier_position(&source, name) else {
-        return Err(hover_locate_failed(format!(
-            "symbol `{name}` not found in {}; cannot provide precise hover information",
-            path.as_str()
-        )));
+    let position = match locate_named(repo_root, path, name, "hover information") {
+        // A declaration in this file is already the docstring site.
+        Ok(Anchor::Definitions(defs)) => return Ok((path.clone(), defs[0])),
+        Ok(Anchor::Usage(position)) => position,
+        Ok(_) => unreachable!("mapped to Err"),
+        Err(reason) => return Err(hover_locate_failed(reason)),
     };
 
     match server.definition(path, position) {
@@ -313,12 +397,29 @@ fn hover_site_failed(failed: Precise<Vec<Location>>) -> Precise<Option<String>> 
 /// `guard_cold_index` 的 `Option<String>` 版：就绪服务器的“无信息”是权威
 /// 答案，但仍在索引的服务器会用空 hover 冒充它。有文本时原样保留——那
 /// 些内容是真实的，至多不全。
+/// Note attached to non-empty results from a server that is still indexing.
+pub const STILL_INDEXING_NOTE: &str = "language server still indexing, results may be incomplete";
+
+fn downgrade_incomplete<T>(mut result: Precise<T>) -> Precise<T> {
+    result.note = Some(match result.note.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {STILL_INDEXING_NOTE}"),
+        _ => STILL_INDEXING_NOTE.to_string(),
+    });
+    if result.confidence == Confidence::Exact {
+        result.confidence = Confidence::Syntactic;
+    }
+    result
+}
+
 fn guard_cold_hover(
     result: Precise<Option<String>>,
     server: &dyn LanguageServer,
 ) -> Precise<Option<String>> {
-    if result.value.is_some() || !server.is_busy() {
+    if !server.is_busy() {
         return result;
+    }
+    if result.value.is_some() {
+        return downgrade_incomplete(result);
     }
     Precise::unknown(
         result.value,
@@ -433,10 +534,51 @@ fn resolve_query_site(
     repo_root: &Path,
     path: &RelPath,
     target: SymbolAt<'_>,
-) -> Result<(RelPath, Position), Precise<Vec<Location>>> {
+) -> Result<QuerySites, SiteError> {
     match target {
-        SymbolAt::Position(position) => Ok((path.clone(), position)),
+        SymbolAt::Position(position) => {
+            let in_comment = std::fs::read_to_string(repo_root.join(path.as_str()))
+                .ok()
+                .and_then(|src| anchor::position_in_comment_or_string(path, &src, position))
+                .unwrap_or(false);
+            Ok(QuerySites {
+                sites: vec![(path.clone(), position)],
+                note: None,
+                in_comment,
+            })
+        }
         SymbolAt::Name(name) => resolve_named_site(server, repo_root, path, name),
+    }
+}
+
+/// Read `path` and pick an anchor for `name`, mapping failures to an Unknown
+/// result whose note ends with `what` ("references", "definitions", …).
+fn locate_named(
+    repo_root: &Path,
+    path: &RelPath,
+    name: &str,
+    what: &str,
+) -> Result<Anchor, String> {
+    if name.is_empty() {
+        return Err(format!("empty symbol name; cannot provide precise {what}"));
+    }
+    let source = std::fs::read_to_string(repo_root.join(path.as_str())).map_err(|err| {
+        format!(
+            "could not read {} to locate `{name}` ({err}); cannot provide precise {what}",
+            path.as_str()
+        )
+    })?;
+    match anchor::locate(path, &source, name) {
+        Anchor::NotFound => Err(format!(
+            "symbol `{name}` not found in {}; cannot provide precise {what}",
+            path.as_str()
+        )),
+        Anchor::OnlyInCommentsOrStrings => Err(format!(
+            "`{name}` only appears inside comments or strings in {}; refusing to anchor there. \
+             Pass the file that declares or uses it, or line/character; cannot provide precise {what}",
+            path.as_str()
+        )),
+        found => Ok(found),
     }
 }
 
@@ -445,53 +587,55 @@ fn resolve_named_site(
     repo_root: &Path,
     path: &RelPath,
     name: &str,
-) -> Result<(RelPath, Position), Precise<Vec<Location>>> {
-    if name.is_empty() {
-        return Err(Precise::unknown(
+) -> Result<QuerySites, SiteError> {
+    let anchor = locate_named(repo_root, path, name, "references").map_err(|reason| {
+        SiteError::Failed(Precise::unknown(
             Vec::new(),
-            "empty symbol name; cannot provide precise references",
-        ));
-    }
-
-    let source = match std::fs::read_to_string(repo_root.join(path.as_str())) {
-        Ok(s) => s,
-        Err(err) => {
-            return Err(Precise::unknown(
-                Vec::new(),
-                format!(
-                    "could not read {} to locate `{name}` ({err}); cannot provide precise references",
-                    path.as_str()
-                ),
-            ));
-        }
-    };
-
-    let Some(position) = first_identifier_position(&source, name) else {
-        return Err(Precise::unknown(
-            Vec::new(),
-            format!(
-                "symbol `{name}` not found in {}; cannot provide precise references",
-                path.as_str()
-            ),
-        ));
-    };
-
-    match server.definition(path, position) {
-        Err(err) => Err(degrade(&err)),
-        Ok(defs) => {
-            let mut in_repo = classify_all(defs, repo_root).in_repo;
-            in_repo.sort();
-            // A single in-repo definition is the declaration we wanted. Zero
-            // or many: stay on the occurrence we found so the server, not a
-            // path-sort, picks the binding.
-            if in_repo.len() == 1 {
-                let loc = &in_repo[0];
-                Ok((loc.path.clone(), loc.range.start))
-            } else {
-                Ok((path.clone(), position))
+            format!("{reason}. {TEXT_SEARCH_HINT}"),
+        ))
+    })?;
+    let sites: Vec<(RelPath, Position)> = match anchor {
+        Anchor::Definitions(defs) => defs.into_iter().map(|p| (path.clone(), p)).collect(),
+        Anchor::Usage(position) => match server.definition(path, position) {
+            Err(err) => return Err(SiteError::Lsp(err)),
+            Ok(defs) => {
+                let mut in_repo = classify_all(defs, repo_root).in_repo;
+                in_repo.sort();
+                in_repo.dedup();
+                if in_repo.is_empty() {
+                    // Out-of-repo or unresolved: let the server pick from the use.
+                    vec![(path.clone(), position)]
+                } else {
+                    in_repo
+                        .into_iter()
+                        .map(|loc| (loc.path, loc.range.start))
+                        .collect()
+                }
             }
-        }
+        },
+        Anchor::NotFound | Anchor::OnlyInCommentsOrStrings => unreachable!("mapped to Err"),
+    };
+    let total = sites.len();
+    let mut note = None;
+    let mut sites = sites;
+    if total > MAX_DEFINITION_ANCHORS {
+        sites.truncate(MAX_DEFINITION_ANCHORS);
+        note = Some(format!(
+            "`{name}` has {total} definitions; merged references of the first {MAX_DEFINITION_ANCHORS} only. \
+             Pass line/character to target one"
+        ));
+    } else if total > 1 {
+        note = Some(format!(
+            "`{name}` has {total} definitions ({}); references of all of them were merged. \
+             Pass line/character to target one",
+            describe_sites(&sites)
+        ));
     }
+    Ok(QuerySites {
+        sites,
+        note,
+        in_comment: false,
+    })
 }
 
 fn finalize_hits(
@@ -632,45 +776,6 @@ fn server_label(language: Language) -> &'static str {
         Language::Dart => "dart language-server",
         Language::CSharp | Language::VisualBasic => "Microsoft.CodeAnalysis.LanguageServer",
     }
-}
-
-/// First identifier-token match, as a zero-based UTF-16 position.
-fn first_identifier_position(source: &str, name: &str) -> Option<Position> {
-    if name.is_empty() {
-        return None;
-    }
-    for (line_idx, line) in source.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(character) = identifier_column(line, name) {
-            return Some(Position {
-                line: line_idx as u32,
-                character,
-            });
-        }
-    }
-    None
-}
-
-fn identifier_column(line: &str, name: &str) -> Option<u32> {
-    for (byte_idx, _) in line.match_indices(name) {
-        let before_ok = match line[..byte_idx].chars().next_back() {
-            None => true,
-            Some(ch) => !is_ident_char(ch),
-        };
-        let after = byte_idx + name.len();
-        let after_ok = match line[after..].chars().next() {
-            None => true,
-            Some(ch) => !is_ident_char(ch),
-        };
-        if before_ok && after_ok {
-            return Some(line[..byte_idx].encode_utf16().count() as u32);
-        }
-    }
-    None
-}
-
-fn is_ident_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
 }
 
 fn looks_like_file_uri(path: &str) -> bool {
@@ -1058,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn truly_empty_references_are_exact_not_unknown() {
+    fn empty_references_are_unknown_not_exact() {
         let server = FakeServer::refs(Vec::new());
         let result = find_references(
             Some(&server),
@@ -1067,8 +1172,8 @@ mod tests {
             SymbolAt::Position(pos(0, 0)),
         );
         assert!(result.value.is_empty());
-        assert_eq!(result.confidence, Confidence::Exact);
-        assert!(result.note.is_none());
+        assert_eq!(result.confidence, Confidence::Unknown);
+        assert!(result.note.is_some());
     }
 
     #[test]
@@ -1253,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn named_query_uses_first_identifier_and_unique_definition() {
+    fn named_query_anchors_on_declaration_without_definition_roundtrip() {
         let repo = TempRepo::new(&[(
             "src/main.go",
             "package p\n\nfunc helper() {}\n\nfunc Run() { helper() }\n",
@@ -1271,10 +1376,9 @@ mod tests {
         assert_eq!(result.confidence, Confidence::Exact);
         assert_eq!(result.value.len(), 2);
 
-        let def_calls = server.def_calls.lock().unwrap().clone();
-        assert_eq!(def_calls.len(), 1);
+        // The declaration is in this file, so no definition round-trip.
+        assert!(server.def_calls.lock().unwrap().is_empty());
         // `func helper` — after "func " the UTF-16 column of `helper` is 5.
-        assert_eq!(def_calls[0].1, pos(2, 5));
 
         let ref_calls = server.ref_calls.lock().unwrap().clone();
         assert_eq!(ref_calls, vec![(RelPath::new("src/main.go"), pos(2, 5))]);
@@ -1414,11 +1518,12 @@ mod tests {
             }),
         );
 
-        // The converse matters just as much: a ready server reporting no
-        // references is a real finding, and downgrading it would make the
-        // tool useless for proving a symbol is dead.
-        assert_eq!(result.confidence, Confidence::Exact);
+        // `includeDeclaration` is on, so a dead symbol still returns its own
+        // declaration. Fully empty means the anchor missed the symbol (e.g. a
+        // doc comment) and must not be reported as an exact "no references".
+        assert_eq!(result.confidence, Confidence::Unknown);
         assert!(result.value.is_empty());
+        assert!(result.note.unwrap().contains("not even the declaration"));
     }
 
     #[test]
@@ -1784,6 +1889,51 @@ mod tests {
     }
 
     #[test]
+    fn named_references_fall_back_to_text_search_when_definition_hop_times_out() {
+        let repo = TempRepo::new(&[
+            ("src/lib.go", "package p\n\nfunc helper() {}\n"),
+            ("src/use.go", "package p\n\nfunc Run() { helper() }\n"),
+        ]);
+        let mut server = FakeServer::refs(Vec::new());
+        server.definition = Script::Timeout;
+
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("src/use.go"),
+            SymbolAt::Name("helper"),
+        );
+
+        assert_ne!(result.confidence, Confidence::Exact);
+        assert!(
+            !result.value.is_empty(),
+            "timeout on the name→declaration hop must fall back to text search"
+        );
+        let note = result.note.as_deref().unwrap();
+        assert!(note.contains("timed out"), "got: {note}");
+    }
+
+    #[test]
+    fn named_references_fall_back_to_text_search_when_references_time_out() {
+        let repo = TempRepo::new(&[
+            ("src/lib.go", "package p\n\nfunc helper() {}\n"),
+            ("src/use.go", "package p\n\nfunc Run() { helper() }\n"),
+        ]);
+        let server = FakeServer::failing(Script::Timeout);
+
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("src/lib.go"),
+            SymbolAt::Name("helper"),
+        );
+
+        assert_ne!(result.confidence, Confidence::Exact);
+        assert!(!result.value.is_empty());
+        assert!(result.note.as_deref().unwrap().contains("timed out"));
+    }
+
+    #[test]
     fn named_hover_falls_back_to_first_identifier_when_definition_errors() {
         let repo = TempRepo::new(&[(
             "src/main.go",
@@ -1905,5 +2055,99 @@ mod tests {
         assert!(!note.contains("search_code"));
         assert!(!note.contains("false positives"));
         assert!(!note.contains("precise references"));
+    }
+
+    #[test]
+    fn named_query_skips_go_doc_comment_anchor() {
+        // Regression: Go doc comments start with the item name, so the first
+        // textual hit was inside `// Execute ...` and gopls errored.
+        let repo = TempRepo::new(&[(
+            "cmd.go",
+            "package cobra\n\n// Execute runs the command.\nfunc Execute() error { return nil }\n",
+        )]);
+        let server = FakeServer::refs(vec![loc("cmd.go", 3, 5)]);
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("cmd.go"),
+            SymbolAt::Name("Execute"),
+        );
+        assert_eq!(result.confidence, Confidence::Exact);
+        let ref_calls = server.ref_calls.lock().unwrap().clone();
+        assert_eq!(ref_calls, vec![(RelPath::new("cmd.go"), pos(3, 5))]);
+    }
+
+    #[test]
+    fn named_query_merges_all_definitions() {
+        let repo = TempRepo::new(&[(
+            "m.rs",
+            "struct A;\nstruct B;\nimpl A { fn run(&self) {} }\nimpl B { fn run(&self) {} }\n",
+        )]);
+        let server = FakeServer::refs(vec![loc("m.rs", 2, 12)]);
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("m.rs"),
+            SymbolAt::Name("run"),
+        );
+        let ref_calls = server.ref_calls.lock().unwrap().clone();
+        assert_eq!(ref_calls.len(), 2);
+        assert_eq!(result.value.len(), 1, "merged hits are de-duplicated");
+        assert!(result.note.unwrap().contains("2 definitions"));
+    }
+
+    #[test]
+    fn name_only_in_comments_is_unknown_without_querying() {
+        let repo = TempRepo::new(&[("a.go", "package a\n// Gone was removed.\n")]);
+        let server = FakeServer::refs(vec![loc("a.go", 1, 3)]);
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("a.go"),
+            SymbolAt::Name("Gone"),
+        );
+        assert_eq!(result.confidence, Confidence::Unknown);
+        assert!(result.note.unwrap().contains("comments or strings"));
+        assert!(server.ref_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn position_inside_comment_is_not_exact() {
+        let repo = TempRepo::new(&[("a.go", "package a\n// Run it.\nfunc Run() {}\n")]);
+        let server = FakeServer::refs(vec![loc("a.go", 2, 5)]);
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("a.go"),
+            SymbolAt::Position(pos(1, 3)),
+        );
+        assert_eq!(result.confidence, Confidence::Unknown);
+    }
+
+    #[test]
+    fn edit_file_then_named_query_reanchors_on_new_declaration() {
+        let repo = TempRepo::new(&[("a.go", "package a\n// Run it.\nfunc old() {}\n")]);
+        let server = FakeServer::refs(vec![loc("a.go", 3, 5)]);
+        let first = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("a.go"),
+            SymbolAt::Name("Run"),
+        );
+        assert_eq!(first.confidence, Confidence::Unknown);
+        std::fs::write(
+            repo.root.join("a.go"),
+            "package a\n// Run it.\n\nfunc Run() {}\n",
+        )
+        .unwrap();
+        let second = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("a.go"),
+            SymbolAt::Name("Run"),
+        );
+        assert_eq!(second.confidence, Confidence::Exact);
+        let ref_calls = server.ref_calls.lock().unwrap().clone();
+        assert_eq!(ref_calls, vec![(RelPath::new("a.go"), pos(3, 5))]);
     }
 }

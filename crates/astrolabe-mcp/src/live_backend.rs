@@ -107,14 +107,40 @@ fn language_from_opt_path(path: Option<&str>, what: &str) -> Result<Language, St
 }
 
 impl PreciseCapability for LiveBackend {
-    fn references(&self, symbol: &str, path: Option<&str>) -> Precise<Vec<Location>> {
+    fn files_changed(&self, changes: &astrolabe_core::watch::ChangeSet) {
+        use astrolabe_core::lsp::{FileChange, FileChangeKind};
+        use astrolabe_core::watch::ChangeKind;
+        let events: Vec<FileChange> = changes
+            .iter()
+            .map(|(kind, path)| FileChange {
+                path: path.clone(),
+                kind: match kind {
+                    ChangeKind::Added => FileChangeKind::Created,
+                    ChangeKind::Modified => FileChangeKind::Changed,
+                    ChangeKind::Removed => FileChangeKind::Deleted,
+                },
+            })
+            .collect();
+        self.pool.notify_files_changed(&events);
+    }
+
+    fn references(
+        &self,
+        symbol: &str,
+        path: Option<&str>,
+        position: Option<Position>,
+    ) -> Precise<Vec<Location>> {
         let language = match language_from_opt_path(path, "精确引用查询") {
             Ok(lang) => lang,
             Err(note) => return Precise::unknown(Vec::new(), note),
         };
         let rel = RelPath::new(path.expect("language resolved"));
         match self.with_server(language, |server| {
-            find_references(server, &self.root, &rel, SymbolAt::Name(symbol))
+            let target = match position {
+                Some(position) => SymbolAt::Position(position),
+                None => SymbolAt::Name(symbol),
+            };
+            find_references(server, &self.root, &rel, target)
         }) {
             Ok(result) => result,
             // The error already carries discovery's install hint; passing it
@@ -285,7 +311,7 @@ mod tests {
     #[test]
     fn missing_path_is_reported_not_guessed() {
         let backend = LiveBackend::new(std::env::temp_dir());
-        let result = backend.references("anything", None);
+        let result = backend.references("anything", None, None);
         assert_eq!(result.confidence, Confidence::Unknown);
         assert!(
             result.note.as_deref().unwrap_or_default().contains("path"),

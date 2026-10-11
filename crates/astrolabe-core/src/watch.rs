@@ -116,32 +116,6 @@ const DEFAULT_STORM_PATHS: usize = 5000;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01b3;
 
-/// Directory names matching [`crate::scan`]'s `EXCLUDED_DIRS` (kept local so
-/// this module does not depend on scan internals). A path is excluded when
-/// any component equals one of these names.
-const EXCLUDED_DIR_NAMES: &[&str] = &[
-    ".astrolabe",
-    ".git",
-    "node_modules",
-    "target",
-    "build",
-    "dist",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".next",
-    ".openvisio",
-    ".serena",
-    // Flutter / Dart toolchain artifacts. Fallback exclude for non-git trees.
-    ".dart_tool",
-    // MSBuild intermediate output and Visual Studio. See scan::EXCLUDED_DIRS.
-    "obj",
-    ".vs",
-];
-
 /// Polling cadence, emit delay, event-mode safety scan, and storm threshold
 /// for [`Watcher::spawn`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -657,7 +631,7 @@ impl Watcher {
             let Some(rel) = relativize(&self.root, abs) else {
                 continue;
             };
-            if is_excluded_rel(&rel, extra) {
+            if is_excluded_rel(&self.root, &rel, extra) {
                 continue;
             }
             if abs.is_dir() {
@@ -1406,10 +1380,15 @@ fn relativize(root: &Path, path: &Path) -> Option<RelPath> {
     Some(RelPath::new(stripped.to_string_lossy().as_ref()))
 }
 
-fn is_excluded_rel(rel: &RelPath, extra: &[String]) -> bool {
+fn is_excluded_rel(root: &Path, rel: &RelPath, extra: &[String]) -> bool {
     let s = rel.as_str();
+    let mut dir = root.to_path_buf();
     for comp in s.split('/') {
-        if !comp.is_empty() && EXCLUDED_DIR_NAMES.contains(&comp) {
+        if comp.is_empty() {
+            continue;
+        }
+        dir.push(comp);
+        if crate::scan::is_default_excluded_dir(root, &dir) {
             return true;
         }
     }
@@ -1441,7 +1420,7 @@ fn keep_event_path(root: &Path, scan: &ScanOptions, path: &Path) -> Option<(Path
         root.join(path)
     };
     let rel = relativize(root, &abs)?;
-    if is_excluded_rel(&rel, &scan.extra_excludes) {
+    if is_excluded_rel(root, &rel, &scan.extra_excludes) {
         return None;
     }
     Some((abs, rel))
@@ -1467,7 +1446,7 @@ fn expand_dir_bounded(
             let Some(rel) = relativize(root, &p) else {
                 continue;
             };
-            if is_excluded_rel(&rel, extra) {
+            if is_excluded_rel(root, &rel, extra) {
                 continue;
             }
             let ft = match ent.file_type() {
@@ -1510,6 +1489,32 @@ fn admit_new(root: &Path, rel: &RelPath, opts: &ScanOptions) -> Admit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_build_dirs_are_watched_but_project_outputs_are_not() {
+        let root =
+            std::env::temp_dir().join(format!("astrolabe-watch-excl-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("internal/build")).unwrap();
+        std::fs::create_dir_all(root.join("web/dist")).unwrap();
+        std::fs::write(root.join("web/package.json"), "{}").unwrap();
+        assert!(!is_excluded_rel(
+            &root,
+            &RelPath::new("internal/build/b.go"),
+            &[]
+        ));
+        assert!(is_excluded_rel(&root, &RelPath::new("web/dist/x.js"), &[]));
+        assert!(is_excluded_rel(
+            &root,
+            &RelPath::new("target/debug/x.rs"),
+            &[]
+        ));
+        assert!(is_excluded_rel(
+            &root,
+            &RelPath::new("a/node_modules/x.js"),
+            &[]
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use std::fs;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};

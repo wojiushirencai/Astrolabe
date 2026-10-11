@@ -410,6 +410,24 @@ impl LspPool {
     pub fn is_resident(&self, language: Language) -> bool {
         self.inner.is_resident(language)
     }
+
+    /// Forward watcher events to every resident server. Never starts one: a
+    /// server that is not running will read the disk fresh when it starts.
+    pub fn notify_files_changed(&self, changes: &[super::FileChange]) {
+        if changes.is_empty() {
+            return;
+        }
+        let servers: Vec<Arc<dyn LanguageServer>> = {
+            let slots = lock(&self.inner.slots);
+            slots
+                .values()
+                .filter_map(|slot| lock(&slot.state).server.clone())
+                .collect()
+        };
+        for server in servers {
+            server.files_changed(changes);
+        }
+    }
 }
 
 impl Drop for LspPool {
@@ -828,6 +846,10 @@ impl LanguageServer for ServerGuard {
 
     fn wait_until_ready(&self, deadline: Duration) -> bool {
         self.server.wait_until_ready(deadline)
+    }
+
+    fn files_changed(&self, changes: &[super::FileChange]) {
+        self.server.files_changed(changes)
     }
 
     fn references(

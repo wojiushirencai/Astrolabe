@@ -5,10 +5,11 @@
 //! distinct queries) is never stopped client-side. This guard lives in the MCP
 //! server process (one per client connection) and:
 //!
-//! * short-circuits a query whose signature (tool + query + path filter +
-//!   flags) already ran more than `repeat_max` times inside `repeat_window`,
-//!   returning a short "you already ran this" note instead of re-searching;
-//! * appends a warning once the overall search call count inside
+//! * short-circuits a query whose signature (tool + every argument, including
+//!   `budget_tokens`, + index generation) already ran successfully
+//!   `repeat_max` times inside `repeat_window`, returning the cached previous
+//!   result with a `blocked: true` note instead of re-searching;
+//! * appends a warning once the overall successful search count inside
 //!   `rate_window` exceeds `rate_max`.
 //!
 //! Thresholds come from env vars (see [`LoopGuardConfig::from_env`]); `0`
@@ -81,20 +82,45 @@ impl LoopGuardConfig {
 
 /// Outcome of [`LoopGuard::check`].
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Verdict {
+pub(crate) enum Verdict<R> {
     /// Run the search normally.
     Run,
     /// Run, but append this warning to the result.
     RunWithWarning(String),
-    /// Do not run; return this text instead.
-    Block(String),
+    /// Do not run; return the cached result of the identical query (same
+    /// arguments, same index generation) with this note prepended.
+    Block { note: String, cached: R },
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct LoopGuard {
+#[derive(Debug)]
+struct Entry<R> {
+    runs: VecDeque<Instant>,
+    last: R,
+}
+
+/// Per-connection guard. `R` is the cached result type (a `CallToolResult`
+/// in the server; a plain string in unit tests).
+///
+/// Only *successful, executed* queries are recorded (via [`LoopGuard::record`]);
+/// errors and "index building, retry" responses never count. The signature
+/// key includes the full argument set and the index generation stamp, so any
+/// index change (an edit picked up by the watcher, a rebuild) starts a fresh
+/// count and re-verification after edits always re-executes.
+#[derive(Debug)]
+pub(crate) struct LoopGuard<R = String> {
     config: LoopGuardConfig,
-    per_sig: HashMap<String, VecDeque<Instant>>,
+    per_sig: HashMap<String, Entry<R>>,
     all: VecDeque<Instant>,
+}
+
+impl<R> Default for LoopGuard<R> {
+    fn default() -> Self {
+        Self {
+            config: LoopGuardConfig::default(),
+            per_sig: HashMap::new(),
+            all: VecDeque::new(),
+        }
+    }
 }
 
 fn prune(q: &mut VecDeque<Instant>, now: Instant, window: Duration) {
@@ -106,7 +132,11 @@ fn prune(q: &mut VecDeque<Instant>, now: Instant, window: Duration) {
     }
 }
 
-impl LoopGuard {
+fn key(tool: &str, signature: &str, stamp: u64) -> String {
+    format!("{tool}\u{1f}{stamp}\u{1f}{signature}")
+}
+
+impl<R: Clone> LoopGuard<R> {
     pub(crate) fn new(config: LoopGuardConfig) -> Self {
         Self {
             config,
@@ -114,62 +144,107 @@ impl LoopGuard {
         }
     }
 
-    pub(crate) fn check(&mut self, tool: &str, signature: &str) -> Verdict {
-        self.check_at(tool, signature, Instant::now())
+    pub(crate) fn check(&mut self, tool: &str, signature: &str, stamp: u64) -> Verdict<R> {
+        self.check_at(tool, signature, stamp, Instant::now())
     }
 
-    pub(crate) fn check_at(&mut self, tool: &str, signature: &str, now: Instant) -> Verdict {
+    pub(crate) fn record(&mut self, tool: &str, signature: &str, stamp: u64, result: R) {
+        self.record_at(tool, signature, stamp, result, Instant::now());
+    }
+
+    /// Decide what to do with a query. Does not count anything by itself.
+    pub(crate) fn check_at(
+        &mut self,
+        tool: &str,
+        signature: &str,
+        stamp: u64,
+        now: Instant,
+    ) -> Verdict<R> {
         let cfg = self.config;
         let mut rate_note = None;
         if cfg.rate_max > 0 {
             prune(&mut self.all, now, cfg.rate_window);
-            self.all.push_back(now);
-            if self.all.len() > cfg.rate_max {
+            if self.all.len() >= cfg.rate_max {
                 rate_note = Some(format!(
-                    "⚠ loop guard: 最近 {} 秒内已调用搜索工具 {} 次（上限 {}）。\
+                    "⚠ loop guard: 最近 {} 秒内已成功执行搜索 {} 次（上限 {}）。\
                      很可能陷入了循环：请停止批量轮换查询，基于已有结果作答，或换用 \
                      find_references / get_repo_skeleton / Read 等方式推进。",
                     cfg.rate_window.as_secs(),
-                    self.all.len(),
+                    self.all.len() + 1,
                     cfg.rate_max
                 ));
             }
         }
         if cfg.repeat_max > 0 {
-            let window = cfg.repeat_window;
-            // Bound memory: drop signatures whose entries all expired.
-            if self.per_sig.len() > 4096 {
-                self.per_sig.retain(|_, q| {
-                    prune(q, now, window);
-                    !q.is_empty()
-                });
-            }
-            let q = self
-                .per_sig
-                .entry(format!("{tool}\u{1f}{signature}"))
-                .or_default();
-            prune(q, now, window);
-            let prior = q.len();
-            q.push_back(now);
-            if prior >= cfg.repeat_max {
-                let mut text = format!(
-                    "loop guard: 这条 {tool} 查询在最近 {} 秒内已执行 {prior} 次（上限 {}），本次未重新执行。\
-                     结果与之前相同——请直接使用先前的结果；若需要不同信息，请修改查询/path_filter，\
-                     或换一种方法（find_references、goto_definition、Read 指定行段）。\
-                     不要在同一组查询之间反复轮换。",
-                    window.as_secs(),
-                    cfg.repeat_max
-                );
-                if let Some(note) = rate_note {
-                    text.push('\n');
-                    text.push_str(&note);
+            if let Some(entry) = self.per_sig.get_mut(&key(tool, signature, stamp)) {
+                prune(&mut entry.runs, now, cfg.repeat_window);
+                let prior = entry.runs.len();
+                if prior >= cfg.repeat_max {
+                    let mut note = format!(
+                        "blocked: true\nloop guard: 这条 {tool} 查询（参数完全相同、索引自上次执行后未变化）\
+                         在最近 {} 秒内已执行 {prior} 次（上限 {}），本次未重新执行，下面附上上一次的执行结果。\
+                         若需要不同信息，请修改查询/path_filter/budget_tokens，或换一种方法\
+                         （find_references、goto_definition、Read 指定行段）；不要在同一组查询之间反复轮换。",
+                        cfg.repeat_window.as_secs(),
+                        cfg.repeat_max
+                    );
+                    if let Some(rate) = rate_note {
+                        note.push('\n');
+                        note.push_str(&rate);
+                    }
+                    return Verdict::Block {
+                        note,
+                        cached: entry.last.clone(),
+                    };
                 }
-                return Verdict::Block(text);
             }
         }
         match rate_note {
             Some(note) => Verdict::RunWithWarning(note),
             None => Verdict::Run,
+        }
+    }
+
+    /// Count a successful execution and cache its result.
+    pub(crate) fn record_at(
+        &mut self,
+        tool: &str,
+        signature: &str,
+        stamp: u64,
+        result: R,
+        now: Instant,
+    ) {
+        let cfg = self.config;
+        if cfg.rate_max > 0 {
+            prune(&mut self.all, now, cfg.rate_window);
+            self.all.push_back(now);
+        }
+        if cfg.repeat_max > 0 {
+            let window = cfg.repeat_window;
+            // Bound memory: drop signatures whose entries all expired.
+            if self.per_sig.len() > 4096 {
+                self.per_sig.retain(|_, e| {
+                    prune(&mut e.runs, now, window);
+                    !e.runs.is_empty()
+                });
+            }
+            let k = key(tool, signature, stamp);
+            match self.per_sig.get_mut(&k) {
+                Some(entry) => {
+                    prune(&mut entry.runs, now, window);
+                    entry.runs.push_back(now);
+                    entry.last = result;
+                }
+                None => {
+                    self.per_sig.insert(
+                        k,
+                        Entry {
+                            runs: VecDeque::from([now]),
+                            last: result,
+                        },
+                    );
+                }
+            }
         }
     }
 }
@@ -187,71 +262,100 @@ mod tests {
         }
     }
 
+    /// Simulates the server: check, and on Run execute + record.
+    fn call(g: &mut LoopGuard, sig: &str, stamp: u64, now: Instant) -> bool {
+        match g.check_at("search_code", sig, stamp, now) {
+            Verdict::Block { .. } => true,
+            _ => {
+                g.record_at("search_code", sig, stamp, format!("res:{sig}"), now);
+                false
+            }
+        }
+    }
+
     #[test]
-    fn repeats_within_window_are_blocked_after_max() {
-        let mut g = LoopGuard::new(cfg(3, 0));
+    fn repeats_within_window_are_blocked_after_max_with_cached_result() {
+        let mut g: LoopGuard = LoopGuard::new(cfg(3, 0));
         let t = Instant::now();
         for i in 0..3 {
-            assert_eq!(
-                g.check_at("search_code", "q", t + Duration::from_secs(i)),
-                Verdict::Run
-            );
+            assert!(!call(&mut g, "q", 1, t + Duration::from_secs(i)));
         }
-        assert!(matches!(
-            g.check_at("search_code", "q", t + Duration::from_secs(4)),
-            Verdict::Block(_)
-        ));
+        match g.check_at("search_code", "q", 1, t + Duration::from_secs(4)) {
+            Verdict::Block { note, cached } => {
+                assert_eq!(cached, "res:q");
+                assert!(note.contains("blocked: true"), "{note}");
+                assert!(!note.contains("结果与之前相同"), "{note}");
+            }
+            v => panic!("expected block, got {v:?}"),
+        }
         // other signature / other tool unaffected
-        assert_eq!(g.check_at("search_code", "other", t), Verdict::Run);
-        assert_eq!(g.check_at("find_symbol", "q", t), Verdict::Run);
+        assert_eq!(g.check_at("search_code", "other", 1, t), Verdict::Run);
+        assert_eq!(g.check_at("find_symbol", "q", 1, t), Verdict::Run);
+    }
+
+    #[test]
+    fn index_change_resets_repeat_count() {
+        let mut g: LoopGuard = LoopGuard::new(cfg(3, 0));
+        let t = Instant::now();
+        for _ in 0..3 {
+            assert!(!call(&mut g, "q", 1, t));
+        }
+        assert!(call(&mut g, "q", 1, t));
+        // an edit bumped the index generation: re-verification executes
+        assert!(!call(&mut g, "q", 2, t));
+    }
+
+    #[test]
+    fn unrecorded_failures_never_count() {
+        let mut g: LoopGuard = LoopGuard::new(cfg(3, 5));
+        let t = Instant::now();
+        // "index building" / error responses: checked but never recorded
+        for _ in 0..50 {
+            assert_eq!(g.check_at("search_code", "q", 1, t), Verdict::Run);
+        }
     }
 
     #[test]
     fn rotating_queries_are_caught_and_window_expires() {
-        let mut g = LoopGuard::new(cfg(3, 0));
+        let mut g: LoopGuard = LoopGuard::new(cfg(3, 0));
         let t = Instant::now();
         let mut blocked = 0;
-        // 5 queries rotated, never back-to-back, 20 rounds, 1s apart
         for round in 0..20u64 {
             for q in 0..5u64 {
                 let now = t + Duration::from_secs(round * 5 + q);
-                if matches!(
-                    g.check_at("search_code", &q.to_string(), now),
-                    Verdict::Block(_)
-                ) {
+                if call(&mut g, &q.to_string(), 7, now) {
                     blocked += 1;
                 }
             }
         }
         assert_eq!(blocked, 100 - 15);
-        // after the window passes the query runs again
         let later = t + Duration::from_secs(100 + 600);
-        assert_eq!(g.check_at("search_code", "0", later), Verdict::Run);
+        assert_eq!(g.check_at("search_code", "0", 7, later), Verdict::Run);
     }
 
     #[test]
     fn rate_cap_warns_but_runs() {
-        let mut g = LoopGuard::new(cfg(0, 5));
+        let mut g: LoopGuard = LoopGuard::new(cfg(0, 5));
         let t = Instant::now();
         for i in 0..5 {
-            assert_eq!(g.check_at("search_code", &i.to_string(), t), Verdict::Run);
+            assert!(!call(&mut g, &i.to_string(), 1, t));
         }
         assert!(matches!(
-            g.check_at("search_code", "x", t),
+            g.check_at("search_code", "x", 1, t),
             Verdict::RunWithWarning(_)
         ));
         assert_eq!(
-            g.check_at("search_code", "y", t + Duration::from_secs(601)),
+            g.check_at("search_code", "y", 1, t + Duration::from_secs(601)),
             Verdict::Run
         );
     }
 
     #[test]
     fn zero_disables_everything() {
-        let mut g = LoopGuard::new(cfg(0, 0));
+        let mut g: LoopGuard = LoopGuard::new(cfg(0, 0));
         let t = Instant::now();
         for _ in 0..1000 {
-            assert_eq!(g.check_at("search_code", "q", t), Verdict::Run);
+            assert!(!call(&mut g, "q", 1, t));
         }
     }
 

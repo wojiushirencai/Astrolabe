@@ -6,6 +6,15 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Fixed
+
+- loop guard（search_code/find_symbol 重复查询上限）不再误拦：签名包含全部参数（含 budget_tokens）和索引代数，索引变化即重置；只统计成功执行的查询；被拦时返回上一次缓存结果并标注 `blocked: true`。
+- **修复 TS `outDir` 误排除源码。** tsconfig `outDir` 等于/包含配置目录或 `rootDir`、或其中仍有 `.ts` 源文件时不再当作构建产物排除（zod 的 `"outDir": "."` 曾让 332 个源文件从索引消失）；被构建输出规则排除的源文件会在 `get_languages` 中列出，不再显示 `unindexed source files: none`。
+- 索引覆盖：`build`/`dist`/`target`/`obj` 仅在仓库根与项目根下排除；GBK/Latin-1 等非 UTF-8 文件解码后入索引；解析失败/超时/超大文件在查询结果中提示并在 get_languages 列出；扩展名大小写不敏感并补齐 C++ 扩展名、含 C++ 语法的 `.h` 按 C++ 解析；Dart 命名构造函数与 Go 函数内常量可被 find_symbol 查到。
+- C# symbol extraction now covers fields, `const` fields, enum members, events, indexers, operators, conversion operators, destructors, delegates and nested local functions (find_symbol recall on Newtonsoft.Json 85.7% → 99.9%, Serilog 84.9% → 99.9%, Polly 88.3% → 100%).
+- **`find_symbol` 匹配与排序修正。** 结果按精确名 > 前缀 > 子串排序，真实定义不再因按路径排序被截断；支持 `Type.method` / `A::b` / `pkg.Func` 层级写法并把 Go 方法挂到接收者类型（`Command.ExecuteC`）；忽略 `Proc struct` 这类尾随关键字，零命中时给出相近符号名；`kind`/`substring` 对名称查询生效，新增 `path_filter`；Java/C#/VB 的锚点与签名落在声明行而非注解/特性行；`find_symbol`/`search_code` 的 `path_filter` 不匹配任何已索引路径时显式报错并列出最接近路径；工具描述补列 C#、VB。
+- **fix: `find_references` / `goto_definition` / hover 按名字查询时不再锚定到注释、字符串或 import。** 用 tree-sitter 定位文件内该名字的声明 token（跳过注释/字符串），多个定义（重载、多个 impl）全部查询后合并；名字只出现在注释/字符串里、或语言服务器返回空结果时置信度改为 `unknown` 并说明原因；`find_references` 新增可选 `line`/`character` 参数，结构化输出新增 `returned`/`omitted`/`truncated`。cobra 上 16/50 个原先报错的符号全部恢复，Rust `LspPool` 引用从 1 条变为 30 条。
+- LSP 查询前同步磁盘内容（didChange/didClose/didChangeWatchedFiles），索引未完成时的非空结果降级并注明，单次请求超时（默认 30 秒，`ASTROLABE_LSP_QUERY_TIMEOUT`）后回退为标注清楚的文本搜索。
 - **`search_code` 覆盖非索引文本文件、新增 `case_sensitive`；空闲仓库不再常驻“索引可能过期”。** 索引代码之后继续搜索扫描到的其他文本文件（md/sql/yaml/json/xml/gradle/kt/模板等，遵守 gitignore/大小/二进制限制，跳过 lock 文件），命中标 `[text-only]` 并排在代码命中之后，这部分改用 ripgrep 引擎（grep-searcher）并行搜索，支持 UTF-16 BOM、非 UTF-8 宽松解码；工具描述写明大小写规则（字面不区分、正则区分）。watcher 忽略只读访问事件（open/close-nowrite），此前 Astrolabe 自己读文件就会产生疑点，导致 gson/Polly 等未改动仓库一直报过期；屏障等待校验超时（2 秒）时也会追加过期提示。
 
 ## [0.10.0] - 2026-10-11
