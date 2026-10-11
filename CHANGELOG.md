@@ -6,10 +6,64 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
-- search_code 支持分页：新增 `offset` 参数；截断时正文给出 `total`、本页范围和下一页的 `next_offset`（structuredContent 同步提供 `total` / `offset` / `next_offset`），顺序稳定（代码命中在前、[text-only] 在后）；loop guard 签名包含 offset，翻页不会被拦。
+## [0.10.2] - 2026-10-12
 
-- TS/TSX 符号抽取补全：`type X = {…}` 别名里的成员、enum 成员、字符串/数字键的方法与字段（`"~standard"`、`"name"() {}`、`200:`）现在可被 find_symbol 查到；参数注解、`as {…}` 断言、泛型实参里的内联对象类型成员不计入。
-- fix(dart): 符号抽取补齐构造函数（按类名索引）、字段/顶层变量、枚举值、extension / extension type、typedef、operator、mixin application 类；provider find_symbol 召回 96% → 100%。
+### 1、具体是什么问题？如何解决的。
+
+- **Dart 构造函数和多类声明没有被抽取**（#47）。问题：无名构造函数、const / factory / 重定向构造函数没有挂在类名下（provider 漏掉 8 个定义）；字段、顶层变量/常量、枚举值、extension、extension type、typedef、运算符，以及 `class D = B with M;` 都没有被抽取。解决：补充 Dart 的 symbols.scm 查询；构造函数按类名记录（命名构造函数同时按自身名字记录）；运算符命名为 `operator +` 的形式。
+- **TS 成员没有被抽取**（#48）。问题：类型别名里的对象成员（`type X = { a: T }`）、enum 成员，以及以字符串/数字命名的方法、字段、接口成员都没有被抽取。解决：补充 typescript 的 symbols.scm 规则，并加入 `ts_inline_object_member` 过滤（断言和参数里的内联匿名类型字面量有意不收录）。
+- **search_code 没有分页**（#49）。问题：命中数很多时只能截断（zod 第一页只覆盖 57.9%）。解决：新增 `offset` 参数；截断时正文给出总数、本页范围（“第 X–Y 条，共 N 条”）和 `next_offset`；结构化输出带 total / offset / next_offset；结果顺序稳定（先代码命中，再 `[text-only]` 命中）；loop guard 的签名包含 offset，翻页不会被误拦。
+
+### 2、新增了哪些支持（sql、xml、toml等）？如何支持的
+
+本版本没有新增可搜索的文件类型（sql、xml、toml 等文本文件的搜索已在 v0.10.1 支持），新增的是符号抽取和分页：
+
+- **Dart**（#47，通过 symbols.scm 查询实现）：构造函数挂在类名下，字段、顶层变量/常量、枚举值、extension / extension type、typedef、运算符、mixin application 类（`class D = B with M;`）。
+- **TypeScript**（#48，通过 symbols.scm 规则加 `ts_inline_object_member` 过滤实现）：类型别名成员、enum 成员、以字符串/数字命名的成员。
+- **search_code 分页**（#49）：通过 `offset` 参数和返回的 `next_offset` 翻页。
+
+### 3、调整后整体的覆盖和性能情况
+
+基线为 v0.10.1。
+
+**全部声明的抽取召回率**
+
+| 仓库 | 声明数 | 调整前 | 调整后 |
+|---|---|---|---|
+| provider (Dart) | 1,400 | 63.9% | 100% |
+| riverpod (Dart) | 30,445 | 69.4% | 100% |
+| dart-lang/http (Dart) | 10,099 | 47.2% | 100% |
+| zod (TS) | 7,783 | 88.94% | 99.74% |
+| trpc (TS) | 10,427 | 68.22% | 99.88% |
+
+**通过 MCP 调用 find_symbol**
+
+| 样本 | 调整前 | 调整后 |
+|---|---|---|
+| provider 209 个定义 | 96% | 100% |
+| zod 抽样 50 个符号（141 处定义） | 119/141 (84%) | 126/141 (89%) |
+
+zod 剩下的 15 处是内联匿名类型成员和基准写法引起的，是有意不收录的。
+
+**TS 分类召回率（zod / trpc）**
+
+| 类别 | 调整前 | 调整后 |
+|---|---|---|
+| 类型别名成员 | 0.9% / 0% | 100% / 100% |
+| enum 成员 | 1% / 0% | 100% / 100% |
+| 对象字面量方法（zod） | 73.7% | 100% |
+
+**zod search_code（budget 32000）**
+
+| | 调整前（只有第一页） | 调整后（按 next_offset 翻页） |
+|---|---|---|
+| 命中覆盖 | 7,459/12,879 (57.9%) | 12,874/12,879 (99.96%) |
+| 页数 | 1 | 最多 4 页 |
+| loop guard 拦截 | — | 0 次 |
+
+**升级提示**：抽取器版本变了，升级后首次启动会重新解析所有文件。Dart 查询类名时，结果里现在也会有构造函数。
+
+**已知仍存在的问题**：打包产物 `build/index.cjs` 中有 5 行没有搜到（正在排查）；find_symbol 还不支持分页；TS 的 find_references 在测试机上不可用。
 
 ## [0.10.1] - 2026-10-12
 
