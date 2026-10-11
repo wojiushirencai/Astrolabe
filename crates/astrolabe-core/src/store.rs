@@ -298,13 +298,28 @@ impl Store {
     }
 }
 
-/// Cache key for a parsed file: language plus content hash.
+/// Version of the symbol extractor (tree-sitter queries + `parse` logic).
+///
+/// Bump this whenever a change alters what `parse_file` produces for the
+/// same bytes (new captures, different anchors/kinds). The parse cache is
+/// keyed by content hash, so without this an upgraded binary keeps serving
+/// symbols extracted by the old version until each file is edited.
+pub const EXTRACTOR_VERSION: u32 = 2;
+
+/// Cache key for a parsed file: extractor version, crate version, language
+/// and content hash.
 ///
 /// The store table is a flat string map, so the language prefix keeps two
 /// files that happen to share bytes (a renamed `.js` → `.ts`, a copied
-/// snippet) from handing each other the wrong query results.
+/// snippet) from handing each other the wrong query results. The version
+/// prefix makes every release (and every extractor bump between releases)
+/// re-parse instead of reusing stale symbols.
 pub fn parse_cache_key(language: Language, sha: &str) -> String {
-    format!("{}:{sha}", language.name())
+    format!(
+        "x{EXTRACTOR_VERSION}-v{}:{}:{sha}",
+        env!("CARGO_PKG_VERSION"),
+        language.name()
+    )
 }
 
 /// Serialize a [`crate::parse::ParsedFile`] for [`PARSE_CACHE`].
@@ -783,6 +798,19 @@ mod tests {
         assert_eq!(loaded.symbols[0].name, "Hello");
         assert_eq!(loaded.symbols[0].kind, SymbolKind::Function);
         assert!(loaded.symbols[0].exported);
+    }
+
+    #[test]
+    fn parse_cache_key_is_versioned() {
+        let key = parse_cache_key(Language::Go, "abc");
+        assert!(
+            key.ends_with(&format!(":{}:abc", Language::Go.name())),
+            "{key}"
+        );
+        assert!(key.contains(&format!("x{EXTRACTOR_VERSION}")), "{key}");
+        assert!(key.contains(env!("CARGO_PKG_VERSION")), "{key}");
+        // A key written by a pre-versioned binary must never be hit.
+        assert_ne!(key, format!("{}:abc", Language::Go.name()));
     }
 
     #[test]
