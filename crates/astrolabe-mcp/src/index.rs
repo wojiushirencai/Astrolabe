@@ -15,7 +15,7 @@ use std::{
 use astrolabe_core::cache::FileCache;
 use astrolabe_core::graph::CodeGraph;
 use astrolabe_core::index::IncrementalIndex;
-use astrolabe_core::{CodeFile, FileId, IndexReport};
+use astrolabe_core::{CodeFile, FileId, IndexReport, RelPath};
 
 use crate::reindex::mcp_index_options;
 
@@ -26,6 +26,8 @@ pub(crate) struct RepoIndex {
     pub root: PathBuf,
     inner: InnerIndex,
     in_graph_paths: OnceLock<HashSet<String>>,
+    /// Process-unique stamp; every index replacement (edit, rebuild) gets a new one.
+    generation: u64,
 }
 
 enum InnerIndex {
@@ -47,12 +49,23 @@ impl std::fmt::Debug for RepoIndex {
     }
 }
 
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl RepoIndex {
+    /// Index generation stamp (changes whenever the index is replaced).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn from_incremental(root: PathBuf, incremental: IncrementalIndex) -> Self {
         Self {
             root,
             inner: InnerIndex::Incremental(incremental),
             in_graph_paths: OnceLock::new(),
+            generation: next_generation(),
         }
     }
 
@@ -62,6 +75,7 @@ impl RepoIndex {
             root,
             inner: InnerIndex::Static { graph, report },
             in_graph_paths: OnceLock::new(),
+            generation: next_generation(),
         }
     }
 
@@ -79,6 +93,54 @@ impl RepoIndex {
             #[cfg(test)]
             InnerIndex::Static { report, .. } => report,
         }
+    }
+
+    /// Source files the index could not cover: parse failures/timeouts and
+    /// files over the size cap. Sorted, de-duplicated.
+    pub(crate) fn coverage_gaps(&self) -> Vec<(RelPath, String)> {
+        let report = self.report();
+        let mut gaps: Vec<(RelPath, String)> = report
+            .parse_failures
+            .iter()
+            .cloned()
+            .chain(
+                report
+                    .too_large
+                    .iter()
+                    .map(|path| (path.clone(), "too large (size cap)".to_string())),
+            )
+            .collect();
+        gaps.sort();
+        gaps.dedup_by(|a, b| a.0 == b.0);
+        gaps
+    }
+
+    /// One-line note appended to query results when some source files are
+    /// missing from the index. `None` when coverage is complete.
+    pub(crate) fn coverage_note(&self) -> Option<String> {
+        let n = self.coverage_gaps().len();
+        (n > 0).then(|| {
+            format!("注意：{n} 个源文件未进入索引（解析失败/超时/超过大小上限），结果可能遗漏；路径见 get_languages，必要时用 Grep/Read。")
+        })
+    }
+
+    /// `get_languages` detail block listing un-indexed source files.
+    pub(crate) fn coverage_detail(&self, limit: usize) -> String {
+        let gaps = self.coverage_gaps();
+        if gaps.is_empty() {
+            return "files not indexed (parse failure / too large): none\n".to_string();
+        }
+        let mut out = format!(
+            "files not indexed (parse failure / too large): {}\n",
+            gaps.len()
+        );
+        for (path, why) in gaps.iter().take(limit) {
+            out.push_str(&format!("  {path}: {why}\n"));
+        }
+        if gaps.len() > limit {
+            out.push_str(&format!("  …及另外 {} 个\n", gaps.len() - limit));
+        }
+        out
     }
 
     pub(crate) fn incremental(&self) -> Option<&IncrementalIndex> {
@@ -118,6 +180,17 @@ impl RepoIndex {
             }
             #[cfg(test)]
             InnerIndex::Static { .. } => std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Authored sources hidden by a declared build-output exclude (e.g. a
+    /// tsconfig `outDir` that still contains sources). Empty for static test
+    /// indexes.
+    pub(crate) fn excluded_source_paths(&self) -> &[astrolabe_core::types::RelPath] {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => inc.excluded_source_paths(),
+            #[cfg(test)]
+            InnerIndex::Static { .. } => &[],
         }
     }
 
@@ -174,7 +247,7 @@ pub(crate) fn load_source_lines(
     if let Some(lines) = cache.get(rel_path, mtime_ms) {
         return Some((lines, true));
     }
-    let source = fs::read_to_string(&disk).ok()?;
+    let source = astrolabe_core::text::read_source(&disk).ok()?;
     let lines: Vec<String> = source.lines().map(str::to_owned).collect();
     cache.insert(rel_path, lines.clone(), mtime_ms);
     Some((Arc::new(lines), false))
@@ -288,6 +361,29 @@ mod tests {
         assert_eq!(&*lines, &["line-two".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_note_counts_parse_failures_and_oversized_files() {
+        let clean = RepoIndex::from_graph(
+            PathBuf::from("/r"),
+            CodeGraph::default(),
+            IndexReport::default(),
+        );
+        assert!(clean.coverage_note().is_none());
+        assert!(clean.coverage_detail(10).contains("none"));
+
+        let report = IndexReport {
+            parse_failures: vec![(RelPath::new("a.py"), "parse: timeout".into())],
+            too_large: vec![RelPath::new("big.ts")],
+            ..IndexReport::default()
+        };
+        let index = RepoIndex::from_graph(PathBuf::from("/r"), CodeGraph::default(), report);
+        let note = index.coverage_note().expect("gaps must be surfaced");
+        assert!(note.contains("2 个源文件未进入索引"), "{note}");
+        let detail = index.coverage_detail(10);
+        assert!(detail.contains("a.py: parse: timeout"), "{detail}");
+        assert!(detail.contains("big.ts: too large"), "{detail}");
     }
 
     #[test]

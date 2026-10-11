@@ -30,6 +30,7 @@ pub mod resolvers;
 pub mod rewrite;
 pub mod scan;
 pub mod store;
+pub mod text;
 pub mod trace_tree;
 pub mod types;
 pub mod watch;
@@ -48,6 +49,8 @@ pub struct IndexReport {
     pub files_parsed: usize,
     /// `(path, reason)` for every file that could not be parsed.
     pub parse_failures: Vec<(RelPath, String)>,
+    /// Source files skipped by the scanner for exceeding the size cap.
+    pub too_large: Vec<RelPath>,
     /// Import specifiers that pointed inside the repo but did not resolve.
     /// This is the metric the five resolver workstreams are judged on.
     pub unresolved_imports: Vec<(RelPath, String)>,

@@ -264,18 +264,38 @@ fn extract_symbols(
         if name.is_empty() {
             continue;
         }
+        let (name, kind) = if lang == Language::CSharp {
+            csharp_symbol_name(definition_node, name, kind, source)
+        } else {
+            (name.to_owned(), kind)
+        };
 
+        // Java/C#/VB 的注解/特性（`@Override`、`[HttpGet]`、`<Fact>`）属于
+        // 定义节点，但锚点与签名应落在声明名字所在行，否则 find_symbol
+        // 给出的是注解行而非真正的声明。
+        let def_row = definition_node.start_position().row;
+        let name_row = name_node.start_position().row;
+        let anchor_on_name = matches!(
+            lang,
+            Language::Java | Language::CSharp | Language::VisualBasic
+        ) && name_row > def_row;
+        let (sig, start_row) = if anchor_on_name {
+            (signature_from_row(source, name_row), name_row)
+        } else {
+            (signature(definition_node, source), def_row)
+        };
+        let exported = is_exported(lang, &name, definition_node, source);
         symbols.push(CodeSymbol {
             // Stable IDs are assigned by the graph builder after all files
             // have been parsed; this layer has no FileId allocation context.
             id: SymbolId(0),
             file: FileId(0),
-            name: name.to_owned(),
+            name,
             kind,
-            signature: signature(definition_node, source),
-            start_line: line_number(definition_node.start_position().row),
+            signature: sig,
+            start_line: line_number(start_row),
             end_line: line_number(definition_node.end_position().row),
-            exported: is_exported(lang, name, definition_node, source),
+            exported,
         });
     }
     symbols
@@ -371,6 +391,43 @@ fn extract_named_captures(
 /// the query pack. Field / Variable (and any other kind the pack has not yet
 /// wired) are filled in locally so a concurrent query update cannot drop the
 /// new categories on the floor.
+/// C# members whose identifier alone is not the symbol name language
+/// servers report (`operator +`, `implicit operator string`), and `const`
+/// fields, which the query reports as plain fields.
+fn csharp_symbol_name(
+    node: tree_sitter::Node<'_>,
+    name: &str,
+    kind: SymbolKind,
+    source: &str,
+) -> (String, SymbolKind) {
+    match node.kind() {
+        "operator_declaration" => (format!("operator {name}"), kind),
+        "conversion_operator_declaration" => {
+            let mut cursor = node.walk();
+            let direction = node
+                .children(&mut cursor)
+                .find(|child| matches!(child.kind(), "implicit" | "explicit"))
+                .map_or("", |child| child.kind());
+            (
+                format!("{direction} operator {name}").trim().to_owned(),
+                kind,
+            )
+        }
+        "field_declaration" => {
+            let mut cursor = node.walk();
+            let is_const = node.children(&mut cursor).any(|child| {
+                child.kind() == "modifier"
+                    && child
+                        .utf8_text(source.as_bytes())
+                        .is_ok_and(|t| t == "const")
+            });
+            let kind = if is_const { SymbolKind::Const } else { kind };
+            (name.to_owned(), kind)
+        }
+        _ => (name.to_owned(), kind),
+    }
+}
+
 fn kind_for_definition_capture(capture: &str) -> Option<SymbolKind> {
     if let Some(kind) = queries::symbol_kind_for_capture(capture) {
         return Some(kind);
@@ -717,6 +774,17 @@ fn signature(node: tree_sitter::Node<'_>, source: &str) -> String {
     result
 }
 
+/// 取源码第 `row` 行（0-based）在 `{` 之前的部分作为签名。
+fn signature_from_row(source: &str, row: usize) -> String {
+    let line = source.lines().nth(row).unwrap_or_default();
+    let before_body = line.split('{').next().unwrap_or(line).trim();
+    let mut result: String = before_body.chars().take(MAX_SIGNATURE_CHARS).collect();
+    if before_body.chars().count() > MAX_SIGNATURE_CHARS {
+        result.push('…');
+    }
+    result
+}
+
 fn unquote(value: &str) -> &str {
     if value.len() >= 2 {
         let bytes = value.as_bytes();
@@ -760,6 +828,71 @@ mod tests {
                         .collect::<Vec<_>>()
                 )
             })
+    }
+
+    const CSHARP_MEMBERS: &str = r#"
+namespace App;
+
+public delegate void Handler(object sender);
+public enum Level { Low, High = 2 }
+
+public partial class Money(decimal amount)
+{
+    private const int Scale = 2;
+    private readonly decimal _amount = amount, _rounded;
+    public event Handler Changed;
+    public event Handler Closed { add { } remove { } }
+    public decimal this[int index] => _amount;
+    public static Money operator +(Money a, Money b) => a;
+    public static implicit operator decimal(Money m) => m._amount;
+    ~Money() { }
+    void IDisposable.Dispose() { }
+    public int Run()
+    {
+        int Twice(int x) => x * 2;
+        return Twice(1);
+    }
+}
+"#;
+
+    #[test]
+    fn csharp_members_fields_events_operators_and_local_functions() {
+        let parsed = parse_src(Language::CSharp, "Money.cs", CSHARP_MEMBERS);
+        for (name, kind) in [
+            ("Handler", SymbolKind::Type),
+            ("Low", SymbolKind::Const),
+            ("High", SymbolKind::Const),
+            ("Scale", SymbolKind::Const),
+            ("_amount", SymbolKind::Field),
+            ("_rounded", SymbolKind::Field),
+            ("Changed", SymbolKind::Field),
+            ("Closed", SymbolKind::Field),
+            ("this", SymbolKind::Method),
+            ("operator +", SymbolKind::Method),
+            ("implicit operator decimal", SymbolKind::Method),
+            ("Dispose", SymbolKind::Method),
+            ("Twice", SymbolKind::Function),
+        ] {
+            assert_eq!(named(&parsed, name).kind, kind, "{name}");
+        }
+        assert_eq!(
+            parsed.symbols.iter().filter(|s| s.name == "Money").count(),
+            2,
+            "class + destructor"
+        );
+    }
+
+    #[test]
+    fn csharp_edited_file_reparse_sees_new_members() {
+        let before = parse_src(Language::CSharp, "Money.cs", CSHARP_MEMBERS);
+        assert!(before.symbols.iter().all(|s| s.name != "Rate"));
+        let edited = CSHARP_MEMBERS.replace(
+            "private const int Scale = 2;",
+            "private const int Scale = 2;\n    public static readonly decimal Rate = 1m;",
+        );
+        let after = parse_src(Language::CSharp, "Money.cs", &edited);
+        assert_eq!(named(&after, "Rate").kind, SymbolKind::Field);
+        assert_eq!(named(&after, "Scale").kind, SymbolKind::Const);
     }
 
     #[test]
@@ -826,6 +959,36 @@ mod tests {
         let symbol = named(&parsed, "second_line");
         assert_eq!(symbol.start_line, 2);
         assert_eq!(symbol.end_line, 2);
+    }
+
+    #[test]
+    fn annotated_java_and_csharp_symbols_anchor_on_name_line() {
+        let java = parse_src(
+            Language::Java,
+            "A.java",
+            "class A {\n    @Override\n    @Deprecated\n    public String toString() { return \"\"; }\n}\n",
+        );
+        let sym = named(&java, "toString");
+        assert_eq!(sym.start_line, 4);
+        assert!(
+            sym.signature.contains("public String toString()"),
+            "{}",
+            sym.signature
+        );
+        assert!(!sym.signature.contains('@'), "{}", sym.signature);
+
+        let cs = parse_src(
+            Language::CSharp,
+            "A.cs",
+            "class A {\n    [HttpGet]\n    public int Get() { return 1; }\n}\n",
+        );
+        let sym = named(&cs, "Get");
+        assert_eq!(sym.start_line, 3);
+        assert!(
+            sym.signature.starts_with("public int Get()"),
+            "{}",
+            sym.signature
+        );
     }
 
     #[test]
