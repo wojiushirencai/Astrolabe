@@ -604,7 +604,13 @@ impl AstrolabeServer {
                 &session.root,
                 text_error(format!("索引构建失败：{error}\nconfidence: unknown")),
             ),
-            IndexState::Ready(index) => f(&session, index),
+            IndexState::Ready(index) => {
+                let result = f(&session, index);
+                match index.coverage_note() {
+                    Some(note) if result.is_error != Some(true) => append_stale_note(result, &note),
+                    _ => result,
+                }
+            }
         };
         match effect {
             BarrierEffect::None => result,
@@ -2110,6 +2116,7 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 种语言因 budget_tokens 被省略。\n"));
             }
+            body.push_str(&index.coverage_detail(50));
             let unindexed = index.unindexed_code_exts(None);
             if unindexed.is_empty() {
                 body.push_str("unindexed source files: none\n");

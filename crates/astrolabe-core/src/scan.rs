@@ -76,9 +76,6 @@ const MTIME_UNTRUSTED_WINDOW: Duration = Duration::from_secs(2);
 const EXCLUDED_DIRS: &[&str] = &[
     ".git",
     "node_modules",
-    "target",
-    "build",
-    "dist",
     "__pycache__",
     ".venv",
     "venv",
@@ -90,17 +87,85 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".serena",
     // Flutter / Dart toolchain artifacts. Fallback exclude for non-git trees.
     ".dart_tool",
-    // MSBuild / Visual Studio output. `bin` is intentionally not listed:
-    // Rust crates keep sources in `src/bin`. C# / VB project output `bin/`
-    // is excluded per project (`ProjectMeta::excludes`), never as a global
-    // path component.
-    "obj",
     ".vs",
     // Own store (index.redb). Must not depend on gitignore: `ignore` skips
     // gitignore rules in non-git trees, so a store-written `.gitignore` of `*`
     // is not enough.
     ".astrolabe",
 ];
+
+/// Build-output directory names. Unlike [`EXCLUDED_DIRS`] these are only
+/// pruned at the repo root or directly inside a project root (a directory
+/// holding a build manifest, see [`PROJECT_MANIFESTS`]). Elsewhere (e.g. Go's
+/// `internal/build/`) they are ordinary source directories and only
+/// `.gitignore` can exclude them. `bin` is intentionally not listed: Rust
+/// crates keep sources in `src/bin`; C# / VB `bin/` is excluded per project
+/// (`ProjectMeta::excludes`).
+const BUILD_OUTPUT_DIRS: &[&str] = &["target", "build", "dist", "obj"];
+
+/// File names (or `*.ext` suffixes) that mark a directory as a project root.
+const PROJECT_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "go.mod",
+    "pubspec.yaml",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "CMakeLists.txt",
+    "Makefile",
+    "meson.build",
+    "tsconfig.json",
+    "composer.json",
+    "Gemfile",
+    "mix.exs",
+    "build.sbt",
+    "Package.swift",
+    "*.csproj",
+    "*.fsproj",
+    "*.vbproj",
+    "*.sln",
+];
+
+fn dir_is_project_root(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten().any(|ent| {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        PROJECT_MANIFESTS.iter().any(|m| match m.strip_prefix('*') {
+            Some(suffix) => name.len() > suffix.len() && name.ends_with(suffix),
+            None => name == *m,
+        })
+    })
+}
+
+/// Whether directory `dir` (absolute, under `root`) is pruned by the built-in
+/// exclude rules: always-excluded tool/cache directory names anywhere, and
+/// build-output names only at the root or directly inside a project root.
+pub fn is_default_excluded_dir(root: &Path, dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if EXCLUDED_DIRS.contains(&name) {
+        return true;
+    }
+    if !BUILD_OUTPUT_DIRS.contains(&name) {
+        return false;
+    }
+    match dir.parent() {
+        Some(parent) => parent == root || dir_is_project_root(parent),
+        None => false,
+    }
+}
 
 /// Why a discovered file did not enter the index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,10 +497,7 @@ impl ExcludeMatcher {
     }
 
     fn matches_dir(&self, root: &Path, path: &Path) -> bool {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| EXCLUDED_DIRS.contains(&name))
-            || self.matches(root, path)
+        is_default_excluded_dir(root, path) || self.matches(root, path)
     }
 
     fn matches(&self, root: &Path, path: &Path) -> bool {
@@ -683,6 +745,51 @@ fn sniff_binary(path: &Path, known_source: bool) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_output_dirs_only_pruned_at_project_roots() {
+        let dir = TestDir::new();
+        dir.write("go.mod", "module x\n");
+        dir.write("build/out.go", "package out");
+        dir.write("internal/build/build.go", "package build");
+        dir.write("cmd/target/t.go", "package target");
+        dir.write("web/package.json", "{}");
+        dir.write("web/dist/bundle.js", "x");
+        dir.write("web/src/dist/keep.js", "x");
+        dir.write("app/App.csproj", "<Project/>");
+        dir.write("app/obj/gen.cs", "class G {}");
+        dir.write("crate/Cargo.toml", "[package]");
+        dir.write("crate/src/bin/tool.rs", "fn main() {}");
+        dir.write("crate/target/debug/x.rs", "fn x() {}");
+
+        let result = scan(dir.path(), &ScanOptions::default());
+        let files: Vec<&str> = result.files.iter().map(RelPath::as_str).collect();
+        for keep in [
+            "internal/build/build.go",
+            "cmd/target/t.go",
+            "web/src/dist/keep.js",
+            "crate/src/bin/tool.rs",
+        ] {
+            assert!(files.contains(&keep), "{keep} must be indexed: {files:?}");
+        }
+        for drop in [
+            "build/out.go",
+            "web/dist/bundle.js",
+            "app/obj/gen.cs",
+            "crate/target/debug/x.rs",
+        ] {
+            assert!(!files.contains(&drop), "{drop} must be pruned: {files:?}");
+        }
+        let opts = ScanOptions::default();
+        assert_eq!(
+            path_admission(dir.path(), &RelPath::new("internal/build/build.go"), &opts),
+            PathAdmission::Indexed
+        );
+        assert_eq!(
+            path_admission(dir.path(), &RelPath::new("web/dist/bundle.js"), &opts),
+            PathAdmission::Ignored
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -799,6 +906,8 @@ mod tests {
 
     #[test]
     fn scan_prunes_default_excluded_directories() {
+        // see also build_output_dirs_only_pruned_at_project_roots
+
         let dir = TestDir::new();
         dir.write("src/main.rs", "fn main() {}");
         dir.write("target/generated.rs", "generated");

@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Fixed
+
+- 索引覆盖：`build`/`dist`/`target`/`obj` 仅在仓库根与项目根下排除；GBK/Latin-1 等非 UTF-8 文件解码后入索引；解析失败/超时/超大文件在查询结果中提示并在 get_languages 列出；扩展名大小写不敏感并补齐 C++ 扩展名、含 C++ 语法的 `.h` 按 C++ 解析；Dart 命名构造函数与 Go 函数内常量可被 find_symbol 查到。
+
 ## [0.10.0] - 2026-10-11
 
 ### Added
