@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "astrolabe-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "astrolabe-mcp"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "astrolabe-core",

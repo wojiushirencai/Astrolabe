@@ -6,17 +6,98 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
-### Fixed
+## [0.10.1] - 2026-10-12
 
-- **升级后不再沿用旧版本抽取的符号。** 解析缓存（`.astrolabe/index.redb`）原来只按语言 + 文件内容哈希取，升级二进制后未改动的文件继续用旧抽取结果，#38/#40/#43 的抽取修复（C# 字段/枚举值、Dart 构造函数、Go 局部常量、注解锚点等）对老仓库不生效。缓存键现在带上抽取器版本和程序版本。
-- loop guard（search_code/find_symbol 重复查询上限）不再误拦：签名包含全部参数（含 budget_tokens）和索引代数，索引变化即重置；只统计成功执行的查询；被拦时返回上一次缓存结果并标注 `blocked: true`。
-- **修复 TS `outDir` 误排除源码。** tsconfig `outDir` 等于/包含配置目录或 `rootDir`、或其中仍有 `.ts` 源文件时不再当作构建产物排除（zod 的 `"outDir": "."` 曾让 332 个源文件从索引消失）；被构建输出规则排除的源文件会在 `get_languages` 中列出，不再显示 `unindexed source files: none`。
-- 索引覆盖：`build`/`dist`/`target`/`obj` 仅在仓库根与项目根下排除；GBK/Latin-1 等非 UTF-8 文件解码后入索引；解析失败/超时/超大文件在查询结果中提示并在 get_languages 列出；扩展名大小写不敏感并补齐 C++ 扩展名、含 C++ 语法的 `.h` 按 C++ 解析；Dart 命名构造函数与 Go 函数内常量可被 find_symbol 查到。
-- C# symbol extraction now covers fields, `const` fields, enum members, events, indexers, operators, conversion operators, destructors, delegates and nested local functions (find_symbol recall on Newtonsoft.Json 85.7% → 99.9%, Serilog 84.9% → 99.9%, Polly 88.3% → 100%).
-- **`find_symbol` 匹配与排序修正。** 结果按精确名 > 前缀 > 子串排序，真实定义不再因按路径排序被截断；支持 `Type.method` / `A::b` / `pkg.Func` 层级写法并把 Go 方法挂到接收者类型（`Command.ExecuteC`）；忽略 `Proc struct` 这类尾随关键字，零命中时给出相近符号名；`kind`/`substring` 对名称查询生效，新增 `path_filter`；Java/C#/VB 的锚点与签名落在声明行而非注解/特性行；`find_symbol`/`search_code` 的 `path_filter` 不匹配任何已索引路径时显式报错并列出最接近路径；工具描述补列 C#、VB。
-- **fix: `find_references` / `goto_definition` / hover 按名字查询时不再锚定到注释、字符串或 import。** 用 tree-sitter 定位文件内该名字的声明 token（跳过注释/字符串），多个定义（重载、多个 impl）全部查询后合并；名字只出现在注释/字符串里、或语言服务器返回空结果时置信度改为 `unknown` 并说明原因；`find_references` 新增可选 `line`/`character` 参数，结构化输出新增 `returned`/`omitted`/`truncated`。cobra 上 16/50 个原先报错的符号全部恢复，Rust `LspPool` 引用从 1 条变为 30 条。
-- LSP 查询前同步磁盘内容（didChange/didClose/didChangeWatchedFiles），索引未完成时的非空结果降级并注明，单次请求超时（默认 30 秒，`ASTROLABE_LSP_QUERY_TIMEOUT`）后回退为标注清楚的文本搜索。
-- **`search_code` 覆盖非索引文本文件、新增 `case_sensitive`；空闲仓库不再常驻“索引可能过期”。** 索引代码之后继续搜索扫描到的其他文本文件（md/sql/yaml/json/xml/gradle/kt/模板等，遵守 gitignore/大小/二进制限制，跳过 lock 文件），命中标 `[text-only]` 并排在代码命中之后，这部分改用 ripgrep 引擎（grep-searcher）并行搜索，支持 UTF-16 BOM、非 UTF-8 宽松解码；工具描述写明大小写规则（字面不区分、正则区分）。watcher 忽略只读访问事件（open/close-nowrite），此前 Astrolabe 自己读文件就会产生疑点，导致 gson/Polly 等未改动仓库一直报过期；屏障等待校验超时（2 秒）时也会追加过期提示。
+### 1、具体是什么问题？如何解决的。
+
+- **loop guard 误拦正常重查**（#36）。问题：调大 `budget_tokens` 重试、改代码后复查、“索引构建中”的响应都被算作重复查询而被拦。解决：签名包含全部参数和索引代数（索引变化即重置），只统计成功执行的查询；被拦时返回上一次缓存的结果并标注 `blocked: true`。
+- **LSP 文档不同步、结果误标、请求无超时**（#37）。问题：语言服务器一直用首次打开时的内容，收不到后续编辑；服务器自身建索引期间的部分结果被标为 Exact；单次请求没有超时（pyright 卡住超过 120 秒）。解决：每个文档记录版本号和哈希，发送 didChange / didClose / didChangeWatchedFiles；服务器建索引期间降级标注；单次查询 30 秒超时（`ASTROLABE_LSP_QUERY_TIMEOUT`），find_references 超时后回退到文本搜索。
+- **find_symbol 排序与匹配问题**（#38）。问题：按路径排序导致真正的定义被截断；`Type.method` / `A::b` / `pkg.Func` 返回 0；`kind` 被忽略；Java/C# 锚点落在 `@注解` 行；path_filter 写错时静默返回 0。解决：按 精确 > 前缀 > 子串 排序；支持 `.` / `::` 分隔，并加入 Go receiver / impl 启发式；遵守 `kind`；锚点落在名字所在行；path_filter 无匹配时报错并给出最接近的路径。工具描述补充 C#/VB。
+- **TS `outDir: "."` 排除整个源码树**（#39）。问题：zod 的 332 个文件被排除，却报告 “unindexed: none”。解决：只有当 outDir 是不含源码的独立目录时才排除，被排除的源码会如实报告。
+- **索引覆盖遗漏**（#40）。问题：任意深度的 build/target/dist/obj 都被排除；非 UTF-8（GBK/Latin-1）文件被跳过；解析失败或文件过大时无提示；大写扩展名以及 .inl .tpp .cu .cppm .ixx 被忽略；.h 一律按 C 处理；Dart 命名构造函数、Go 局部常量缺失。解决：只在仓库/项目根目录排除构建目录；用 chardetng + encoding_rs 识别编码；给出 “N files not indexed” 提示；扩展名大小写不敏感并新增 C++ 扩展名；.h 按内容识别是否为 C++；补齐上述符号。
+- **find_references 锚点错误**（#41）。问题：锚点取第一次文本出现的位置（注释/文档/import），Go 50 个符号中 16 个报错，Rust 返回空结果却标为 Exact（LspPool 32 处引用只找到 1 处）。解决：用 tree-sitter 定位到声明处，合并重载（最多 8 个），支持 line/character 参数，空结果或落在注释上时标为 Unknown，返回结构化的 returned/omitted/truncated。
+- **search_code 只搜代码文件、空闲仓库频繁提示索引过期**（#42）。问题：search_code 只搜已索引的代码文件；未改动的仓库也一直提示 “index may be stale”（Linux 监听把 read/close 事件算作变更，导致反复重建，gson 30 秒约 7.4 万个事件）。解决：对所有扫描到的文本文件做 text-only 搜索（见第 2 节），`[text-only]` 命中排在代码命中之后，新增 `case_sensitive` 参数，跳过 lock 文件；丢弃只读类监听事件；barrier 2 秒超时时给出提示。
+- **C# 符号抽取遗漏**（#43）。问题：漏掉字段、枚举成员、事件、索引器、运算符、转换运算符、析构函数、委托、嵌套局部函数。解决：补充 symbols.scm 查询和命名规则。
+- **升级后沿用旧的符号抽取结果**（#44）。问题：单文件符号缓存只按语言和文件内容做键，升级后仍用旧版抽取结果，#38/#40/#43 的修复对老仓库不生效。解决：缓存键加入抽取器版本和程序版本。
+- **测试补充**（#45）：按名字定位的 find_references 在服务器卡住时回退到文本搜索。
+
+### 2、新增了哪些支持（sql、xml、toml等）？如何支持的
+
+- **search_code 支持 text-only 搜索**（#42）：未进入代码索引的文本文件也能被搜到，包括 .md .sql .yaml/.yml .json .xml .toml .ini .cfg .conf .properties .env* .gradle(.kts) .kt Dockerfile Makefile .sh .proto .graphql .csv 以及模板文件等。
+  - 实现方式：基于 ripgrep 的 grep-searcher / grep-regex 库，用 rayon 按文件并行搜索。
+  - 规则：遵守 .gitignore；单文件上限 1.5MB；含 NUL 字节视为二进制并跳过；跳过 lock 文件（Cargo.lock、package-lock.json 等）；UTF-16 BOM 文件转码，GBK 文件有损解码。
+- **其他新增**：非 UTF-8 源码可以建索引（#40）；新增 C++ 扩展名 .inl .tpp .cu .cppm .ixx（#40）；C# 成员类型（#43）；Dart 命名构造函数、Go 局部常量（#40）。
+
+### 3、调整后整体的覆盖和性能情况
+
+基线为 v0.10.0（`7094e4c`），调整后为 main `e53f3e6` 及之后。
+
+**find_symbol 召回率（budget 2500 tokens，%）**
+
+| 仓库 | 调整前 | 调整后 |
+|---|---|---|
+| Polly (C#) | 99 | 100 |
+| astrolabe (Rust) | 100 | 100 |
+| cobra (Go) | 96 | 100 |
+| express (JS) | 100 | 100 |
+| gson (Java) | 98 | 100 |
+| provider (Dart) | 96 | 96 |
+| requests (Python) | 100 | 100 |
+| zod (TS) | 13 | 84 |
+
+**search_code 召回率（budget 32000，%）**
+
+| 仓库 | 调整前 | 调整后 |
+|---|---|---|
+| astrolabe | 85 | 85 |
+| zod（字面） | 10 | 58 |
+| zod（regex） | 10 | 97 |
+| 其他仓库 | 100 | 100 |
+
+regex 模式其余仓库不变（Go 的 51 是大小写敏感与基线大小写不敏感的口径差异）。zod 静默截断：39 → 1。
+
+**find_references（50 个符号）**
+
+| 仓库 | 调整前 | 调整后 |
+|---|---|---|
+| cobra (Go) | 34 成功 / 16 报错 | 50 成功 / 0 报错 |
+| astrolabe (Rust) | 44 成功 / 6 空结果却标 Exact | 50 成功 / 0 空结果 |
+| LspPool 引用数（rg 为 32） | 1 | 30 |
+
+**C# 声明抽取召回率（%）**
+
+| 仓库 | 调整前 | 调整后 |
+|---|---|---|
+| Polly | 88.3 | 100.0 |
+| Newtonsoft.Json | 85.7 | 99.9 |
+| Serilog | 84.9 | 99.9 |
+| Java gson / jackson-core / spring-petclinic | 100 | 100 |
+
+通过 MCP 调用 find_symbol 的同名冲突样本（Polly、Newtonsoft、gson、jackson-core 各 25 个）：100/100 定义都在结果中。
+
+**未改动仓库的“索引可能过期”提示**
+
+| 仓库 | 调整前 | 调整后 |
+|---|---|---|
+| gson | 每次查询 123 个疑似变更 | 0 |
+| Polly | 约 975 | 0 |
+| requests | 反复重建 | 0 |
+
+**性能（text-only 搜索，9,510 个 .md 文件，91MB，8 核，5 次取中位数）**
+
+| 查询 | 调整前 (ms) | 调整后 (ms) |
+|---|---|---|
+| xyznotfound | 94 | 29 |
+| JsonReader | 117 | 36 |
+| version | 101 | 29 |
+| = | 181 | 149 |
+| the | 140 | 91 |
+
+同目录下 rg 命令行耗时 24–46ms。LSP 单次查询超时从 300 秒降到 30 秒。
+
+**升级提示**：由于 #44，升级后首次启动会重新解析所有文件，耗时比平时长。
+
+**已知仍存在的问题**：zod 仍有 22 个定义未召回；Dart provider 召回率 96%；TS 的 find_references 在测试机上为 0%（TS 服务器环境问题）；非常常见的名字会被 budget 截断，请用 path_filter 或调大 budget_tokens。
 
 ## [0.10.0] - 2026-10-11
 
