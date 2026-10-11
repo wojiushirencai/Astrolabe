@@ -310,6 +310,11 @@ pub(crate) struct SearchParams {
         description = "Optional case-sensitive substring of the repo-relative path (e.g. relay/channel). Not a glob. Do not pass an absolute path or a ./ prefix."
     )]
     pub path_filter: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional. Omitted: literal search is case-insensitive, regex search is case-sensitive. true forces case-sensitive matching; false forces case-insensitive (also for regex)."
+    )]
+    pub case_sensitive: Option<bool>,
     #[serde(default = "default_budget")]
     #[schemars(
         description = "Maximum approximate tokens in the rendered result (default 2500). Overflow drops later hits and sets truncated=true; raise this or tighten path_filter — there is no page or cursor."
@@ -889,10 +894,10 @@ fn format_search_code_unindexed_hint(
         .join("、");
     let msg = match path_filter {
         Some(filter) => format!(
-            "注意：path_filter '{filter}' 范围内有 {ext_summary}属于尚未支持的语言，未入代码索引——本结果只代表已索引语言中无匹配，不覆盖这些文件。请改用 Grep/Read 检索它们。\n"
+            "注意：path_filter '{filter}' 范围内有 {ext_summary}属于尚未支持的语言，未入代码索引——已按纯文本一并搜索，同样无匹配；它们没有符号/引用信息。\n"
         ),
         None => format!(
-            "注意：仓库内有 {ext_summary}属于尚未支持的语言，未入代码索引——本结果只代表已索引语言中无匹配，不覆盖这些文件。请改用 Grep/Read 检索它们。\n"
+            "注意：仓库内有 {ext_summary}属于尚未支持的语言，未入代码索引——已按纯文本一并搜索，同样无匹配；它们没有符号/引用信息。\n"
         ),
     };
     Some(msg)
@@ -1280,7 +1285,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search indexed source for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb — other source files are invisible to this tool; use Grep/Read for them."
+        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, kt, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (shown/omitted/truncated); raise budget_tokens or tighten path_filter for more hits — there is no pagination. Discovery only; edits and renames must be driven by find_references."
     )]
     pub(crate) fn search_code(
         &self,
@@ -1297,23 +1302,50 @@ impl AstrolabeServer {
         self.with_fresh_index(
             &Self::join_hint(&[params.path_filter.as_deref().unwrap_or(""), &params.query]),
             |session, index| {
-                if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
-                    return text_error(message);
-                }
-                let regex = if params.regex {
-                    match regex::Regex::new(&params.query) {
-                        Ok(regex) => Some(regex),
-                        Err(error) => {
-                            return text_error(format!("无效正则表达式：{error}"));
-                        }
+                // A filter that only hits non-code text files (docs/, *.toml …)
+                // is valid here: those files are searched as [text-only].
+                if index
+                    .text_only_paths(params.path_filter.as_deref())
+                    .is_empty()
+                {
+                    if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
+                        return text_error(message);
                     }
-                } else {
-                    None
+                }
+                let matcher = match build_search_matcher(
+                    &params.query,
+                    params.regex,
+                    params.case_sensitive,
+                ) {
+                    Ok(matcher) => matcher,
+                    Err(error) => return text_error(format!("无效正则表达式：{error}")),
                 };
-                let needle = params.query.to_lowercase();
                 let mut matches = Vec::new();
                 let mut hits = 0u64;
                 let mut misses = 0u64;
+                let mut scan_file = |path: &str, matches: &mut Vec<String>| {
+                    let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
+                        return;
+                    };
+                    if hit {
+                        hits += 1;
+                    } else {
+                        misses += 1;
+                    }
+                    for (line_no, line) in lines.iter().enumerate() {
+                        if matcher.is_match(line) {
+                            // P0：超长行先做单行安全切片（Unicode 边界安全），
+                            // 单条 match 不会把 budget 一口气吃光，也不会在
+                            // 大小写折叠差异上 panic。
+                            matches.push(format!(
+                                "@{}:{} {}",
+                                path,
+                                line_no + 1,
+                                clip_match_line(line, &params.query, Some(&matcher))
+                            ));
+                        }
+                    }
+                };
                 for file in &index.graph().files {
                     if params
                         .path_filter
@@ -1322,35 +1354,38 @@ impl AstrolabeServer {
                     {
                         continue;
                     }
-                    let Some((lines, hit)) =
-                        index.cached_lines(&session.file_cache, file.path.as_str())
-                    else {
-                        continue;
-                    };
-                    if hit {
-                        hits += 1;
-                    } else {
-                        misses += 1;
-                    }
-                    for (line_no, line) in lines.iter().enumerate() {
-                        let matched = if let Some(regex) = &regex {
-                            regex.is_match(line)
-                        } else {
-                            line.to_lowercase().contains(&needle)
-                        };
-                        if matched {
-                            // P0：超长行先做单行安全切片（Unicode 边界安全），
-                            // 单条 match 不会把 budget 一口气吃光，也不会在
-                            // 大小写折叠差异上 panic。
+                    scan_file(file.path.as_str(), &mut matches);
+                }
+                // 非索引文本文件（md/sql/yaml/json/xml/gradle/kt/模板…）也搜，
+                // 排在代码命中之后并标注 [text-only]：它们没有符号/引用信息。
+                // ripgrep 引擎（grep-searcher）并行搜索，按输入顺序回收结果。
+                let code_matches = matches.len();
+                let text_paths = index.text_only_paths(params.path_filter.as_deref());
+                let sensitive = params.case_sensitive.unwrap_or(params.regex);
+                if let Ok(text_matcher) = astrolabe_core::text_search::build_matcher(
+                    &params.query,
+                    params.regex,
+                    sensitive,
+                ) {
+                    let rels: Vec<&str> = text_paths.iter().map(|p| p.as_str()).collect();
+                    let found = astrolabe_core::text_search::search_files(
+                        &session.root,
+                        &rels,
+                        &text_matcher,
+                        TEXT_SEARCH_MAX_FILE_BYTES,
+                    );
+                    for (idx, file_hits) in found {
+                        for hit in file_hits {
                             matches.push(format!(
-                                "@{}:{} {}",
-                                file.path,
-                                line_no + 1,
-                                clip_match_line(line, &params.query, regex.as_ref())
+                                "@{}:{} [text-only] {}",
+                                rels[idx],
+                                hit.line,
+                                clip_match_line(&hit.text, &params.query, Some(&matcher))
                             ));
                         }
                     }
                 }
+                let text_matches = matches.len() - code_matches;
                 session.cache_hits.fetch_add(hits, Ordering::Relaxed);
                 session.cache_misses.fetch_add(misses, Ordering::Relaxed);
                 tracing::debug!(
@@ -1403,7 +1438,9 @@ impl AstrolabeServer {
                         "omitted": omitted,
                         "truncated": truncated,
                         "budget_tokens": params.budget_tokens,
-                        "unindexed_hint": unindexed_hint
+                        "unindexed_hint": unindexed_hint,
+                        "text_only_matches": text_matches,
+                        "text_only_files_searched": text_paths.len()
                     }),
                     Some(params.budget_tokens),
                 )
@@ -2398,6 +2435,31 @@ fn truncate_body_text(text: &str, budget_tokens: usize) -> String {
 /// 定位命中；字面量搜索用 `regex::escape(needle)` 构建 case-insensitive
 /// regex 在原串上查找。找不到 Match（极端 Unicode 折叠差异，或命中只落
 /// 在被 trim 掉的空白里）时退回行首固定窗口兜底，绝不 unwrap/panic。
+/// Size cap for text-only search, same as the scanner's default admission
+/// cap (files that grew past it after the scan are skipped).
+const TEXT_SEARCH_MAX_FILE_BYTES: u64 = 1_500_000;
+
+/// Compile the single matcher used by `search_code`.
+///
+/// Literal queries are escaped. Default case rules: literal is
+/// case-insensitive, regex is case-sensitive; `case_sensitive` overrides
+/// both.
+fn build_search_matcher(
+    query: &str,
+    regex: bool,
+    case_sensitive: Option<bool>,
+) -> Result<regex::Regex, regex::Error> {
+    let pattern = if regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
+    let sensitive = case_sensitive.unwrap_or(regex);
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(!sensitive)
+        .build()
+}
+
 fn clip_match_line(line: &str, needle: &str, regex: Option<&regex::Regex>) -> String {
     let trimmed = line.trim();
     if trimmed.chars().count() <= MAX_LINE_COLUMNS {
@@ -2934,6 +2996,7 @@ mod tests {
             query: "definitely absent".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 100,
         })));
         assert_first_text(server.get_dependents(Parameters(DependentsParams {
@@ -3190,6 +3253,7 @@ mod tests {
             query: "marker".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 2_500,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
@@ -3225,6 +3289,7 @@ mod tests {
             query: "needle".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 1,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -3382,6 +3447,7 @@ mod tests {
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 1000,
         };
 
@@ -3427,6 +3493,7 @@ mod tests {
             query: "payload".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 200,
         }));
 
@@ -3450,6 +3517,7 @@ mod tests {
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 1000,
         }));
 
@@ -3464,6 +3532,7 @@ mod tests {
             query: "fresh-content".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 1000,
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
@@ -3487,6 +3556,7 @@ mod tests {
             query: q.into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: budget,
         }));
         result.content[0].as_text().unwrap().text.clone()
@@ -3546,6 +3616,7 @@ mod tests {
                 query: "(".into(),
                 regex: true,
                 path_filter: None,
+                case_sensitive: None,
                 budget_tokens: 1000,
             }))
         };
@@ -3602,6 +3673,7 @@ mod tests {
             query: "totally-absent-needle".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 1000,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -3625,6 +3697,7 @@ mod tests {
             query: "scanForBrandHint|RewriteStreamingBody".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 1000,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -3657,6 +3730,7 @@ mod tests {
             query: "needle".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 20,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -3839,6 +3913,7 @@ mod tests {
             query: "send".into(),
             regex: false,
             path_filter: Some("./relay/channel".into()),
+            case_sensitive: None,
             budget_tokens: 2500,
         }));
         assert_eq!(result.is_error, Some(true));
@@ -4466,6 +4541,7 @@ mod tests {
             query: "nonexistent_code_pattern".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 2500,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
@@ -4477,7 +4553,7 @@ mod tests {
         assert!(search_text.contains("3 个 .kt 文件"), "{search_text}");
         assert!(search_text.contains("未入代码索引"), "{search_text}");
         assert!(
-            search_text.contains("请改用 Grep/Read 检索它们"),
+            search_text.contains("已按纯文本一并搜索，同样无匹配"),
             "{search_text}"
         );
         assert!(
@@ -4492,6 +4568,7 @@ mod tests {
             query: "nonexistent".into(),
             regex: false,
             path_filter: Some(".kt".into()),
+            case_sensitive: None,
             budget_tokens: 2500,
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
@@ -4514,6 +4591,7 @@ mod tests {
             query: "nonexistent".into(),
             regex: false,
             path_filter: Some("A.kt".into()),
+            case_sensitive: None,
             budget_tokens: 2500,
         }));
         let filter_miss_text = search_filter_miss.content[0]
@@ -4604,6 +4682,7 @@ mod tests {
             query: "dart service running".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 2500,
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
@@ -4611,6 +4690,158 @@ mod tests {
         assert!(!dart_text.contains("(未找到匹配的代码行)"), "{dart_text}");
         let dart_structured = search_dart.structured_content.expect("structured");
         assert_eq!(dart_structured["unindexed_hint"], json!(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn search_text(
+        server: &AstrolabeServer,
+        query: &str,
+        regex: bool,
+        cs: Option<bool>,
+    ) -> (String, Value) {
+        let result = server.search_code(Parameters(SearchParams {
+            query: query.into(),
+            regex,
+            path_filter: None,
+            case_sensitive: cs,
+            budget_tokens: 2500,
+        }));
+        let text = result.content[0].as_text().unwrap().text.clone();
+        (text, result.structured_content.expect("structured"))
+    }
+
+    #[test]
+    fn search_code_covers_non_indexed_text_files() {
+        let dir = unique_temp_dir();
+        std::fs::write(
+            dir.join("main.py"),
+            "def load_user():\n    return 'user_table'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("README.md"),
+            "Call load_user to read user_table.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("schema.sql"),
+            "CREATE TABLE user_table (id int);\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("config.yaml"), "table: user_table\n").unwrap();
+        std::fs::write(dir.join("App.kt"), "val t = \"user_table\"\n").unwrap();
+        std::fs::write(dir.join("package-lock.json"), "{\"user_table\": 1}\n").unwrap();
+
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = true;
+
+        let (text, structured) = search_text(&server, "user_table", false, None);
+        assert!(text.contains("@main.py:2 "), "{text}");
+        for anchor in [
+            "@README.md:1 [text-only]",
+            "@schema.sql:1 [text-only]",
+            "@config.yaml:1 [text-only]",
+            "@App.kt:1 [text-only]",
+        ] {
+            assert!(text.contains(anchor), "missing {anchor}: {text}");
+        }
+        assert!(
+            !text.contains("package-lock.json"),
+            "lock files skipped: {text}"
+        );
+        // Code hits rank before text-only hits.
+        assert!(
+            text.find("@main.py").unwrap() < text.find("@README.md").unwrap(),
+            "{text}"
+        );
+        assert_eq!(structured["text_only_matches"], json!(4));
+
+        // Edit a text file, then query: the new content is visible.
+        std::fs::write(dir.join("README.md"), "Renamed to account_table.\n").unwrap();
+        let (text, _) = search_text(&server, "account_table", false, None);
+        assert!(text.contains("@README.md:1 [text-only]"), "{text}");
+        let (text, _) = search_text(&server, "read user_table", false, None);
+        assert!(!text.contains("README.md"), "stale text hit: {text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_text_only_covers_common_config_types() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("main.py"), "x = 1\n").unwrap();
+        let files = [
+            "Cargo.toml",
+            "pyproject.toml",
+            "config.toml",
+            "setup.cfg",
+            "app.ini",
+            "nginx.conf",
+            "app.properties",
+            ".env",
+            ".env.local",
+            "ci.yml",
+            "build.gradle.kts",
+            "Dockerfile",
+            "Makefile",
+            "run.sh",
+            "api.proto",
+            "schema.graphql",
+            "data.csv",
+        ];
+        for name in files {
+            std::fs::write(dir.join(name), "marker_value_42\n").unwrap();
+        }
+        std::fs::write(dir.join("Cargo.lock"), "marker_value_42\n").unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = true;
+        let (text, _) = search_text(&server, "marker_value_42", false, None);
+        for name in files {
+            let anchor = format!("@{name}:1");
+            assert!(text.contains(&anchor), "missing {anchor}: {text}");
+        }
+        assert!(text.contains("@Cargo.toml:1 [text-only]"), "{text}");
+        assert!(
+            !text.contains("Cargo.lock"),
+            "Cargo.lock must be skipped: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_case_rules_and_override() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("main.py"), "def LoadUser():\n    pass\n").unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = true;
+
+        // Literal default: case-insensitive.
+        assert!(search_text(&server, "loaduser", false, None)
+            .0
+            .contains("@main.py:1"));
+        // Literal forced case-sensitive.
+        assert!(!search_text(&server, "loaduser", false, Some(true))
+            .0
+            .contains("@main.py:1"));
+        // Regex default: case-sensitive.
+        assert!(!search_text(&server, "load.ser", true, None)
+            .0
+            .contains("@main.py:1"));
+        // Regex forced case-insensitive.
+        assert!(search_text(&server, "load.ser", true, Some(false))
+            .0
+            .contains("@main.py:1"));
+        // Literal special characters are escaped, not treated as regex.
+        assert!(!search_text(&server, "Load.ser", false, None)
+            .0
+            .contains("@main.py:1"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4632,6 +4863,7 @@ mod tests {
             query: "nonexistent".into(),
             regex: false,
             path_filter: None,
+            case_sensitive: None,
             budget_tokens: 2500,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
@@ -4694,7 +4926,7 @@ mod tests {
     fn tool_descriptions_declare_indexed_languages_boundary() {
         let server = ready_server();
         let tools = server.listed_tools();
-        for name in &["search_code", "find_symbol", "resolve_context"] {
+        for name in &["find_symbol", "resolve_context"] {
             let tool = tools.iter().find(|t| t.name == *name).expect(name);
             let desc = tool.description.as_deref().unwrap_or("");
             assert!(
@@ -4702,5 +4934,13 @@ mod tests {
                 "{name} description missing indexed languages notice: {desc}"
             );
         }
+        // search_code also covers non-indexed text files and says so.
+        let tool = tools.iter().find(|t| t.name == "search_code").unwrap();
+        let desc = tool.description.as_deref().unwrap_or("");
+        assert!(desc.contains("[text-only]"), "{desc}");
+        assert!(
+            desc.contains("literal is case-insensitive, regex is case-sensitive"),
+            "{desc}"
+        );
     }
 }

@@ -865,10 +865,16 @@ impl EventFeed for NotifyFeed {
         match self.rx.recv_timeout(timeout) {
             Ok(Ok(ev)) => {
                 let overflow = self.overflow.swap(false, Ordering::SeqCst) || ev.need_rescan();
-                Ok(FeedWake::Events {
-                    paths: ev.paths,
-                    overflow,
-                })
+                // Read-only access (open / close-nowrite / read) never changes
+                // content. Our own scans, rebuilds and search reads generate a
+                // constant stream of these on inotify; treating them as
+                // suspects kept untouched repos permanently "stale".
+                let paths = if is_content_event(&ev.kind) {
+                    ev.paths
+                } else {
+                    Vec::new()
+                };
+                Ok(FeedWake::Events { paths, overflow })
             }
             Ok(Err(_)) => Ok(FeedWake::Error),
             Err(e) => {
@@ -882,6 +888,18 @@ impl EventFeed for NotifyFeed {
                 }
             }
         }
+    }
+}
+
+/// Whether a notify event can reflect a content / tree change. Pure
+/// access events (open, read, close without write) are dropped; a
+/// close-after-write is kept because it marks a completed write.
+fn is_content_event(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        notify::EventKind::Access(_) => false,
+        _ => true,
     }
 }
 
@@ -2088,6 +2106,68 @@ mod tests {
             safety_phase_offset(Duration::from_nanos(1), 0),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn read_only_access_events_are_not_content_events() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
+        use notify::EventKind;
+        assert!(!is_content_event(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!is_content_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!is_content_event(&EventKind::Access(AccessKind::Read)));
+        assert!(is_content_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(is_content_event(&EventKind::Modify(ModifyKind::Any)));
+        assert!(is_content_event(&EventKind::Create(CreateKind::File)));
+    }
+
+    /// Regression: reading files in an untouched tree (our own scans,
+    /// rebuilds and search reads) must not leave suspects behind, or the
+    /// query barrier reports a permanently stale index.
+    #[test]
+    fn reading_untouched_tree_leaves_no_suspects() {
+        let dir = TestDir::new();
+        for i in 0..20 {
+            dir.write(&format!("f{i}.rs"), "fn a() {}");
+        }
+        // Long debounce: directed checks never run, so any noted suspect
+        // would stay visible.
+        let w = watcher(&dir).debounce(Duration::from_secs(60));
+        let (_rx, handle, log) = w.spawn_with_log();
+        let start = Instant::now();
+        while !log.is_seeded() {
+            assert!(start.elapsed() < Duration::from_secs(5), "never seeded");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let since = log.watermark();
+        thread::sleep(Duration::from_millis(100));
+        for _ in 0..3 {
+            for i in 0..20 {
+                let _ = fs::read_to_string(dir.path().join(format!("f{i}.rs")));
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            log.suspect_paths(since).is_empty(),
+            "reads produced suspects: {:?}",
+            log.suspect_paths(since)
+        );
+        // Sanity: a real write is still noted.
+        dir.write("f0.rs", "fn b() {}");
+        let start = Instant::now();
+        while log.suspect_paths(since).is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "write was not noted as a suspect"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.stop();
     }
 
     #[test]
