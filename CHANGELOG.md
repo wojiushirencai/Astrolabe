@@ -7,6 +7,7 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 ## [Unreleased]
 
 - TS/TSX 符号抽取补全：`type X = {…}` 别名里的成员、enum 成员、字符串/数字键的方法与字段（`"~standard"`、`"name"() {}`、`200:`）现在可被 find_symbol 查到；参数注解、`as {…}` 断言、泛型实参里的内联对象类型成员不计入。
+- fix(dart): 符号抽取补齐构造函数（按类名索引）、字段/顶层变量、枚举值、extension / extension type、typedef、operator、mixin application 类；provider find_symbol 召回 96% → 100%。
 
 ## [0.10.1] - 2026-10-12
 

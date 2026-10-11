@@ -272,6 +272,8 @@ fn extract_symbols(
         }
         let (name, kind) = if lang == Language::CSharp {
             csharp_symbol_name(definition_node, name, kind, source)
+        } else if lang == Language::Dart && definition_node.kind() == "operator_signature" {
+            (dart_operator_name(definition_node, source), kind)
         } else {
             (name.to_owned(), kind)
         };
@@ -397,6 +399,26 @@ fn extract_named_captures(
 /// the query pack. Field / Variable (and any other kind the pack has not yet
 /// wired) are filled in locally so a concurrent query update cannot drop the
 /// new categories on the floor.
+/// Dart `operator_signature` has no name field (`operator []` is two
+/// anonymous tokens), so render `operator <tokens>` from the children between
+/// the `operator` keyword and the parameter list.
+fn dart_operator_name(node: tree_sitter::Node<'_>, source: &str) -> String {
+    let mut cursor = node.walk();
+    let mut seen_keyword = false;
+    let mut op = String::new();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "formal_parameter_list" {
+            break;
+        }
+        if seen_keyword {
+            op.push_str(child.utf8_text(source.as_bytes()).unwrap_or("").trim());
+        } else if child.kind() == "operator" {
+            seen_keyword = true;
+        }
+    }
+    format!("operator {op}")
+}
+
 /// C# members whose identifier alone is not the symbol name language
 /// servers report (`operator +`, `implicit operator string`), and `const`
 /// fields, which the query reports as plain fields.
@@ -1638,6 +1660,70 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
     #[ignore = "真实语料符号召回验收；使用 cargo test -- --ignored 运行"]
     fn typescript_symbol_recall() {
         run_symbol_recall(RecallLang::TypeScript);
+    }
+
+    #[test]
+    fn dart_full_declaration_coverage() {
+        let src = "typedef Cb = void Function(int);\ntypedef void Old(int x);\nconst top = 1, top2 = 2;\nint topLate;\nenum Color { red, green }\nmixin M on Object { int mf = 0; }\nextension Ext on String { int get len2 => length; }\nextension type ET(int v) { void m() {} }\nclass A {\n  static const k = 1;\n  final int x, y;\n  abstract int af;\n  A(this.x, this.y);\n  const A.c(this.x, this.y);\n  factory A.f() => A(1, 2);\n  A operator +(A o) => this;\n  A operator [](int i) => this;\n}\nclass D = B with M;\n";
+        let parsed = ParserPool::new()
+            .parse(Language::Dart, &RelPath::new("lib/a.dart"), src)
+            .expect("parse");
+        let got: Vec<(String, SymbolKind, u32)> = parsed
+            .symbols
+            .iter()
+            .map(|s| (s.name.clone(), s.kind, s.start_line))
+            .collect();
+        let has = |name: &str, kind: SymbolKind, line: u32| {
+            assert!(
+                got.contains(&(name.to_owned(), kind, line)),
+                "missing {name} {kind:?} @{line} in {got:?}"
+            );
+        };
+        has("Cb", SymbolKind::Type, 1);
+        has("Old", SymbolKind::Type, 2);
+        has("top", SymbolKind::Variable, 3);
+        has("top2", SymbolKind::Variable, 3);
+        has("topLate", SymbolKind::Variable, 4);
+        has("red", SymbolKind::Field, 5);
+        has("green", SymbolKind::Field, 5);
+        has("mf", SymbolKind::Field, 6);
+        has("Ext", SymbolKind::Class, 7);
+        has("ET", SymbolKind::Class, 8);
+        has("k", SymbolKind::Field, 10);
+        has("x", SymbolKind::Field, 11);
+        has("y", SymbolKind::Field, 11);
+        has("af", SymbolKind::Field, 12);
+        has("A", SymbolKind::Method, 13);
+        has("A", SymbolKind::Method, 14);
+        has("c", SymbolKind::Method, 14);
+        has("A", SymbolKind::Method, 15);
+        has("f", SymbolKind::Method, 15);
+        has("operator +", SymbolKind::Method, 16);
+        has("operator []", SymbolKind::Method, 17);
+        has("D", SymbolKind::Class, 19);
+    }
+
+    #[test]
+    fn dart_reparse_after_edit_picks_up_new_constructor() {
+        let pool = ParserPool::new();
+        let path = RelPath::new("lib/p.dart");
+        let before = pool
+            .parse(Language::Dart, &path, "class P {\n  P();\n}\n")
+            .expect("parse");
+        let count = |f: &ParsedFile| f.symbols.iter().filter(|s| s.name == "P").count();
+        assert_eq!(count(&before), 2);
+        let after = pool
+            .parse(
+                Language::Dart,
+                &path,
+                "class P {\n  P();\n  P.value(int v);\n}\n",
+            )
+            .expect("parse");
+        assert_eq!(count(&after), 3);
+        assert!(after
+            .symbols
+            .iter()
+            .any(|s| s.name == "value" && s.start_line == 3));
     }
 
     #[test]
