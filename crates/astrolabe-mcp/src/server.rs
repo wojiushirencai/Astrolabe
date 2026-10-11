@@ -30,6 +30,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::loop_guard::{LoopGuard, Verdict};
 use crate::{
     context::ClientContext,
     index::RepoIndex,
@@ -406,6 +407,7 @@ pub struct AstrolabeServer {
     cache_budget_bytes: u64,
     context: ClientContext,
     structured_output: bool,
+    loop_guard: Arc<Mutex<LoopGuard>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -508,6 +510,7 @@ impl AstrolabeServer {
             cache_budget_bytes = budget_bytes,
             "configured bounded file cache"
         );
+        let loop_guard_config = knobs.loop_guard;
         let primary = RootSession::new(root.clone(), knobs, budget_bytes);
         Self {
             root: primary.root.clone(),
@@ -519,6 +522,7 @@ impl AstrolabeServer {
             next_resource: Arc::new(AtomicU64::new(1)),
             context,
             structured_output,
+            loop_guard: Arc::new(Mutex::new(LoopGuard::new(loop_guard_config))),
             tool_router: Self::tool_router(),
         }
     }
@@ -645,6 +649,36 @@ impl AstrolabeServer {
         }
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
+    }
+
+    /// Run a search tool through the per-connection [`LoopGuard`].
+    fn guarded(
+        &self,
+        tool: &str,
+        signature: &str,
+        run: impl FnOnce() -> CallToolResult,
+    ) -> CallToolResult {
+        let verdict = self
+            .loop_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .check(tool, signature);
+        match verdict {
+            Verdict::Run => run(),
+            Verdict::Block(text) => {
+                tracing::warn!(tool, "loop guard blocked repeated query");
+                self.finish(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            Verdict::RunWithWarning(note) => {
+                let mut result = run();
+                if let Some(first) = result.content.first_mut() {
+                    if let Some(t) = first.as_text() {
+                        *first = ContentBlock::text(format!("{}\n\n{note}", t.text));
+                    }
+                }
+                result
+            }
+        }
     }
 
     fn finish(&self, result: CallToolResult) -> CallToolResult {
@@ -1075,6 +1109,14 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> CallToolResult {
+        let signature = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
+            params.query, params.include_body, params.substring, params.kind, params.depth
+        );
+        self.guarded("find_symbol", &signature, || self.find_symbol_inner(params))
+    }
+
+    fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
         self.with_fresh_index(&params.query, |session, index| {
             // "Class/method" 路径查询（含 "/"）走层级匹配器（Serena
             // NamePathMatcher 对应物：后缀匹配/绝对路径/kind 过滤/depth 展开）。
@@ -1152,6 +1194,16 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> CallToolResult {
+        let signature = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            params.query,
+            params.path_filter.as_deref().unwrap_or(""),
+            params.regex
+        );
+        self.guarded("search_code", &signature, || self.search_code_inner(params))
+    }
+
+    fn search_code_inner(&self, params: SearchParams) -> CallToolResult {
         self.with_fresh_index(
             &Self::join_hint(&[params.path_filter.as_deref().unwrap_or(""), &params.query]),
             |session, index| {
@@ -3014,6 +3066,33 @@ mod tests {
     }
 
     #[test]
+    fn search_code_loop_guard_short_circuits_repeated_query() {
+        let (server, dir) = ready_server_with_disk();
+        *server.loop_guard.lock().unwrap() = LoopGuard::new(crate::loop_guard::LoopGuardConfig {
+            repeat_max: 2,
+            ..crate::loop_guard::LoopGuardConfig::default()
+        });
+        let call = |q: &str| {
+            let result = server.search_code(Parameters(SearchParams {
+                query: q.into(),
+                regex: false,
+                path_filter: None,
+                budget_tokens: 1000,
+            }));
+            result.content[0].as_text().unwrap().text.clone()
+        };
+        assert!(call("needle-a").contains("confidence: exact"));
+        assert!(call("needle-b").contains("confidence: exact"));
+        assert!(call("needle-a").contains("confidence: exact"));
+        let blocked = call("needle-a");
+        assert!(blocked.contains("loop guard"), "{blocked}");
+        assert!(!blocked.contains("confidence: exact"), "{blocked}");
+        assert!(call("needle-b").contains("confidence: exact"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn search_code_empty_result_states_no_match_explicitly() {
         let (server, dir) = ready_server_with_disk();
         let result = server.search_code(Parameters(SearchParams {
@@ -3248,6 +3327,12 @@ mod tests {
             safety_interval: Duration::ZERO,
             reindex_throttle: Duration::from_secs(60),
             watch_mode: Some(crate::knobs::WatchMode::Events),
+            // Polling loops in these tests legitimately repeat one query.
+            loop_guard: crate::loop_guard::LoopGuardConfig {
+                repeat_max: 0,
+                rate_max: 0,
+                ..Default::default()
+            },
             ..crate::knobs::McpKnobs::default()
         }
     }

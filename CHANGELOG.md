@@ -8,6 +8,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ### Added
 
+- **`search_code` / `find_symbol` 服务端防循环守卫。** hook 不统计 Astrolabe 自身工具，曾出现子 Agent 48 分钟内调用 `search_code` 9,055 次、在 109 条查询间轮换的死循环。现在 MCP 服务端按连接记录查询签名（工具 + 查询串 + path_filter + 选项）：同一签名在 10 分钟窗口内执行超过 3 次后不再重新搜索，改为返回“已执行过、请使用先前结果或换方法”的短提示；窗口内搜索总次数超过 300 次时在结果末尾追加循环警告。阈值可用 `ASTROLABE_SEARCH_REPEAT_MAX` / `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` / `ASTROLABE_SEARCH_RATE_MAX` / `ASTROLABE_SEARCH_RATE_WINDOW_SECS` 调整，`0` 关闭对应检查。
+
 - **`astrolabe hooks gc` 与 remind 内置过期会话 GC。** 删除 `~/.astrolabe/hook_data/` 下超过 24 小时（`ASTROLABE_HOOK_GC_HOURS` 可调；`0` 关闭 remind 中的机会式 GC）未活动的会话目录（以目录树内文件最新 mtime 判定，当前会话永不删除）。`hooks remind` 借助 `~/.astrolabe/hook_gc.stamp` 节流，每小时至多扫描一次。用于无 `SessionEnd` 事件的宿主（ZCode）与会话异常退出的兜底清理。
 
 ### Fixed
