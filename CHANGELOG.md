@@ -6,15 +6,23 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-11
+
 ### Added
 
-- **`search_code` / `find_symbol` 服务端防循环守卫。** hook 不统计 Astrolabe 自身工具，曾出现子 Agent 48 分钟内调用 `search_code` 9,055 次、在 109 条查询间轮换的死循环。现在 MCP 服务端按连接记录查询签名（工具 + 查询串 + path_filter + 选项）：同一签名在 10 分钟窗口内执行超过 3 次后不再重新搜索，改为返回“已执行过、请使用先前结果或换方法”的短提示；窗口内搜索总次数超过 300 次时在结果末尾追加循环警告。阈值可用 `ASTROLABE_SEARCH_REPEAT_MAX` / `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` / `ASTROLABE_SEARCH_RATE_MAX` / `ASTROLABE_SEARCH_RATE_WINDOW_SECS` 调整，`0` 关闭对应检查。
+- **`search_code` / `find_symbol` 服务端防循环守卫。** hook 不统计 Astrolabe 自身工具，曾出现子 Agent 48 分钟内调用 `search_code` 9,055 次、在 109 条查询间轮换的死循环。现在 MCP 服务端按连接记录查询签名（工具 + 查询串 + path_filter + 选项）：同一签名在 10 分钟窗口内执行超过 3 次后不再重新搜索，改为返回“已执行过、请使用先前结果或换方法”的短提示；窗口内搜索总次数超过 300 次时在结果末尾追加循环警告。阈值可用 `ASTROLABE_SEARCH_REPEAT_MAX` / `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` / `ASTROLABE_SEARCH_RATE_MAX` / `ASTROLABE_SEARCH_RATE_WINDOW_SECS` 调整，`0` 关闭对应检查（#34）。
 
-- **`astrolabe hooks gc` 与 remind 内置过期会话 GC。** 删除 `~/.astrolabe/hook_data/` 下超过 24 小时（`ASTROLABE_HOOK_GC_HOURS` 可调；`0` 关闭 remind 中的机会式 GC）未活动的会话目录（以目录树内文件最新 mtime 判定，当前会话永不删除）。`hooks remind` 借助 `~/.astrolabe/hook_gc.stamp` 节流，每小时至多扫描一次。用于无 `SessionEnd` 事件的宿主（ZCode）与会话异常退出的兜底清理。
+- **`astrolabe hooks gc` 与 remind 内置过期会话 GC。** 删除 `~/.astrolabe/hook_data/` 下超过 24 小时（`ASTROLABE_HOOK_GC_HOURS` 可调；`0` 关闭 remind 中的机会式 GC）未活动的会话目录（以目录树内文件最新 mtime 判定，当前会话永不删除）。`hooks remind` 借助 `~/.astrolabe/hook_gc.stamp` 节流，每小时至多扫描一次。用于无 `SessionEnd` 事件的宿主（ZCode）与会话异常退出的兜底清理（#31）。
 
 ### Fixed
 
-- **ZCode 接入文档纠正**（Refs #30）。ZCode 仅支持 7 个 hook 事件且严格校验，配置 `SessionEnd` 会导致整段 hooks 加载失败；README 与 `docs/CLIENT_ALIGNMENT.md` 改为给出 `~/.zcode/cli/config.json`（Windows `%USERPROFILE%\.zcode\cli\config.json`）的正确结构（`enabled: true` + `events` 包装层，`PreToolUse` 调用 `astrolabe hooks remind --client=zcode`），明确不配 `SessionEnd`、不在 `Stop` 上挂 cleanup，清理交由过期 GC。
+- **ZCode 接入文档纠正**（Refs #30）。ZCode 仅支持 7 个 hook 事件且严格校验，配置 `SessionEnd` 会导致整段 hooks 加载失败；README 与 `docs/CLIENT_ALIGNMENT.md` 改为给出 `~/.zcode/cli/config.json`（Windows `%USERPROFILE%\.zcode\cli\config.json`）的正确结构（`enabled: true` + `events` 包装层，`PreToolUse` 调用 `astrolabe hooks remind --client=zcode`），明确不配 `SessionEnd`、不在 `Stop` 上挂 cleanup，清理交由过期 GC（#31）。
+
+- **冷启动索引竞态导致的偶发测试失败**（#32）。文件监听已启动但首次全量扫描未完成的空档内新建的文件可能永远不进索引（`cold_build_edit_is_visible_at_ready` 偶发失败）；现在先等待首次扫描完成（最多 60 秒）再开始建索引。
+
+### Removed
+
+- **README 友情链接一节**（#33）：移除 linux.do 友情链接（该节仅此一条，标题一并删除）。
 
 ## [0.9.0] - 2026-10-08
 
