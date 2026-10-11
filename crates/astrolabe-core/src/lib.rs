@@ -30,6 +30,7 @@ pub mod resolvers;
 pub mod rewrite;
 pub mod scan;
 pub mod store;
+pub mod text_search;
 pub mod trace_tree;
 pub mod types;
 pub mod watch;

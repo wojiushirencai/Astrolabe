@@ -1224,7 +1224,7 @@ impl AstrolabeServer {
                 let mut matches = Vec::new();
                 let mut hits = 0u64;
                 let mut misses = 0u64;
-                let mut scan_file = |path: &str, tag: &str, matches: &mut Vec<String>| {
+                let mut scan_file = |path: &str, matches: &mut Vec<String>| {
                     let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
                         return;
                     };
@@ -1239,10 +1239,9 @@ impl AstrolabeServer {
                             // 单条 match 不会把 budget 一口气吃光，也不会在
                             // 大小写折叠差异上 panic。
                             matches.push(format!(
-                                "@{}:{}{} {}",
+                                "@{}:{} {}",
                                 path,
                                 line_no + 1,
-                                tag,
                                 clip_match_line(line, &params.query, Some(&matcher))
                             ));
                         }
@@ -1256,14 +1255,36 @@ impl AstrolabeServer {
                     {
                         continue;
                     }
-                    scan_file(file.path.as_str(), "", &mut matches);
+                    scan_file(file.path.as_str(), &mut matches);
                 }
                 // 非索引文本文件（md/sql/yaml/json/xml/gradle/kt/模板…）也搜，
                 // 排在代码命中之后并标注 [text-only]：它们没有符号/引用信息。
+                // ripgrep 引擎（grep-searcher）并行搜索，按输入顺序回收结果。
                 let code_matches = matches.len();
                 let text_paths = index.text_only_paths(params.path_filter.as_deref());
-                for path in &text_paths {
-                    scan_file(path.as_str(), " [text-only]", &mut matches);
+                let sensitive = params.case_sensitive.unwrap_or(params.regex);
+                if let Ok(text_matcher) = astrolabe_core::text_search::build_matcher(
+                    &params.query,
+                    params.regex,
+                    sensitive,
+                ) {
+                    let rels: Vec<&str> = text_paths.iter().map(|p| p.as_str()).collect();
+                    let found = astrolabe_core::text_search::search_files(
+                        &session.root,
+                        &rels,
+                        &text_matcher,
+                        TEXT_SEARCH_MAX_FILE_BYTES,
+                    );
+                    for (idx, file_hits) in found {
+                        for hit in file_hits {
+                            matches.push(format!(
+                                "@{}:{} [text-only] {}",
+                                rels[idx],
+                                hit.line,
+                                clip_match_line(&hit.text, &params.query, Some(&matcher))
+                            ));
+                        }
+                    }
                 }
                 let text_matches = matches.len() - code_matches;
                 session.cache_hits.fetch_add(hits, Ordering::Relaxed);
@@ -2244,6 +2265,10 @@ fn truncate_body_text(text: &str, budget_tokens: usize) -> String {
 /// 定位命中；字面量搜索用 `regex::escape(needle)` 构建 case-insensitive
 /// regex 在原串上查找。找不到 Match（极端 Unicode 折叠差异，或命中只落
 /// 在被 trim 掉的空白里）时退回行首固定窗口兜底，绝不 unwrap/panic。
+/// Size cap for text-only search, same as the scanner's default admission
+/// cap (files that grew past it after the scan are skipped).
+const TEXT_SEARCH_MAX_FILE_BYTES: u64 = 1_500_000;
+
 /// Compile the single matcher used by `search_code`.
 ///
 /// Literal queries are escaped. Default case rules: literal is
