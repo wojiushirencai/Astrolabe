@@ -26,6 +26,8 @@ pub(crate) struct RepoIndex {
     pub root: PathBuf,
     inner: InnerIndex,
     in_graph_paths: OnceLock<HashSet<String>>,
+    /// Process-unique stamp; every index replacement (edit, rebuild) gets a new one.
+    generation: u64,
 }
 
 enum InnerIndex {
@@ -47,12 +49,23 @@ impl std::fmt::Debug for RepoIndex {
     }
 }
 
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl RepoIndex {
+    /// Index generation stamp (changes whenever the index is replaced).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn from_incremental(root: PathBuf, incremental: IncrementalIndex) -> Self {
         Self {
             root,
             inner: InnerIndex::Incremental(incremental),
             in_graph_paths: OnceLock::new(),
+            generation: next_generation(),
         }
     }
 
@@ -62,6 +75,7 @@ impl RepoIndex {
             root,
             inner: InnerIndex::Static { graph, report },
             in_graph_paths: OnceLock::new(),
+            generation: next_generation(),
         }
     }
 
@@ -166,6 +180,17 @@ impl RepoIndex {
             }
             #[cfg(test)]
             InnerIndex::Static { .. } => std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Authored sources hidden by a declared build-output exclude (e.g. a
+    /// tsconfig `outDir` that still contains sources). Empty for static test
+    /// indexes.
+    pub(crate) fn excluded_source_paths(&self) -> &[astrolabe_core::types::RelPath] {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => inc.excluded_source_paths(),
+            #[cfg(test)]
+            InnerIndex::Static { .. } => &[],
         }
     }
 
