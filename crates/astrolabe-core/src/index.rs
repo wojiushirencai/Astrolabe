@@ -230,19 +230,35 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
 
 /// Scan + detect + resolver-declared excludes. Shared by the full and
 /// incremental-capable first build.
-fn discover(root: &Path, opts: &IndexOptions) -> (ScanResult, FileIndex, ResolverSet) {
+fn discover(
+    root: &Path,
+    opts: &IndexOptions,
+) -> (ScanResult, FileIndex, ResolverSet, Vec<RelPath>) {
     let scanned = scan::scan(root, &opts.scan);
     let files = scan::to_index(root, &scanned);
     let resolvers = ResolverSet::detect(&files);
-    let (scanned, files) = apply_declared_excludes(root, scanned, &resolvers);
-    (scanned, files, resolvers)
+    let (scanned, files, dropped) = apply_declared_excludes(root, scanned, &resolvers);
+    (scanned, files, resolvers, dropped)
+}
+
+/// Authored source files (TS family, not `.d.ts`) among paths dropped by
+/// declared build-output excludes. Build output never contains these, so
+/// any hit means sources went missing and must be surfaced as unindexed.
+fn dropped_sources(before: &[RelPath], after: &[RelPath]) -> Vec<RelPath> {
+    let kept: HashSet<&RelPath> = after.iter().collect();
+    before
+        .iter()
+        .filter(|p| !kept.contains(p))
+        .filter(|p| crate::resolvers::typescript::is_authored_ts(p.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn apply_declared_excludes(
     root: &Path,
     scanned: ScanResult,
     resolvers: &ResolverSet,
-) -> (ScanResult, FileIndex) {
+) -> (ScanResult, FileIndex, Vec<RelPath>) {
     // Build output can sit outside the default exclude list — Cargo's
     // `crates/*/target`, a tsconfig `outDir` like `packages/app/dist`. Only
     // `detect` knows about those, so the scan is filtered afterwards rather
@@ -251,11 +267,13 @@ fn apply_declared_excludes(
     let excludes = declared_excludes(resolvers);
     if excludes.is_empty() {
         let files = scan::to_index(root, &scanned);
-        (scanned, files)
+        (scanned, files, Vec::new())
     } else {
+        let before = scanned.files.clone();
         let scanned = scan::apply_excludes(scanned, &excludes);
+        let dropped = dropped_sources(&before, &scanned.files);
         let files = scan::to_index(root, &scanned);
-        (scanned, files)
+        (scanned, files, dropped)
     }
 }
 
@@ -652,7 +670,7 @@ fn assemble_graph(
 /// and drop the parse products. MCP (and anything else that reindexes on
 /// watcher events) should keep an [`IncrementalIndex`] instead.
 pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) {
-    let (scanned, files, resolvers) = discover(root, opts);
+    let (scanned, files, resolvers, _) = discover(root, opts);
     let mut report = IndexReport {
         files_scanned: scanned.files.len(),
         ..IndexReport::default()
@@ -685,6 +703,9 @@ pub struct IncrementalIndex {
     /// Admitted paths after resolver excludes, including non-source files
     /// (`go.mod`, `Cargo.toml`, …) that resolvers need in [`FileIndex`].
     files: Vec<RelPath>,
+    /// Authored sources dropped by declared build-output excludes; reported
+    /// as unindexed so an empty result is never mistaken for full coverage.
+    excluded_sources: Vec<RelPath>,
     products: ParseProductCache,
     /// Parse failures for files not re-read on the next apply.
     failures: Vec<(RelPath, String)>,
@@ -703,7 +724,7 @@ impl std::fmt::Debug for IncrementalIndex {
 impl IncrementalIndex {
     /// Full index, retaining parse products for later [`Self::apply_changeset`].
     pub fn build(root: &Path, opts: &IndexOptions) -> Self {
-        let (scanned, files, resolvers) = discover(root, opts);
+        let (scanned, files, resolvers, excluded_sources) = discover(root, opts);
         let mut report = IndexReport {
             files_scanned: scanned.files.len(),
             ..IndexReport::default()
@@ -717,6 +738,7 @@ impl IncrementalIndex {
             graph,
             report,
             files: scanned.files,
+            excluded_sources,
             products,
             failures,
         }
@@ -737,6 +759,11 @@ impl IncrementalIndex {
     /// (`go.mod`, `Cargo.toml`, …) that resolvers need in [`FileIndex`].
     pub fn admitted_paths(&self) -> &[RelPath] {
         &self.files
+    }
+
+    /// Authored source files hidden by a declared build-output exclude.
+    pub fn excluded_source_paths(&self) -> &[RelPath] {
+        &self.excluded_sources
     }
 
     #[cfg(test)]
@@ -779,7 +806,17 @@ pub fn index_repo_incremental(
     };
     let file_index = scan::to_index(root, &scanned);
     let resolvers = ResolverSet::detect(&file_index);
-    let (scanned, file_index) = apply_declared_excludes(root, scanned, &resolvers);
+    let (scanned, file_index, newly_dropped) = apply_declared_excludes(root, scanned, &resolvers);
+    let mut excluded_sources: BTreeSet<RelPath> = previous
+        .excluded_sources
+        .iter()
+        .filter(|p| !changes.removed.contains(p))
+        .cloned()
+        .collect();
+    excluded_sources.extend(newly_dropped);
+    for p in &scanned.files {
+        excluded_sources.remove(p);
+    }
 
     let mut report = IndexReport {
         files_scanned: scanned.files.len(),
@@ -859,6 +896,7 @@ pub fn index_repo_incremental(
         graph,
         report,
         files: scanned.files,
+        excluded_sources: excluded_sources.into_iter().collect(),
         products,
         failures,
     }
@@ -1370,6 +1408,62 @@ mod tests {
         assert_graphs_equivalent(&inc.graph, &next.graph);
         assert_graphs_equivalent(&full, &next.graph);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ts_out_dir_dot_keeps_sources_indexed_after_edit() {
+        // zod: packages/zod/tsconfig.build.json has `"outDir": "."`.
+        let root = scratch("ts-outdir-dot");
+        write(
+            &root,
+            "packages/zod/tsconfig.build.json",
+            r#"{"compilerOptions": {"outDir": "."}}"#,
+        );
+        write(
+            &root,
+            "packages/zod/src/v4/classic/errors.ts",
+            "export class ZodError extends Error {}\n",
+        );
+        let opts = with_calls();
+        let inc = IncrementalIndex::build(&root, &opts);
+        assert!(
+            inc.graph.symbols.iter().any(|s| s.name == "ZodError"),
+            "outDir \".\" must not drop the package's sources"
+        );
+        assert!(inc.excluded_source_paths().is_empty());
+
+        // Edit then query: the new symbol is visible after the changeset.
+        write(
+            &root,
+            "packages/zod/src/v4/classic/errors.ts",
+            "export class ZodError extends Error {}\nexport class ZodRealError extends ZodError {}\n",
+        );
+        let inc = inc.apply_changeset(
+            &root,
+            &ChangeSet {
+                modified: vec![RelPath::new("packages/zod/src/v4/classic/errors.ts")],
+                ..ChangeSet::default()
+            },
+            &opts,
+        );
+        assert!(inc.graph.symbols.iter().any(|s| s.name == "ZodRealError"));
+        assert!(inc.excluded_source_paths().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dropped_sources_reports_only_authored_ts() {
+        let before = vec![
+            RelPath::new("app/dist/main.js"),
+            RelPath::new("app/dist/main.d.ts"),
+            RelPath::new("app/dist/leak.ts"),
+            RelPath::new("app/src/main.ts"),
+        ];
+        let after = vec![RelPath::new("app/src/main.ts")];
+        assert_eq!(
+            dropped_sources(&before, &after),
+            vec![RelPath::new("app/dist/leak.ts")]
+        );
     }
 
     #[test]

@@ -2111,8 +2111,23 @@ impl AstrolabeServer {
                 body.push_str(&format!("{omitted} 种语言因 budget_tokens 被省略。\n"));
             }
             let unindexed = index.unindexed_code_exts(None);
-            if unindexed.is_empty() {
+            let excluded = index.excluded_source_paths();
+            if !excluded.is_empty() {
+                let sample = excluded
+                    .iter()
+                    .take(3)
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                body.push_str(&format!(
+                    "build-output-excluded source files: {} (e.g. {sample}; 被构建输出排除规则排除，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
+                    excluded.len()
+                ));
+            }
+            if unindexed.is_empty() && excluded.is_empty() {
                 body.push_str("unindexed source files: none\n");
+            } else if unindexed.is_empty() {
+                body.push_str("unindexed source files: none in unsupported languages\n");
             } else {
                 let mut list: Vec<(&String, &u32)> = unindexed.iter().collect();
                 list.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));

@@ -6,6 +6,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+- **修复 TS `outDir` 误排除源码。** tsconfig `outDir` 等于/包含配置目录或 `rootDir`、或其中仍有 `.ts` 源文件时不再当作构建产物排除（zod 的 `"outDir": "."` 曾让 332 个源文件从索引消失）；被构建输出规则排除的源文件会在 `get_languages` 中列出，不再显示 `unindexed source files: none`。
+
 ## [0.10.0] - 2026-10-11
 
 ### Added

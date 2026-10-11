@@ -121,6 +121,17 @@ impl RepoIndex {
         }
     }
 
+    /// Authored sources hidden by a declared build-output exclude (e.g. a
+    /// tsconfig `outDir` that still contains sources). Empty for static test
+    /// indexes.
+    pub(crate) fn excluded_source_paths(&self) -> &[astrolabe_core::types::RelPath] {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => inc.excluded_source_paths(),
+            #[cfg(test)]
+            InnerIndex::Static { .. } => &[],
+        }
+    }
+
     /// Load source lines through the process-wide [`FileCache`].
     ///
     /// The current mtime is always passed to [`FileCache::get`], so an edited
