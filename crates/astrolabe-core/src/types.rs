@@ -92,10 +92,32 @@ pub enum Language {
     VisualBasic,
 }
 
+/// Cheap textual check for C++-only constructs in a header.
+fn header_looks_cpp(source: &str) -> bool {
+    const LEADING: &[&str] = &[
+        "class ",
+        "namespace ",
+        "template",
+        "using namespace",
+        "public:",
+        "private:",
+        "protected:",
+    ];
+    const ANYWHERE: &[&str] = &["::", "nullptr", "constexpr ", "extern \"C++\""];
+    source.lines().any(|line| {
+        let line = line.trim_start();
+        if line.starts_with("//") || line.starts_with('*') || line.starts_with("/*") {
+            return false;
+        }
+        LEADING.iter().any(|m| line.starts_with(m)) || ANYWHERE.iter().any(|m| line.contains(m))
+    })
+}
+
 impl Language {
     /// Language implied by a file extension, if any.
     pub fn from_path(p: &RelPath) -> Option<Self> {
-        Some(match p.extension()? {
+        let ext = p.extension()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
             "py" | "pyi" => Language::Python,
             "go" => Language::Go,
             "java" => Language::Java,
@@ -104,7 +126,8 @@ impl Language {
             "tsx" => Language::Tsx,
             "js" | "mjs" | "cjs" | "jsx" => Language::JavaScript,
             "c" | "h" => Language::C,
-            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "ipp" => Language::Cpp,
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ipp" | "inl" | "tpp"
+            | "tcc" | "cu" | "cuh" | "cppm" | "ixx" => Language::Cpp,
             "m" => Language::ObjC,
             "mm" => Language::ObjCpp,
             "swift" => Language::Swift,
@@ -117,6 +140,19 @@ impl Language {
             "vb" => Language::VisualBasic,
             _ => return None,
         })
+    }
+
+    /// Like [`Language::from_path`], but a `.h` header whose text uses C++
+    /// constructs (`class`, `namespace`, `template<`, `::`, …) is C++.
+    pub fn from_path_and_source(p: &RelPath, source: &str) -> Option<Self> {
+        let lang = Self::from_path(p)?;
+        if lang == Language::C
+            && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h"))
+            && header_looks_cpp(source)
+        {
+            return Some(Language::Cpp);
+        }
+        Some(lang)
     }
 
     /// Parse a canonical language name (`"python"`, `"c++"`, `"objc"`, …).
@@ -508,6 +544,49 @@ pub struct CodeEdge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extensions_are_case_insensitive_and_cover_cpp_variants() {
+        for (path, lang) in [
+            ("A.CPP", Language::Cpp),
+            ("Main.Java", Language::Java),
+            ("x.PY", Language::Python),
+            ("a.inl", Language::Cpp),
+            ("a.tpp", Language::Cpp),
+            ("k.cu", Language::Cpp),
+            ("m.cppm", Language::Cpp),
+            ("m.ixx", Language::Cpp),
+            ("a.hh", Language::Cpp),
+            ("a.HXX", Language::Cpp),
+            ("a.H", Language::C),
+        ] {
+            assert_eq!(
+                Language::from_path(&RelPath::new(path)),
+                Some(lang),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_language_follows_content() {
+        let h = RelPath::new("inc/w.h");
+        assert_eq!(
+            Language::from_path_and_source(&h, "#pragma once\nint add(int a, int b);\n"),
+            Some(Language::C)
+        );
+        assert_eq!(
+            Language::from_path_and_source(
+                &h,
+                "#pragma once\nnamespace w {\nclass Widget {};\n}\n"
+            ),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            Language::from_path_and_source(&h, "// this class:: is just a comment\nint f(void);\n"),
+            Some(Language::C)
+        );
+    }
 
     #[test]
     fn language_from_path_and_name_cover_p0_matrix() {

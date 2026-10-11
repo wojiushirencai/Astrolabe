@@ -228,6 +228,18 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
     .collect()
 }
 
+/// Source-language files the scanner dropped for exceeding the size cap.
+fn too_large_sources(scanned: &ScanResult) -> Vec<RelPath> {
+    scanned
+        .skipped
+        .iter()
+        .filter(|(path, reason)| {
+            *reason == scan::SkipReason::TooLarge && Language::from_path(path).is_some()
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// Scan + detect + resolver-declared excludes. Shared by the full and
 /// incremental-capable first build.
 fn discover(
@@ -287,7 +299,7 @@ fn parse_one(
     cache_hits: &AtomicUsize,
 ) -> Option<ParsedRow> {
     let language = Language::from_path(path)?;
-    let source = match std::fs::read_to_string(root.join(path.as_str())) {
+    let source = match crate::text::read_source(&root.join(path.as_str())) {
         Ok(source) => source,
         Err(error) => {
             failures
@@ -297,6 +309,7 @@ fn parse_one(
             return None;
         }
     };
+    let language = Language::from_path_and_source(path, &source).unwrap_or(language);
     let (sha, loc) = digest(&source);
     let cache_key = store::parse_cache_key(language, &sha);
 
@@ -673,6 +686,7 @@ pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) 
     let (scanned, files, resolvers, _) = discover(root, opts);
     let mut report = IndexReport {
         files_scanned: scanned.files.len(),
+        too_large: too_large_sources(&scanned),
         ..IndexReport::default()
     };
     let outcome = parse_paths(root, &scanned.files, opts);
@@ -727,6 +741,7 @@ impl IncrementalIndex {
         let (scanned, files, resolvers, excluded_sources) = discover(root, opts);
         let mut report = IndexReport {
             files_scanned: scanned.files.len(),
+            too_large: too_large_sources(&scanned),
             ..IndexReport::default()
         };
         let outcome = parse_paths(root, &scanned.files, opts);
@@ -818,8 +833,17 @@ pub fn index_repo_incremental(
         excluded_sources.remove(p);
     }
 
+    let admitted: HashSet<&RelPath> = scanned.files.iter().collect();
+    let too_large = previous
+        .report
+        .too_large
+        .iter()
+        .filter(|path| !changes.removed.contains(path) && !admitted.contains(path))
+        .cloned()
+        .collect();
     let mut report = IndexReport {
         files_scanned: scanned.files.len(),
+        too_large,
         ..IndexReport::default()
     };
 
@@ -986,7 +1010,93 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_and_cpp_header_files_are_indexed() {
+        let root = scratch("enc");
+        let (gbk, _, _) =
+            encoding_rs::GBK.encode("# 中文注释：计算总和\ndef gbk_func():\n    return '你好'\n");
+        let p = root.join("legacy.py");
+        std::fs::write(&p, gbk.as_ref()).unwrap();
+        std::fs::write(
+            root.join("latin.py"),
+            b"# caf\xe9\ndef latin_func():\n    pass\n",
+        )
+        .unwrap();
+        write(
+            &root,
+            "inc/widget.h",
+            "#pragma once\nnamespace ui {\nclass Widget {\npublic:\n  void draw();\n};\n}\n",
+        );
+        write(&root, "inc/plain.h", "int plain_add(int a, int b);\n");
+
+        let opts = IndexOptions::default();
+        let inc = IncrementalIndex::build(&root, &opts);
+        let names: Vec<&str> = inc.graph.symbols.iter().map(|s| s.name.as_str()).collect();
+        for need in ["gbk_func", "latin_func", "Widget", "plain_add"] {
+            assert!(names.contains(&need), "missing {need}: {names:?}");
+        }
+        assert!(
+            inc.report.parse_failures.is_empty(),
+            "{:?}",
+            inc.report.parse_failures
+        );
+        let lang_of = |path: &str| {
+            inc.graph
+                .files
+                .iter()
+                .find(|f| f.path.as_str() == path)
+                .and_then(|f| f.language)
+        };
+        assert_eq!(lang_of("inc/widget.h"), Some(Language::Cpp));
+        assert_eq!(lang_of("inc/plain.h"), Some(Language::C));
+
+        // Edit the GBK file, then query again: the new symbol must appear.
+        let (gbk2, _, _) = encoding_rs::GBK.encode(
+            "# 中文注释：计算总和\ndef gbk_func():\n    return 1\n\ndef gbk_added():\n    pass\n",
+        );
+        std::fs::write(&p, gbk2.as_ref()).unwrap();
+        let changes = ChangeSet {
+            modified: vec![RelPath::new("legacy.py")],
+            ..ChangeSet::default()
+        };
+        let next = inc.apply_changeset(&root, &changes, &opts);
+        assert!(
+            next.graph.symbols.iter().any(|s| s.name == "gbk_added"),
+            "edited non-UTF-8 file must be re-indexed"
+        );
+    }
+
+    #[test]
+    fn oversized_sources_are_reported_and_survive_incremental_apply() {
+        let root = scratch("big");
+        write(&root, "small.py", "def small():\n    pass\n");
+        write(&root, "huge.py", &"x = 1\n".repeat(400_000));
+        write(&root, "huge.txt", &"x\n".repeat(1_000_000));
+        let opts = IndexOptions::default();
+        let inc = IncrementalIndex::build(&root, &opts);
+        assert_eq!(inc.report.too_large, vec![RelPath::new("huge.py")]);
+
+        write(&root, "small.py", "def small():\n    return 2\n");
+        let changes = ChangeSet {
+            modified: vec![RelPath::new("small.py")],
+            ..ChangeSet::default()
+        };
+        let next = inc.apply_changeset(&root, &changes, &opts);
+        assert_eq!(next.report.too_large, vec![RelPath::new("huge.py")]);
+        let gone = ChangeSet {
+            removed: vec![RelPath::new("huge.py")],
+            ..ChangeSet::default()
+        };
+        assert!(next
+            .apply_changeset(&root, &gone, &opts)
+            .report
+            .too_large
+            .is_empty());
+    }
+
+    #[test]
     fn indexes_a_repo_end_to_end() {
+        // (see also non_utf8_and_cpp_header_files_are_indexed)
+
         let root = scratch("e2e");
         write(&root, "go.mod", "module example.com/app\n");
         write(
