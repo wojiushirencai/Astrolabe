@@ -80,6 +80,13 @@
 (method_definition
   name: [(property_identifier) (private_property_identifier)] @name) @definition.method
 
+;; String-literal method names: `{ "no rest (valid)"() {} }`, `'a-b'(): void`.
+(method_definition
+  name: (string (string_fragment) @name)) @definition.method
+
+(method_signature
+  name: (string (string_fragment) @name)) @definition.method
+
 ;; Interface members and overload signatures inside classes.
 (method_signature
   name: [(property_identifier) (private_property_identifier)] @name) @definition.method
@@ -262,6 +269,39 @@
   body: (interface_body
     (property_signature
       name: [(property_identifier) (private_property_identifier)] @name) @definition.field))
+
+(interface_declaration
+  body: (interface_body
+    (property_signature
+      name: (string (string_fragment) @name)) @definition.field))
+
+;; Members of object types anywhere inside a `type X = …` alias
+;; (`type A = { a: T }`, `type L = null | { next: L }`, nested literals).
+;; Object types elsewhere (parameter annotations, `as { x }` casts, generic
+;; arguments) are dropped in Rust: only aliases and interfaces are kept.
+(object_type
+  (property_signature
+    name: [
+      (property_identifier) @name
+      (string (string_fragment) @name)
+      (number) @name
+    ]) @definition.field)
+
+;; ---------------------------------------------------------- enum members
+;; `enum E { A, B = 1, "c-d" = 2 }`
+(enum_body
+  name: (property_identifier) @name @definition.field)
+
+(enum_body
+  (enum_assignment
+    name: [
+      (property_identifier) @name
+      (string (string_fragment) @name)
+    ]) @definition.field)
+
+;; String-named class fields: `"~standard": T;`.
+(public_field_definition
+  name: (string (string_fragment) @name)) @definition.field
 
 ;; Class fields that are not methods. `onClick = (e) => {}` is captured as
 ;; a method above via an explicit function-value list; this allow-list is
