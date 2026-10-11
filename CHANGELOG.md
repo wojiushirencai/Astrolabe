@@ -6,6 +6,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+- **`search_code` 覆盖非索引文本文件、新增 `case_sensitive`；空闲仓库不再常驻“索引可能过期”。** 索引代码之后继续搜索扫描到的其他文本文件（md/sql/yaml/json/xml/gradle/kt/模板等，遵守 gitignore/大小/二进制限制，跳过 lock 文件），命中标 `[text-only]` 并排在代码命中之后；工具描述写明大小写规则（字面不区分、正则区分）。watcher 忽略只读访问事件（open/close-nowrite），此前 Astrolabe 自己读文件就会产生疑点，导致 gson/Polly 等未改动仓库一直报过期；屏障等待校验超时（2 秒）时也会追加过期提示。
+
 ## [0.10.0] - 2026-10-11
 
 ### Added

@@ -15,6 +15,7 @@ use std::{
 use astrolabe_core::cache::FileCache;
 use astrolabe_core::graph::CodeGraph;
 use astrolabe_core::index::IncrementalIndex;
+use astrolabe_core::types::RelPath;
 use astrolabe_core::{CodeFile, FileId, IndexReport};
 
 use crate::reindex::mcp_index_options;
@@ -121,6 +122,36 @@ impl RepoIndex {
         }
     }
 
+    /// Scanned text files that are not in the code graph (docs, config,
+    /// SQL, templates, unsupported languages …), filtered by the
+    /// `path_filter` substring. These already passed the scanner's
+    /// gitignore / size / binary gates. Lock files are skipped: they are
+    /// large, generated, and drown real hits.
+    pub(crate) fn text_only_paths(&self, filter: Option<&str>) -> Vec<&RelPath> {
+        match &self.inner {
+            InnerIndex::Incremental(inc) => {
+                let in_graph_set = self.in_graph_paths.get_or_init(|| {
+                    self.graph()
+                        .files
+                        .iter()
+                        .map(|file| file.path.as_str().to_owned())
+                        .collect()
+                });
+                inc.admitted_paths()
+                    .iter()
+                    .filter(|path| {
+                        let s = path.as_str();
+                        filter.is_none_or(|f| s.contains(f))
+                            && !in_graph_set.contains(s)
+                            && !is_lock_file(s)
+                    })
+                    .collect()
+            }
+            #[cfg(test)]
+            InnerIndex::Static { .. } => Vec::new(),
+        }
+    }
+
     /// Load source lines through the process-wide [`FileCache`].
     ///
     /// The current mtime is always passed to [`FileCache::get`], so an edited
@@ -156,6 +187,29 @@ impl RepoIndex {
             .min_by_key(|file| file.path.as_str().len())
             .map(|file| file.id)
     }
+}
+
+/// Generated dependency lock files excluded from text-only search.
+fn is_lock_file(path: &str) -> bool {
+    const LOCKS: &[&str] = &[
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "Cargo.lock",
+        "go.sum",
+        "poetry.lock",
+        "Pipfile.lock",
+        "uv.lock",
+        "composer.lock",
+        "Gemfile.lock",
+        "pubspec.lock",
+        "Podfile.lock",
+        "packages.lock.json",
+    ];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    LOCKS.contains(&name)
 }
 
 /// Read a source file through [`FileCache`], keyed by repo-relative path.

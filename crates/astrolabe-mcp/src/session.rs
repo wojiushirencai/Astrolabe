@@ -379,8 +379,13 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
         BarrierDecision::Repair(paths) if paths.is_empty() => {
             let before = log.watermark();
             log.request_verification();
-            wait_watermark_advance(&log, before, Duration::from_secs(2));
-            BarrierEffect::None
+            if wait_watermark_advance(&log, before, BARRIER_VERIFY_WAIT) {
+                BarrierEffect::None
+            } else {
+                // The verification scan did not finish in time: we answer
+                // from an unverified index, so say so instead of staying silent.
+                BarrierEffect::StaleNote(verification_timeout_note())
+            }
         }
         BarrierDecision::Repair(paths) => {
             inline_repair(session, paths);
@@ -393,9 +398,23 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
     }
 }
 
-fn wait_watermark_advance(log: &FreshnessLog, before: Instant, timeout: Duration) {
+/// How long a `Repair([])` barrier waits for the requested full check.
+const BARRIER_VERIFY_WAIT: Duration = Duration::from_secs(2);
+
+pub(crate) fn verification_timeout_note() -> String {
+    "索引可能过期：变更校验未在 2 秒内完成，本结果基于未确认的索引。confidence: unknown".to_string()
+}
+
+/// Returns `true` when the watermark advanced before `timeout`.
+fn wait_watermark_advance(log: &FreshnessLog, before: Instant, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while log.watermark() == before && Instant::now() < deadline {
+    loop {
+        if log.watermark() != before {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -575,6 +594,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    #[test]
+    fn verification_wait_reports_timeout() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        let (_rx, handle, log) = Watcher::new(dir.clone()).events(false).spawn_with_log();
+        let start = Instant::now();
+        while !log.is_seeded() {
+            assert!(start.elapsed() < Duration::from_secs(5), "never seeded");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Live watcher: a requested verification advances the watermark.
+        let before = log.watermark();
+        log.request_verification();
+        assert!(wait_watermark_advance(&log, before, Duration::from_secs(5)));
+        // Stopped watcher: nobody advances it, the wait must report timeout.
+        handle.stop();
+        let before = log.watermark();
+        log.request_verification();
+        assert!(!wait_watermark_advance(
+            &log,
+            before,
+            Duration::from_millis(50)
+        ));
+        assert!(verification_timeout_note().contains("索引可能过期"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
