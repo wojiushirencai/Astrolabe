@@ -275,6 +275,9 @@ fn start_watching(session: &Arc<RootSession>, mode: WatchMode) {
                     removed = changes.removed.len(),
                     "reindexing after file changes"
                 );
+                // Before reindexing: the LSP sync is cheap and a query racing
+                // the rebuild should already see the new text.
+                session.precise.files_changed(changes);
                 apply_or_buffer(&session, changes);
             });
         })

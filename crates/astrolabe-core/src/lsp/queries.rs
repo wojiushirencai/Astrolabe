@@ -59,7 +59,9 @@ pub fn find_references(
     };
     let sites = match resolve_query_site(server, repo_root, path, target) {
         Ok(sites) => sites,
-        Err(failed) => return failed,
+        // The name→declaration hop can time out too: answer by text search.
+        Err(SiteError::Lsp(err)) => return references_failed(repo_root, path, target, &err),
+        Err(SiteError::Failed(failed)) => return failed,
     };
     let mut hits = Vec::new();
     let mut errors = Vec::new();
@@ -70,7 +72,7 @@ pub fn find_references(
         }
     }
     if errors.len() == sites.sites.len() {
-        return degrade(&errors[0]);
+        return references_failed(repo_root, path, target, &errors[0]);
     }
     let mut result = guard_cold_index(finalize_hits(hits, repo_root, path), server);
     let all_external = result.value.is_empty() && result.note.is_some();
@@ -131,6 +133,50 @@ struct QuerySites {
     in_comment: bool,
 }
 
+/// Why no references query site could be produced.
+enum SiteError {
+    /// The language server itself failed (e.g. the name→declaration hop);
+    /// kept structured so timeouts can fall back to text search.
+    Lsp(LspError),
+    /// Already-rendered Unknown result (name not found, only in comments…).
+    Failed(Precise<Vec<Location>>),
+}
+
+/// Answer for a references query whose LSP request failed: text search on
+/// timeout (when the name is known), otherwise an Unknown degrade.
+fn references_failed(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    err: &LspError,
+) -> Precise<Vec<Location>> {
+    if matches!(err, LspError::Timeout(_)) {
+        if let Some(fallback) = timeout_fallback(repo_root, path, target, &err.to_string()) {
+            return fallback;
+        }
+    }
+    degrade(err)
+}
+
+/// Text-search answer for a timed-out references query, when we can tell
+/// which name was asked about.
+fn timeout_fallback(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    reason: &str,
+) -> Option<Precise<Vec<Location>>> {
+    let name = match target {
+        SymbolAt::Name(name) if !name.is_empty() => name.to_string(),
+        SymbolAt::Name(_) => return None,
+        SymbolAt::Position(pos) => super::fallback::identifier_at(repo_root, path, pos)?,
+    };
+    let reason = reason.split(';').next().unwrap_or(reason);
+    Some(super::fallback::text_references(
+        repo_root, path, &name, reason,
+    ))
+}
+
 /// Refuse to call an empty result authoritative while the server is still
 /// indexing.
 ///
@@ -140,8 +186,13 @@ struct QuerySites {
 /// live code. A non-empty result is kept as-is: those hits are real, they may
 /// merely be incomplete.
 fn guard_cold_index<T>(result: Precise<Vec<T>>, server: &dyn LanguageServer) -> Precise<Vec<T>> {
-    if !result.value.is_empty() || !server.is_busy() {
+    if !server.is_busy() {
         return result;
+    }
+    if !result.value.is_empty() {
+        // The hits are real but a half-built index can miss some; never
+        // let a caller treat this list as the complete set.
+        return downgrade_incomplete(result);
     }
     const COLD: &str = "语言服务器仍在建立索引，返回的空结果不可信。\
          请在索引完成后重试。";
@@ -346,12 +397,29 @@ fn hover_site_failed(failed: Precise<Vec<Location>>) -> Precise<Option<String>> 
 /// `guard_cold_index` 的 `Option<String>` 版：就绪服务器的“无信息”是权威
 /// 答案，但仍在索引的服务器会用空 hover 冒充它。有文本时原样保留——那
 /// 些内容是真实的，至多不全。
+/// Note attached to non-empty results from a server that is still indexing.
+pub const STILL_INDEXING_NOTE: &str = "language server still indexing, results may be incomplete";
+
+fn downgrade_incomplete<T>(mut result: Precise<T>) -> Precise<T> {
+    result.note = Some(match result.note.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {STILL_INDEXING_NOTE}"),
+        _ => STILL_INDEXING_NOTE.to_string(),
+    });
+    if result.confidence == Confidence::Exact {
+        result.confidence = Confidence::Syntactic;
+    }
+    result
+}
+
 fn guard_cold_hover(
     result: Precise<Option<String>>,
     server: &dyn LanguageServer,
 ) -> Precise<Option<String>> {
-    if result.value.is_some() || !server.is_busy() {
+    if !server.is_busy() {
         return result;
+    }
+    if result.value.is_some() {
+        return downgrade_incomplete(result);
     }
     Precise::unknown(
         result.value,
@@ -466,7 +534,7 @@ fn resolve_query_site(
     repo_root: &Path,
     path: &RelPath,
     target: SymbolAt<'_>,
-) -> Result<QuerySites, Precise<Vec<Location>>> {
+) -> Result<QuerySites, SiteError> {
     match target {
         SymbolAt::Position(position) => {
             let in_comment = std::fs::read_to_string(repo_root.join(path.as_str()))
@@ -519,13 +587,17 @@ fn resolve_named_site(
     repo_root: &Path,
     path: &RelPath,
     name: &str,
-) -> Result<QuerySites, Precise<Vec<Location>>> {
-    let anchor = locate_named(repo_root, path, name, "references")
-        .map_err(|reason| Precise::unknown(Vec::new(), format!("{reason}. {TEXT_SEARCH_HINT}")))?;
+) -> Result<QuerySites, SiteError> {
+    let anchor = locate_named(repo_root, path, name, "references").map_err(|reason| {
+        SiteError::Failed(Precise::unknown(
+            Vec::new(),
+            format!("{reason}. {TEXT_SEARCH_HINT}"),
+        ))
+    })?;
     let sites: Vec<(RelPath, Position)> = match anchor {
         Anchor::Definitions(defs) => defs.into_iter().map(|p| (path.clone(), p)).collect(),
         Anchor::Usage(position) => match server.definition(path, position) {
-            Err(err) => return Err(degrade(&err)),
+            Err(err) => return Err(SiteError::Lsp(err)),
             Ok(defs) => {
                 let mut in_repo = classify_all(defs, repo_root).in_repo;
                 in_repo.sort();
@@ -1814,6 +1886,51 @@ mod tests {
             "hover site-failure must not reuse references wording, got: {note}"
         );
         assert!(note.contains("hover information") || note.contains("`absent`"));
+    }
+
+    #[test]
+    fn named_references_fall_back_to_text_search_when_definition_hop_times_out() {
+        let repo = TempRepo::new(&[
+            ("src/lib.go", "package p\n\nfunc helper() {}\n"),
+            ("src/use.go", "package p\n\nfunc Run() { helper() }\n"),
+        ]);
+        let mut server = FakeServer::refs(Vec::new());
+        server.definition = Script::Timeout;
+
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("src/use.go"),
+            SymbolAt::Name("helper"),
+        );
+
+        assert_ne!(result.confidence, Confidence::Exact);
+        assert!(
+            !result.value.is_empty(),
+            "timeout on the name→declaration hop must fall back to text search"
+        );
+        let note = result.note.as_deref().unwrap();
+        assert!(note.contains("timed out"), "got: {note}");
+    }
+
+    #[test]
+    fn named_references_fall_back_to_text_search_when_references_time_out() {
+        let repo = TempRepo::new(&[
+            ("src/lib.go", "package p\n\nfunc helper() {}\n"),
+            ("src/use.go", "package p\n\nfunc Run() { helper() }\n"),
+        ]);
+        let server = FakeServer::failing(Script::Timeout);
+
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("src/lib.go"),
+            SymbolAt::Name("helper"),
+        );
+
+        assert_ne!(result.confidence, Confidence::Exact);
+        assert!(!result.value.is_empty());
+        assert!(result.note.as_deref().unwrap().contains("timed out"));
     }
 
     #[test]

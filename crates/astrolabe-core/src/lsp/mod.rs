@@ -32,6 +32,7 @@ pub mod anchor;
 pub mod csharp;
 pub mod diagnostics;
 pub mod discovery;
+mod fallback;
 pub mod install;
 pub mod installer;
 pub mod pool;
@@ -160,6 +161,20 @@ impl<T> Precise<T> {
     }
 }
 
+/// What happened to a file, as reported by the workspace watcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileChangeKind {
+    Created,
+    Changed,
+    Deleted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: RelPath,
+    pub kind: FileChangeKind,
+}
+
 /// One running language server, scoped to a workspace root.
 ///
 /// Implementations must be usable from multiple threads; the pool hands out
@@ -210,6 +225,13 @@ pub trait LanguageServer: Send + Sync {
     fn is_busy(&self) -> bool {
         false
     }
+
+    /// Files changed on disk (from the workspace watcher).
+    ///
+    /// Implementations forward these as `workspace/didChangeWatchedFiles`
+    /// and resynchronise or close any documents they hold open, so the next
+    /// answer is computed from what is on disk now. Default: nothing to do.
+    fn files_changed(&self, _changes: &[FileChange]) {}
 
     /// Resident-set size of the server process tree, when observable. Used by
     /// the pool to reclaim servers that have grown past their budget.

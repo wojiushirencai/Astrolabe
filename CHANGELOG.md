@@ -14,6 +14,7 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 - C# symbol extraction now covers fields, `const` fields, enum members, events, indexers, operators, conversion operators, destructors, delegates and nested local functions (find_symbol recall on Newtonsoft.Json 85.7% → 99.9%, Serilog 84.9% → 99.9%, Polly 88.3% → 100%).
 - **`find_symbol` 匹配与排序修正。** 结果按精确名 > 前缀 > 子串排序，真实定义不再因按路径排序被截断；支持 `Type.method` / `A::b` / `pkg.Func` 层级写法并把 Go 方法挂到接收者类型（`Command.ExecuteC`）；忽略 `Proc struct` 这类尾随关键字，零命中时给出相近符号名；`kind`/`substring` 对名称查询生效，新增 `path_filter`；Java/C#/VB 的锚点与签名落在声明行而非注解/特性行；`find_symbol`/`search_code` 的 `path_filter` 不匹配任何已索引路径时显式报错并列出最接近路径；工具描述补列 C#、VB。
 - **fix: `find_references` / `goto_definition` / hover 按名字查询时不再锚定到注释、字符串或 import。** 用 tree-sitter 定位文件内该名字的声明 token（跳过注释/字符串），多个定义（重载、多个 impl）全部查询后合并；名字只出现在注释/字符串里、或语言服务器返回空结果时置信度改为 `unknown` 并说明原因；`find_references` 新增可选 `line`/`character` 参数，结构化输出新增 `returned`/`omitted`/`truncated`。cobra 上 16/50 个原先报错的符号全部恢复，Rust `LspPool` 引用从 1 条变为 30 条。
+- LSP 查询前同步磁盘内容（didChange/didClose/didChangeWatchedFiles），索引未完成时的非空结果降级并注明，单次请求超时（默认 30 秒，`ASTROLABE_LSP_QUERY_TIMEOUT`）后回退为标注清楚的文本搜索。
 
 ## [0.10.0] - 2026-10-11
 

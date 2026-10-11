@@ -172,6 +172,8 @@ pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
     fn info(&self, symbol: &str, path: Option<&str>) -> Precise<Option<String>>;
     fn plan_rename(&self, symbol: &str, new_name: &str, path: Option<&str>)
         -> Precise<RewritePlan>;
+    /// Files changed on disk; keeps running language servers in sync.
+    fn files_changed(&self, _changes: &astrolabe_core::watch::ChangeSet) {}
 }
 
 /// Backend with no language server behind it.
