@@ -107,6 +107,23 @@ fn language_from_opt_path(path: Option<&str>, what: &str) -> Result<Language, St
 }
 
 impl PreciseCapability for LiveBackend {
+    fn files_changed(&self, changes: &astrolabe_core::watch::ChangeSet) {
+        use astrolabe_core::lsp::{FileChange, FileChangeKind};
+        use astrolabe_core::watch::ChangeKind;
+        let events: Vec<FileChange> = changes
+            .iter()
+            .map(|(kind, path)| FileChange {
+                path: path.clone(),
+                kind: match kind {
+                    ChangeKind::Added => FileChangeKind::Created,
+                    ChangeKind::Modified => FileChangeKind::Changed,
+                    ChangeKind::Removed => FileChangeKind::Deleted,
+                },
+            })
+            .collect();
+        self.pool.notify_files_changed(&events);
+    }
+
     fn references(&self, symbol: &str, path: Option<&str>) -> Precise<Vec<Location>> {
         let language = match language_from_opt_path(path, "精确引用查询") {
             Ok(lang) => lang,

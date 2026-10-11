@@ -52,8 +52,8 @@ use serde_json::{json, Value};
 
 use super::pool::SpawnServer;
 use super::{
-    Diagnostic, LanguageServer, Location, LspError, Position, Range, ServerSpec, Severity,
-    TextEdit, WorkspaceEdit,
+    Diagnostic, FileChange, FileChangeKind, LanguageServer, Location, LspError, Position, Range,
+    ServerSpec, Severity, TextEdit, WorkspaceEdit,
 };
 use crate::types::{Language, RelPath};
 
@@ -105,6 +105,9 @@ struct Shared {
     /// results" unless we track this.
     active_progress: Mutex<HashSet<String>>,
     ready_confirmed: AtomicBool,
+    /// When the process was spawned. Servers that never report progress are
+    /// treated as warming up for [`SETTLE_WINDOW`] after this.
+    started: Instant,
 }
 
 impl std::fmt::Debug for LspTransport {
@@ -207,6 +210,7 @@ impl LspTransport {
             saw_progress: AtomicBool::new(false),
             active_progress: Mutex::new(HashSet::new()),
             ready_confirmed: AtomicBool::new(false),
+            started: Instant::now(),
             initialize_result: Mutex::new(None),
             workspace_folders: Mutex::new(None),
             stderr_bytes: AtomicU64::new(0),
@@ -285,7 +289,15 @@ impl LspTransport {
     /// Callers use this to avoid reporting an empty result as authoritative
     /// while the server is still building its index.
     pub fn is_busy(&self) -> bool {
-        !lock(&self.shared.active_progress).is_empty()
+        if !lock(&self.shared.active_progress).is_empty() {
+            return true;
+        }
+        // A server that has never reported progress may simply not support
+        // it. Its first seconds are still a warm-up: answers given then can
+        // come from a half-built index, so do not call them authoritative.
+        !self.shared.saw_progress.load(Ordering::SeqCst)
+            && !self.shared.ready_confirmed.load(Ordering::Acquire)
+            && self.shared.started.elapsed() < SETTLE_WINDOW
     }
 
     /// Poll until no background work is outstanding, or `deadline` elapses.
@@ -625,18 +637,44 @@ fn timeout_from_env() -> Option<Duration> {
 pub struct StdioSpawn {
     pub root: PathBuf,
     pub timeout: Duration,
+    /// Bound on a single query (`references`, `definition`, …). Kept far
+    /// below [`DEFAULT_TIMEOUT`]: a query that hangs for minutes is worse
+    /// than a clearly-labelled text-search fallback.
+    pub query_timeout: Duration,
+}
+
+/// Default bound on one query request. pyright was observed hanging on
+/// `textDocument/references` for more than 120 s.
+pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn query_timeout_from_env() -> Option<Duration> {
+    let raw = std::env::var("ASTROLABE_LSP_QUERY_TIMEOUT").ok()?;
+    match raw.parse::<u64>() {
+        Ok(0) | Err(_) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+    }
 }
 
 impl StdioSpawn {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let timeout = timeout_from_env().unwrap_or(DEFAULT_TIMEOUT);
         Self {
             root: root.into(),
-            timeout: timeout_from_env().unwrap_or(DEFAULT_TIMEOUT),
+            timeout,
+            query_timeout: query_timeout_from_env()
+                .unwrap_or(DEFAULT_QUERY_TIMEOUT)
+                .min(timeout),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self.query_timeout = self.query_timeout.min(timeout);
+        self
+    }
+
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
         self
     }
 }
@@ -651,11 +689,11 @@ impl SpawnServer for StdioSpawn {
         root: &std::path::Path,
     ) -> Result<Box<dyn LanguageServer>, LspError> {
         let transport = LspTransport::connect(spec, root, self.timeout)?;
-        Ok(Box::new(LspSession {
+        Ok(Box::new(LspSession::new(
             transport,
-            root: root.to_path_buf(),
-            opened: Mutex::new(HashSet::new()),
-        }))
+            root.to_path_buf(),
+            self.query_timeout,
+        )))
     }
 }
 
@@ -663,36 +701,118 @@ impl SpawnServer for StdioSpawn {
 pub struct LspSession {
     transport: LspTransport,
     root: PathBuf,
-    opened: Mutex<HashSet<String>>,
+    /// Documents we have `didOpen`ed, keyed by repo-relative path.
+    ///
+    /// Once a document is open the server answers from *our* copy, not from
+    /// disk, so every query must first push whatever changed on disk;
+    /// otherwise positions we compute from disk are matched against stale
+    /// text and fresh references are silently missed.
+    opened: Mutex<HashMap<String, OpenDoc>>,
+    query_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OpenDoc {
+    version: i64,
+    hash: [u8; 32],
+}
+
+/// `FileChangeType` values from the LSP spec.
+const FILE_CREATED: u8 = 1;
+const FILE_CHANGED: u8 = 2;
+const FILE_DELETED: u8 = 3;
+
+fn content_hash(text: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes()).into()
 }
 
 impl LspSession {
+    pub fn new(transport: LspTransport, root: PathBuf, query_timeout: Duration) -> Self {
+        LspSession {
+            transport,
+            root,
+            opened: Mutex::new(HashMap::new()),
+            query_timeout,
+        }
+    }
+
     fn file_uri(&self, path: &RelPath) -> String {
         path_to_file_uri(&self.root.join(path.as_str()))
     }
 
+    fn query(&self, method: &str, params: Value) -> Result<Value, LspError> {
+        self.transport
+            .request_timeout(method, params, self.query_timeout)
+    }
+
+    /// Make the server's copy of `path` match the disk.
+    ///
+    /// First use sends `didOpen`; later uses compare a content hash and send
+    /// a full-text `didChange` with a bumped version when it moved. A file
+    /// that vanished is `didClose`d so the server stops answering from a
+    /// ghost buffer.
     fn ensure_open(&self, path: &RelPath) -> Result<(), LspError> {
         let key = path.as_str().to_string();
-        if lock(&self.opened).contains(&key) {
-            return Ok(());
-        }
         let abs = self.root.join(path.as_str());
-        let text = std::fs::read_to_string(&abs).map_err(|err| {
-            LspError::Protocol(format!("could not read {} ({err})", path.as_str()))
-        })?;
-        self.transport.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": self.file_uri(path),
-                    "languageId": language_id(self.transport.language()),
-                    "version": 1,
-                    "text": text,
-                }
-            }),
-        )?;
-        lock(&self.opened).insert(key);
-        Ok(())
+        let text = match std::fs::read_to_string(&abs) {
+            Ok(text) => text,
+            Err(err) => {
+                self.close_if_open(path);
+                return Err(LspError::Protocol(format!(
+                    "could not read {} ({err})",
+                    path.as_str()
+                )));
+            }
+        };
+        let hash = content_hash(&text);
+        // Hold the lock across the notification so two callers cannot send
+        // the same version twice or interleave open/change.
+        let mut opened = lock(&self.opened);
+        match opened.get_mut(&key) {
+            Some(doc) if doc.hash == hash => Ok(()),
+            Some(doc) => {
+                let version = doc.version + 1;
+                self.transport.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": self.file_uri(path), "version": version },
+                        "contentChanges": [ { "text": text } ],
+                    }),
+                )?;
+                *doc = OpenDoc { version, hash };
+                Ok(())
+            }
+            None => {
+                self.transport.notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": self.file_uri(path),
+                            "languageId": language_id(self.transport.language()),
+                            "version": 1,
+                            "text": text,
+                        }
+                    }),
+                )?;
+                opened.insert(key, OpenDoc { version: 1, hash });
+                Ok(())
+            }
+        }
+    }
+
+    fn close_if_open(&self, path: &RelPath) {
+        if lock(&self.opened).remove(path.as_str()).is_some() {
+            let _ = self.transport.notify(
+                "textDocument/didClose",
+                json!({ "textDocument": { "uri": self.file_uri(path) } }),
+            );
+        }
+    }
+
+    /// Version the server currently holds for `path`, if open. Test hook.
+    pub fn open_version(&self, path: &RelPath) -> Option<i64> {
+        lock(&self.opened).get(path.as_str()).map(|d| d.version)
     }
 }
 
@@ -703,7 +823,7 @@ impl LanguageServer for LspSession {
 
     fn references(&self, path: &RelPath, position: Position) -> Result<Vec<Location>, LspError> {
         self.ensure_open(path)?;
-        let result = self.transport.request(
+        let result = self.query(
             "textDocument/references",
             json!({
                 "textDocument": { "uri": self.file_uri(path) },
@@ -716,7 +836,7 @@ impl LanguageServer for LspSession {
 
     fn definition(&self, path: &RelPath, position: Position) -> Result<Vec<Location>, LspError> {
         self.ensure_open(path)?;
-        let result = self.transport.request(
+        let result = self.query(
             "textDocument/definition",
             json!({
                 "textDocument": { "uri": self.file_uri(path) },
@@ -728,7 +848,7 @@ impl LanguageServer for LspSession {
 
     fn hover(&self, path: &RelPath, position: Position) -> Result<Value, LspError> {
         self.ensure_open(path)?;
-        self.transport.request(
+        self.query(
             crate::lsp::queries::HOVER_METHOD,
             crate::lsp::queries::hover_params(&self.file_uri(path), position),
         )
@@ -737,7 +857,7 @@ impl LanguageServer for LspSession {
     fn diagnostics(&self, path: &RelPath) -> Result<Vec<Diagnostic>, LspError> {
         self.ensure_open(path)?;
         let uri = self.file_uri(path);
-        match self.transport.request(
+        match self.query(
             "textDocument/diagnostic",
             json!({ "textDocument": { "uri": uri } }),
         ) {
@@ -773,7 +893,7 @@ impl LanguageServer for LspSession {
         new_name: &str,
     ) -> Result<WorkspaceEdit, LspError> {
         self.ensure_open(path)?;
-        let result = self.transport.request(
+        let result = self.query(
             "textDocument/rename",
             json!({
                 "textDocument": { "uri": self.file_uri(path) },
@@ -786,6 +906,37 @@ impl LanguageServer for LspSession {
 
     fn is_busy(&self) -> bool {
         self.transport.is_busy()
+    }
+
+    fn files_changed(&self, changes: &[FileChange]) {
+        if changes.is_empty() {
+            return;
+        }
+        let events: Vec<Value> = changes
+            .iter()
+            .map(|change| {
+                let kind = match change.kind {
+                    FileChangeKind::Created => FILE_CREATED,
+                    FileChangeKind::Changed => FILE_CHANGED,
+                    FileChangeKind::Deleted => FILE_DELETED,
+                };
+                json!({ "uri": self.file_uri(&change.path), "type": kind })
+            })
+            .collect();
+        let _ = self.transport.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({ "changes": events }),
+        );
+        for change in changes {
+            match change.kind {
+                FileChangeKind::Deleted => self.close_if_open(&change.path),
+                FileChangeKind::Created | FileChangeKind::Changed => {
+                    if lock(&self.opened).contains_key(change.path.as_str()) {
+                        let _ = self.ensure_open(&change.path);
+                    }
+                }
+            }
+        }
     }
 
     fn wait_until_ready(&self, deadline: Duration) -> bool {
@@ -1570,6 +1721,7 @@ fn rss_bytes(pid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Confidence;
     use std::fs;
     use std::sync::atomic::AtomicU64;
 
@@ -1623,6 +1775,24 @@ if "--flood" in sys.argv:
 
 BATCH = []
 INITIALIZE_PARAMS = None
+DOCS = {}
+WATCHED = []
+BUFFERS = "--buffers" in sys.argv
+HANG_REFS = "--hang-refs" in sys.argv
+
+def is_ident(c):
+    return c.isalnum() or c == "_"
+
+def word_hits(uri, text, name):
+    out = []
+    for ln, line in enumerate(text.split("\n")):
+        i = line.find(name)
+        while i >= 0:
+            j = i + len(name)
+            if (i == 0 or not is_ident(line[i-1])) and (j >= len(line) or not is_ident(line[j])):
+                out.append({"uri": uri, "range": {"start": {"line": ln, "character": i}, "end": {"line": ln, "character": j}}})
+            i = line.find(name, i + 1)
+    return out
 
 while True:
     msg = read_msg()
@@ -1633,6 +1803,20 @@ while True:
         continue
     if method == "exit":
         break
+    if method == "textDocument/didOpen":
+        td = msg["params"]["textDocument"]
+        DOCS[td["uri"]] = {"version": td["version"], "text": td["text"]}
+        continue
+    if method == "textDocument/didChange":
+        td = msg["params"]["textDocument"]
+        DOCS[td["uri"]] = {"version": td["version"], "text": msg["params"]["contentChanges"][-1]["text"]}
+        continue
+    if method == "textDocument/didClose":
+        DOCS.pop(msg["params"]["textDocument"]["uri"], None)
+        continue
+    if method == "workspace/didChangeWatchedFiles":
+        WATCHED.extend(msg["params"]["changes"])
+        continue
     if method == "initialized" or "id" not in msg:
         continue
     if method == "initialize":
@@ -1699,6 +1883,27 @@ while True:
     elif method == "blob":
         n = int((msg.get("params") or {}).get("n") or 0)
         reply(msg, {"blob": "x" * n})
+    elif method == "fake-state":
+        reply(msg, {"docs": DOCS, "watched": WATCHED})
+    elif method == "textDocument/references" and HANG_REFS:
+        time.sleep(30)
+        reply(msg, [])
+    elif method == "textDocument/references" and BUFFERS:
+        params = msg.get("params") or {}
+        doc = (params.get("textDocument") or {}).get("uri")
+        pos = params.get("position") or {"line": 0, "character": 0}
+        text = DOCS.get(doc, {}).get("text", "")
+        line = text.split("\n")[pos["line"]] if pos["line"] < len(text.split("\n")) else ""
+        a = b = pos["character"]
+        while a > 0 and is_ident(line[a-1]):
+            a -= 1
+        while b < len(line) and is_ident(line[b]):
+            b += 1
+        name = line[a:b]
+        hits = []
+        for uri, d in DOCS.items():
+            hits.extend(word_hits(uri, d["text"], name))
+        reply(msg, hits)
     elif method in ("textDocument/references", "textDocument/definition"):
         params = msg.get("params") or {}
         doc = (params.get("textDocument") or {}).get("uri")
@@ -2515,5 +2720,139 @@ while True:
                 .join(", ")
         );
         t.shutdown().unwrap();
+    }
+
+    fn spawn_session(extra: &[&str], query_timeout: Duration) -> (LspSession, TmpDir) {
+        let tmp = unique_temp();
+        let script = tmp.0.join("fake_lsp.py");
+        fs::write(&script, FAKE_SERVER).expect("write fake server");
+        let mut args = vec!["-u".into(), script.to_string_lossy().into_owned()];
+        args.extend(extra.iter().map(|a| a.to_string()));
+        let spec = ServerSpec {
+            language: Language::Python,
+            command: python3(),
+            args,
+            install_hint: "install python3".into(),
+        };
+        let transport = LspTransport::connect(&spec, &tmp.0, Duration::from_secs(10))
+            .expect("connect fake language server");
+        let session = LspSession::new(transport, tmp.0.clone(), query_timeout);
+        (session, tmp)
+    }
+
+    fn ref_paths_and_lines(hits: &[Location]) -> Vec<(String, u32)> {
+        hits.iter()
+            .map(|l| (l.path.as_str().to_string(), l.range.start.line))
+            .collect()
+    }
+
+    /// Regression: a document opened once used to stay frozen at its first
+    /// contents, so a reference added afterwards was never found.
+    #[test]
+    fn edit_then_query_sees_new_reference() {
+        use crate::lsp::queries::{find_references, SymbolAt};
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        assert!(session.wait_until_ready(Duration::from_secs(10)));
+        let path = RelPath::new("m.py");
+        fs::write(tmp.0.join("m.py"), "def target():\n    pass\n").unwrap();
+        let at = SymbolAt::Position(Position {
+            line: 0,
+            character: 4,
+        });
+
+        let first = find_references(Some(&session), &tmp.0, &path, at);
+        assert_eq!(first.confidence, Confidence::Exact, "{:?}", first.note);
+        assert_eq!(ref_paths_and_lines(&first.value), vec![("m.py".into(), 0)]);
+        assert_eq!(session.open_version(&path), Some(1));
+
+        fs::write(tmp.0.join("m.py"), "def target():\n    pass\n\ntarget()\n").unwrap();
+        let second = find_references(Some(&session), &tmp.0, &path, at);
+        assert_eq!(second.confidence, Confidence::Exact, "{:?}", second.note);
+        assert_eq!(
+            ref_paths_and_lines(&second.value),
+            vec![("m.py".into(), 0), ("m.py".into(), 3)],
+            "the reference added after the first query must be found"
+        );
+        assert_eq!(session.open_version(&path), Some(2));
+
+        // Unchanged content: no new version.
+        let _ = find_references(Some(&session), &tmp.0, &path, at);
+        assert_eq!(session.open_version(&path), Some(2));
+    }
+
+    #[test]
+    fn watcher_events_forwarded_and_deleted_docs_closed() {
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        let path = RelPath::new("m.py");
+        fs::write(tmp.0.join("m.py"), "x = 1\n").unwrap();
+        session.ensure_open(&path).unwrap();
+        fs::remove_file(tmp.0.join("m.py")).unwrap();
+        session.files_changed(&[
+            FileChange {
+                path: RelPath::new("n.py"),
+                kind: FileChangeKind::Created,
+            },
+            FileChange {
+                path: path.clone(),
+                kind: FileChangeKind::Deleted,
+            },
+        ]);
+        assert_eq!(session.open_version(&path), None);
+        let state = session.transport.request("fake-state", json!({})).unwrap();
+        let watched = state["watched"].as_array().unwrap();
+        let types: Vec<u64> = watched
+            .iter()
+            .map(|c| c["type"].as_u64().unwrap())
+            .collect();
+        assert_eq!(types, vec![1, 3]);
+        assert!(
+            state["docs"].as_object().unwrap().is_empty(),
+            "deleted doc must be closed"
+        );
+    }
+
+    #[test]
+    fn non_empty_results_while_warming_are_not_exact() {
+        use crate::lsp::queries::{find_references, SymbolAt, STILL_INDEXING_NOTE};
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        fs::write(tmp.0.join("m.py"), "def target():\n    target()\n").unwrap();
+        let at = SymbolAt::Position(Position {
+            line: 0,
+            character: 4,
+        });
+        // Fake server reports no progress: its first seconds count as warm-up.
+        let r = find_references(Some(&session), &tmp.0, &RelPath::new("m.py"), at);
+        assert_eq!(r.value.len(), 2);
+        assert_ne!(r.confidence, Confidence::Exact);
+        assert!(r.note.unwrap().contains(STILL_INDEXING_NOTE));
+    }
+
+    #[test]
+    fn hung_references_fall_back_to_text_search() {
+        use crate::lsp::queries::{find_references, SymbolAt};
+        let (session, tmp) = spawn_session(&["--hang-refs"], Duration::from_millis(500));
+        fs::write(tmp.0.join("m.py"), "def target():\n    pass\n").unwrap();
+        fs::write(tmp.0.join("other.py"), "from m import target\ntarget()\n").unwrap();
+        let at = SymbolAt::Position(Position {
+            line: 0,
+            character: 4,
+        });
+        let started = Instant::now();
+        let r = find_references(Some(&session), &tmp.0, &RelPath::new("m.py"), at);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(r.confidence, Confidence::Syntactic);
+        let note = r.note.unwrap();
+        assert!(
+            note.contains("timed out") && note.contains("text search"),
+            "{note}"
+        );
+        assert_eq!(
+            ref_paths_and_lines(&r.value),
+            vec![
+                ("m.py".into(), 0),
+                ("other.py".into(), 0),
+                ("other.py".into(), 1)
+            ]
+        );
     }
 }

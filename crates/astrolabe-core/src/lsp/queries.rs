@@ -57,12 +57,56 @@ pub fn find_references(
     };
     let (query_path, query_pos) = match resolve_query_site(server, repo_root, path, target) {
         Ok(site) => site,
-        Err(failed) => return failed,
+        Err(failed) => {
+            // The name→declaration hop can time out too; it reports that
+            // through `degrade`, whose note starts with the Timeout text.
+            let timed_out = failed
+                .note
+                .as_deref()
+                .is_some_and(|n| n.starts_with(TIMEOUT_PREFIX));
+            if timed_out {
+                if let Some(fallback) = timeout_fallback(
+                    repo_root,
+                    path,
+                    target,
+                    failed.note.as_deref().unwrap_or_default(),
+                ) {
+                    return fallback;
+                }
+            }
+            return failed;
+        }
     };
     match server.references(&query_path, query_pos) {
         Ok(hits) => guard_cold_index(finalize_hits(hits, repo_root, path), server),
+        Err(err @ LspError::Timeout(_)) => {
+            let reason = format!("{err}");
+            timeout_fallback(repo_root, path, target, &reason).unwrap_or_else(|| degrade(&err))
+        }
         Err(err) => degrade(&err),
     }
+}
+
+/// Display prefix of [`LspError::Timeout`].
+const TIMEOUT_PREFIX: &str = "language server request timed out";
+
+/// Text-search answer for a timed-out references query, when we can tell
+/// which name was asked about.
+fn timeout_fallback(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    reason: &str,
+) -> Option<Precise<Vec<Location>>> {
+    let name = match target {
+        SymbolAt::Name(name) if !name.is_empty() => name.to_string(),
+        SymbolAt::Name(_) => return None,
+        SymbolAt::Position(pos) => super::fallback::identifier_at(repo_root, path, pos)?,
+    };
+    let reason = reason.split(';').next().unwrap_or(reason);
+    Some(super::fallback::text_references(
+        repo_root, path, &name, reason,
+    ))
 }
 
 /// Refuse to call an empty result authoritative while the server is still
@@ -74,8 +118,13 @@ pub fn find_references(
 /// live code. A non-empty result is kept as-is: those hits are real, they may
 /// merely be incomplete.
 fn guard_cold_index<T>(result: Precise<Vec<T>>, server: &dyn LanguageServer) -> Precise<Vec<T>> {
-    if !result.value.is_empty() || !server.is_busy() {
+    if !server.is_busy() {
         return result;
+    }
+    if !result.value.is_empty() {
+        // The hits are real but a half-built index can miss some; never
+        // let a caller treat this list as the complete set.
+        return downgrade_incomplete(result);
     }
     const COLD: &str = "语言服务器仍在建立索引，返回的空结果不可信。\
          请在索引完成后重试。";
@@ -313,12 +362,29 @@ fn hover_site_failed(failed: Precise<Vec<Location>>) -> Precise<Option<String>> 
 /// `guard_cold_index` 的 `Option<String>` 版：就绪服务器的“无信息”是权威
 /// 答案，但仍在索引的服务器会用空 hover 冒充它。有文本时原样保留——那
 /// 些内容是真实的，至多不全。
+/// Note attached to non-empty results from a server that is still indexing.
+pub const STILL_INDEXING_NOTE: &str = "language server still indexing, results may be incomplete";
+
+fn downgrade_incomplete<T>(mut result: Precise<T>) -> Precise<T> {
+    result.note = Some(match result.note.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {STILL_INDEXING_NOTE}"),
+        _ => STILL_INDEXING_NOTE.to_string(),
+    });
+    if result.confidence == Confidence::Exact {
+        result.confidence = Confidence::Syntactic;
+    }
+    result
+}
+
 fn guard_cold_hover(
     result: Precise<Option<String>>,
     server: &dyn LanguageServer,
 ) -> Precise<Option<String>> {
-    if result.value.is_some() || !server.is_busy() {
+    if !server.is_busy() {
         return result;
+    }
+    if result.value.is_some() {
+        return downgrade_incomplete(result);
     }
     Precise::unknown(
         result.value,

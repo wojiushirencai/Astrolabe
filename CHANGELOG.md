@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### Fixed
+
+- LSP 查询前同步磁盘内容（didChange/didClose/didChangeWatchedFiles），索引未完成时的非空结果降级并注明，单次请求超时（默认 30 秒，`ASTROLABE_LSP_QUERY_TIMEOUT`）后回退为标注清楚的文本搜索。
+
 ## [0.10.0] - 2026-10-11
 
 ### Added
