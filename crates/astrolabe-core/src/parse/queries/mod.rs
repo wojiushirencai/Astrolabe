@@ -1672,9 +1672,22 @@ void topLevelFunction() {
                 "missing ctor {need} in {names:?}"
             );
         }
+        // The class plus every constructor (unnamed and named) under the class
+        // name, so a class rename finds all construction sites.
         assert_eq!(
-            names.iter().filter(|(n, _)| *n == "Point").count(),
+            names
+                .iter()
+                .filter(|(n, k)| *n == "Point" && *k == "class")
+                .count(),
             1,
+            "{names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|(n, k)| *n == "Point" && *k == "method")
+                .count(),
+            5,
             "{names:?}"
         );
     }
