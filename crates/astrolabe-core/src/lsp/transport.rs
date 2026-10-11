@@ -2855,4 +2855,33 @@ while True:
             ]
         );
     }
+
+    #[test]
+    fn hung_references_by_name_fall_back_to_text_search() {
+        use crate::lsp::queries::{find_references, SymbolAt};
+        let (session, tmp) = spawn_session(&["--hang-refs"], Duration::from_millis(500));
+        fs::write(
+            tmp.0.join("m.py"),
+            "# target is documented here\ndef target():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(tmp.0.join("other.py"), "from m import target\ntarget()\n").unwrap();
+        let started = Instant::now();
+        let r = find_references(
+            Some(&session),
+            &tmp.0,
+            &RelPath::new("m.py"),
+            SymbolAt::Name("target"),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(r.confidence, Confidence::Syntactic);
+        let note = r.note.unwrap();
+        assert!(
+            note.contains("timed out") && note.contains("text search"),
+            "{note}"
+        );
+        let hits = ref_paths_and_lines(&r.value);
+        assert!(hits.contains(&("m.py".into(), 1)), "{hits:?}");
+        assert!(hits.contains(&("other.py".into(), 1)), "{hits:?}");
+    }
 }
