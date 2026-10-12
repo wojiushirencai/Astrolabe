@@ -304,9 +304,16 @@ fn parse_one(
     cache_writes: &Mutex<Vec<(String, Vec<u8>)>>,
     cache_hits: &AtomicUsize,
 ) -> Option<ParsedRow> {
-    let language = Language::from_path(path)?;
+    let by_path = Language::from_path(path);
+    // Extension-less files may still be scripts (`#!/usr/bin/env bash`);
+    // only those are sniffed. Anything else without a known extension is skipped.
+    if by_path.is_none() && path.extension().is_some() {
+        return None;
+    }
     let source = match crate::text::read_source(&root.join(path.as_str())) {
         Ok(source) => source,
+        // An unreadable / binary extension-less file is not a source failure.
+        Err(_) if by_path.is_none() => return None,
         Err(error) => {
             failures
                 .lock()
@@ -315,7 +322,7 @@ fn parse_one(
             return None;
         }
     };
-    let language = Language::from_path_and_source(path, &source).unwrap_or(language);
+    let language = Language::from_path_and_source(path, &source).or(by_path)?;
     let (sha, loc) = digest(&source);
     let cache_key = store::parse_cache_key(language, &sha);
 
@@ -543,8 +550,11 @@ fn assemble_graph(
     let mut edges = Vec::new();
     for row in &parsed {
         let from = index_of[&row.path];
+        // Path language first (keeps `.h` on the C resolver); content-sniffed
+        // language only for extension-less shebang scripts.
+        let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
         for spec in &row.parsed.imports {
-            match resolvers.resolve_import(&row.path, spec, files) {
+            match resolvers.resolve_import_as(import_lang, &row.path, spec, files) {
                 ImportResolution::File(target) => {
                     if let Some(&to) = index_of.get(&target) {
                         edges.push(CodeEdge {
@@ -864,7 +874,9 @@ pub fn index_repo_incremental(
             to_parse.push(path.clone());
             continue;
         }
-        if Language::from_path(path).is_none() {
+        // Keep in step with `parse_one`: extension-less files may be shebang
+        // scripts, so they are not dropped here (no previous product → re-parse).
+        if Language::from_path(path).is_none() && path.extension().is_some() {
             continue;
         }
         if let Some(product) = previous.products.get(path) {
@@ -1651,6 +1663,74 @@ mod tests {
         let (full, _) = index_repo(&root, &opts);
         assert_graphs_equivalent(&full, &inc.graph);
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extensionless_shebang_scripts_are_indexed_full_and_incremental() {
+        let root = scratch("shebang");
+        write(
+            &root,
+            "bin/tool",
+            "#!/usr/bin/env bash\nsource \"$(dirname \"$0\")/../lib/util.sh\"\nf() { :; }\n",
+        );
+        write(&root, "lib/util.sh", "u() { :; }\n");
+        write(&root, "LICENSE", "MIT License\n");
+        write(&root, "notes.txt", "#!/bin/bash\nnot_a_script() { :; }\n");
+        let opts = IndexOptions::default();
+        let has = |graph: &CodeGraph, file: &str, name: &str| {
+            graph.symbols.iter().any(|s| {
+                s.name == name
+                    && graph
+                        .files
+                        .iter()
+                        .any(|f| f.id == s.file && f.path.as_str() == file)
+            })
+        };
+
+        let (full, report) = index_repo(&root, &opts);
+        assert!(has(&full, "bin/tool", "f"), "shebang script must be parsed");
+        assert!(
+            full.edges.iter().any(|e| e.kind == EdgeKind::Import),
+            "`source` in an extension-less script must resolve"
+        );
+        assert!(
+            full.symbols.iter().all(|s| s.name != "not_a_script"),
+            "files with an unknown extension are never sniffed"
+        );
+        assert!(
+            report.parse_failures.is_empty(),
+            "non-script files are skipped, not failures: {:?}",
+            report.parse_failures
+        );
+
+        let mut inc = IncrementalIndex::build(&root, &opts);
+        assert!(has(&inc.graph, "bin/tool", "f"));
+        write(&root, "a.go", "package a\n\nfunc A() {}\n");
+        inc = inc.apply_changeset(
+            &root,
+            &ChangeSet {
+                added: vec![RelPath::new("a.go")],
+                ..ChangeSet::default()
+            },
+            &opts,
+        );
+        assert!(
+            has(&inc.graph, "bin/tool", "f"),
+            "an unchanged shebang script must survive an incremental run"
+        );
+        write(&root, "bin/tool", "#!/bin/sh\ng() { :; }\n");
+        inc = inc.apply_changeset(
+            &root,
+            &ChangeSet {
+                modified: vec![RelPath::new("bin/tool")],
+                ..ChangeSet::default()
+            },
+            &opts,
+        );
+        assert!(has(&inc.graph, "bin/tool", "g"));
+        let (full, _) = index_repo(&root, &opts);
+        assert_graphs_equivalent(&full, &inc.graph);
         std::fs::remove_dir_all(&root).ok();
     }
 

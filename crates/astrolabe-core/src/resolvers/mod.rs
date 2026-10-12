@@ -153,9 +153,22 @@ impl ResolverSet {
         spec: &str,
         files: &FileIndex,
     ) -> crate::types::ImportResolution {
-        let Some(lang) = Language::from_path(from) else {
-            return crate::types::ImportResolution::Unresolved;
-        };
+        match Language::from_path(from) {
+            Some(lang) => self.resolve_import_as(lang, from, spec, files),
+            None => crate::types::ImportResolution::Unresolved,
+        }
+    }
+
+    /// [`Self::resolve_import`] with the importing file's language supplied by
+    /// the caller — needed for extension-less shebang scripts, whose language
+    /// comes from content rather than the path.
+    pub fn resolve_import_as(
+        &self,
+        lang: Language,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+    ) -> crate::types::ImportResolution {
         // TS and TSX and JS share one resolver.
         let owner = match lang {
             Language::Tsx | Language::JavaScript | Language::Vue => Language::TypeScript,

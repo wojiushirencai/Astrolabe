@@ -195,11 +195,14 @@ impl Language {
                 None
             };
         };
-        if lang == Language::C
-            && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h"))
-            && header_looks_cpp(source)
-        {
-            return Some(Language::Cpp);
+        if lang == Language::C && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h")) {
+            // `@interface` / `#import` headers carry the public ObjC API.
+            if let Some(objc) = crate::parse::objc_header_language(source) {
+                return Some(objc);
+            }
+            if header_looks_cpp(source) {
+                return Some(Language::Cpp);
+            }
         }
         Some(lang)
     }

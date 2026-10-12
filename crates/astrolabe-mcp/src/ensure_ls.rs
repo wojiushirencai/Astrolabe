@@ -60,7 +60,8 @@ pub(crate) fn run_ensure_language_server(
                 format!(
                     "confidence: unknown\n{err}\n\
                      Supported: python, go, java, rust, typescript, tsx, javascript, \
-                     c, cpp, objc, objcpp, swift, php, vue, dart.\n\
+                     c, cpp, objc, objcpp, swift, php, vue, dart, csharp, visualbasic, \
+                     kotlin, shell, ruby, lua.\n\
                      get_languages reports Ready / needs_install / AST-only per language.\n"
                 ),
                 json!({

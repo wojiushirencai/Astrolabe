@@ -1018,7 +1018,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb — other source files are invisible to this tool; use Grep/Read for them."
+        description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn resolve_context(
         &self,
@@ -1203,7 +1203,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb — other source files are invisible to this tool; use Grep/Read for them."
+        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -1231,7 +1231,13 @@ impl AstrolabeServer {
             let normalized = normalize_symbol_query(&params.query);
             // "Class/method"（及 Type.method / A::b / pkg.Func）路径查询走层级
             // 匹配器（Serena NamePathMatcher 对应物）。
-            if normalized.query.contains('/') {
+            // A symbol literally named `a::b` / `a.b` (shell `bats::on_failure`,
+            // Ruby `self.x`) wins over the hierarchical path reading.
+            let literal = params.query.trim();
+            let literal_hit = normalized.query != literal
+                && !literal.contains('/')
+                && index.graph().symbols.iter().any(|s| s.name == literal);
+            if normalized.query.contains('/') && !literal_hit {
                 let mut params = params.clone();
                 params.query = normalized.query;
                 return self.find_symbol_by_path(
@@ -1241,7 +1247,11 @@ impl AstrolabeServer {
                     normalized.ignored.as_deref(),
                 );
             }
-            let needle = normalized.query.to_lowercase();
+            let needle = if literal_hit {
+                literal.to_lowercase()
+            } else {
+                normalized.query.to_lowercase()
+            };
             // 命中对先收集 (锚点行, symbol 下标)，与展示列表同一排序源——
             // include_body 只对"用户实际看到的" kept 前几个附体（审查 major：
             // 原实现按 graph 构建序取前 5，可能对应被 budget 裁掉的符号）。
@@ -1331,7 +1341,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, kt, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
+        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
     )]
     pub(crate) fn search_code(
         &self,
@@ -2338,7 +2348,7 @@ impl AstrolabeServer {
                 "file cache occupancy"
             );
             let mut body = format!(
-                "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart\n\
+                "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, visualbasic, kotlin, shell, ruby, lua\n\
                  confidence: exact (来自已扫描文件元数据 + LSP discovery)\n\
                  file_cache: {cache_bytes}/{} bytes, hits={cache_hits}, misses={cache_misses}\n\
                  LSP status: Ready = server on PATH; needs_install = ask user then \
@@ -4066,6 +4076,17 @@ mod tests {
     }
 
     #[test]
+    fn find_symbol_prefers_literal_names_containing_separators() {
+        let (server, dir) = server_on_files(&[(
+            "lib/hooks.sh",
+            "#!/bin/bash\nbats::on_failure() {\n  :\n}\n",
+        )]);
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("bats::on_failure"))));
+        assert!(text.contains("lib/hooks.sh:2"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn unmatched_path_filter_is_an_explicit_error_with_closest_paths() {
         let (server, dir) =
             server_on_files(&[("relay/channel/openai.py", "def send():\n    pass\n")]);
@@ -4834,7 +4855,7 @@ mod tests {
             .expect("first line after index_root");
         assert_eq!(
             first_body_line,
-            "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart"
+            "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, visualbasic, kotlin, shell, ruby, lua"
         );
         assert!(
             langs_text.contains("unindexed source files: .scala×3"),

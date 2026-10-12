@@ -1108,6 +1108,95 @@ const VB_KEYWORDS: &[&str] = &[
     "yield",
 ];
 
+/// Kotlin hard keywords (soft/modifier keywords stay usable as identifiers).
+const KOTLIN_KEYWORDS: &[&str] = &[
+    "as",
+    "break",
+    "class",
+    "continue",
+    "do",
+    "else",
+    "false",
+    "for",
+    "fun",
+    "if",
+    "in",
+    "interface",
+    "is",
+    "null",
+    "object",
+    "package",
+    "return",
+    "super",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typealias",
+    "typeof",
+    "val",
+    "var",
+    "when",
+    "while",
+];
+
+/// POSIX/bash reserved words plus the declaration builtins.
+const SHELL_KEYWORDS: &[&str] = &[
+    "case", "coproc", "declare", "do", "done", "elif", "else", "esac", "export", "fi", "for",
+    "function", "if", "in", "local", "readonly", "select", "source", "then", "time", "typeset",
+    "until", "while",
+];
+
+const RUBY_KEYWORDS: &[&str] = &[
+    "BEGIN",
+    "END",
+    "__ENCODING__",
+    "__FILE__",
+    "__LINE__",
+    "alias",
+    "and",
+    "begin",
+    "break",
+    "case",
+    "class",
+    "def",
+    "defined?",
+    "do",
+    "else",
+    "elsif",
+    "end",
+    "ensure",
+    "false",
+    "for",
+    "if",
+    "in",
+    "module",
+    "next",
+    "nil",
+    "not",
+    "or",
+    "redo",
+    "rescue",
+    "retry",
+    "return",
+    "self",
+    "super",
+    "then",
+    "true",
+    "undef",
+    "unless",
+    "until",
+    "when",
+    "while",
+    "yield",
+];
+
+/// Lua 5.1–5.5 reserved words (`global` is reserved from 5.5).
+const LUA_KEYWORDS: &[&str] = &[
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "global", "goto",
+    "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+];
+
 fn keywords(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::Python => PYTHON_KEYWORDS,
@@ -1122,8 +1211,10 @@ fn keywords(lang: Language) -> &'static [&'static str] {
         Language::Dart => DART_KEYWORDS,
         Language::CSharp => CSHARP_KEYWORDS,
         Language::VisualBasic => VB_KEYWORDS,
-        // lang-batch-8: keyword lists TBD by each language worker (lead merges).
-        Language::Kotlin | Language::Shell | Language::Ruby | Language::Lua => &[],
+        Language::Kotlin => KOTLIN_KEYWORDS,
+        Language::Shell => SHELL_KEYWORDS,
+        Language::Ruby => RUBY_KEYWORDS,
+        Language::Lua => LUA_KEYWORDS,
     }
 }
 
@@ -1211,6 +1302,8 @@ enum Flavor {
     Rust,
     Js,
     Vb,
+    /// Nested `/* */`, `"""` raw strings, backticks are identifiers.
+    Kotlin,
 }
 
 fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
@@ -1233,15 +1326,14 @@ fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
             | Language::ObjCpp
             | Language::Swift
             | Language::Dart
-            | Language::CSharp
-            | Language::Kotlin,
+            | Language::CSharp,
         )
         | None => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
         Some(Language::VisualBasic) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Vb),
-        // `#` line comments + quoted strings; close enough until a dedicated flavor lands.
-        Some(Language::Shell | Language::Ruby) => classify_python(source.as_bytes(), &mut kind),
-        // TODO(lang-batch-8/lua): `--` comments and `[[ ]]` long strings.
-        Some(Language::Lua) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
+        Some(Language::Kotlin) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Kotlin),
+        Some(Language::Shell) => classify_shell(source.as_bytes(), &mut kind),
+        Some(Language::Ruby) => classify_ruby(source.as_bytes(), &mut kind),
+        Some(Language::Lua) => classify_lua(source.as_bytes(), &mut kind),
     }
     kind
 }
@@ -1296,6 +1388,165 @@ fn classify_python(bytes: &[u8], kind: &mut [SliceKind]) {
     }
 }
 
+/// Lua: `--` line comments, `--[==[ … ]==]` block comments, `'…'` / `"…"`
+/// strings with backslash escapes, and `[==[ … ]==]` long strings (any level).
+fn classify_lua(bytes: &[u8], kind: &mut [SliceKind]) {
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        if c == b'-' && i + 1 < n && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            if let Some(level) = lua_long_open(bytes, i) {
+                i = lua_long_close(bytes, i + level + 2, level);
+            } else {
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            mark(kind, start, i, SliceKind::Comment);
+            continue;
+        }
+        if c == b'[' {
+            if let Some(level) = lua_long_open(bytes, i) {
+                let start = i;
+                i = lua_long_close(bytes, i + level + 2, level);
+                mark(kind, start, i, SliceKind::String);
+                continue;
+            }
+        }
+        if c == b'\'' || c == b'"' {
+            let start = i;
+            i += 1;
+            while i < n && bytes[i] != c && bytes[i] != b'\n' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(n);
+            mark(kind, start, i, SliceKind::String);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// `[` `=`* `[` at `at` → the level (number of `=`).
+fn lua_long_open(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes.get(at) != Some(&b'[') {
+        return None;
+    }
+    let mut j = at + 1;
+    while bytes.get(j) == Some(&b'=') {
+        j += 1;
+    }
+    (bytes.get(j) == Some(&b'[')).then_some(j - at - 1)
+}
+
+/// Scan from `from` to just past `]` `=`{level} `]`, or to EOF.
+fn lua_long_close(bytes: &[u8], from: usize, level: usize) -> usize {
+    let n = bytes.len();
+    let mut i = from;
+    while i < n {
+        if bytes[i] == b']'
+            && bytes
+                .get(i + 1..i + 1 + level)
+                .is_some_and(|eq| eq.iter().all(|&b| b == b'='))
+            && bytes.get(i + 1 + level) == Some(&b']')
+        {
+            return i + level + 2;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Shell: `#` starts a comment only at a word start (not `$#`, `${#x}`, `a#b`);
+/// `'…'` has no escapes, `"…"` honours backslashes; `\#` is literal.
+fn classify_shell(bytes: &[u8], kind: &mut [SliceKind]) {
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if c == b'#'
+            && (i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b';' | b'(' | b'&' | b'|'
+                ))
+        {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            mark(kind, start, i, SliceKind::Comment);
+            continue;
+        }
+        if c == b'\'' {
+            i = consume_quoted(bytes, kind, i, b'\'', false);
+            continue;
+        }
+        if c == b'"' {
+            i = consume_quoted(bytes, kind, i, b'"', true);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Ruby: `#` line comments, `=begin` … `=end` blocks at line start, and
+/// `'…'` / `"…"` / `` `…` `` strings with backslash escapes. Heredocs and
+/// `%w[]`-style literals are left as code.
+fn classify_ruby(bytes: &[u8], kind: &mut [SliceKind]) {
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        let line_start = i == 0 || bytes[i - 1] == b'\n';
+        if line_start && bytes[i..].starts_with(b"=begin") {
+            let start = i;
+            loop {
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if i >= n {
+                    break;
+                }
+                i += 1;
+                if bytes[i..].starts_with(b"=end") {
+                    while i < n && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    break;
+                }
+            }
+            mark(kind, start, i, SliceKind::Comment);
+            continue;
+        }
+        if c == b'?' && i + 1 < n && matches!(bytes[i + 1], b'#' | b'\'' | b'"') {
+            // `?#` / `?'` character literals.
+            i += 2;
+            continue;
+        }
+        if c == b'#' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            mark(kind, start, i, SliceKind::Comment);
+            continue;
+        }
+        if matches!(c, b'\'' | b'"' | b'`') {
+            i = consume_quoted(bytes, kind, i, c, true);
+            continue;
+        }
+        i += 1;
+    }
+}
+
 fn python_raw_prefix(bytes: &[u8], quote_at: usize) -> bool {
     let mut j = quote_at;
     let mut raw = false;
@@ -1336,7 +1587,7 @@ fn classify_c_like(bytes: &[u8], kind: &mut [SliceKind], flavor: Flavor) {
                 continue;
             }
         }
-        if matches!(flavor, Flavor::Java)
+        if matches!(flavor, Flavor::Java | Flavor::Kotlin)
             && bytes[i] == b'"'
             && i + 2 < n
             && bytes[i + 1] == b'"'
@@ -1389,7 +1640,7 @@ fn classify_c_like(bytes: &[u8], kind: &mut [SliceKind], flavor: Flavor) {
             i += 2;
             let mut depth = 1u32;
             while i < n && depth > 0 {
-                if matches!(flavor, Flavor::Rust)
+                if matches!(flavor, Flavor::Rust | Flavor::Kotlin)
                     && bytes[i] == b'/'
                     && i + 1 < n
                     && bytes[i + 1] == b'*'
@@ -1500,6 +1751,54 @@ fn rust_raw_closer(bytes: &[u8], i: usize, hashes: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lua_comments_and_long_strings() {
+        use super::{classify, SliceKind};
+        let src = "a = [==[x]]y]==] -- c\n--[[ b\nb ]] d = 'q\\'q' e\n";
+        let k = classify(src, Some(crate::types::Language::Lua));
+        let at = |needle: &str| k[src.find(needle).unwrap()];
+        assert_eq!(at("a ="), SliceKind::Code);
+        assert_eq!(at("x]]y"), SliceKind::String);
+        assert_eq!(at("-- c"), SliceKind::Comment);
+        assert_eq!(at(" b\nb"), SliceKind::Comment);
+        assert_eq!(at("d ="), SliceKind::Code);
+        assert_eq!(at("q\\"), SliceKind::String);
+        assert_eq!(at("e\n"), SliceKind::Code);
+    }
+
+    #[test]
+    fn kotlin_shell_ruby_classifiers() {
+        use super::{classify, SliceKind};
+        use crate::types::Language;
+        let src = "fun `x y`() {} /* a /* b */ c */ k \"\"\"r\"q\"\"\" m // z\n";
+        let k = classify(src, Some(Language::Kotlin));
+        let at = |needle: &str| k[src.find(needle).unwrap()];
+        assert_eq!(at("x y"), SliceKind::Code);
+        assert_eq!(at(" c */"), SliceKind::Comment);
+        assert_eq!(at("k "), SliceKind::Code);
+        assert_eq!(at("r\"q"), SliceKind::String);
+        assert_eq!(at("m "), SliceKind::Code);
+        assert_eq!(at("// z"), SliceKind::Comment);
+
+        let src = "n=${#arr} $# x # c\necho 'a\\' b \"q\\\"q\" d\n";
+        let k = classify(src, Some(Language::Shell));
+        let at = |needle: &str| k[src.find(needle).unwrap()];
+        assert_eq!(at("#arr"), SliceKind::Code);
+        assert_eq!(at("# x"), SliceKind::Code);
+        assert_eq!(at("# c"), SliceKind::Comment);
+        assert_eq!(at(" b "), SliceKind::Code);
+        assert_eq!(at("q\\"), SliceKind::String);
+        assert_eq!(at(" d"), SliceKind::Code);
+
+        let src = "a = \"#{x}\" # c\n=begin\nhidden\n=end\nb = ?# + 1\n";
+        let k = classify(src, Some(Language::Ruby));
+        let at = |needle: &str| k[src.find(needle).unwrap()];
+        assert_eq!(at("#{x}"), SliceKind::String);
+        assert_eq!(at("# c"), SliceKind::Comment);
+        assert_eq!(at("hidden"), SliceKind::Comment);
+        assert_eq!(at("b ="), SliceKind::Code);
+        assert_eq!(at("+ 1"), SliceKind::Code);
+    }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
