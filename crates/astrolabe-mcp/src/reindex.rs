@@ -76,24 +76,36 @@ pub(crate) fn mcp_index_options(persist: bool, parse_cache_bytes: u64) -> IndexO
 }
 
 /// Keep `added`/`modified` only when [`Language::from_path`] recognizes the
-/// file or it has no extension (possible shebang script; the indexer sniffs
-/// it and skips non-scripts); keep every `removed` path (dropping a node is
-/// cheap and must not miss a delete).
-pub(crate) fn filter_changeset(changes: ChangeSet) -> ChangeSet {
-    let maybe_source =
-        |path: &RelPath| Language::from_path(path).is_some() || path.extension().is_none();
+/// file, or it has no extension and is (or just stopped being) a shebang
+/// script. Editing `LICENSE` / `Makefile` therefore never triggers a rebuild;
+/// the `#!` probe is cached by mtime/size so it costs a stat. A script that
+/// lost its shebang is turned into a removal so its symbols are dropped.
+/// Every `removed` path is kept (dropping a node is cheap and must not miss a
+/// delete).
+pub(crate) fn filter_changeset(root: &Path, changes: ChangeSet) -> ChangeSet {
+    let mut removed = changes.removed;
+    let mut keep = |path: &RelPath| -> bool {
+        if Language::from_path(path).is_some() {
+            return true;
+        }
+        if path.extension().is_some() {
+            return false;
+        }
+        let state = astrolabe_core::index::shebang_state(&root.join(path.as_str()));
+        if state.script || state.missing {
+            return true;
+        }
+        if state.was_script {
+            removed.push(path.clone());
+        }
+        false
+    };
+    let added: Vec<RelPath> = changes.added.into_iter().filter(|p| keep(p)).collect();
+    let modified: Vec<RelPath> = changes.modified.into_iter().filter(|p| keep(p)).collect();
     ChangeSet {
-        added: changes
-            .added
-            .into_iter()
-            .filter(|p| maybe_source(p))
-            .collect(),
-        modified: changes
-            .modified
-            .into_iter()
-            .filter(|p| maybe_source(p))
-            .collect(),
-        removed: changes.removed,
+        added,
+        modified,
+        removed,
     }
 }
 
@@ -182,6 +194,7 @@ pub(crate) fn coalesce_window(
 /// the rebuild; changes that arrive while it runs stay in `rx` and merge on
 /// the next iteration.
 pub(crate) fn for_each_reindex_batch(
+    root: &Path,
     rx: Receiver<ChangeSet>,
     throttle: Duration,
     mut on_batch: impl FnMut(&ChangeSet),
@@ -192,7 +205,7 @@ pub(crate) fn for_each_reindex_batch(
             .map(|at| throttle.saturating_sub(at.elapsed()))
             .unwrap_or(Duration::ZERO);
         let merged = coalesce_window(&rx, first, wait);
-        let filtered = filter_changeset(merged);
+        let filtered = filter_changeset(root, merged);
         if filtered.is_empty() {
             continue;
         }
@@ -274,16 +287,28 @@ mod tests {
             modified: vec![RelPath::new("notes.log"), RelPath::new("app.py")],
             removed: vec![RelPath::new("gone.sql"), RelPath::new("old.rs")],
         };
-        let filtered = filter_changeset(mixed);
+        let filtered = filter_changeset(Path::new("/nonexistent-astrolabe-root"), mixed);
         assert_eq!(filtered.added, vec![RelPath::new("src/lib.rs")]);
         assert_eq!(filtered.modified, vec![RelPath::new("app.py")]);
         assert_eq!(
             filtered.removed,
             vec![RelPath::new("gone.sql"), RelPath::new("old.rs")]
         );
-        assert!(filter_changeset(cs_modified(&["docs/guide.md"])).is_empty());
-        assert!(!filter_changeset(cs_removed(&["docs/guide.md"])).is_empty());
-        assert!(!filter_changeset(cs_modified(&["bin/tool"])).is_empty());
+        assert!(filter_changeset(
+            Path::new("/nonexistent-astrolabe-root"),
+            cs_modified(&["docs/guide.md"])
+        )
+        .is_empty());
+        assert!(!filter_changeset(
+            Path::new("/nonexistent-astrolabe-root"),
+            cs_removed(&["docs/guide.md"])
+        )
+        .is_empty());
+        assert!(!filter_changeset(
+            Path::new("/nonexistent-astrolabe-root"),
+            cs_modified(&["bin/tool"])
+        )
+        .is_empty());
     }
 
     #[test]
@@ -318,14 +343,43 @@ mod tests {
     }
 
     #[test]
+    fn extensionless_filter_keeps_scripts_drops_license() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("LICENSE"), "MIT\n").unwrap();
+        std::fs::write(dir.join("Makefile"), "all:\n\ttrue\n").unwrap();
+        std::fs::write(dir.join("bin/tool"), "#!/usr/bin/env bash\nf() { :; }\n").unwrap();
+        let cs = ChangeSet {
+            added: vec![RelPath::new("Makefile")],
+            modified: vec![RelPath::new("LICENSE"), RelPath::new("bin/tool")],
+            removed: Vec::new(),
+        };
+        let filtered = filter_changeset(&dir, cs);
+        assert!(filtered.added.is_empty());
+        assert_eq!(filtered.modified, vec![RelPath::new("bin/tool")]);
+        assert!(filter_changeset(&dir, cs_modified(&["LICENSE"])).is_empty());
+        // A script that loses its shebang becomes a removal.
+        std::fs::write(dir.join("bin/tool"), "just text\n").unwrap();
+        let lost = filter_changeset(&dir, cs_modified(&["bin/tool"]));
+        assert!(lost.modified.is_empty());
+        assert_eq!(lost.removed, vec![RelPath::new("bin/tool")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn md_touch_does_not_call_apply() {
         let (tx, rx) = mpsc::channel();
         let applied = Arc::new(Mutex::new(0usize));
         let applied_thread = Arc::clone(&applied);
         let join = std::thread::spawn(move || {
-            for_each_reindex_batch(rx, Duration::ZERO, |_| {
-                *applied_thread.lock().unwrap() += 1;
-            });
+            for_each_reindex_batch(
+                Path::new("/nonexistent-astrolabe-root"),
+                rx,
+                Duration::ZERO,
+                |_| {
+                    *applied_thread.lock().unwrap() += 1;
+                },
+            );
         });
         tx.send(cs_modified(&["README.md"])).unwrap();
         tx.send(cs_added(&["notes.sql"])).unwrap();
@@ -348,9 +402,14 @@ mod tests {
         let applied = Arc::new(Mutex::new(Vec::<ChangeSet>::new()));
         let applied_thread = Arc::clone(&applied);
         let join = std::thread::spawn(move || {
-            for_each_reindex_batch(rx, Duration::from_millis(80), |cs| {
-                applied_thread.lock().unwrap().push(cs.clone());
-            });
+            for_each_reindex_batch(
+                Path::new("/nonexistent-astrolabe-root"),
+                rx,
+                Duration::from_millis(80),
+                |cs| {
+                    applied_thread.lock().unwrap().push(cs.clone());
+                },
+            );
         });
         join.join().unwrap();
         let batches = applied.lock().unwrap();
