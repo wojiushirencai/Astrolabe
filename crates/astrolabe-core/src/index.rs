@@ -221,6 +221,12 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
         Language::Dart,
         Language::CSharp,
         Language::VisualBasic,
+        Language::Swift,
+        Language::ObjC,
+        Language::Kotlin,
+        Language::Shell,
+        Language::Ruby,
+        Language::Lua,
     ]
     .iter()
     .filter_map(|lang| resolvers.meta_for(*lang))
@@ -1896,9 +1902,9 @@ mod tests {
     fn test_unindexed_code_exts_basic() {
         let admitted = vec![
             RelPath::new("src/main.rs"),     // supported (Rust) -> skipped
-            RelPath::new("scripts/run.rb"),  // not supported, in KNOWN -> counted
-            RelPath::new("scripts/test.rb"), // not supported, in KNOWN -> counted
-            RelPath::new("src/App.kt"),      // not supported, in KNOWN -> counted
+            RelPath::new("scripts/run.ex"),  // not supported, in KNOWN -> counted
+            RelPath::new("scripts/test.ex"), // not supported, in KNOWN -> counted
+            RelPath::new("src/App.hs"),      // not supported, in KNOWN -> counted
             RelPath::new("data/info.json"),  // data file, removed from KNOWN -> skipped
             RelPath::new("docs/readme.txt"), // txt not in KNOWN -> skipped
             RelPath::new("LICENSE"),         // no ext -> skipped
@@ -1907,8 +1913,8 @@ mod tests {
 
         let in_graph = |p: &str| p == "src/lib.rs";
         let counts = unindexed_code_exts(&admitted, &in_graph, None);
-        assert_eq!(counts.get("rb"), Some(&2));
-        assert_eq!(counts.get("kt"), Some(&1)); // .kt 仍被统计
+        assert_eq!(counts.get("ex"), Some(&2));
+        assert_eq!(counts.get("hs"), Some(&1)); // .hs 仍被统计
         assert_eq!(counts.get("json"), None); // .json 数据文件不再被统计
         assert_eq!(counts.get("rs"), None);
         assert_eq!(counts.get("txt"), None);
@@ -1917,30 +1923,30 @@ mod tests {
     #[test]
     fn test_unindexed_code_exts_with_filter() {
         let admitted = vec![
-            RelPath::new("backend/script.lua"),
-            RelPath::new("frontend/script.lua"),
+            RelPath::new("backend/script.zig"),
+            RelPath::new("frontend/script.zig"),
             RelPath::new("backend/service.scala"),
         ];
         let in_graph = |_p: &str| false;
         let counts = unindexed_code_exts(&admitted, &in_graph, Some("backend"));
-        assert_eq!(counts.get("lua"), Some(&1));
+        assert_eq!(counts.get("zig"), Some(&1));
         assert_eq!(counts.get("scala"), Some(&1));
 
         let counts_fe = unindexed_code_exts(&admitted, &in_graph, Some("frontend"));
-        assert_eq!(counts_fe.get("lua"), Some(&1));
+        assert_eq!(counts_fe.get("zig"), Some(&1));
         assert_eq!(counts_fe.get("scala"), None);
     }
 
     #[test]
     fn test_unindexed_code_exts_case_insensitive_and_vocabulary() {
         let admitted = vec![
-            RelPath::new("build/deploy.KT"),
+            RelPath::new("build/deploy.HS"),
             RelPath::new("model.SCALA"),
             RelPath::new("unknown.xyz123"),
         ];
         let in_graph = |_p: &str| false;
         let counts = unindexed_code_exts(&admitted, &in_graph, None);
-        assert_eq!(counts.get("kt"), Some(&1));
+        assert_eq!(counts.get("hs"), Some(&1));
         assert_eq!(counts.get("scala"), Some(&1));
         assert_eq!(counts.get("xyz123"), None);
     }

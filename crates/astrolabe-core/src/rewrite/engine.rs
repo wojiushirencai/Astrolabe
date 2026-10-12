@@ -364,7 +364,11 @@ fn ident_start(c: char, lang: Option<Language>) -> bool {
             | Language::ObjCpp
             | Language::Swift
             | Language::CSharp
-            | Language::VisualBasic,
+            | Language::VisualBasic
+            | Language::Kotlin
+            | Language::Shell
+            | Language::Ruby
+            | Language::Lua,
         )
         | None => c.is_alphabetic() || c == '_' || (lang.is_none() && c == '$'),
     }
@@ -391,7 +395,11 @@ fn ident_continue(c: char, lang: Option<Language>) -> bool {
             | Language::ObjCpp
             | Language::Swift
             | Language::CSharp
-            | Language::VisualBasic,
+            | Language::VisualBasic
+            | Language::Kotlin
+            | Language::Shell
+            | Language::Ruby
+            | Language::Lua,
         )
         | None => c.is_alphanumeric() || c == '_' || (lang.is_none() && c == '$'),
     }
@@ -1114,6 +1122,8 @@ fn keywords(lang: Language) -> &'static [&'static str] {
         Language::Dart => DART_KEYWORDS,
         Language::CSharp => CSHARP_KEYWORDS,
         Language::VisualBasic => VB_KEYWORDS,
+        // lang-batch-8: keyword lists TBD by each language worker (lead merges).
+        Language::Kotlin | Language::Shell | Language::Ruby | Language::Lua => &[],
     }
 }
 
@@ -1223,10 +1233,15 @@ fn classify(source: &str, lang: Option<Language>) -> Vec<SliceKind> {
             | Language::ObjCpp
             | Language::Swift
             | Language::Dart
-            | Language::CSharp,
+            | Language::CSharp
+            | Language::Kotlin,
         )
         | None => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
         Some(Language::VisualBasic) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Vb),
+        // `#` line comments + quoted strings; close enough until a dedicated flavor lands.
+        Some(Language::Shell | Language::Ruby) => classify_python(source.as_bytes(), &mut kind),
+        // TODO(lang-batch-8/lua): `--` comments and `[[ ]]` long strings.
+        Some(Language::Lua) => classify_c_like(source.as_bytes(), &mut kind, Flavor::Js),
     }
     kind
 }

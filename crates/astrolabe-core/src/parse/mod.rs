@@ -29,12 +29,19 @@ use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 pub mod queries;
 mod razor;
 mod vue;
+// lang-batch-8 per-language hooks (one file per worker).
+mod kotlin;
+mod lua;
+mod objc;
+mod ruby;
+mod shell;
+mod swift;
 
 pub(crate) use razor::extract_razor_csharp;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SIGNATURE_CHARS: usize = 240;
-const LANGUAGES: [Language; 13] = [
+const LANGUAGES: [Language; 20] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -48,6 +55,13 @@ const LANGUAGES: [Language; 13] = [
     Language::Dart,
     Language::CSharp,
     Language::VisualBasic,
+    Language::ObjC,
+    Language::ObjCpp,
+    Language::Swift,
+    Language::Kotlin,
+    Language::Shell,
+    Language::Ruby,
+    Language::Lua,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -196,7 +210,14 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Dart => 10,
         Language::CSharp => 11,
         Language::VisualBasic => 12,
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        Language::ObjC => 13,
+        Language::ObjCpp => 14,
+        Language::Swift => 15,
+        Language::Kotlin => 16,
+        Language::Shell => 17,
+        Language::Ruby => 18,
+        Language::Lua => 19,
+        Language::Vue => return None,
     })
 }
 
@@ -215,7 +236,14 @@ pub(crate) fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         Language::VisualBasic => tree_sitter_vb_dotnet::LANGUAGE.into(),
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        Language::ObjC => tree_sitter_objc::LANGUAGE.into(),
+        Language::ObjCpp => tree_sitter_objc::LANGUAGE.into(),
+        Language::Swift => tree_sitter_swift::LANGUAGE.into(),
+        Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        Language::Shell => tree_sitter_bash::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Language::Lua => tree_sitter_lua::LANGUAGE.into(),
+        Language::Vue => return None,
     })
 }
 
@@ -275,7 +303,17 @@ fn extract_symbols(
         } else if lang == Language::Dart && definition_node.kind() == "operator_signature" {
             (dart_operator_name(definition_node, source), kind)
         } else {
-            (name.to_owned(), kind)
+            match lang {
+                Language::Swift => swift::symbol_name(definition_node, name, kind, source),
+                Language::ObjC | Language::ObjCpp => {
+                    objc::symbol_name(definition_node, name, kind, source)
+                }
+                Language::Kotlin => kotlin::symbol_name(definition_node, name, kind, source),
+                Language::Shell => shell::symbol_name(definition_node, name, kind, source),
+                Language::Ruby => ruby::symbol_name(definition_node, name, kind, source),
+                Language::Lua => lua::symbol_name(definition_node, name, kind, source),
+                _ => (name.to_owned(), kind),
+            }
         };
 
         // Java/C#/VB 的注解/特性（`@Override`、`[HttpGet]`、`<Fact>`）属于
@@ -480,14 +518,15 @@ fn is_exported(lang: Language, name: &str, node: tree_sitter::Node<'_>, source: 
         Language::Php => php_exported(node, source),
         Language::Dart => !name.starts_with('_'),
         // Sibling P0 languages: treat as exported until their agents land visibility rules.
-        Language::C
-        | Language::Cpp
-        | Language::ObjC
-        | Language::ObjCpp
-        | Language::Swift
-        | Language::Vue
-        | Language::CSharp
-        | Language::VisualBasic => true,
+        Language::Swift => swift::exported(name, node, source),
+        Language::ObjC | Language::ObjCpp => objc::exported(name, node, source),
+        Language::Kotlin => kotlin::exported(name, node, source),
+        Language::Shell => shell::exported(name, node, source),
+        Language::Ruby => ruby::exported(name, node, source),
+        Language::Lua => lua::exported(name, node, source),
+        Language::C | Language::Cpp | Language::Vue | Language::CSharp | Language::VisualBasic => {
+            true
+        }
     }
 }
 
@@ -1495,7 +1534,11 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             | Language::Vue
             | Language::Dart
             | Language::CSharp
-            | Language::VisualBasic => Vec::new(),
+            | Language::VisualBasic
+            | Language::Kotlin
+            | Language::Shell
+            | Language::Ruby
+            | Language::Lua => Vec::new(),
         }
     }
 

@@ -194,7 +194,8 @@ pub(crate) const READ_SHELL_COMMANDS: &[&str] = &[
 pub(crate) const SUPPORTED_CODE_EXTENSIONS: &[&str] = &[
     "py", "pyi", "go", "java", "rs", "ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx", "c",
     "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp", "m", "mm", "swift", "php", "vue", "dart",
-    "cs", "cshtml", "csx", "razor", "vb",
+    "cs", "cshtml", "csx", "razor", "vb", "kt", "kts", "sh", "bash", "rb", "rake", "gemspec",
+    "lua",
 ];
 
 /// 触发 hook 的客户端类型
@@ -2768,7 +2769,7 @@ mod tests {
         assert_eq!(kind, ToolKind::SliceRead);
 
         // 单元层：非代码文件（未索引语言/markdown）的切片 → Neutral（与全量读口径一致）
-        for non_code in ["src/Main.kt", "README.md", "notes.txt"] {
+        for non_code in ["src/Main.scala", "README.md", "notes.txt"] {
             assert_eq!(
                 classify_tool(
                     "read",
@@ -2992,7 +2993,7 @@ mod tests {
         let payload = serde_json::json!({
             "session_id": "kt_slice_sess",
             "tool_name": "Read",
-            "tool_input": { "file_path": "src/Main.kt", "offset": 1, "limit": 50 }
+            "tool_input": { "file_path": "src/Main.scala", "offset": 1, "limit": 50 }
         })
         .to_string();
 
@@ -3009,7 +3010,7 @@ mod tests {
                 Some(&temp_home),
             );
             assert_eq!(code, 0);
-            assert!(out.is_empty(), "第 {} 次 .kt 切片读不应有输出", i + 1);
+            assert!(out.is_empty(), "第 {} 次 .scala 切片读不应有输出", i + 1);
         }
 
         let _ = std::fs::remove_dir_all(&temp_home);
@@ -3485,9 +3486,9 @@ mod tests {
     #[test]
     fn test_is_code_file_path_supported_vs_unsupported() {
         // 未支持语言不应计为代码文件（不拦截）
-        assert!(!is_code_file_path("a.kt"));
+        assert!(!is_code_file_path("a.ex"));
         assert!(!is_code_file_path("a.scala"));
-        assert!(!is_code_file_path("a.rb"));
+        assert!(!is_code_file_path("a.hs"));
         assert!(!is_code_file_path("noext"));
 
         // 支持的语言应计为代码文件（拦截）
@@ -3499,7 +3500,7 @@ mod tests {
         // 带引号的路径 trim 逻辑仍正常工作
         assert!(is_code_file_path("'a.py'"));
         assert!(is_code_file_path("\"a.rs\""));
-        assert!(!is_code_file_path("'a.kt'"));
+        assert!(!is_code_file_path("'a.scala'"));
     }
 
     #[test]
@@ -3507,7 +3508,7 @@ mod tests {
         let kind_kt = classify_tool(
             "read",
             Client::ClaudeCode,
-            Some("src/Main.kt"),
+            Some("src/Main.scala"),
             None,
             None,
             None,

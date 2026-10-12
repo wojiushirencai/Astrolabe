@@ -1056,6 +1056,18 @@ fn install_hint_one(language: Language) -> String {
         Language::C | Language::Cpp => {
             "C/C++（clangd）：`brew install llvm`，或设置 ASTROLABE_LSP_C。".into()
         }
+        Language::Kotlin => {
+            "Kotlin：优先 kotlin-lsp（JetBrains，`brew install JetBrains/utils/kotlin-lsp`），回退 kotlin-language-server；可用 ASTROLABE_LSP_KOTLIN 覆盖。".into()
+        }
+        Language::Shell => {
+            "Shell/Bash（bash-language-server）：`npm i -g bash-language-server`，可选装 shellcheck。".into()
+        }
+        Language::Ruby => {
+            "Ruby（ruby-lsp）：`gem install ruby-lsp`，回退 solargraph。".into()
+        }
+        Language::Lua => {
+            "Lua（lua-language-server）：`brew install lua-language-server`。".into()
+        }
         Language::Php => {
             "PHP（intelephense）：`npm i -g intelephense`。".into()
         }

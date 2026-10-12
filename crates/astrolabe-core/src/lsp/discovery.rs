@@ -55,6 +55,10 @@ pub const PROBED_LANGUAGES: &[Language] = &[
     Language::Dart,
     Language::CSharp,
     Language::VisualBasic,
+    Language::Kotlin,
+    Language::Shell,
+    Language::Ruby,
+    Language::Lua,
 ];
 
 /// Snapshot of PATH and override variables used for one probe.
@@ -247,6 +251,45 @@ const VUE: &[Candidate] = &[Candidate {
     bin: "vue-language-server",
     args: &["--stdio"],
     install: "npm i -g @vue/language-server",
+}];
+
+/// Kotlin — JetBrains kotlin-lsp first, fwcd kotlin-language-server fallback.
+const KOTLIN: &[Candidate] = &[
+    Candidate {
+        bin: "kotlin-lsp",
+        args: &["--stdio"],
+        install: "kotlin-lsp (JetBrains, preview): brew install JetBrains/utils/kotlin-lsp  # or download from https://github.com/Kotlin/kotlin-lsp/releases; set ASTROLABE_LSP_KOTLIN",
+    },
+    Candidate {
+        bin: "kotlin-language-server",
+        args: &[],
+        install: "kotlin-language-server (fwcd): brew install kotlin-language-server  # or https://github.com/fwcd/kotlin-language-server/releases",
+    },
+];
+
+const SHELL: &[Candidate] = &[Candidate {
+    bin: "bash-language-server",
+    args: &["start"],
+    install: "npm i -g bash-language-server  # optional: shellcheck on PATH for diagnostics; set ASTROLABE_LSP_SHELL",
+}];
+
+const RUBY: &[Candidate] = &[
+    Candidate {
+        bin: "ruby-lsp",
+        args: &[],
+        install: "gem install ruby-lsp  # set ASTROLABE_LSP_RUBY",
+    },
+    Candidate {
+        bin: "solargraph",
+        args: &["stdio"],
+        install: "gem install solargraph",
+    },
+];
+
+const LUA: &[Candidate] = &[Candidate {
+    bin: "lua-language-server",
+    args: &[],
+    install: "brew install lua-language-server  # or https://github.com/LuaLS/lua-language-server/releases; set ASTROLABE_LSP_LUA",
 }];
 
 const DART: &[Candidate] = &[Candidate {
@@ -818,6 +861,10 @@ fn candidates(language: Language) -> &'static [Candidate] {
         Language::Vue => VUE,
         Language::Dart => DART,
         Language::CSharp | Language::VisualBasic => CSHARP,
+        Language::Kotlin => KOTLIN,
+        Language::Shell => SHELL,
+        Language::Ruby => RUBY,
+        Language::Lua => LUA,
     }
 }
 
@@ -839,6 +886,10 @@ fn env_override_keys(language: Language) -> &'static [&'static str] {
         Language::Vue => &["ASTROLABE_LSP_VUE"],
         Language::Dart => &["ASTROLABE_LSP_DART"],
         Language::CSharp | Language::VisualBasic => &["ASTROLABE_LSP_CSHARP"],
+        Language::Kotlin => &["ASTROLABE_LSP_KOTLIN"],
+        Language::Shell => &["ASTROLABE_LSP_SHELL"],
+        Language::Ruby => &["ASTROLABE_LSP_RUBY"],
+        Language::Lua => &["ASTROLABE_LSP_LUA"],
     }
 }
 
@@ -860,6 +911,10 @@ fn override_keys_all() -> &'static [&'static str] {
         "ASTROLABE_LSP_VUE",
         "ASTROLABE_LSP_DART",
         "ASTROLABE_LSP_CSHARP",
+        "ASTROLABE_LSP_KOTLIN",
+        "ASTROLABE_LSP_SHELL",
+        "ASTROLABE_LSP_RUBY",
+        "ASTROLABE_LSP_LUA",
     ]
 }
 
@@ -1240,6 +1295,10 @@ mod tests {
                     assert!(result.install_hint.contains("ASTROLABE_LSP_CSHARP"));
                     assert!(result.install_hint.contains("dotnet"));
                 }
+                Language::Kotlin => assert!(result.install_hint.contains("kotlin-lsp")),
+                Language::Shell => assert!(result.install_hint.contains("bash-language-server")),
+                Language::Ruby => assert!(result.install_hint.contains("ruby-lsp")),
+                Language::Lua => assert!(result.install_hint.contains("lua-language-server")),
             }
             assert!(
                 result.needs_install.is_some(),

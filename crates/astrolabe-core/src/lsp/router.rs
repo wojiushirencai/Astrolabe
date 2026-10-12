@@ -266,6 +266,12 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::VisualBasic => {
             "Microsoft.CodeAnalysis.LanguageServer via `dotnet <dll> --stdio` (.NET 10 runtime; set ASTROLABE_LSP_CSHARP; same server as C#)"
         }
+        Language::Kotlin => {
+            "kotlin-lsp (JetBrains) or kotlin-language-server (fwcd); set ASTROLABE_LSP_KOTLIN"
+        }
+        Language::Shell => "bash-language-server (`npm i -g bash-language-server`)",
+        Language::Ruby => "ruby-lsp (`gem install ruby-lsp`) or solargraph",
+        Language::Lua => "lua-language-server (`brew install lua-language-server`)",
     }
 }
 
@@ -284,6 +290,10 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Vue => "vue-language-server",
         Language::Dart => "dart language-server",
         Language::CSharp | Language::VisualBasic => "Microsoft.CodeAnalysis.LanguageServer",
+        Language::Kotlin => "kotlin-lsp",
+        Language::Shell => "bash-language-server",
+        Language::Ruby => "ruby-lsp",
+        Language::Lua => "lua-language-server",
     }
 }
 

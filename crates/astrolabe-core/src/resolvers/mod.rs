@@ -51,6 +51,13 @@ pub mod python;
 pub mod rust;
 pub mod typescript;
 pub mod visualbasic;
+// lang-batch-8 stubs (one file per worker).
+pub mod kotlin;
+pub mod lua;
+pub mod objc;
+pub mod ruby;
+pub mod shell;
+pub mod swift;
 
 /// All resolvers, one per supported language.
 pub fn all() -> Vec<Box<dyn ModuleResolver>> {
@@ -63,6 +70,12 @@ pub fn all() -> Vec<Box<dyn ModuleResolver>> {
         Box::new(dart::DartResolver),
         Box::new(csharp::CSharpResolver),
         Box::new(visualbasic::VisualBasicResolver),
+        Box::new(swift::SwiftResolver),
+        Box::new(objc::ObjCResolver),
+        Box::new(kotlin::KotlinResolver),
+        Box::new(shell::ShellResolver),
+        Box::new(ruby::RubyResolver),
+        Box::new(lua::LuaResolver),
     ]
 }
 
@@ -146,6 +159,7 @@ impl ResolverSet {
         // TS and TSX and JS share one resolver.
         let owner = match lang {
             Language::Tsx | Language::JavaScript | Language::Vue => Language::TypeScript,
+            Language::ObjCpp => Language::ObjC,
             other => other,
         };
         let Some(r) = self.resolvers.iter().find(|r| r.language() == owner) else {

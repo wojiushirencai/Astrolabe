@@ -443,17 +443,17 @@ mod tests {
     fn unindexed_code_exts_caches_in_graph_set() {
         let dir = unique_temp_dir();
         std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(dir.join("script.rb"), "puts 'hello'\n").unwrap();
+        std::fs::write(dir.join("script.ex"), "puts 'hello'\n").unwrap();
         let index = build(&dir).expect("index build");
         assert!(index.in_graph_paths.get().is_none());
 
         let counts1 = index.unindexed_code_exts(None);
-        assert_eq!(counts1.get("rb"), Some(&1));
+        assert_eq!(counts1.get("ex"), Some(&1));
         assert!(index.in_graph_paths.get().is_some());
 
         let cached_ptr = index.in_graph_paths.get().unwrap() as *const _;
         let counts2 = index.unindexed_code_exts(None);
-        assert_eq!(counts2.get("rb"), Some(&1));
+        assert_eq!(counts2.get("ex"), Some(&1));
         let cached_ptr2 = index.in_graph_paths.get().unwrap() as *const _;
         assert_eq!(cached_ptr, cached_ptr2);
 

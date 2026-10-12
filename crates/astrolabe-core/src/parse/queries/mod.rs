@@ -89,7 +89,15 @@ pub fn for_language(lang: Language) -> Option<LanguageQueries> {
         Language::VisualBasic => queries!("vb"),
         Language::C => queries!("c"),
         Language::Cpp => queries!("cpp"),
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        // lang-batch-8: ObjC++ shares the ObjC grammar and queries.
+        Language::ObjC | Language::ObjCpp => queries!("objc"),
+        Language::Swift => queries!("swift"),
+        Language::Kotlin => queries!("kotlin"),
+        Language::Shell => queries!("bash"),
+        Language::Ruby => queries!("ruby"),
+        Language::Lua => queries!("lua"),
+        // Vue SFCs are peeled in `parse::vue` and parsed with JS/TS queries.
+        Language::Vue => return None,
     })
 }
 
@@ -138,7 +146,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
-    const ALL: [Language; 13] = [
+    const ALL: [Language; 20] = [
         Language::Python,
         Language::Go,
         Language::Java,
@@ -152,6 +160,13 @@ mod tests {
         Language::Dart,
         Language::CSharp,
         Language::VisualBasic,
+        Language::ObjC,
+        Language::ObjCpp,
+        Language::Swift,
+        Language::Kotlin,
+        Language::Shell,
+        Language::Ruby,
+        Language::Lua,
     ];
 
     fn grammar(lang: Language) -> tree_sitter::Language {
@@ -171,10 +186,27 @@ mod tests {
             Language::Dart => tree_sitter::Language::new(tree_sitter_dart::LANGUAGE),
             Language::CSharp => tree_sitter::Language::new(tree_sitter_c_sharp::LANGUAGE),
             Language::VisualBasic => tree_sitter::Language::new(tree_sitter_vb_dotnet::LANGUAGE),
-            Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => {
+            Language::ObjC | Language::ObjCpp => {
+                tree_sitter::Language::new(tree_sitter_objc::LANGUAGE)
+            }
+            Language::Swift => tree_sitter::Language::new(tree_sitter_swift::LANGUAGE),
+            Language::Kotlin => tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
+            Language::Shell => tree_sitter::Language::new(tree_sitter_bash::LANGUAGE),
+            Language::Ruby => tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
+            Language::Lua => tree_sitter::Language::new(tree_sitter_lua::LANGUAGE),
+            Language::Vue => {
                 panic!("{lang:?} grammar not registered in query tests yet")
             }
         }
+    }
+
+    /// lang-batch-8 placeholder `.scm` (comment-only). Workers delete the
+    /// `placeholder` marker line when real patterns land; the capture checks
+    /// then apply in full. Compilation is still checked for placeholders.
+    fn is_placeholder(src: &str) -> bool {
+        src.lines()
+            .next()
+            .is_some_and(|l| l.contains("placeholder (lang-batch-8)"))
     }
 
     fn compile(lang: Language, src: &str, what: &str) -> Query {
@@ -338,6 +370,9 @@ mod tests {
     fn every_definition_capture_maps_to_a_symbol_kind() {
         for lang in ALL {
             let q = for_language(lang).unwrap();
+            if is_placeholder(q.symbols) {
+                continue; // lang-batch-8 worker has not landed queries yet.
+            }
             let query = compile(lang, q.symbols, "symbols");
             let mut saw_name = false;
             for cap in query.capture_names() {
@@ -363,6 +398,9 @@ mod tests {
     fn import_and_call_queries_use_the_documented_captures() {
         for lang in ALL {
             let q = for_language(lang).unwrap();
+            if is_placeholder(q.symbols) {
+                continue; // lang-batch-8 worker has not landed queries yet.
+            }
             let imports = compile(lang, q.imports, "imports");
             assert!(
                 imports.capture_names().contains(&IMPORT),

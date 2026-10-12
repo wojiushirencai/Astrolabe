@@ -4687,10 +4687,10 @@ mod tests {
         )
         .unwrap();
 
-        // 3 个 .kt 文件 (未支持语言)
-        std::fs::write(dir.join("A.kt"), "class A { val x = 1 }\n").unwrap();
-        std::fs::write(dir.join("B.kt"), "class B { val y = 2 }\n").unwrap();
-        std::fs::write(dir.join("C.kt"), "class C { val z = 3 }\n").unwrap();
+        // 3 个 .scala 文件 (未支持语言)
+        std::fs::write(dir.join("A.scala"), "class A { val x = 1 }\n").unwrap();
+        std::fs::write(dir.join("B.scala"), "class B { val y = 2 }\n").unwrap();
+        std::fs::write(dir.join("C.scala"), "class C { val z = 3 }\n").unwrap();
 
         // 1 个 .dart 文件 (支持语言对照)
         std::fs::write(
@@ -4704,7 +4704,7 @@ mod tests {
         *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
         server.structured_output = true;
 
-        // 1. search_code 零命中且无 path_filter，含 .kt×3 (N>=3) 时提示尚未支持语言且带计数
+        // 1. search_code 零命中且无 path_filter，含 .scala×3 (N>=3) 时提示尚未支持语言且带计数
         let search_miss = server.search_code(Parameters(SearchParams {
             query: "nonexistent_code_pattern".into(),
             regex: false,
@@ -4719,14 +4719,14 @@ mod tests {
             "{search_text}"
         );
         assert!(search_text.contains("尚未支持的语言"), "{search_text}");
-        assert!(search_text.contains("3 个 .kt 文件"), "{search_text}");
+        assert!(search_text.contains("3 个 .scala 文件"), "{search_text}");
         assert!(search_text.contains("未入代码索引"), "{search_text}");
         assert!(
             search_text.contains("已按纯文本一并搜索，同样无匹配"),
             "{search_text}"
         );
         assert!(
-            search_text.contains("注意：仓库内有 3 个 .kt 文件属于尚未支持的语言"),
+            search_text.contains("注意：仓库内有 3 个 .scala 文件属于尚未支持的语言"),
             "{search_text}"
         );
         let structured = search_miss.structured_content.expect("structured");
@@ -4736,7 +4736,7 @@ mod tests {
         let search_filter_hit_hint = server.search_code(Parameters(SearchParams {
             query: "nonexistent".into(),
             regex: false,
-            path_filter: Some(".kt".into()),
+            path_filter: Some(".scala".into()),
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
@@ -4748,7 +4748,7 @@ mod tests {
             .as_str();
         assert!(
             filter_hint_text
-                .contains("注意：path_filter '.kt' 范围内有 3 个 .kt 文件属于尚未支持的语言"),
+                .contains("注意：path_filter '.scala' 范围内有 3 个 .scala 文件属于尚未支持的语言"),
             "{filter_hint_text}"
         );
         let filter_hint_structured = search_filter_hit_hint
@@ -4756,11 +4756,11 @@ mod tests {
             .expect("structured");
         assert_eq!(filter_hint_structured["unindexed_hint"], json!(true));
 
-        // 1c. 带 path_filter 的 search_code 零命中：filter 范围内 N<3 (仅 A.kt 匹配，计 1)
+        // 1c. 带 path_filter 的 search_code 零命中：filter 范围内 N<3 (仅 A.scala 匹配，计 1)
         let search_filter_miss = server.search_code(Parameters(SearchParams {
             query: "nonexistent".into(),
             regex: false,
-            path_filter: Some("A.kt".into()),
+            path_filter: Some("A.scala".into()),
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
@@ -4794,32 +4794,32 @@ mod tests {
         let symbol_text = symbol_miss.content[0].as_text().unwrap().text.as_str();
         assert!(symbol_text.contains("(未找到匹配的符号)"), "{symbol_text}");
         assert!(
-            symbol_text.contains("(仓库另有 3 个 .kt 等未支持语言的源码文件未入符号索引，符号搜索不覆盖它们——如需检索请用 Grep/Read)"),
+            symbol_text.contains("(仓库另有 3 个 .scala 等未支持语言的源码文件未入符号索引，符号搜索不覆盖它们——如需检索请用 Grep/Read)"),
             "{symbol_text}"
         );
 
-        // 3. get_dependents target=A.kt 精确文案
+        // 3. get_dependents target=A.scala 精确文案
         let dep_res = server.get_dependents(Parameters(DependentsParams {
-            target: "A.kt".into(),
+            target: "A.scala".into(),
             direction: "dependents".into(),
             budget_tokens: 2500,
         }));
         let dep_text = dep_res.content[0].as_text().unwrap().text.as_str();
         assert!(
-            dep_text.contains("目标 A.kt 是 .kt 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
+            dep_text.contains("目标 A.scala 是 .scala 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
             "{dep_text}"
         );
 
-        // 3b. get_neighborhood target=A.kt 精确文案
+        // 3b. get_neighborhood target=A.scala 精确文案
         let neigh_res = server.get_neighborhood(Parameters(NeighborhoodParams {
-            target: "A.kt".into(),
+            target: "A.scala".into(),
             direction: "both".into(),
             depth: 2,
             budget_tokens: 2500,
         }));
         let neigh_text = neigh_res.content[0].as_text().unwrap().text.as_str();
         assert!(
-            neigh_text.contains("目标 A.kt 是 .kt 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
+            neigh_text.contains("目标 A.scala 是 .scala 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
             "{neigh_text}"
         );
 
@@ -4837,7 +4837,7 @@ mod tests {
             "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart"
         );
         assert!(
-            langs_text.contains("unindexed source files: .kt×3"),
+            langs_text.contains("unindexed source files: .scala×3"),
             "{langs_text}"
         );
         assert!(
@@ -4903,7 +4903,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("config.yaml"), "table: user_table\n").unwrap();
-        std::fs::write(dir.join("App.kt"), "val t = \"user_table\"\n").unwrap();
+        std::fs::write(dir.join("App.scala"), "val t = \"user_table\"\n").unwrap();
         std::fs::write(dir.join("package-lock.json"), "{\"user_table\": 1}\n").unwrap();
 
         let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
@@ -4917,7 +4917,7 @@ mod tests {
             "@README.md:1 [text-only]",
             "@schema.sql:1 [text-only]",
             "@config.yaml:1 [text-only]",
-            "@App.kt:1 [text-only]",
+            "@App.scala:1 [text-only]",
         ] {
             assert!(text.contains(anchor), "missing {anchor}: {text}");
         }
@@ -5023,9 +5023,9 @@ mod tests {
     fn unindexed_languages_threshold_under_three_does_not_hint() {
         let dir = unique_temp_dir();
         std::fs::write(dir.join("main.py"), "def main(): pass\n").unwrap();
-        // 仅 2 个 .kt 文件 (N = 2 < 3)
-        std::fs::write(dir.join("A.kt"), "class A\n").unwrap();
-        std::fs::write(dir.join("B.kt"), "class B\n").unwrap();
+        // 仅 2 个 .scala 文件 (N = 2 < 3)
+        std::fs::write(dir.join("A.scala"), "class A\n").unwrap();
+        std::fs::write(dir.join("B.scala"), "class B\n").unwrap();
 
         let server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
         let index = crate::index::build(&dir).expect("index");
@@ -5061,13 +5061,13 @@ mod tests {
         assert!(symbol_text.contains("(未找到匹配的符号)"), "{symbol_text}");
         assert!(!symbol_text.contains("未支持语言"), "{symbol_text}");
 
-        // get_languages: >=1 就显示统计，这里有 2 个 .kt 仍会显示
+        // get_languages: >=1 就显示统计，这里有 2 个 .scala 仍会显示
         let langs_res = server.get_languages(Parameters(BudgetOnly {
             budget_tokens: 2500,
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
         assert!(
-            langs_text.contains("unindexed source files: .kt×2"),
+            langs_text.contains("unindexed source files: .scala×2"),
             "{langs_text}"
         );
 
