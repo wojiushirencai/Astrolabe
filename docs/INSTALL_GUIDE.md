@@ -203,6 +203,24 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 | `ASTROLABE_READ_THRESHOLD` | `3` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） |
 | `ASTROLABE_DENY_SILENCE_SECS` | `15` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） |
 
+### 语言服务器（可选）
+
+符号索引、`find_symbol`、文件图谱只靠内置 tree-sitter，不需要任何语言服务器。`find_references` / `goto_definition` / `get_diagnostics` / 改名需要对应的语言服务器在 `PATH` 上；找不到时这些工具返回 `unknown` 并给出安装提示，不会静默降级。也可用 `ASTROLABE_LSP_<LANG>` 指定可执行文件路径。Astrolabe 不会自动下载。
+
+| 语言 | 扩展名 | 语言服务器（优先 → 回退） | 安装 | 覆盖变量 |
+|---|---|---|---|---|
+| Swift | `.swift` | `sourcekit-lsp` | macOS：`xcode-select --install`；Linux / Windows：安装 [Swift 工具链](https://www.swift.org/install/) | `ASTROLABE_LSP_SWIFT` |
+| Objective-C / ObjC++ | `.m`, `.mm`, ObjC `.h` | `sourcekit-lsp` → `clangd` | `xcode-select --install`；或 `brew install llvm` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` |
+| Vue | `.vue` | `vue-language-server --stdio` | `npm i -g @vue/language-server` | `ASTROLABE_LSP_VUE` |
+| Kotlin | `.kt`, `.kts` | `kotlin-lsp` → `kotlin-language-server` | `brew install JetBrains/utils/kotlin-lsp`（预览版）或 [Releases](https://github.com/Kotlin/kotlin-lsp/releases)；回退 `brew install kotlin-language-server` | `ASTROLABE_LSP_KOTLIN` |
+| Shell / Bash | `.sh`, `.bash`, sh/bash shebang 脚本 | `bash-language-server start` | `npm i -g bash-language-server`（可选 `shellcheck`） | `ASTROLABE_LSP_SHELL` |
+| Ruby | `.rb`, `.rake`, `.gemspec`, `Rakefile` / `Gemfile` 等 | `ruby-lsp` → `solargraph stdio` | `gem install ruby-lsp`（或 `gem install solargraph`） | `ASTROLABE_LSP_RUBY` |
+| Lua | `.lua`, lua shebang 脚本 | `lua-language-server` | `brew install lua-language-server` 或 [Releases](https://github.com/LuaLS/lua-language-server/releases) | `ASTROLABE_LSP_LUA` |
+
+其余语言（Python、Go、Rust、Java、TS/JS、C/C++、PHP、Dart、C#/VB）见 README「语言支持与 LSP 矩阵」。
+
+Hook 的读源码拦截按 41 个受支持扩展名判断（含上表的 `.kt` / `.kts` / `.sh` / `.bash` / `.rb` / `.rake` / `.gemspec` / `.lua` / `.swift` / `.m` / `.mm` / `.vue`）；不在表里的语言正常读取，不拦截。
+
 ### 客户端与 Hook 支持矩阵
 
 | 客户端 (`--client`) | 工具识别规则 | Deny 决策格式 | 上下文预设 (`--context`) | 状态与说明 |
