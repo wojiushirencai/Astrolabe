@@ -80,8 +80,9 @@ pub(crate) fn mcp_index_options(persist: bool, parse_cache_bytes: u64) -> IndexO
 /// it and skips non-scripts); keep every `removed` path (dropping a node is
 /// cheap and must not miss a delete).
 pub(crate) fn filter_changeset(changes: ChangeSet) -> ChangeSet {
-    let maybe_source =
-        |path: &RelPath| Language::from_path(path).is_some() || path.extension().is_none();
+    let maybe_source = |path: &RelPath| {
+        Language::from_path(path).is_some() || Language::is_shebang_candidate(path)
+    };
     ChangeSet {
         added: changes
             .added

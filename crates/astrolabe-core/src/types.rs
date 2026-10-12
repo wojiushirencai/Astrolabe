@@ -185,11 +185,20 @@ impl Language {
         }
     }
 
+    /// Whether `p` has no real extension, so its language may come from a
+    /// shebang. `Sourcing nvm.sh global alias bug` counts: a "suffix" that is
+    /// not a plain alphanumeric token (`sh global alias bug`) is part of the
+    /// name, not an extension.
+    pub fn is_shebang_candidate(p: &RelPath) -> bool {
+        p.extension()
+            .is_none_or(|e| e.is_empty() || !e.bytes().all(|b| b.is_ascii_alphanumeric()))
+    }
+
     /// Like [`Language::from_path`], but a `.h` header whose text uses C++
     /// constructs (`class`, `namespace`, `template<`, `::`, …) is C++.
     pub fn from_path_and_source(p: &RelPath, source: &str) -> Option<Self> {
         let Some(lang) = Self::from_path(p) else {
-            return if p.extension().is_none() {
+            return if Self::is_shebang_candidate(p) {
                 Self::from_shebang(source)
             } else {
                 None
@@ -644,6 +653,15 @@ mod tests {
             Language::from_path_and_source(&RelPath::new("x.txt"), "#!/bin/sh\n"),
             None
         );
+        assert_eq!(
+            Language::from_path_and_source(
+                &RelPath::new("test/Sourcing nvm.sh global alias bug"),
+                "#!/bin/sh\n"
+            ),
+            Some(Language::Shell)
+        );
+        assert!(!Language::is_shebang_candidate(&RelPath::new("a/b.txt")));
+        assert!(Language::is_shebang_candidate(&RelPath::new("bin/run")));
         for name in ["kotlin", "shell", "ruby", "lua"] {
             assert_eq!(Language::from_name(name).map(|l| l.name()), Some(name));
         }

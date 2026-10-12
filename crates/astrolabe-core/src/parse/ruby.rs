@@ -177,7 +177,7 @@ def top; end
     #[test]
     fn imports_and_calls() {
         let parsed = parse_source(Language::Ruby, SRC).expect("parse");
-        assert_eq!(parsed.imports, vec!["foo/bar", "../x", "baz/q"]);
+        assert_eq!(parsed.imports, vec!["foo/bar", "relative:../x", "baz/q"]);
         let calls: Vec<&str> = parsed.calls.iter().map(|(c, _)| c.as_str()).collect();
         assert!(calls.contains(&"attr_accessor"), "{calls:?}");
     }
