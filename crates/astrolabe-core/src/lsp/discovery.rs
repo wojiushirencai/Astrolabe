@@ -174,7 +174,7 @@ const TYPESCRIPT: &[Candidate] = &[
     Candidate {
         bin: "typescript-language-server",
         args: &["--stdio"],
-        install: "npm i -g typescript-language-server typescript",
+        install: "npm i -g typescript-language-server typescript@5  # TypeScript 7 (native) ships no tsserver.js; keep a 5.x next to the server or set ASTROLABE_TSSERVER_PATH",
     },
     Candidate {
         bin: "vtsls",
@@ -250,7 +250,7 @@ const APPLE_OBJC: &[Candidate] = &[
 const VUE: &[Candidate] = &[Candidate {
     bin: "vue-language-server",
     args: &["--stdio"],
-    install: "npm i -g @vue/language-server",
+    install: "npm i -g @vue/language-server@2 typescript@5  # Volar 3.x needs a tsserver bridge Astrolabe does not provide yet; 2.x runs with hybridMode=false",
 }];
 
 /// Kotlin — JetBrains kotlin-lsp first, fwcd kotlin-language-server fallback.
@@ -276,7 +276,10 @@ const SHELL: &[Candidate] = &[Candidate {
 const RUBY: &[Candidate] = &[
     Candidate {
         bin: "ruby-lsp",
-        args: &[],
+        // The launcher boots in degraded mode instead of exiting 78 when a
+        // repo has a Gemfile but no Gemfile.lock (fresh clones, gems that
+        // never commit the lock), and when some bundle gems fail to install.
+        args: &["--use-launcher"],
         install: "gem install ruby-lsp  # set ASTROLABE_LSP_RUBY",
     },
     Candidate {
