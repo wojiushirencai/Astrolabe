@@ -134,6 +134,11 @@ impl ParserPool {
         if matches!(lang, Language::ObjC | Language::ObjCpp) {
             return objc::parse_with(lang, source, |l, s| self.parse_raw(l, path, s));
         }
+        // Shell: zsh-only syntax and `.bats` `@test` blocks are rewritten
+        // (line-preserving) for the bash grammar.
+        if lang == Language::Shell {
+            return shell::parse_with(path.as_str(), source, |s| self.parse_raw(lang, path, s));
+        }
         self.parse_raw(lang, path, source)
     }
 
