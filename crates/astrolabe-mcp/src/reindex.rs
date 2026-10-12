@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use astrolabe_core::elect::IndexerLock;
 use astrolabe_core::index::{IncrementalIndex, IndexOptions, DEFAULT_PARSE_CACHE_BYTES};
-use astrolabe_core::{ChangeSet, Language};
+use astrolabe_core::{ChangeSet, Language, RelPath};
 
 /// Minimum gap between two published rebuilds. Bursts of editor saves collapse
 /// into one `apply_changeset` instead of a chain of full (or even incremental)
@@ -76,19 +76,22 @@ pub(crate) fn mcp_index_options(persist: bool, parse_cache_bytes: u64) -> IndexO
 }
 
 /// Keep `added`/`modified` only when [`Language::from_path`] recognizes the
-/// file; keep every `removed` path (dropping a node is cheap and must not miss
-/// a delete).
+/// file or it has no extension (possible shebang script; the indexer sniffs
+/// it and skips non-scripts); keep every `removed` path (dropping a node is
+/// cheap and must not miss a delete).
 pub(crate) fn filter_changeset(changes: ChangeSet) -> ChangeSet {
+    let maybe_source =
+        |path: &RelPath| Language::from_path(path).is_some() || path.extension().is_none();
     ChangeSet {
         added: changes
             .added
             .into_iter()
-            .filter(|path| Language::from_path(path).is_some())
+            .filter(|p| maybe_source(p))
             .collect(),
         modified: changes
             .modified
             .into_iter()
-            .filter(|path| Language::from_path(path).is_some())
+            .filter(|p| maybe_source(p))
             .collect(),
         removed: changes.removed,
     }
@@ -280,6 +283,7 @@ mod tests {
         );
         assert!(filter_changeset(cs_modified(&["docs/guide.md"])).is_empty());
         assert!(!filter_changeset(cs_removed(&["docs/guide.md"])).is_empty());
+        assert!(!filter_changeset(cs_modified(&["bin/tool"])).is_empty());
     }
 
     #[test]

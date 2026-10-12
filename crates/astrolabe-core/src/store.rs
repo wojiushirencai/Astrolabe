@@ -414,6 +414,11 @@ fn language_to_u8(language: Language) -> u8 {
         Language::Dart => 14,
         Language::CSharp => 15,
         Language::VisualBasic => 16,
+        // lang-batch-8: append only, never renumber.
+        Language::Kotlin => 17,
+        Language::Shell => 18,
+        Language::Ruby => 19,
+        Language::Lua => 20,
     }
 }
 
@@ -463,6 +468,10 @@ fn language_from_u8(language: u8) -> Option<Language> {
         14 => Language::Dart,
         15 => Language::CSharp,
         16 => Language::VisualBasic,
+        17 => Language::Kotlin,
+        18 => Language::Shell,
+        19 => Language::Ruby,
+        20 => Language::Lua,
         _ => return None,
     })
 }
@@ -878,8 +887,21 @@ mod tests {
             Language::Dart,
             Language::CSharp,
             Language::VisualBasic,
+            Language::Kotlin,
+            Language::Shell,
+            Language::Ruby,
+            Language::Lua,
         ] {
             assert_eq!(language_from_u8(language_to_u8(lang)), Some(lang));
         }
+    }
+
+    #[test]
+    fn lang_batch_8_tags_are_appended_not_renumbered() {
+        assert_eq!(language_to_u8(Language::VisualBasic), 16);
+        assert_eq!(language_to_u8(Language::Kotlin), 17);
+        assert_eq!(language_to_u8(Language::Shell), 18);
+        assert_eq!(language_to_u8(Language::Ruby), 19);
+        assert_eq!(language_to_u8(Language::Lua), 20);
     }
 }

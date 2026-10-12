@@ -24,7 +24,7 @@ use crate::types::{Language, RelPath};
 use super::RewriteError;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
-const LANGUAGES: [Language; 13] = [
+const LANGUAGES: [Language; 20] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -38,6 +38,13 @@ const LANGUAGES: [Language; 13] = [
     Language::Dart,
     Language::CSharp,
     Language::VisualBasic,
+    Language::ObjC,
+    Language::ObjCpp,
+    Language::Swift,
+    Language::Kotlin,
+    Language::Shell,
+    Language::Ruby,
+    Language::Lua,
 ];
 
 /// Parse-health of one file, captured before or after a rewrite.
@@ -267,7 +274,14 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Dart => 10,
         Language::CSharp => 11,
         Language::VisualBasic => 12,
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        Language::ObjC => 13,
+        Language::ObjCpp => 14,
+        Language::Swift => 15,
+        Language::Kotlin => 16,
+        Language::Shell => 17,
+        Language::Ruby => 18,
+        Language::Lua => 19,
+        Language::Vue => return None,
     })
 }
 
@@ -286,7 +300,14 @@ fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         Language::VisualBasic => tree_sitter_vb_dotnet::LANGUAGE.into(),
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        Language::ObjC => tree_sitter_objc::LANGUAGE.into(),
+        Language::ObjCpp => tree_sitter_objc::LANGUAGE.into(),
+        Language::Swift => tree_sitter_swift::LANGUAGE.into(),
+        Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        Language::Shell => tree_sitter_bash::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Language::Lua => tree_sitter_lua::LANGUAGE.into(),
+        Language::Vue => return None,
     })
 }
 

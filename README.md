@@ -485,12 +485,17 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 | **Java** | `.java` | `jdtls` | `ASTROLABE_LSP_JAVA` | `brew install jdtls`；支持 Maven、Gradle 源根解析 |
 | **TypeScript / JS** | `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs` | `typescript-language-server` | `ASTROLABE_LSP_TYPESCRIPT` | 支持 `tsconfig.json` paths、Node workspace `package.json` |
 | **C / C++** | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.ipp` | `clangd` / `ccls` | `ASTROLABE_LSP_C`, `ASTROLABE_LSP_CXX` | `clangd --background-index`；支持 `#include` 路径解析 |
-| **Swift / ObjC** | `.swift`, `.m`, `.mm` | `sourcekit-lsp` / `clangd` | `ASTROLABE_LSP_SWIFT`, `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` | macOS Command Line Tools 自带 `sourcekit-lsp`；ObjC 可回退 `clangd` |
+| **Swift** | `.swift` | `sourcekit-lsp` | `ASTROLABE_LSP_SWIFT` | macOS Command Line Tools 自带 `sourcekit-lsp`（Linux / Windows 需另装 Swift 工具链）。tree-sitter 符号抽取：class / struct / enum / protocol / extension / actor / func / init / 属性 / typealias；带大段属性（如 `@Test(arguments:)`）的声明锚点落在名字所在行 |
+| **Objective-C / ObjC++** | `.m`, `.mm` | `sourcekit-lsp` / `clangd` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` | tree-sitter 符号抽取：`@interface` / `@implementation` / `@protocol` / category / 方法 / 属性；`.mm` 使用 ObjC 语法（C++ 构造可能产生 ERROR 节点）；ObjC 可回退 `clangd` |
 | **PHP** | `.php` | `intelephense` / `phpactor` | `ASTROLABE_LSP_PHP` | `npm i -g intelephense`；支持 include/require 路径解析 |
-| **Vue** | `.vue` | `vue-language-server` (Volar) | `ASTROLABE_LSP_VUE` | SFC 内嵌 `<script>` / `<script setup>` 提取与语义解析 |
+| **Vue** | `.vue` | `vue-language-server` (Volar) | `ASTROLABE_LSP_VUE` | SFC 内嵌 `<script>` / `<script setup>` 走 TS/JS 语法抽取；另抽组件名、`defineProps` / `defineEmits` / `defineModel` 与选项式 API 的 props / emits |
 | **Dart** | `.dart` | `dart language-server` | `ASTROLABE_LSP_DART` | 随 Dart / Flutter SDK 自带；`pubspec.yaml` 行级解析与多 pubspec monorepo 支持；`rootUri` 置 `null` 规避重复分析 |
 | **C#** | `.cs`, `.csx`, `.razor`, `.cshtml` | `Microsoft.CodeAnalysis.LanguageServer`（可选 Roslyn） | `ASTROLABE_LSP_CSHARP` | `.cs` / `.csx` / `.razor` / `.cshtml` 同为 C#（不另建语言变体，没有 Razor 语言）。`.csx` 用 C# 语法（含顶层语句与 local function）。`.razor` / `.cshtml` 在 tree-sitter 之前抽出 C#（`@code`、`@{ }`、行首 `@using` / `@inherits`；标记不当成 C# 符号；换行保留，列号不映射）。没有工程时 Roslyn 加载不了松散 `.csx`，这类脚本只走语法索引。命名空间 using 扇出到每个声明文件（不进 PageRank），`_ViewImports.cshtml` 的 `@using` 走同一解析（仅仓内命名空间；`System` / NuGet 为 None）。`ProjectReference` 记为 Import。Roslyn 为 `dotnet <dll> --stdio`，需要 .NET 10 runtime（工程目标框架可更旧），不静默下载，不是 OmniSharp / csharp-ls。Razor 没有语言服务器：现有启动器只认 Roslyn 的 `solution/open` / `project/open`，不是 Razor 协议，因此没有 `ASTROLABE_LSP_RAZOR`。 |
 | **Visual Basic .NET** | `.vb` | 同一个 `Microsoft.CodeAnalysis.LanguageServer` | `ASTROLABE_LSP_CSHARP`（与 C# 共用，无第二个变量） | 只索引 `.vb`（不含 `.bas` / `.frm`）。`Imports` 命名空间扇出到每个声明文件（Namespace，不进 PageRank）；类型 `Imports` 仅在恰好一个仓内目标时记为 Import。`.vbproj` 的 `ProjectReference` 与 C# 一样记在项目元数据上，工程文件本身不是图节点，不伪造边。`.sln` / `.vbproj` 走同一 `dotnet <dll> --stdio`。 |
+| **Kotlin** | `.kt`, `.kts` | `kotlin-lsp`（回退 `kotlin-language-server`） | `ASTROLABE_LSP_KOTLIN` | class / interface / object / companion / fun / 属性 / typealias / enum entry；import 按文件声明的 `package` 解析（包名不必与目录一致），支持与 Java 混写项目 |
+| **Shell / Bash** | `.sh`, `.bash`，以及 `#!` 为 sh/bash/dash/ksh 的无后缀脚本 | `bash-language-server` | `ASTROLABE_LSP_SHELL` | 函数定义（含 `a::b` 风格名字）与 `source` / `.` 相对路径；`.bats` 暂按纯文本；zsh 专有语法不在 bash 语法覆盖范围内 |
+| **Ruby** | `.rb`, `.rake`, `.gemspec`，`Rakefile` / `Gemfile` 等，以及 ruby shebang 脚本 | `ruby-lsp`（回退 `solargraph`） | `ASTROLABE_LSP_RUBY` | class / module / def / `def self.x` / 常量；`define_method`、`alias_method`、`attr_*` 与 `A::B` 嵌套命名；`require_relative` / `require`（经 `lib/`）解析 |
+| **Lua** | `.lua`，以及 lua/luajit shebang 脚本 | `lua-language-server` | `ASTROLABE_LSP_LUA` | `function a.b:c()`、`local function`、表字段函数与模块表；`require("a.b")` → `a/b.lua` / `a/b/init.lua` |
 
 ---
 
@@ -499,7 +504,7 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 即使有 System Prompt 军规约束，大模型在上下文拉长后依然可能出现注意力衰退（Agent Drift），退化为盲目使用 `grep` / `read`。Astrolabe 提供了硬核的门禁拦截机制：
 
 ### 核心拦截与放行规则
-- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 28 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截）、连续 4 次混合调用，或连续 10 次切片读（可通过 `ASTROLABE_SLICE_READ_THRESHOLD` 调整，期间无任何 Astrolabe 工具调用），Hook 将坚决拦截，deny 文案直接给出切换指令（"Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe)."）。
+- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 41 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截）、连续 4 次混合调用，或连续 10 次切片读（可通过 `ASTROLABE_SLICE_READ_THRESHOLD` 调整，期间无任何 Astrolabe 工具调用），Hook 将坚决拦截，deny 文案直接给出切换指令（"Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe)."）。
 - **切片精读额度制**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 切片调用仍可正常使用，但不再无限豁免——连续 10 次切片读且期间无任何 Astrolabe 工具调用时触发提醒式拦截，任何 Astrolabe 工具调用（含 `search_code` 等非符号工具）都会清零该额度。`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片 shell 命令仍完全放行、不计数。
 - **计数重置**：AI 调用任意 Astrolabe 符号工具（如 `resolve_context`、`find_symbol` 等）时，全部连续计数立即清零；`search_code` 等非符号 Astrolabe 工具调用只清零切片读额度（不影响 grep/read 计数）；若连续调用间隔超过设定时间，亦自动重置。
 - **智能放行窗口**：触发 Deny 后进入 15 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。

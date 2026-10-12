@@ -90,6 +90,14 @@ pub enum Language {
     CSharp,
     /// Visual Basic .NET (`.vb` only; not `.bas` / `.frm`).
     VisualBasic,
+    /// Kotlin (`.kt`, `.kts`). lang-batch-8, storage tag 17.
+    Kotlin,
+    /// Shell / Bash (`.sh`, `.bash`, plus bash/sh shebang). Storage tag 18.
+    Shell,
+    /// Ruby (`.rb`, `.rake`, `.gemspec`, `Rakefile`, `Gemfile`). Storage tag 19.
+    Ruby,
+    /// Lua (`.lua`). Storage tag 20.
+    Lua,
 }
 
 /// Cheap textual check for C++-only constructs in a header.
@@ -116,6 +124,9 @@ fn header_looks_cpp(source: &str) -> bool {
 impl Language {
     /// Language implied by a file extension, if any.
     pub fn from_path(p: &RelPath) -> Option<Self> {
+        if let Some(lang) = Self::from_file_name(p.as_str()) {
+            return Some(lang);
+        }
         let ext = p.extension()?.to_ascii_lowercase();
         Some(match ext.as_str() {
             "py" | "pyi" => Language::Python,
@@ -138,19 +149,60 @@ impl Language {
             // before tree-sitter. `.csx` uses the C# grammar as-is.
             "cs" | "csx" | "razor" | "cshtml" => Language::CSharp,
             "vb" => Language::VisualBasic,
+            "kt" | "kts" => Language::Kotlin,
+            "sh" | "bash" => Language::Shell,
+            "rb" | "rake" | "gemspec" => Language::Ruby,
+            "lua" => Language::Lua,
             _ => return None,
         })
+    }
+
+    /// Extension-less well-known file names (`Rakefile`, `Gemfile`, …).
+    fn from_file_name(path: &str) -> Option<Self> {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        match name {
+            "Rakefile" | "Gemfile" | "Guardfile" | "Podfile" | "Fastfile" | "Brewfile" => {
+                Some(Language::Ruby)
+            }
+            _ => None,
+        }
+    }
+
+    /// Language implied by a `#!` shebang line (`bash`, `sh`, `ruby`, `lua`).
+    /// Used only for extension-less files; see [`Language::from_path_and_source`].
+    pub fn from_shebang(source: &str) -> Option<Self> {
+        let first = source.lines().next()?.strip_prefix("#!")?.trim();
+        let mut parts = first.split_whitespace();
+        let mut interp = parts.next()?.rsplit('/').next()?;
+        if interp == "env" {
+            interp = parts.find(|p| !p.starts_with('-'))?;
+        }
+        match interp {
+            "sh" | "bash" | "dash" | "ksh" => Some(Language::Shell),
+            "ruby" => Some(Language::Ruby),
+            "lua" | "luajit" => Some(Language::Lua),
+            _ => None,
+        }
     }
 
     /// Like [`Language::from_path`], but a `.h` header whose text uses C++
     /// constructs (`class`, `namespace`, `template<`, `::`, …) is C++.
     pub fn from_path_and_source(p: &RelPath, source: &str) -> Option<Self> {
-        let lang = Self::from_path(p)?;
-        if lang == Language::C
-            && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h"))
-            && header_looks_cpp(source)
-        {
-            return Some(Language::Cpp);
+        let Some(lang) = Self::from_path(p) else {
+            return if p.extension().is_none() {
+                Self::from_shebang(source)
+            } else {
+                None
+            };
+        };
+        if lang == Language::C && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h")) {
+            // `@interface` / `#import` headers carry the public ObjC API.
+            if let Some(objc) = crate::parse::objc_header_language(source) {
+                return Some(objc);
+            }
+            if header_looks_cpp(source) {
+                return Some(Language::Cpp);
+            }
         }
         Some(lang)
     }
@@ -175,6 +227,10 @@ impl Language {
             "dart" => Some(Language::Dart),
             "csharp" | "cs" | "c#" => Some(Language::CSharp),
             "vb" | "visualbasic" | "visual-basic" => Some(Language::VisualBasic),
+            "kotlin" | "kt" => Some(Language::Kotlin),
+            "shell" | "sh" | "bash" | "shellscript" => Some(Language::Shell),
+            "ruby" | "rb" => Some(Language::Ruby),
+            "lua" => Some(Language::Lua),
             _ => None,
         }
     }
@@ -198,6 +254,10 @@ impl Language {
             Language::Dart => "dart",
             Language::CSharp => "csharp",
             Language::VisualBasic => "vb",
+            Language::Kotlin => "kotlin",
+            Language::Shell => "shell",
+            Language::Ruby => "ruby",
+            Language::Lua => "lua",
         }
     }
 }
@@ -544,6 +604,50 @@ pub struct CodeEdge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lang_batch_8_paths_and_shebangs() {
+        for (path, lang) in [
+            ("a.kt", Language::Kotlin),
+            ("build.gradle.kts", Language::Kotlin),
+            ("x.sh", Language::Shell),
+            ("x.bash", Language::Shell),
+            ("a.rb", Language::Ruby),
+            ("tasks.rake", Language::Ruby),
+            ("Rakefile", Language::Ruby),
+            ("sub/Gemfile", Language::Ruby),
+            ("init.lua", Language::Lua),
+            ("A.swift", Language::Swift),
+            ("A.m", Language::ObjC),
+            ("A.mm", Language::ObjCpp),
+        ] {
+            assert_eq!(
+                Language::from_path(&RelPath::new(path)),
+                Some(lang),
+                "{path}"
+            );
+        }
+        let bin = RelPath::new("bin/deploy");
+        assert_eq!(
+            Language::from_path_and_source(&bin, "#!/usr/bin/env bash\necho"),
+            Some(Language::Shell)
+        );
+        assert_eq!(
+            Language::from_path_and_source(&bin, "#!/usr/bin/ruby -w\n"),
+            Some(Language::Ruby)
+        );
+        assert_eq!(
+            Language::from_path_and_source(&bin, "#!/usr/bin/env python3\n"),
+            None
+        );
+        assert_eq!(
+            Language::from_path_and_source(&RelPath::new("x.txt"), "#!/bin/sh\n"),
+            None
+        );
+        for name in ["kotlin", "shell", "ruby", "lua"] {
+            assert_eq!(Language::from_name(name).map(|l| l.name()), Some(name));
+        }
+    }
 
     #[test]
     fn extensions_are_case_insensitive_and_cover_cpp_variants() {

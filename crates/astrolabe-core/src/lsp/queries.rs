@@ -775,6 +775,10 @@ fn server_label(language: Language) -> &'static str {
         Language::Vue => "vue-language-server",
         Language::Dart => "dart language-server",
         Language::CSharp | Language::VisualBasic => "Microsoft.CodeAnalysis.LanguageServer",
+        Language::Kotlin => "kotlin-lsp",
+        Language::Shell => "bash-language-server",
+        Language::Ruby => "ruby-lsp",
+        Language::Lua => "lua-language-server",
     }
 }
 

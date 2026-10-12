@@ -73,6 +73,17 @@ pub(crate) fn parse_sfc(
             }
             symbols.push(sym);
         }
+        let mut seen: std::collections::HashSet<(String, u32)> = symbols
+            .iter()
+            .map(|s| (s.name.clone(), s.start_line))
+            .collect();
+        for mut sym in sfc_macro_symbols(block.lang, &block.body, &component) {
+            sym.start_line = sym.start_line.saturating_add(line_offset);
+            sym.end_line = sym.end_line.saturating_add(line_offset);
+            if seen.insert((sym.name.clone(), sym.start_line)) {
+                symbols.push(sym);
+            }
+        }
         imports.extend(parsed.imports);
         for (name, line) in parsed.calls {
             calls.push((name, line.saturating_add(line_offset)));
@@ -193,6 +204,244 @@ fn lang_is(open_tag_lower: &str, want: &str) -> bool {
     patterns.iter().any(|p| open_tag_lower.contains(p.as_str()))
 }
 
+const SFC_MACRO_TRIGGERS: &[&str] = &[
+    "defineProps",
+    "defineEmits",
+    "defineModel",
+    "defineOptions",
+    "defineComponent",
+    "export default",
+];
+
+/// SFC compiler-macro / options surface that the plain TS/JS queries do not
+/// name: the component `name` option (`defineOptions`, `defineComponent`,
+/// `export default { name }`), props (`defineProps` object/array/inline type,
+/// `defineModel`, options-API `props`), and emitted events (`defineEmits`
+/// array/call-signature/named-tuple forms, options-API `emits`). Lines are
+/// 1-based inside `body`.
+fn sfc_macro_symbols(lang: Language, body: &str, component: &str) -> Vec<CodeSymbol> {
+    if !SFC_MACRO_TRIGGERS.iter().any(|t| body.contains(t)) {
+        return Vec::new();
+    }
+    let Some(grammar) = super::grammar(lang) else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(body, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "call_expression" => {
+                let callee = node
+                    .child_by_field_name("function")
+                    .map(|f| text(f, body))
+                    .unwrap_or_default();
+                let args = node.child_by_field_name("arguments");
+                let first_arg = args.and_then(|a| a.named_child(0));
+                let type_arg = node
+                    .child_by_field_name("type_arguments")
+                    .and_then(|t| t.named_child(0));
+                match callee {
+                    "defineOptions" | "defineComponent" => {
+                        if let Some(obj) = first_arg.filter(|n| n.kind() == "object") {
+                            options_object(obj, body, component, &mut out);
+                        }
+                    }
+                    "defineProps" => {
+                        if let Some(arg) = first_arg {
+                            keys_of(arg, body, "prop", &mut out);
+                        }
+                        if let Some(ty) = type_arg {
+                            keys_of(ty, body, "prop", &mut out);
+                        }
+                    }
+                    "defineEmits" => {
+                        if let Some(arg) = first_arg {
+                            keys_of(arg, body, "emit", &mut out);
+                        }
+                        if let Some(ty) = type_arg {
+                            keys_of(ty, body, "emit", &mut out);
+                        }
+                    }
+                    "defineModel" => {
+                        let name = match first_arg.filter(|n| n.kind() == "string") {
+                            Some(s) => string_value(s, body),
+                            None => "modelValue".to_string(),
+                        };
+                        push_field(&mut out, name, node, "model");
+                    }
+                    _ => {}
+                }
+            }
+            "export_statement" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    if value.kind() == "object" {
+                        options_object(value, body, component, &mut out);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+fn text<'a>(node: tree_sitter::Node<'_>, src: &'a str) -> &'a str {
+    src.get(node.byte_range()).unwrap_or("")
+}
+
+fn string_value(node: tree_sitter::Node<'_>, src: &str) -> String {
+    text(node, src)
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .to_string()
+}
+
+fn key_name(key: tree_sitter::Node<'_>, src: &str) -> Option<String> {
+    match key.kind() {
+        "property_identifier" | "identifier" | "shorthand_property_identifier" => {
+            Some(text(key, src).to_string())
+        }
+        "string" => Some(string_value(key, src)),
+        _ => None,
+    }
+}
+
+fn push_field(out: &mut Vec<CodeSymbol>, name: String, at: tree_sitter::Node<'_>, what: &str) {
+    if name.is_empty() {
+        return;
+    }
+    out.push(CodeSymbol {
+        id: SymbolId(0),
+        file: FileId(0),
+        signature: format!("vue {what} {name}"),
+        name,
+        kind: SymbolKind::Field,
+        start_line: line_number(at.start_position().row),
+        end_line: line_number(at.end_position().row),
+        exported: true,
+    });
+}
+
+/// Options object of `defineComponent` / `defineOptions` / `export default`.
+fn options_object(
+    obj: tree_sitter::Node<'_>,
+    src: &str,
+    component: &str,
+    out: &mut Vec<CodeSymbol>,
+) {
+    let mut cursor = obj.walk();
+    for pair in obj.named_children(&mut cursor) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let (Some(key), Some(value)) = (
+            pair.child_by_field_name("key"),
+            pair.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        match key_name(key, src).as_deref() {
+            Some("name") if value.kind() == "string" => {
+                let name = string_value(value, src);
+                if !name.is_empty() && name != component {
+                    out.push(CodeSymbol {
+                        id: SymbolId(0),
+                        file: FileId(0),
+                        signature: format!("vue component {name}"),
+                        name,
+                        kind: SymbolKind::Class,
+                        start_line: line_number(pair.start_position().row),
+                        end_line: line_number(pair.end_position().row),
+                        exported: true,
+                    });
+                }
+            }
+            Some("props") => keys_of(value, src, "prop", out),
+            Some("emits") => keys_of(value, src, "emit", out),
+            _ => {}
+        }
+    }
+}
+
+/// Names declared by a props/emits argument: object keys, string array
+/// elements, inline object-type members, and emit call signatures
+/// `(e: 'change', ...)`. Type references (`Props`) are skipped: their
+/// interface members are already indexed by the TS query.
+fn keys_of(node: tree_sitter::Node<'_>, src: &str, what: &str, out: &mut Vec<CodeSymbol>) {
+    let mut cursor = node.walk();
+    match node.kind() {
+        "object" => {
+            for child in node.named_children(&mut cursor) {
+                let key = match child.kind() {
+                    "pair" => child.child_by_field_name("key"),
+                    "method_definition" => child.child_by_field_name("name"),
+                    "shorthand_property_identifier" => Some(child),
+                    _ => None,
+                };
+                if let Some(name) = key.and_then(|k| key_name(k, src)) {
+                    push_field(out, name, child, what);
+                }
+            }
+        }
+        "array" => {
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "string" {
+                    push_field(out, string_value(child, src), child, what);
+                }
+            }
+        }
+        "object_type" => {
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "property_signature" | "method_signature" => {
+                        if let Some(name) = child
+                            .child_by_field_name("name")
+                            .and_then(|k| key_name(k, src))
+                        {
+                            push_field(out, name, child, what);
+                        }
+                    }
+                    "call_signature" => {
+                        if let Some(name) = first_param_literal(child, src) {
+                            push_field(out, name, child, what);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "parenthesized_expression" | "as_expression" | "satisfies_expression" => {
+            if let Some(inner) = node.named_child(0) {
+                keys_of(inner, src, what, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `(e: 'change', v: number): void` → `change`.
+fn first_param_literal(sig: tree_sitter::Node<'_>, src: &str) -> Option<String> {
+    let params = sig.child_by_field_name("parameters")?;
+    let first = params.named_child(0)?;
+    let ty = first.child_by_field_name("type")?;
+    let lit = ty.named_child(0)?;
+    if lit.kind() != "literal_type" {
+        return None;
+    }
+    let s = lit.named_child(0)?;
+    (s.kind() == "string").then(|| string_value(s, src))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +514,81 @@ const msg = ref('hi')
         assert_eq!(script_language(tag), Language::TypeScript);
         assert_eq!(script_language("<script lang='tsx'>"), Language::Tsx);
         assert_eq!(script_language("<script>"), Language::JavaScript);
+    }
+
+    #[test]
+    fn indexes_component_name_props_and_emits() {
+        let src = r#"<template><button /></template>
+<script setup lang="ts">
+defineOptions({ name: 'ElButton', inheritAttrs: false })
+const props = withDefaults(defineProps<{ size?: string; plain: boolean }>(), { size: 'md' })
+const emit = defineEmits<{
+  (e: 'click', ev: MouseEvent): void
+  (e: 'update:modelValue', v: string): void
+}>()
+const checked = defineModel<boolean>('checked')
+defineEmits<{ focus: [ev: FocusEvent] }>()
+</script>
+"#;
+        let parsed = parse_sfc(&pool(), &RelPath::new("src/button.vue"), src).unwrap();
+        let find = |n: &str| parsed.symbols.iter().find(|s| s.name == n);
+        let el = find("ElButton").expect("component name option");
+        assert_eq!(el.kind, SymbolKind::Class);
+        assert_eq!(el.start_line, 3);
+        for n in [
+            "size",
+            "plain",
+            "click",
+            "update:modelValue",
+            "checked",
+            "focus",
+            "props",
+            "emit",
+        ] {
+            assert!(
+                find(n).is_some(),
+                "missing {n}: {:?}",
+                parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(find("size").unwrap().kind, SymbolKind::Field);
+        assert_eq!(find("click").unwrap().start_line, 6);
+    }
+
+    #[test]
+    fn options_api_and_js_runtime_declarations() {
+        let src = r#"<script>
+import { defineComponent } from 'vue'
+export default defineComponent({
+  name: 'MyTable',
+  props: { rows: Array, dense: { type: Boolean } },
+  emits: ['select', 'sort'],
+  methods: { refresh() {} },
+})
+</script>
+<script setup>
+const p = defineProps(['title'])
+const e = defineEmits({ close: () => true })
+</script>
+"#;
+        let parsed = parse_sfc(&pool(), &RelPath::new("Table.vue"), src).unwrap();
+        let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        for n in [
+            "Table", "MyTable", "rows", "dense", "select", "sort", "title", "close",
+        ] {
+            assert!(names.contains(&n), "missing {n}: {names:?}");
+        }
+        let title = parsed.symbols.iter().find(|s| s.name == "title").unwrap();
+        assert_eq!(title.start_line, 11);
+    }
+
+    #[test]
+    fn plain_export_default_name_and_tsx_lang() {
+        let src = "<script lang=\"tsx\">\nexport default { name: 'Cell', props: ['value'] }\nexport const Render = () => <div />\n</script>\n";
+        let parsed = parse_sfc(&pool(), &RelPath::new("cell.vue"), src).unwrap();
+        let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        for n in ["cell", "Cell", "value", "Render"] {
+            assert!(names.contains(&n), "missing {n}: {names:?}");
+        }
     }
 }

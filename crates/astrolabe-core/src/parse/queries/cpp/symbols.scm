@@ -98,3 +98,26 @@
 ;; --------------------------------------------------------------- constants
 (enumerator
   name: (identifier) @name) @definition.const
+
+;; ------------------------------------------------------------ destructors
+;; In-class `~X();` / `~X() {}` and out-of-line `X::~X() {}`.
+(function_definition
+  declarator: (function_declarator
+    declarator: (destructor_name) @name)) @definition.method
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      name: (destructor_name) @name))) @definition.method
+
+(declaration
+  declarator: (function_declarator
+    declarator: (destructor_name) @name)) @definition.method
+
+(field_declaration
+  declarator: (function_declarator
+    declarator: (destructor_name) @name)) @definition.method
+
+;; C++17 nested namespaces `namespace facebook::react {`.
+(namespace_definition
+  name: (nested_namespace_specifier) @name) @definition.module

@@ -988,6 +988,10 @@ fn language_id(language: Language) -> &'static str {
         Language::Dart => "dart",
         Language::CSharp => "csharp",
         Language::VisualBasic => "vb",
+        Language::Kotlin => "kotlin",
+        Language::Shell => "shellscript",
+        Language::Ruby => "ruby",
+        Language::Lua => "lua",
     }
 }
 

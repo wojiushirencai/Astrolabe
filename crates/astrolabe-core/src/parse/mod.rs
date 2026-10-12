@@ -20,7 +20,7 @@
 //! (`@definition.*` / `@reference.*`) over inventing capture names.
 
 use std::ops::ControlFlow;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::types::{CodeSymbol, FileId, Language, RelPath, SymbolId, SymbolKind};
@@ -29,12 +29,20 @@ use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 pub mod queries;
 mod razor;
 mod vue;
+// lang-batch-8 per-language hooks (one file per worker).
+mod kotlin;
+mod lua;
+mod objc;
+pub use objc::header_language as objc_header_language;
+mod ruby;
+mod shell;
+mod swift;
 
 pub(crate) use razor::extract_razor_csharp;
 
 const PARSE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SIGNATURE_CHARS: usize = 240;
-const LANGUAGES: [Language; 13] = [
+const LANGUAGES: [Language; 20] = [
     Language::Python,
     Language::Go,
     Language::Java,
@@ -48,6 +56,13 @@ const LANGUAGES: [Language; 13] = [
     Language::Dart,
     Language::CSharp,
     Language::VisualBasic,
+    Language::ObjC,
+    Language::ObjCpp,
+    Language::Swift,
+    Language::Kotlin,
+    Language::Shell,
+    Language::Ruby,
+    Language::Lua,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +129,21 @@ impl ParserPool {
                 &extracted,
             );
         }
+        // ObjC / ObjC++: macro normalisation, and for `.mm` an ObjC pass over
+        // C++-masked text unioned with a C++ pass over ObjC-masked text.
+        if matches!(lang, Language::ObjC | Language::ObjCpp) {
+            return objc::parse_with(lang, source, |l, s| self.parse_raw(l, path, s));
+        }
+        self.parse_raw(lang, path, source)
+    }
+
+    /// One tree-sitter parse + query extraction, no per-language pre-pass.
+    fn parse_raw(
+        &self,
+        lang: Language,
+        _path: &RelPath,
+        source: &str,
+    ) -> Result<ParsedFile, ParseError> {
         let index = language_index(lang).ok_or(ParseError::NoGrammar(lang))?;
         let mut slot = self.parsers[index]
             .lock()
@@ -154,16 +184,10 @@ impl ParserPool {
         };
         drop(slot);
 
-        let query_sources = queries::for_language(lang)
-            .ok_or_else(|| ParseError::Query(format!("no queries for {lang:?}")))?;
-        let grammar = grammar(lang).ok_or(ParseError::NoGrammar(lang))?;
-        let symbols_query = Query::new(&grammar, query_sources.symbols).map_err(query_error)?;
-        let imports_query = Query::new(&grammar, query_sources.imports).map_err(query_error)?;
-        let calls_query = Query::new(&grammar, query_sources.calls).map_err(query_error)?;
-
-        let symbols = extract_symbols(lang, &symbols_query, tree.root_node(), source);
-        let imports = extract_imports(lang, &imports_query, tree.root_node(), source);
-        let calls = extract_calls(&calls_query, tree.root_node(), source);
+        let compiled = compiled_queries(lang)?;
+        let symbols = extract_symbols(lang, &compiled.symbols, tree.root_node(), source);
+        let imports = extract_imports(lang, &compiled.imports, tree.root_node(), source);
+        let calls = extract_calls_for(lang, &compiled.calls, tree.root_node(), source);
 
         // `tree`, all Nodes, queries, and cursors are local and drop here.
         // ParsedFile contains only owned strings and scalar line numbers.
@@ -181,6 +205,40 @@ impl Default for ParserPool {
     }
 }
 
+/// The three compiled queries of one language. `Query` is immutable after
+/// construction and `Send + Sync`, so one copy per language is shared by all
+/// parse calls instead of recompiling the `.scm` sources for every file.
+struct CompiledQueries {
+    symbols: Query,
+    imports: Query,
+    calls: Query,
+}
+
+fn compiled_queries(lang: Language) -> Result<&'static CompiledQueries, ParseError> {
+    static CACHE: [OnceLock<Result<CompiledQueries, String>>; LANGUAGES.len()] =
+        [const { OnceLock::new() }; LANGUAGES.len()];
+    let index = language_index(lang).ok_or(ParseError::NoGrammar(lang))?;
+    CACHE[index]
+        .get_or_init(|| {
+            let sources =
+                queries::for_language(lang).ok_or_else(|| format!("no queries for {lang:?}"))?;
+            let grammar = grammar(lang).ok_or_else(|| format!("no grammar for {lang:?}"))?;
+            let compile = |source: &str| {
+                Query::new(&grammar, source).map_err(|error| match query_error(error) {
+                    ParseError::Query(message) => message,
+                    other => other.to_string(),
+                })
+            };
+            Ok(CompiledQueries {
+                symbols: compile(sources.symbols)?,
+                imports: compile(sources.imports)?,
+                calls: compile(sources.calls)?,
+            })
+        })
+        .as_ref()
+        .map_err(|message| ParseError::Query(message.clone()))
+}
+
 fn language_index(lang: Language) -> Option<usize> {
     Some(match lang {
         Language::Python => 0,
@@ -196,7 +254,14 @@ fn language_index(lang: Language) -> Option<usize> {
         Language::Dart => 10,
         Language::CSharp => 11,
         Language::VisualBasic => 12,
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        Language::ObjC => 13,
+        Language::ObjCpp => 14,
+        Language::Swift => 15,
+        Language::Kotlin => 16,
+        Language::Shell => 17,
+        Language::Ruby => 18,
+        Language::Lua => 19,
+        Language::Vue => return None,
     })
 }
 
@@ -215,7 +280,14 @@ pub(crate) fn grammar(lang: Language) -> Option<tree_sitter::Language> {
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         Language::VisualBasic => tree_sitter_vb_dotnet::LANGUAGE.into(),
-        Language::ObjC | Language::ObjCpp | Language::Swift | Language::Vue => return None,
+        Language::ObjC => tree_sitter_objc::LANGUAGE.into(),
+        Language::ObjCpp => tree_sitter_objc::LANGUAGE.into(),
+        Language::Swift => tree_sitter_swift::LANGUAGE.into(),
+        Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        Language::Shell => tree_sitter_bash::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Language::Lua => tree_sitter_lua::LANGUAGE.into(),
+        Language::Vue => return None,
     })
 }
 
@@ -275,7 +347,17 @@ fn extract_symbols(
         } else if lang == Language::Dart && definition_node.kind() == "operator_signature" {
             (dart_operator_name(definition_node, source), kind)
         } else {
-            (name.to_owned(), kind)
+            match lang {
+                Language::Swift => swift::symbol_name(definition_node, name, kind, source),
+                Language::ObjC | Language::ObjCpp => {
+                    objc::symbol_name(definition_node, name, kind, source)
+                }
+                Language::Kotlin => kotlin::symbol_name(definition_node, name, kind, source),
+                Language::Shell => shell::symbol_name(definition_node, name, kind, source),
+                Language::Ruby => ruby::symbol_name(definition_node, name, kind, source),
+                Language::Lua => lua::symbol_name(definition_node, name, kind, source),
+                _ => (name.to_owned(), kind),
+            }
         };
 
         // Java/C#/VB 的注解/特性（`@Override`、`[HttpGet]`、`<Fact>`）属于
@@ -285,7 +367,7 @@ fn extract_symbols(
         let name_row = name_node.start_position().row;
         let anchor_on_name = matches!(
             lang,
-            Language::Java | Language::CSharp | Language::VisualBasic
+            Language::Java | Language::CSharp | Language::VisualBasic | Language::Swift
         ) && name_row > def_row;
         let (sig, start_row) = if anchor_on_name {
             (signature_from_row(source, name_row), name_row)
@@ -363,10 +445,46 @@ fn extract_imports(
     output
 }
 
-fn extract_calls(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<(String, u32)> {
-    extract_named_captures(query, root, source, |name| {
-        name == "call" || name == "name" || name == "reference.call"
-    })
+fn extract_calls_for(
+    lang: Language,
+    query: &Query,
+    root: tree_sitter::Node<'_>,
+    source: &str,
+) -> Vec<(String, u32)> {
+    let wanted = |name: &str| name == "call" || name == "name" || name == "reference.call";
+    if !matches!(lang, Language::ObjC | Language::ObjCpp) {
+        return extract_named_captures(query, root, source, wanted);
+    }
+    // ObjC: name message sends by full selector (`setObject:forKey:`) so call
+    // names line up with method symbols.
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, root, source.as_bytes());
+    let mut output = Vec::new();
+    while let Some(query_match) = matches.next() {
+        let call_node = query_match
+            .captures()
+            .iter()
+            .find(|c| capture_names[c.index as usize] == "reference.call")
+            .map(|c| c.node);
+        for capture in query_match.captures() {
+            let capture_name = capture_names[capture.index as usize];
+            let redundant_call =
+                capture_name == "reference.call" && query_match.captures().len() > 1;
+            if !wanted(capture_name) || redundant_call {
+                continue;
+            }
+            let Ok(text) = capture.node.utf8_text(source.as_bytes()) else {
+                continue;
+            };
+            let name = match call_node {
+                Some(call) => objc::call_name(call, text, source),
+                None => text.to_owned(),
+            };
+            output.push((name, line_number(capture.node.start_position().row)));
+        }
+    }
+    output
 }
 
 fn extract_named_captures(
@@ -480,14 +598,15 @@ fn is_exported(lang: Language, name: &str, node: tree_sitter::Node<'_>, source: 
         Language::Php => php_exported(node, source),
         Language::Dart => !name.starts_with('_'),
         // Sibling P0 languages: treat as exported until their agents land visibility rules.
-        Language::C
-        | Language::Cpp
-        | Language::ObjC
-        | Language::ObjCpp
-        | Language::Swift
-        | Language::Vue
-        | Language::CSharp
-        | Language::VisualBasic => true,
+        Language::Swift => swift::exported(name, node, source),
+        Language::ObjC | Language::ObjCpp => objc::exported(name, node, source),
+        Language::Kotlin => kotlin::exported(name, node, source),
+        Language::Shell => shell::exported(name, node, source),
+        Language::Ruby => ruby::exported(name, node, source),
+        Language::Lua => lua::exported(name, node, source),
+        Language::C | Language::Cpp | Language::Vue | Language::CSharp | Language::VisualBasic => {
+            true
+        }
     }
 }
 
@@ -830,6 +949,47 @@ fn unquote(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpp_destructors_and_nested_namespaces_are_symbols() {
+        let pool = ParserPool::new();
+        let src = "namespace a::b {\nclass X {\n public:\n  ~X();\n};\nX::~X() {}\n}\n";
+        let parsed = pool
+            .parse(Language::Cpp, &RelPath::new("x.cpp"), src)
+            .expect("cpp parses");
+        let got: Vec<(&str, u32)> = parsed
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.start_line))
+            .collect();
+        assert!(got.contains(&("a::b", 1)), "{got:?}");
+        assert!(got.contains(&("~X", 4)), "{got:?}");
+        assert!(got.contains(&("~X", 6)), "{got:?}");
+    }
+
+    #[test]
+    fn objc_message_sends_use_full_selector_and_headers_sniff_objc() {
+        let pool = ParserPool::new();
+        let src = "void f(NSMutableDictionary *d) {\n  [d setObject:@1 forKey:@\"k\"];\n  [d removeAllObjects];\n  g(1);\n}\n";
+        let parsed = pool
+            .parse(Language::ObjC, &RelPath::new("a.m"), src)
+            .expect("objc parses");
+        let names: Vec<&str> = parsed.calls.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"setObject:forKey:"), "{names:?}");
+        assert!(names.contains(&"removeAllObjects"), "{names:?}");
+        assert!(names.contains(&"g"), "{names:?}");
+
+        let h = RelPath::new("A.h");
+        let objc = "#import <Foundation/Foundation.h>\n@interface A : NSObject\n@end\n";
+        assert_eq!(
+            Language::from_path_and_source(&h, objc),
+            Some(Language::ObjC)
+        );
+        let cpp = "#pragma once\nnamespace n { class C {}; }\n";
+        assert_eq!(Language::from_path_and_source(&h, cpp), Some(Language::Cpp));
+        let c = "#ifndef A_H\n#define A_H\nint a(void);\n#endif\n";
+        assert_eq!(Language::from_path_and_source(&h, c), Some(Language::C));
+    }
+
     use super::*;
     use std::collections::BTreeMap;
     use std::fs;
@@ -1495,7 +1655,11 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             | Language::Vue
             | Language::Dart
             | Language::CSharp
-            | Language::VisualBasic => Vec::new(),
+            | Language::VisualBasic
+            | Language::Kotlin
+            | Language::Shell
+            | Language::Ruby
+            | Language::Lua => Vec::new(),
         }
     }
 

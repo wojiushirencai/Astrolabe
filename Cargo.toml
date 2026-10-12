@@ -59,6 +59,13 @@ tree-sitter-c-sharp = "0.23.5"
 tree-sitter-vb-dotnet = "0.1.0"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
+# lang-batch-8 grammars (LanguageFn / tree-sitter-language mode, host tree-sitter 0.27).
+tree-sitter-swift = "0.7"
+tree-sitter-objc = "3.0"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-bash = "0.25"
+tree-sitter-ruby = "0.23"
+tree-sitter-lua = "0.5"
 # astrolabe-mcp. Caret (not `=`) so patch releases still apply.
 # rmcp 3.4.0 is the floor because it implements MCP spec 2026-07-28
 # (initialize is optional; per-request `_meta` is the new lifecycle).
