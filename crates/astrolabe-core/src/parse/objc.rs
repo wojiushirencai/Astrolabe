@@ -284,6 +284,31 @@ pub(super) fn parse_with(
     }
     let mut parsed = raw(Language::ObjC, &objc_source)?;
     restore_signatures(&mut parsed.symbols, &objc_source, source);
+    if let Some(heads) = alternate_method_heads(source) {
+        // `#if SD_MAC - (void)a #else - (void)b #endif {…}`: preprocess keeps
+        // the first head; the other platforms' selectors come from a
+        // line-aligned stub `@interface` holding just those heads.
+        if let Ok(alt) = raw(Language::ObjC, &heads) {
+            let seen: HashSet<(String, u32)> = parsed
+                .symbols
+                .iter()
+                .map(|s| (s.name.clone(), s.start_line))
+                .collect();
+            let original: Vec<&str> = source.lines().collect();
+            for mut symbol in alt.symbols {
+                if symbol.kind != SymbolKind::Method
+                    || seen.contains(&(symbol.name.clone(), symbol.start_line))
+                {
+                    continue;
+                }
+                if let Some(line) = original.get(symbol.start_line as usize - 1) {
+                    symbol.signature = super::signature_from_row(line, 0);
+                }
+                parsed.symbols.push(symbol);
+            }
+            parsed.symbols.sort_by_key(|s| s.start_line);
+        }
+    }
     if lang != Language::ObjCpp {
         return Ok(parsed);
     }
@@ -334,6 +359,78 @@ pub(super) fn parse_with(
     }
     parsed.symbols.sort_by_key(|s| s.start_line);
     Ok(parsed)
+}
+
+/// Line-aligned stub for the non-first branches of per-platform method
+/// heads sharing one body:
+///
+/// ```text
+/// #if SD_MAC
+/// - (void)viewDidMoveToWindow
+/// #else                        → @interface _
+/// - (void)didMoveToWindow      → - (void)didMoveToWindow
+/// #endif                       → ;@end
+/// {
+/// ```
+///
+/// Every other line is empty, so symbol lines match the original. `None`
+/// when the file has no such group.
+fn alternate_method_heads(source: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let directive = |l: &str| {
+        l.trim_start().strip_prefix('#').map(|d| {
+            d.trim_start()
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .unwrap_or("")
+                .to_owned()
+        })
+    };
+    let is_head = |l: &str| {
+        let t = l.trim_start();
+        (t.starts_with('-') || t.starts_with('+')) && t[1..].trim_start().starts_with('(')
+    };
+    let mut out: Vec<String> = vec![String::new(); lines.len()];
+    let mut found = false;
+    let mut k = 0;
+    while k < lines.len() {
+        let is_alt = matches!(directive(lines[k]).as_deref(), Some("else" | "elif"));
+        if !(is_alt && lines.get(k + 1).is_some_and(|l| is_head(l))) {
+            k += 1;
+            continue;
+        }
+        // Head lines up to the closing directive (multi-line selectors allowed).
+        let mut j = k + 1;
+        while j < lines.len() && directive(lines[j]).is_none() && !lines[j].contains(['{', ';']) {
+            j += 1;
+        }
+        let closes = j < lines.len()
+            && matches!(
+                directive(lines[j]).as_deref(),
+                Some("endif" | "else" | "elif")
+            );
+        let body_follows = closes && {
+            // Through `#endif`, the next code line opens the shared body.
+            let mut e = j;
+            while e < lines.len() && directive(lines[e]).as_deref() != Some("endif") {
+                e += 1;
+            }
+            lines[e + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|l| l.trim_start().starts_with('{'))
+        };
+        if closes && body_follows {
+            out[k] = "@interface _".to_owned();
+            for row in k + 1..j {
+                out[row] = lines[row].to_owned();
+            }
+            out[j] = ";@end".to_owned();
+            found = true;
+        }
+        k = j.max(k + 1);
+    }
+    found.then(|| out.join("\n"))
 }
 
 /// Signatures are cut from the parsed (normalised / masked) buffer; rebuild
@@ -415,6 +512,14 @@ fn mask_cpp(source: &str) -> String {
             b'}' => depth -= 1,
             _ => {}
         }
+        if b == b'\n' && depth == 0 {
+            // A statement starts after an ObjC container line (`@end`,
+            // `@interface X : Y`), which ends without `;` / `}`.
+            let line_start = source[..i].rfind('\n').map_or(0, |p| p + 1);
+            if source[line_start..i].trim_start().starts_with('@') {
+                stmt_start = true;
+            }
+        }
         if b.is_ascii_whitespace() {
             i += 1;
             continue;
@@ -422,7 +527,15 @@ fn mask_cpp(source: &str) -> String {
         if depth == 0 && stmt_start && is_ident(b) {
             let word_end = i + bytes[i..].iter().take_while(|&&c| is_ident(c)).count();
             let word = &source[i..word_end];
-            if matches!(word, "namespace" | "template" | "using" | "class") {
+            // A struct *definition* (`struct Key {…}`, `struct A : B {…}`)
+            // may hold C++ members (`operator()`, methods, nested types);
+            // the C++ pass extracts it, plain C structs included.
+            let struct_def = word == "struct" && {
+                let name = skip_ws(bytes, word_end);
+                let name_end = name + bytes[name..].iter().take_while(|&&c| is_ident(c)).count();
+                name_end > name && matches!(bytes.get(skip_ws(bytes, name_end)), Some(b'{' | b':'))
+            };
+            if struct_def || matches!(word, "namespace" | "template" | "using" | "class") {
                 if let Some(end) = cpp_decl_end(bytes, word_end, word == "using") {
                     blank(&mut out, i, end);
                     i = end;
@@ -501,7 +614,8 @@ fn mask_cpp(source: &str) -> String {
         // Lambda `[&](T x) {…}` / `[]() {…}` → block `^  (T x) {…}`.
         if b == b'[' && out[i] == b'[' {
             let prev = source[..i].trim_end();
-            let expr_start = prev.ends_with(['=', '(', ',', '{', ';']) || prev.ends_with("return");
+            let expr_start =
+                prev.ends_with(['=', '(', ',', '{', ';', ':']) || prev.ends_with("return");
             if expr_start {
                 if let Some(rel) = bytes[i + 1..].iter().position(|&c| c == b']') {
                     let close = i + 1 + rel;
@@ -533,6 +647,30 @@ fn mask_cpp(source: &str) -> String {
                         blank(&mut out, open + 1, close);
                         out[open + 1] = b';';
                         out[open + 2] = b';';
+                    }
+                }
+            }
+        }
+        // Template arguments the ObjC grammar reads as comparisons:
+        // `Element<T>()`, `make_shared<T>(…)`, `Pool<17> pool_;`.
+        if b == b'<' && i > 0 && is_ident(bytes[i - 1]) && out[i] == b'<' {
+            if let Some(close) = matching_angle(bytes, i) {
+                let inner = source[i + 1..close].trim();
+                let numeric = !inner.is_empty() && inner.bytes().all(|c| c.is_ascii_digit());
+                if numeric || matches!(bytes.get(close + 1), Some(b'(' | b'{')) {
+                    blank(&mut out, i, close + 1);
+                }
+            }
+        }
+        // Brace-init argument `f({a, b})` / `.children({x, y})` → `f((a, b))`
+        // (a comma expression); GNU `({ stmt; })` keeps its braces.
+        if b == b'{' && depth > 1 {
+            let prev = source[..i].trim_end();
+            if prev.ends_with(['(', ',']) {
+                if let Some(close) = matching_block(bytes, i) {
+                    if !has_top_level_semicolon(&bytes[i + 1..close]) {
+                        out[i] = b'(';
+                        out[close] = b')';
                     }
                 }
             }
@@ -587,7 +725,297 @@ fn mask_objc(source: &str) -> String {
         }
         offset += line.len();
     }
+    mask_objc_exprs(&mut out);
     String::from_utf8(out).unwrap_or_else(|_| source.to_owned())
+}
+
+/// ObjC expressions left in C++ code of an ObjC++ file (C++ class bodies,
+/// free functions, lambdas) become a length-preserving `0`: message sends
+/// `[obj sel:x]`, `@selector(…)` / `@{…}` / `@[…]` / `@(…)` literals and
+/// blocks `^(T x) {…}`. `@"…"` strings drop the `@`, `@try` / `@catch (…)` /
+/// `@autoreleasepool` heads are blanked, and ARC qualifiers (`__bridge`,
+/// `__weak`, …) are blanked. Without this tree-sitter-cpp drops the whole
+/// enclosing class or function into an ERROR node.
+fn mask_objc_exprs(out: &mut [u8]) {
+    let src = out.to_vec();
+    let bytes = &src[..];
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let prev_sig = |i: usize| {
+        bytes[..i]
+            .iter()
+            .rev()
+            .find(|b| !b.is_ascii_whitespace())
+            .copied()
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_literal(bytes, i);
+                continue;
+            }
+            b'#' if bytes[..i]
+                .iter()
+                .rev()
+                .take_while(|&&c| c != b'\n')
+                .all(u8::is_ascii_whitespace) =>
+            {
+                while i < bytes.len() && !(bytes[i] == b'\n' && bytes[i - 1] != b'\\') {
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if b == b'@' {
+            let next = bytes.get(i + 1).copied();
+            match next {
+                Some(b'"') => {
+                    out[i] = b' ';
+                    i += 1;
+                    continue;
+                }
+                Some(b'{' | b'[' | b'(') => {
+                    if let Some(close) = matching_any(bytes, i + 1) {
+                        blank(out, i, close + 1);
+                        out[i] = b'0';
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                Some(c) if is_ident(c) => {
+                    let end = i + 1 + bytes[i + 1..].iter().take_while(|&&c| is_ident(c)).count();
+                    let word = &bytes[i + 1..end];
+                    let open = skip_ws(bytes, end);
+                    let paren = (bytes.get(open) == Some(&b'('))
+                        .then(|| matching_paren(bytes, open))
+                        .flatten();
+                    match word {
+                        b"selector" | b"encode" | b"protocol" if paren.is_some() => {
+                            let close = paren.unwrap_or(end);
+                            blank(out, i, close + 1);
+                            out[i] = b'0';
+                            i = close + 1;
+                            continue;
+                        }
+                        b"catch" | b"synchronized" if paren.is_some() => {
+                            blank(out, i, paren.unwrap_or(end) + 1);
+                            i = paren.unwrap_or(end) + 1;
+                            continue;
+                        }
+                        b"try" | b"finally" | b"autoreleasepool" => blank(out, i, end),
+                        b"YES" | b"NO" | b"true" | b"false" => out[i] = b' ',
+                        _ if word.first().is_some_and(u8::is_ascii_digit) => out[i] = b' ',
+                        _ => {}
+                    }
+                    i = end;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if b == b'_' && bytes.get(i + 1) == Some(&b'_') && (i == 0 || !is_ident(bytes[i - 1])) {
+            let end = i + bytes[i..].iter().take_while(|&&c| is_ident(c)).count();
+            if matches!(
+                &bytes[i..end],
+                b"__bridge"
+                    | b"__bridge_transfer"
+                    | b"__bridge_retained"
+                    | b"__weak"
+                    | b"__strong"
+                    | b"__block"
+                    | b"__unsafe_unretained"
+                    | b"__autoreleasing"
+                    | b"__kindof"
+            ) {
+                blank(out, i, end);
+            }
+            i = end;
+            continue;
+        }
+        // Block literal `^{…}` / `^(T x) {…}` / `^T(T x) {…}` in expression
+        // position (not `a ^ b`).
+        if b == b'^' && !prev_sig(i).is_some_and(|c| is_ident(c) || c == b')' || c == b']') {
+            let mut j = i + 1;
+            while j < bytes.len() && !matches!(bytes[j], b'{' | b';' | b'}') {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'{') {
+                if let Some(close) = matching_block(bytes, j) {
+                    blank(out, i, close + 1);
+                    out[i] = b'0';
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        // Fast enumeration `for (T x in xs)` → C++ range-for `for (T x :  xs)`.
+        if b == b'f'
+            && bytes[i..].starts_with(b"for")
+            && (i == 0 || !is_ident(bytes[i - 1]))
+            && !bytes.get(i + 3).copied().is_some_and(is_ident)
+        {
+            let open = skip_ws(bytes, i + 3);
+            if bytes.get(open) == Some(&b'(') {
+                if let Some(close) = matching_paren(bytes, open) {
+                    let head = &bytes[open + 1..close];
+                    if let Some(k) = head.windows(4).position(|w| w == b" in ") {
+                        if !head.contains(&b';') {
+                            out[open + 1 + k + 1] = b':';
+                            out[open + 1 + k + 2] = b' ';
+                        }
+                    }
+                }
+            }
+        }
+        // Message send `[recv sel…]` (not a subscript, lambda or attribute).
+        if b == b'[' && !prev_sig(i).is_some_and(|c| is_ident(c) || matches!(c, b')' | b']' | b'['))
+        {
+            if let Some(close) = matching_any(bytes, i) {
+                let after = bytes.get(skip_ws(bytes, close + 1)).copied();
+                if !matches!(after, Some(b'(' | b'{' | b'['))
+                    && message_send_shaped(&bytes[i + 1..close])
+                {
+                    blank(out, i, close + 1);
+                    out[i] = b'0';
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// `recv sel`, `recv sel:arg`, `[nested] sel`: a receiver followed by
+/// whitespace and a selector word at nesting depth 0.
+fn message_send_shaped(inner: &[u8]) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut depth = 0i32;
+    let mut k = 0;
+    let mut saw_receiver = false;
+    while k < inner.len() {
+        let c = inner[k];
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'"' | b'\'' => {
+                k = skip_literal(inner, k);
+                saw_receiver = true;
+                continue;
+            }
+            b';' => return false,
+            _ => {}
+        }
+        if depth == 0 && c.is_ascii_whitespace() && saw_receiver {
+            let w = skip_ws(inner, k);
+            let end = w + inner[w..].iter().take_while(|&&c| is_ident(c)).count();
+            if end > w && (inner[w].is_ascii_alphabetic() || inner[w] == b'_') {
+                let rest = skip_ws(inner, end);
+                // `a sel` / `a sel:` but not `a + b` / `a ? b : c`.
+                let prev = inner[..k].iter().rev().find(|b| !b.is_ascii_whitespace());
+                let operand_end =
+                    prev.is_some_and(|&p| is_ident(p) || matches!(p, b')' | b']' | b'"'));
+                return operand_end && (rest == inner.len() || inner[rest] == b':');
+            }
+            return false;
+        }
+        if !c.is_ascii_whitespace() {
+            saw_receiver = true;
+        }
+        k += 1;
+    }
+    false
+}
+
+/// Whether `inner` holds a `;` outside nested brackets and literals.
+fn has_top_level_semicolon(inner: &[u8]) -> bool {
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < inner.len() {
+        match inner[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'"' | b'\'' => {
+                i = skip_literal(inner, i);
+                continue;
+            }
+            b';' if depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Matching close of `bytes[open]` (`(`, `[` or `{`), skipping literals.
+fn matching_any(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'"' | b'\'' => {
+                i = skip_literal(bytes, i);
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `}` matching a block body `{` (statements allowed), skipping literals and
+/// comments.
+fn matching_block(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_literal(bytes, i);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// End (exclusive) of a top-level C++ declaration starting after its
@@ -927,6 +1355,18 @@ pub(super) fn preprocess(source: &str) -> Option<String> {
             // `RCT_EXPORT_MODULE()`, `RCT_EXPORT_VIEW_PROPERTY(a, T)`.
             blank(&mut out, start, close + 1);
             changed = true;
+        } else if at_line_start
+            && next == Some(b';')
+            && word.starts_with("RCT_")
+            && brace_depth(&bytes[..start]) == 0
+        {
+            // File-scope declaration macro ending in `;` (often inside an
+            // `@implementation`): `RCT_ENUM_CONVERTER(T, (@{…}), d, v);`,
+            // `RCT_MULTI_ENUM_CONVERTER(…);`. They expand to methods the
+            // grammar cannot see; blanking keeps the rest of the block.
+            let semi = skip_attributes(bytes, close + 1);
+            blank(&mut out, start, semi + 1);
+            changed = true;
         } else if at_line_start && next == Some(b'{') && word.starts_with("RCT_") {
             // `RCT_CUSTOM_VIEW_PROPERTY(name, T, V) { ... }`: method body
             // without a selector; keep the body, drop the head.
@@ -1045,6 +1485,51 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// `text` without `//` line comments and `#pragma` lines (block comments
+/// are kept; they never hold the `#` / brace tokens the caller checks).
+fn strip_line_comments(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("#pragma"))
+        .map(|l| l.find("//").map_or(l, |p| &l[..p]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `{` minus `}` outside comments and literals: brace depth at the end of
+/// `bytes`. `@implementation` / `@interface` do not open a brace scope, so 0
+/// means file scope (or directly inside an ObjC container).
+fn brace_depth(bytes: &[u8]) -> i32 {
+    let mut depth = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_literal(bytes, i);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
 /// Overwrite `out[start..end]` with spaces, keeping newlines (line numbers).
 fn blank(out: &mut [u8], start: usize, end: usize) {
     let end = end.min(out.len());
@@ -1156,8 +1641,12 @@ fn blank_unbalanced_branches(source: &str, out: &mut [u8]) -> bool {
         delta: i32,
         /// Byte offset of the `#if` line.
         if_line: usize,
+        /// The `#if` sits directly in an `@interface` / `@implementation` /
+        /// `@protocol` body.
+        in_container: bool,
     }
     let mut stack: Vec<Group> = Vec::new();
+    let mut in_container = false;
     let mut changed = false;
     let mut offset = 0;
     // Open `<` of an `@interface … <` / `@protocol … <` protocol list.
@@ -1166,6 +1655,15 @@ fn blank_unbalanced_branches(source: &str, out: &mut [u8]) -> bool {
     let mut open_extern_guards = 0usize;
     for line in source.split_inclusive('\n') {
         let t = line.trim_start();
+        if t.starts_with("@end") {
+            in_container = false;
+        } else if (t.starts_with("@interface")
+            || t.starts_with("@implementation")
+            || t.starts_with("@protocol"))
+            && !t.trim_end().ends_with(';')
+        {
+            in_container = true;
+        }
         if in_protocol_list {
             if t.starts_with('#') {
                 // `#if !TARGET_OS_TV , UITextDropDelegate #endif`: keep the
@@ -1195,6 +1693,7 @@ fn blank_unbalanced_branches(source: &str, out: &mut [u8]) -> bool {
                 cur_start: offset + line.len(),
                 delta: 0,
                 if_line: offset,
+                in_container,
             }),
             Some("elif" | "else" | "elifdef" | "elifndef") => {
                 if let Some(g) = stack.last_mut() {
@@ -1243,7 +1742,25 @@ fn blank_unbalanced_branches(source: &str, out: &mut [u8]) -> bool {
                                         && text.ends_with('}')
                                         && !text.contains('#')))
                         });
-                    if whole_methods {
+                    // `#ifdef X @property … / - (T)m; / - (T)m {…} #endif`
+                    // directly in an ObjC container (any number of branches):
+                    // the grammar cannot hold directives there, so drop only
+                    // the directive lines and keep every branch's members.
+                    let decl_only = g.in_container
+                        && g.branches.iter().all(|&(s, e, d)| {
+                            let text = strip_line_comments(&source[s..e]);
+                            let text = text.trim();
+                            d == 0
+                                && (text.is_empty()
+                                    || ((text.starts_with('-')
+                                        || text.starts_with('+')
+                                        || text.starts_with("@property")
+                                        || text.starts_with("@dynamic")
+                                        || text.starts_with("@synthesize"))
+                                        && text.ends_with([';', '}'])
+                                        && !text.contains('#')))
+                        });
+                    if whole_methods || decl_only {
                         let line_end = offset + line.len();
                         blank(out, g.if_line, g.branches[0].0);
                         for pair in g.branches.windows(2) {
@@ -1510,6 +2027,30 @@ mod tests {
 
     /// Debug helper: writes the ObjC-pass text (`.objc`) and the C++-pass
     /// text (`.cpp`, ObjC++ only) of `XFORM_FILE` next to `XFORM_OUT`.
+    #[test]
+    fn objcpp_cpp_class_with_message_sends() {
+        let src = "class H : public mmkv::Handler {\npublic:\n    void log(int l) override {\n        if ([g respondsToSelector:@selector(x:)]) { [g x:@\"a\"]; }\n    }\n    std::mutex &mutex() { return m_; }\n};\nRCTX::WebSocket::WebSocket(int a) : a_(a) {}\nvoid f() { for (id k in xs) { dispatch_async(q, ^{ [k run]; }); } }\n";
+        let names = names(&parse(Language::ObjCpp, src));
+        for want in ["H", "log", "mutex", "WebSocket", "f"] {
+            assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+        }
+    }
+
+    #[test]
+    fn objc_conditional_members_and_alternate_heads() {
+        let src = "@interface U : NSObject\n#ifdef MAC\n@property (nonatomic) NSImage *profileImage;\n#endif\n#ifdef __cplusplus\n- (mmkv::MMKV *)cppInstance;\n#endif\n@end\n@implementation V\n#if SD_MAC\n- (void)viewDidMoveToWindow\n#else\n- (void)didMoveToWindow\n#endif\n{\n}\nRCT_ENUM_CONVERTER(\n    A,\n    (@{ @\"x\" : @(1) }),\n    B,\n    integerValue);\n- (void)after\n{\n}\n@end\n";
+        let names = names(&parse(Language::ObjCpp, src));
+        for want in [
+            "profileImage",
+            "cppInstance",
+            "viewDidMoveToWindow",
+            "didMoveToWindow",
+            "after",
+        ] {
+            assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn zz_transform() {

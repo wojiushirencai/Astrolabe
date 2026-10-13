@@ -112,3 +112,26 @@ In multi-language projects containing Flutter/Dart (first observed in live sessi
 - **Cold start settle window:** Cold start of `dart language-server` (~3.2s) slightly exceeds the uniform 3.0s LSP settle quiet window; initial queries are guarded by `didOpen` immediate priority analysis fallback.
 - **Corpus edge case:** The `flutter/packages` corpus achieves a 99.66% import resolution rate due to multiple nested example packages sharing identical names; scheduled for corpus-specific resolver refinement.
 
+## 9. Post-P0 addition: Kotlin, Shell, Ruby, Lua, and tree-sitter extraction for Swift / ObjC / Vue (PR #51)
+
+Before PR #51, Swift, ObjC/ObjC++ and Vue were routed to language servers only: `parse/mod.rs` returned `None` for them, so `find_symbol` and the file graph never saw their declarations. PR #51 added tree-sitter extraction for those three and four new languages, all on tree-sitter host 0.27 with MIT-licensed grammars.
+
+| Language | Extensions | Storage tag added | LSP (first → fallback) | Override |
+|---|---|---|---|---|
+| Swift | `.swift` | existing | `sourcekit-lsp` | `ASTROLABE_LSP_SWIFT` |
+| ObjC / ObjC++ | `.m`, `.mm`, ObjC-sniffed `.h` | existing | `sourcekit-lsp` → `clangd` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` |
+| Vue | `.vue` | existing | `vue-language-server --stdio` | `ASTROLABE_LSP_VUE` |
+| Kotlin | `.kt`, `.kts` | new | `kotlin-lsp --stdio` → `kotlin-language-server` | `ASTROLABE_LSP_KOTLIN` |
+| Shell | `.sh`, `.bash`, sh/bash/dash/ksh shebang | new | `bash-language-server start` | `ASTROLABE_LSP_SHELL` |
+| Ruby | `.rb`, `.rake`, `.gemspec`, `Rakefile` / `Gemfile` / `Podfile` …, ruby shebang | new | `ruby-lsp` → `solargraph stdio` | `ASTROLABE_LSP_RUBY` |
+| Lua | `.lua`, lua/luajit shebang | new | `lua-language-server` | `ASTROLABE_LSP_LUA` |
+
+Key decisions:
+
+- **Extension-less scripts** are classified by their `#!` line at scan time, so `nvm.sh`-style and `bin/` scripts enter the index and `source` edges resolve.
+- **Names containing `::`** (`bats::on_failure`, Ruby `A::B`) are looked up as a whole name first, then as a path.
+- **ObjC preprocessing** rewrites Cocoa macros and `#if` branches into parseable text without moving lines; `.mm` is parsed with both the ObjC and the C++ grammar and merged. `.h` headers are sniffed (ObjC → C++ → C).
+- **Compiled query cache**: queries are compiled once per language instead of per file, which cut cold indexing 5–20× for every language (e.g. element-plus 20 s → 1.0 s, React Native 27 s → 1.8 s).
+- **Acceptance**: all-declaration recall 99.14–100% on 21 real repositories, 200/200 `find_symbol` samples; existing languages byte-identical on a 1,500-name diff. One pinned corpus per new language runs in CI (`scripts/recall-gate`).
+
+Known limits: zsh-only syntax in `.sh` files, `.bats` files (text only), declarations inside complex React Native macros (`RCT_ENUM_CONVERTER`), and the C++ half of `.mm` files (MMKV 72.7%). Language-server behaviour for the new languages is not yet covered by an automated test.
