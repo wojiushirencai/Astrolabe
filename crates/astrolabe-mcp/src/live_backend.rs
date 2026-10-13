@@ -18,10 +18,12 @@ use astrolabe_core::lsp::diagnostics::{query_server, FetchOptions};
 use astrolabe_core::lsp::discovery::Discovery;
 use astrolabe_core::lsp::pool::{LspPool, LspPoolConfig};
 use astrolabe_core::lsp::queries::{
-    apple_references_fallback, find_references, goto_definition, hover, SymbolAt,
+    apple_references_fallback, find_references, goto_definition, hover, identifier_at,
+    text_fallback_references, SymbolAt,
 };
 use astrolabe_core::lsp::transport::StdioSpawn;
 use astrolabe_core::lsp::Position;
+use astrolabe_core::lsp::Range;
 use astrolabe_core::lsp::{Diagnostic, LanguageServer, Location, LspError, Precise};
 use astrolabe_core::rewrite::engine::{plan_rename, FileSource};
 use astrolabe_core::rewrite::scope_js::JsScopeResolver;
@@ -29,11 +31,21 @@ use astrolabe_core::rewrite::scope_ts::TreeSitterScopeResolver;
 use astrolabe_core::rewrite::{ByteRange, Evidence, RewritePlan, ScopeResolver};
 use astrolabe_core::types::{Confidence, Language, RelPath};
 
+use crate::index::RepoIndex;
 use crate::precise_tools::PreciseCapability;
+
+/// Current tree-sitter index, when one has been built.
+pub(crate) type SyntaxIndex = Arc<dyn Fn() -> Option<Arc<RepoIndex>> + Send + Sync>;
+
+/// Cap on syntactic stand-in answers so a common name cannot flood a reply.
+const MAX_SYNTACTIC_DEFINITIONS: usize = 30;
 
 pub(crate) struct LiveBackend {
     root: PathBuf,
     pool: Arc<LspPool>,
+    /// Syntax index used to answer while a server is still importing or
+    /// indexing (kotlin-lsp's first Gradle import runs for many minutes).
+    syntax: Option<SyntaxIndex>,
 }
 
 impl std::fmt::Debug for LiveBackend {
@@ -56,6 +68,62 @@ impl LiveBackend {
         LiveBackend {
             root,
             pool: Arc::new(pool),
+            syntax: None,
+        }
+    }
+
+    /// Answer from `index` while a language server is still warming up.
+    pub(crate) fn with_syntax_index(mut self, index: SyntaxIndex) -> Self {
+        self.syntax = Some(index);
+        self
+    }
+
+    /// Declarations named `name` in the syntax index, same language family,
+    /// `origin`'s file first.
+    fn syntactic_definitions(
+        &self,
+        language: Language,
+        origin: &RelPath,
+        name: &str,
+    ) -> Vec<(Location, String)> {
+        let Some(index) = self.syntax.as_ref().and_then(|f| f()) else {
+            return Vec::new();
+        };
+        let family = |l: Option<Language>| l.is_some_and(|l| same_family(l, language));
+        let mut hits: Vec<(bool, Location, String)> = Vec::new();
+        for symbol in &index.graph().symbols {
+            if symbol.name != name {
+                continue;
+            }
+            let Some(file) = index.file(symbol.file) else {
+                continue;
+            };
+            if !family(file.language) {
+                continue;
+            }
+            let line = symbol.start_line.saturating_sub(1);
+            let at = Position { line, character: 0 };
+            hits.push((
+                file.path != *origin,
+                Location {
+                    path: file.path.clone(),
+                    range: Range { start: at, end: at },
+                },
+                symbol.signature.clone(),
+            ));
+        }
+        hits.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        hits.into_iter()
+            .take(MAX_SYNTACTIC_DEFINITIONS)
+            .map(|(_, loc, sig)| (loc, sig))
+            .collect()
+    }
+
+    fn target_name(&self, path: &RelPath, target: SymbolAt<'_>) -> Option<String> {
+        match target {
+            SymbolAt::Name(name) if !name.is_empty() => Some(name.to_string()),
+            SymbolAt::Name(_) => None,
+            SymbolAt::Position(pos) => identifier_at(&self.root, path, pos),
         }
     }
 
@@ -82,6 +150,45 @@ impl LiveBackend {
     fn read(&self, path: &RelPath) -> std::io::Result<String> {
         std::fs::read_to_string(Path::new(&self.root).join(path.as_str()))
     }
+}
+
+/// An empty, unknown answer: what a server gives while still importing.
+fn warming_unknown<T>(value: &[T], result: &Precise<Vec<T>>) -> bool {
+    value.is_empty() && result.confidence == Confidence::Unknown
+}
+
+/// Note for answers given from the syntax index while the server warms up.
+fn warming_note(language: Language, n: usize, what: &str) -> String {
+    let server = astrolabe_core::lsp::router::primary_server_name(language);
+    let head = format!(
+        "{server} 仍在导入项目 / 建立索引，精确结果稍后可用（首次导入大型 Gradle 项目可能需要十几分钟，之后有缓存）"
+    );
+    if n == 0 {
+        head
+    } else {
+        format!("{head}。先给出 tree-sitter 语法索引里的{what} {n} 处（syntactic：按名字匹配，可能含同名的其他实体）。")
+    }
+}
+
+/// Note for an idle server that returned nothing.
+fn empty_note(language: Language, what: &str) -> String {
+    let server = astrolabe_core::lsp::router::primary_server_name(language);
+    format!(
+        "{server} 没有返回{what}：该文件可能不在它导入的项目模型里（例如 Kotlin 多平台 / Android 源集未被导入、未安装 Android SDK），所以空结果不作为精确结论。"
+    )
+}
+
+/// Languages whose declarations can answer for each other (mixed projects).
+fn same_family(a: Language, b: Language) -> bool {
+    use Language::*;
+    let group = |l: Language| match l {
+        Kotlin | Java => 1,
+        TypeScript | Tsx | JavaScript | Vue => 2,
+        C | Cpp | ObjC | ObjCpp => 3,
+        CSharp | VisualBasic => 4,
+        _ => 0,
+    };
+    a == b || (group(a) != 0 && group(a) == group(b))
 }
 
 /// Note shown when a tool needs a path but was not given one.
@@ -169,9 +276,33 @@ impl PreciseCapability for LiveBackend {
             None => SymbolAt::Name(symbol),
         };
         let result = match self.with_server(language, |server| {
-            find_references(server, &self.root, &rel, target)
+            let result = find_references(server, &self.root, &rel, target);
+            (result, server.is_some_and(|s| s.is_busy()))
         }) {
-            Ok(result) => result,
+            Ok((result, busy)) if busy && warming_unknown(&result.value, &result) => {
+                let reason = warming_note(language, 0, "");
+                match text_fallback_references(&self.root, &rel, target, &reason) {
+                    Some(fallback) if !fallback.value.is_empty() => fallback,
+                    _ => result,
+                }
+            }
+            // An idle server that finds no reference at all, while the name
+            // occurs elsewhere in the repo, usually does not have the file
+            // in its project model (unimported module, KMP / Android source
+            // set). That is not an authoritative zero.
+            // kotlin-lsp answers a file outside its project model with just
+            // the declaration itself, so one hit is as suspect as none there.
+            Ok((result, false))
+                if result.value.is_empty()
+                    || (language == Language::Kotlin && result.value.len() <= 1) =>
+            {
+                let reason = empty_note(language, "引用");
+                match text_fallback_references(&self.root, &rel, target, &reason) {
+                    Some(fallback) if fallback.value.len() > result.value.len().max(1) => fallback,
+                    _ => result,
+                }
+            }
+            Ok((result, _)) => result,
             // The error already carries discovery's install hint; passing it
             // through verbatim is what makes "not found" actionable.
             Err(error) => Precise::unknown(Vec::new(), error.to_string()),
@@ -188,15 +319,46 @@ impl PreciseCapability for LiveBackend {
         };
         let rel = RelPath::new(path.expect("language resolved"));
         match self.with_server(language, |server| {
-            hover(
+            let result = hover(
                 server,
                 &self.root,
                 &rel,
                 SymbolAt::Name(symbol),
                 |server, path, position| server.hover(&path, position),
-            )
+            );
+            (result, server.is_some_and(|s| s.is_busy()))
         }) {
-            Ok(result) => result,
+            Ok((result, busy))
+                if result.value.is_none()
+                    && (!busy || result.confidence == Confidence::Unknown) =>
+            {
+                let hits = self.syntactic_definitions(language, &rel, symbol);
+                if hits.is_empty() {
+                    return result;
+                }
+                let text = hits
+                    .iter()
+                    .map(|(loc, sig)| {
+                        format!("{}:{}  {}", loc.path, loc.range.start.line + 1, sig.trim())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let note = if busy {
+                    warming_note(language, hits.len(), "同名声明签名")
+                } else {
+                    format!(
+                        "{}先给出 tree-sitter 语法索引里的同名声明签名 {} 处（syntactic）。",
+                        empty_note(language, "悬停信息"),
+                        hits.len()
+                    )
+                };
+                Precise {
+                    confidence: Confidence::Syntactic,
+                    note: Some(note),
+                    value: Some(text),
+                }
+            }
+            Ok((result, _)) => result,
             Err(error) => Precise::unknown(None, error.to_string()),
         }
     }
@@ -223,9 +385,32 @@ impl PreciseCapability for LiveBackend {
             }
         };
         match self.with_server(language, |server| {
-            goto_definition(server, &self.root, &rel, target)
+            let result = goto_definition(server, &self.root, &rel, target);
+            (result, server.is_some_and(|s| s.is_busy()))
         }) {
-            Ok(result) => result,
+            Ok((result, busy))
+                if result.value.is_empty()
+                    && (!busy || result.confidence == Confidence::Unknown) =>
+            {
+                let Some(name) = self.target_name(&rel, target) else {
+                    return result;
+                };
+                let hits = self.syntactic_definitions(language, &rel, &name);
+                if hits.is_empty() {
+                    return result;
+                }
+                let note = if busy {
+                    warming_note(language, hits.len(), "同名声明")
+                } else {
+                    format!("{}先给出 tree-sitter 语法索引里的同名声明 {} 处（syntactic：按名字匹配，可能含同名的其他实体）。", empty_note(language, "定义"), hits.len())
+                };
+                Precise {
+                    confidence: Confidence::Syntactic,
+                    note: Some(note),
+                    value: hits.into_iter().map(|(loc, _)| loc).collect(),
+                }
+            }
+            Ok((result, _)) => result,
             Err(error) => Precise::unknown(Vec::new(), error.to_string()),
         }
     }

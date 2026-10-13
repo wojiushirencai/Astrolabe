@@ -217,6 +217,14 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 | Ruby | `.rb`, `.rake`, `.gemspec`, `Rakefile` / `Gemfile` 等 | `ruby-lsp` → `solargraph stdio` | `gem install ruby-lsp`（或 `gem install solargraph`） | `ASTROLABE_LSP_RUBY` |
 | Lua | `.lua`, lua shebang 脚本 | `lua-language-server` | `brew install lua-language-server` 或 [Releases](https://github.com/LuaLS/lua-language-server/releases) | `ASTROLABE_LSP_LUA` |
 
+**Kotlin（kotlin-lsp）补充说明**
+
+- 启动器：新版独立包用 `bin/intellij-server` 启动（旧的 `kotlin-lsp.sh` 已弃用）。Astrolabe 会在 PATH、Homebrew `libexec`、`/opt`、`~/.local/share`、`%LOCALAPPDATA%\Programs`、VS Code / Cursor 扩展目录里查找；`ASTROLABE_LSP_KOTLIN` 可以直接指向解压目录。
+- 缓存：每个仓库用独立的 `--system-path`（默认 `~/.astrolabe/kotlin-lsp/<仓库名>-<哈希>`，可用 `ASTROLABE_KOTLIN_SYSTEM_PATH` 覆盖）。首次 Gradle 导入成功后，Astrolabe 会导出 `workspace.json`；之后重启时只要构建文件（`settings.gradle*`、`build.gradle*`、`gradle.properties`、`libs.versions.toml`、`pom.xml`）没变，就用 `json` 导入器在几秒内恢复项目模型，不再重跑 Gradle 同步。
+- `ASTROLABE_KOTLIN_BUILD_TOOL`：强制指定导入方式（`gradle` / `maven` / `json` / `*`；空字符串表示不导入）。
+- 导入期间和 kotlin-lsp 返回空结果时（例如 Kotlin 多平台 / Android 源集没有被导入），`goto_definition` / `find_references` / 悬停会给出 tree-sitter 语法索引的结果，标为 `Syntactic` 并附说明，不会把空结果标成 `Exact`。
+
+
 其余语言（Python、Go、Rust、Java、TS/JS、C/C++、PHP、Dart、C#/VB）见 README「语言支持与 LSP 矩阵」。
 
 Hook 的读源码拦截按 41 个受支持扩展名判断（含上表的 `.kt` / `.kts` / `.sh` / `.bash` / `.rb` / `.rake` / `.gemspec` / `.lua` / `.swift` / `.m` / `.mm` / `.vue`）；不在表里的语言正常读取，不拦截。

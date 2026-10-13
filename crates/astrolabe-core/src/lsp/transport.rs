@@ -170,8 +170,12 @@ impl LspTransport {
 
     fn start(spec: &ServerSpec, cwd: Option<&Path>, timeout: Duration) -> Result<Self, LspError> {
         let mut cmd = Command::new(&spec.command);
-        cmd.args(&spec.args)
-            .stdin(Stdio::piped())
+        cmd.args(&spec.args);
+        if let Some(dir) = cwd.and_then(|root| kotlin_system_path(spec, root)) {
+            let _ = std::fs::create_dir_all(&dir);
+            cmd.arg("--system-path").arg(dir);
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
@@ -1097,6 +1101,15 @@ pub(crate) fn initialization_options_for(
             Some(json!({ "tsserver": { "path": tsserver.to_string_lossy() } }))
         }
         Language::Shell => Some(shell_settings()),
+        Language::Kotlin if super::kotlin::is_jetbrains_server(command) => {
+            let exported =
+                super::kotlin::exported_workspace(root, &super::kotlin::system_path(root));
+            super::kotlin::initialization_options(
+                root,
+                std::env::var(super::kotlin::ENV_BUILD_TOOL).ok(),
+                exported.as_deref(),
+            )
+        }
         // sourcekit-lsp only answers cross-file queries from its index, and on
         // a bare checkout (no prior `swift build` / Xcode build) that index is
         // empty: references come back `[]`. Background indexing makes the
@@ -1640,6 +1653,9 @@ fn handle_notification(shared: &Shared, method: &str, params: Option<&Value>) {
     if method == "experimental/serverStatus" {
         track_server_status(shared, &params);
     }
+    if method == "intellij/workspaceImportState" {
+        track_kotlin_import(shared, &params);
+    }
     if method == "textDocument/publishDiagnostics" {
         if let Ok(parsed) = serde_json::from_value::<PublishDiagnosticsLoose>(params.clone()) {
             lock(&shared.diagnostics).insert(parsed.uri, parsed.diagnostics);
@@ -1715,6 +1731,71 @@ fn track_server_status(shared: &Shared, params: &Value) {
     if params.get("quiescent").and_then(Value::as_bool) == Some(true) {
         lock(&shared.active_progress).remove(ANALYZER_TOKEN);
     }
+}
+
+/// `--system-path` for a JetBrains kotlin-lsp launch in `root`, unless the
+/// user already passed one.
+fn kotlin_system_path(spec: &ServerSpec, root: &Path) -> Option<PathBuf> {
+    if spec.language != Language::Kotlin
+        || !super::kotlin::is_jetbrains_server(&spec.command)
+        || spec.args.iter().any(|a| a.starts_with("--system-path"))
+    {
+        return None;
+    }
+    Some(super::kotlin::system_path(root))
+}
+
+/// Progress token held while kotlin-lsp reports a project import in flight.
+const KOTLIN_IMPORT_TOKEN: &str = "astrolabe:intellij-import";
+/// Request id for the fire-and-forget `exportWorkspace` command; its reply
+/// matches no pending waiter and is dropped.
+const KOTLIN_EXPORT_ID: u64 = u64::MAX - 7;
+
+/// Follow kotlin-lsp's `intellij/workspaceImportState`
+/// (`{"phase": "...", "folders": [{"tool": "gradle", "status": "SUCCESS"}]}`).
+///
+/// Until the phase is `FINISHED` the server answers from a half-built (or
+/// empty) project model, so the import counts as background work. After a
+/// successful Gradle / Maven import the model is exported so the next start
+/// can re-import it in seconds (see [`super::kotlin::exported_workspace`]).
+fn track_kotlin_import(shared: &Shared, params: &Value) {
+    let phase = params.get("phase").and_then(Value::as_str).unwrap_or("");
+    if phase != "FINISHED" {
+        shared.saw_progress.store(true, Ordering::SeqCst);
+        shared.ready_confirmed.store(false, Ordering::Release);
+        lock(&shared.active_progress).insert(KOTLIN_IMPORT_TOKEN.to_string());
+        return;
+    }
+    lock(&shared.active_progress).remove(KOTLIN_IMPORT_TOKEN);
+    let folders = params
+        .get("folders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let built = !folders.is_empty()
+        && folders.iter().all(|f| {
+            f.get("status").and_then(Value::as_str) == Some("SUCCESS")
+                && f.get("tool").and_then(Value::as_str) != Some("json")
+        });
+    let Some(root) = shared.cwd.as_deref() else {
+        return;
+    };
+    if !built || shared.spec.language != Language::Kotlin {
+        return;
+    }
+    let dir = super::kotlin::export_dir(&super::kotlin::system_path(root));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = write_rpc(
+        shared,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": KOTLIN_EXPORT_ID,
+            "method": "workspace/executeCommand",
+            "params": { "command": "exportWorkspace", "arguments": [dir.to_string_lossy()] },
+        }),
+    );
 }
 
 /// Apply a Dart analyzing transition to the shared progress state, mirroring
