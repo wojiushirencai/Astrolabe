@@ -150,7 +150,7 @@ impl Language {
             "cs" | "csx" | "razor" | "cshtml" => Language::CSharp,
             "vb" => Language::VisualBasic,
             "kt" | "kts" => Language::Kotlin,
-            "sh" | "bash" => Language::Shell,
+            "sh" | "bash" | "zsh" | "zsh-theme" | "bats" => Language::Shell,
             "rb" | "rake" | "gemspec" => Language::Ruby,
             "lua" => Language::Lua,
             _ => return None,
@@ -171,18 +171,23 @@ impl Language {
     /// Language implied by a `#!` shebang line (`bash`, `sh`, `ruby`, `lua`).
     /// Used only for extension-less files; see [`Language::from_path_and_source`].
     pub fn from_shebang(source: &str) -> Option<Self> {
+        match Self::shebang_interpreter(source)? {
+            "sh" | "bash" | "dash" | "ksh" | "zsh" | "bats" => Some(Language::Shell),
+            "ruby" => Some(Language::Ruby),
+            "lua" | "luajit" => Some(Language::Lua),
+            _ => None,
+        }
+    }
+
+    /// Interpreter basename named by a `#!` line (`#!/usr/bin/env zsh` → `zsh`).
+    pub fn shebang_interpreter(source: &str) -> Option<&str> {
         let first = source.lines().next()?.strip_prefix("#!")?.trim();
         let mut parts = first.split_whitespace();
         let mut interp = parts.next()?.rsplit('/').next()?;
         if interp == "env" {
             interp = parts.find(|p| !p.starts_with('-'))?;
         }
-        match interp {
-            "sh" | "bash" | "dash" | "ksh" => Some(Language::Shell),
-            "ruby" => Some(Language::Ruby),
-            "lua" | "luajit" => Some(Language::Lua),
-            _ => None,
-        }
+        Some(interp)
     }
 
     /// Whether `p` has no real extension, so its language may come from a
@@ -621,6 +626,9 @@ mod tests {
             ("build.gradle.kts", Language::Kotlin),
             ("x.sh", Language::Shell),
             ("x.bash", Language::Shell),
+            ("x.zsh", Language::Shell),
+            ("x.zsh-theme", Language::Shell),
+            ("x.bats", Language::Shell),
             ("a.rb", Language::Ruby),
             ("tasks.rake", Language::Ruby),
             ("Rakefile", Language::Ruby),

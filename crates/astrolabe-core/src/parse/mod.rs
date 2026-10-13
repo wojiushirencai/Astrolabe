@@ -134,10 +134,18 @@ impl ParserPool {
         if matches!(lang, Language::ObjC | Language::ObjCpp) {
             return objc::parse_with(lang, source, |l, s| self.parse_raw(l, path, s));
         }
+        // Shell: zsh-only syntax and `.bats` `@test` blocks are rewritten
+        // (line-preserving) for the bash grammar; nvm-style `\. file` source
+        // lines are normalized (same length) on every parse pass.
         if lang == Language::Shell {
-            if let Some(fixed) = shell::normalize_backslash_dot(source) {
-                return self.parse_raw(lang, path, &fixed);
-            }
+            return shell::parse_with(
+                path.as_str(),
+                source,
+                |s| match shell::normalize_backslash_dot(s) {
+                    Some(fixed) => self.parse_raw(lang, path, &fixed),
+                    None => self.parse_raw(lang, path, s),
+                },
+            );
         }
         self.parse_raw(lang, path, source)
     }
