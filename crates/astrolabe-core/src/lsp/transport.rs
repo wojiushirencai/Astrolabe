@@ -91,6 +91,10 @@ struct Shared {
     initialize_result: Mutex<Option<Value>>,
     workspace_folders: Mutex<Option<Value>>,
     stderr_bytes: AtomicU64,
+    /// Last few KiB of the server's stderr, so a server that exits during
+    /// `initialize` can say why (missing Gemfile.lock, no tsserver, ...)
+    /// instead of a bare "exited unexpectedly".
+    stderr_tail: Mutex<Vec<u8>>,
     cwd: Option<PathBuf>,
     /// Whether the server has ever announced background work.
     ///
@@ -156,7 +160,7 @@ impl LspTransport {
             Ok(_) => Ok(transport),
             Err(err) => {
                 transport.force_stop();
-                Err(err)
+                Err(transport.explain_startup_error(err))
             }
         }
     }
@@ -214,6 +218,7 @@ impl LspTransport {
             initialize_result: Mutex::new(None),
             workspace_folders: Mutex::new(None),
             stderr_bytes: AtomicU64::new(0),
+            stderr_tail: Mutex::new(Vec::new()),
             cwd: cwd.map(Path::to_path_buf),
         });
 
@@ -266,6 +271,33 @@ impl LspTransport {
 
     pub fn is_alive(&self) -> bool {
         self.shared.life.load(Ordering::SeqCst) == LIFE_RUNNING
+    }
+
+    /// Recent stderr output, trimmed to the last few non-empty lines.
+    pub fn stderr_tail(&self) -> String {
+        // Give the drain thread a beat to pick up the dying server's last words.
+        thread::sleep(Duration::from_millis(50));
+        let tail = lock(&self.shared.stderr_tail);
+        summarize_stderr(&String::from_utf8_lossy(&tail))
+    }
+
+    /// Turn a bare crash during startup into a [`LspError::Startup`] that
+    /// carries the server's own explanation from stderr, when it printed one.
+    fn explain_startup_error(&self, err: LspError) -> LspError {
+        match err {
+            LspError::Crashed => {
+                let tail = self.stderr_tail();
+                if tail.is_empty() {
+                    LspError::Crashed
+                } else {
+                    LspError::Startup(
+                        self.shared.spec.language,
+                        format!("exited during initialize: {tail}"),
+                    )
+                }
+            }
+            other => other,
+        }
     }
 
     /// Bytes the stderr thread has consumed. Used by tests; also a cheap
@@ -450,9 +482,9 @@ impl LspTransport {
             params["rootPath"] = Value::Null;
             params["rootUri"] = Value::Null;
         }
-        if let Some(options) =
-            initialization_options.or_else(|| initialization_options_for(self.shared.spec.language))
-        {
+        if let Some(options) = initialization_options.or_else(|| {
+            initialization_options_for(self.shared.spec.language, root, &self.shared.spec.command)
+        }) {
             params["initializationOptions"] = options;
         }
 
@@ -1015,8 +1047,25 @@ fn send_root_uri(language: Language) -> bool {
 /// labels, Dart and Flutter outlines) are switched off so the analysis server
 /// does the minimum work. `None` means "no options" and `initialize` then
 /// omits the field entirely, exactly as before this hook existed.
-fn initialization_options_for(language: Language) -> Option<Value> {
+fn initialization_options_for(language: Language, root: &Path, command: &Path) -> Option<Value> {
     match language {
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            let tsserver = find_tsserver(root, command)?;
+            Some(json!({ "tsserver": { "path": tsserver.to_string_lossy() } }))
+        }
+        Language::Shell => Some(shell_settings()),
+        Language::Vue => {
+            let tsserver = find_tsserver(root, command)?;
+            let tsdk = tsserver.parent()?;
+            // `hybridMode: false` makes Volar 2.x run its own embedded TS
+            // service. Volar 3.x dropped that mode and instead expects the
+            // client to forward `tsserver/request` to a tsserver running
+            // @vue/typescript-plugin, which Astrolabe does not bridge yet.
+            Some(json!({
+                "typescript": { "tsdk": tsdk.to_string_lossy() },
+                "vue": { "hybridMode": false },
+            }))
+        }
         Language::Dart => Some(json!({
             "onlyAnalyzeProjectsWithOpenFiles": false,
             "closingLabels": false,
@@ -1025,6 +1074,53 @@ fn initialization_options_for(language: Language) -> Option<Value> {
         })),
         _ => None,
     }
+}
+
+/// Locate a `typescript/lib/tsserver.js` when the workspace has none.
+///
+/// typescript-language-server only looks in the workspace's `node_modules`
+/// and then gives up with "Could not find a valid TypeScript installation",
+/// so repos without `npm install` (fresh clones, CI checkouts, read-only
+/// browsing) get no precise TS answers at all. A global
+/// `npm i -g typescript-language-server typescript` puts `typescript` next to
+/// the server package; point the server at it. Returns `None` when the
+/// workspace already ships TypeScript so its own version wins.
+fn find_tsserver(root: &Path, command: &Path) -> Option<PathBuf> {
+    const REL: &str = "typescript/lib/tsserver.js";
+    if root.join("node_modules").join(REL).is_file() {
+        return None;
+    }
+    if let Some(explicit) = std::env::var_os("ASTROLABE_TSSERVER_PATH") {
+        let p = PathBuf::from(explicit);
+        let p = if p.is_dir() { p.join("tsserver.js") } else { p };
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let resolved = std::fs::canonicalize(command).unwrap_or_else(|_| command.to_path_buf());
+    let mut starts = vec![resolved];
+    if let Some(parent) = command.parent() {
+        // `<prefix>/bin/tsls` -> `<prefix>/lib/node_modules` (unix npm -g layout)
+        if let Some(prefix) = parent.parent() {
+            starts.push(prefix.join("lib").join("node_modules").join("x"));
+            starts.push(prefix.join("node_modules").join("x"));
+        }
+        // Windows npm -g: shims live directly in the prefix.
+        starts.push(parent.join("node_modules").join("x"));
+    }
+    for start in &starts {
+        for dir in start.ancestors().skip(1) {
+            let candidate = dir.join(REL);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            let nested = dir.join("node_modules").join(REL);
+            if nested.is_file() {
+                return Some(nested);
+            }
+        }
+    }
+    None
 }
 
 fn locations_from_value(value: &Value, root: &Path) -> Vec<Location> {
@@ -1367,6 +1463,22 @@ fn on_reader_exit(shared: &Shared) {
     }
 }
 
+const STDERR_TAIL_BYTES: usize = 4096;
+
+fn summarize_stderr(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(6);
+    let mut out = lines[start..].join(" | ");
+    if out.chars().count() > 600 {
+        out = out.chars().take(600).collect::<String>() + "…";
+    }
+    out
+}
+
 fn drain_stderr(mut stderr: std::process::ChildStderr, shared: Arc<Shared>) {
     let mut buf = [0u8; 4096];
     loop {
@@ -1374,6 +1486,14 @@ fn drain_stderr(mut stderr: std::process::ChildStderr, shared: Arc<Shared>) {
             Ok(0) => break,
             Ok(n) => {
                 shared.stderr_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                {
+                    let mut tail = lock(&shared.stderr_tail);
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.len() > STDERR_TAIL_BYTES {
+                        let cut = tail.len() - STDERR_TAIL_BYTES;
+                        tail.drain(..cut);
+                    }
+                }
                 tracing::debug!(
                     target: "astrolabe_lsp_stderr",
                     "{}",
@@ -1558,12 +1678,20 @@ fn handle_server_request(shared: &Shared, method: &str, params: Option<&Value>, 
 fn reverse_request_result(shared: &Shared, method: &str, params: &Value) -> Value {
     match method {
         "workspace/configuration" => {
-            let n = params
+            let items = params
                 .get("items")
                 .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            Value::Array(vec![Value::Null; n])
+                .cloned()
+                .unwrap_or_default();
+            Value::Array(
+                items
+                    .iter()
+                    .map(|item| {
+                        let section = item.get("section").and_then(Value::as_str);
+                        configuration_section(shared.spec.language, section)
+                    })
+                    .collect(),
+            )
         }
         "workspace/workspaceFolders" => lock(&shared.workspace_folders)
             .clone()
@@ -1572,6 +1700,25 @@ fn reverse_request_result(shared: &Shared, method: &str, params: &Value) -> Valu
         "window/showDocument" => json!({ "success": false }),
         _ => Value::Null,
     }
+}
+
+/// Answers for `workspace/configuration` pulls. Anything not listed gets
+/// `null` ("use your defaults"), which is what every server expects from a
+/// client without settings.
+fn configuration_section(language: Language, section: Option<&str>) -> Value {
+    match (language, section) {
+        // bash-language-server only resolves symbols across files reachable
+        // via `source` unless this is on, so go-to-definition from a test
+        // script into the library it exercises comes back empty. It pulls
+        // `bashIde` after `initialized` and a null answer resets the value
+        // passed in initializationOptions back to false.
+        (Language::Shell, Some("bashIde")) => shell_settings(),
+        _ => Value::Null,
+    }
+}
+
+fn shell_settings() -> Value {
+    json!({ "includeAllWorkspaceSymbols": true })
 }
 
 fn rpc_id_u64(id: &Value) -> Option<u64> {
@@ -2186,8 +2333,10 @@ while True:
 
     #[test]
     fn initialization_options_are_dart_only() {
+        let nowhere = Path::new("/nonexistent-astrolabe-root");
+        let cmd = Path::new("/nonexistent-astrolabe-bin/server");
         assert_eq!(
-            initialization_options_for(Language::Dart),
+            initialization_options_for(Language::Dart, nowhere, cmd),
             Some(json!({
                 "onlyAnalyzeProjectsWithOpenFiles": false,
                 "closingLabels": false,
@@ -2196,8 +2345,50 @@ while True:
             }))
         );
         for language in [Language::Python, Language::Go, Language::Rust] {
-            assert_eq!(initialization_options_for(language), None);
+            assert_eq!(initialization_options_for(language, nowhere, cmd), None);
         }
+    }
+
+    #[test]
+    fn typescript_points_at_global_tsserver_when_workspace_has_none() {
+        let tmp = std::env::temp_dir().join(format!("astro-tsserver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let prefix = tmp.join("prefix");
+        let tsserver = prefix.join("lib/node_modules/typescript/lib/tsserver.js");
+        std::fs::create_dir_all(tsserver.parent().unwrap()).unwrap();
+        std::fs::write(&tsserver, "").unwrap();
+        let bin = prefix.join("bin/typescript-language-server");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "").unwrap();
+        let root = tmp.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let opts = initialization_options_for(Language::TypeScript, &root, &bin).unwrap();
+        let got = PathBuf::from(opts["tsserver"]["path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::canonicalize(got).unwrap(),
+            std::fs::canonicalize(&tsserver).unwrap()
+        );
+        let vue = initialization_options_for(Language::Vue, &root, &bin).unwrap();
+        assert!(vue["typescript"]["tsdk"].as_str().unwrap().ends_with("lib"));
+
+        // A workspace-local TypeScript wins: send nothing.
+        let local = root.join("node_modules/typescript/lib/tsserver.js");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "").unwrap();
+        assert_eq!(
+            initialization_options_for(Language::TypeScript, &root, &bin),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stderr_summary_keeps_last_lines() {
+        let text = "a\n\nb\nc\nd\ne\nf\nProject contains a Gemfile, but no Gemfile.lock\n";
+        let s = summarize_stderr(text);
+        assert!(s.ends_with("Project contains a Gemfile, but no Gemfile.lock"));
+        assert!(!s.starts_with("a |"));
     }
 
     #[test]

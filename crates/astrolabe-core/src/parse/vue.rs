@@ -105,7 +105,9 @@ struct ScriptBlock {
     body_start_line: u32,
 }
 
-fn component_name(path: &RelPath) -> String {
+/// Path-derived component name; also salts the parse cache key because
+/// identical SFC bodies at different paths must yield different symbols.
+pub(crate) fn component_name(path: &RelPath) -> String {
     let file = path.file_name();
     let stem = file.strip_suffix(".vue").unwrap_or(file);
     if stem.is_empty() {

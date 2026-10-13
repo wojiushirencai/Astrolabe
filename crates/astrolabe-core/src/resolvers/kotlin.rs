@@ -211,9 +211,16 @@ fn code_lines(src: &str) -> impl Iterator<Item = String> + '_ {
 
 /// First `package a.b.c` (Kotlin or Java) in a source file.
 fn package_decl(src: &str) -> Option<String> {
+    // Paren depth of an annotation that spans lines
+    // (`@file:Suppress(\n  "X",\n)` above the package line).
+    let mut depth = 0i32;
     for line in code_lines(src) {
         let t = line.trim();
-        if t.is_empty() || t.starts_with('@') {
+        if depth > 0 || t.starts_with('@') {
+            depth += paren_delta(t);
+            continue;
+        }
+        if t.is_empty() {
             continue;
         }
         let rest = t.strip_prefix("package")?;
@@ -229,6 +236,23 @@ fn package_decl(src: &str) -> Option<String> {
         return (!pkg.is_empty()).then_some(pkg);
     }
     None
+}
+
+/// Net `(` minus `)` outside string literals.
+fn paren_delta(line: &str) -> i32 {
+    let mut delta = 0;
+    let mut in_str = false;
+    let mut prev = '\0';
+    for c in line.chars() {
+        match c {
+            '"' if prev != '\\' => in_str = !in_str,
+            '(' if !in_str => delta += 1,
+            ')' if !in_str => delta -= 1,
+            _ => {}
+        }
+        prev = c;
+    }
+    delta
 }
 
 const MODIFIERS: &[&str] = &[
@@ -542,5 +566,15 @@ mod tests {
         assert_eq!(res("kotlin.collections.List"), None);
         assert_eq!(res("okio.Buffer"), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn package_after_multiline_file_annotation() {
+        let src = "/* license */\n@file:Suppress(\n  \"INVISIBLE_MEMBER\",\n  \"x(\",\n)\n\npackage mockwebserver3\n\nclass MockResponse\n";
+        assert_eq!(package_decl(src).as_deref(), Some("mockwebserver3"));
+        assert_eq!(
+            package_decl("@file:JvmName(\"A\")\npackage a.b\n").as_deref(),
+            Some("a.b")
+        );
     }
 }
