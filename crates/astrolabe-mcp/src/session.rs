@@ -83,10 +83,19 @@ impl fmt::Debug for RootSession {
 impl RootSession {
     pub(crate) fn new(root: PathBuf, knobs: McpKnobs, cache_budget_bytes: u64) -> Arc<Self> {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let state = Arc::new(RwLock::new(IndexState::Building));
+        let syntax_state = Arc::clone(&state);
+        let precise =
+            LiveBackend::new(root.clone()).with_syntax_index(Arc::new(
+                move || match &*syntax_state.read().ok()? {
+                    IndexState::Ready(index) => Some(Arc::clone(index)),
+                    _ => None,
+                },
+            ));
         Arc::new(Self {
-            precise: Arc::new(LiveBackend::new(root.clone())),
+            precise: Arc::new(precise),
             root,
-            state: Arc::new(RwLock::new(IndexState::Building)),
+            state,
             watch: Arc::new(Mutex::new(None)),
             freshness: Arc::new(Mutex::new(None)),
             indexer_lock: Arc::new(Mutex::new(None)),

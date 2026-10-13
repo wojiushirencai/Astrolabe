@@ -96,6 +96,42 @@ pub const DEFAULT_MEMORY_HARD_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// one, most of it spent fetching and building the crate graph.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Longest a still-indexing server is spared idle reclaim.
+///
+/// Idle reclaim used to ignore background work, so kotlin-lsp — whose first
+/// Gradle import of okhttp takes ~20 min — was shut down 5 min into the
+/// import whenever no query happened to arrive, and every later query
+/// started the import over. A server stuck "busy" forever is still bounded.
+pub const BUSY_IDLE_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// First-checkout wait cap for servers whose initial project import is far
+/// longer than any caller should block on. Callers get the syntactic
+/// fallback (with an "importing" note) immediately instead.
+const SLOW_IMPORT_READY_CAP: Duration = Duration::from_secs(15);
+
+/// Steady-state RSS floor for JVM-hosted servers. kotlin-lsp ships with
+/// `-Xmx2048m` plus a 512 MiB code cache, so the generic 2 GiB ceiling
+/// reclaimed it the moment its import finished.
+const JVM_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const JVM_MEMORY_HARD_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// Per-language view of [`LspPoolConfig`]: JVM servers get a higher memory
+/// ceiling and servers with long project imports a short first wait. A `0`
+/// (disabled) limit stays disabled.
+fn config_for(config: &LspPoolConfig, language: Language) -> LspPoolConfig {
+    let mut c = config.clone();
+    if language == Language::Kotlin {
+        if c.memory_limit_bytes > 0 {
+            c.memory_limit_bytes = c.memory_limit_bytes.max(JVM_MEMORY_LIMIT_BYTES);
+        }
+        if c.memory_hard_limit_bytes > 0 {
+            c.memory_hard_limit_bytes = c.memory_hard_limit_bytes.max(JVM_MEMORY_HARD_LIMIT_BYTES);
+        }
+        c.ready_timeout = c.ready_timeout.min(SLOW_IMPORT_READY_CAP);
+    }
+    c
+}
+
 /// Wait after a failed start before trying again.
 pub const DEFAULT_START_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -253,6 +289,8 @@ pub struct ServerGuard {
     server: Arc<dyn LanguageServer>,
     language: Language,
     generation: u64,
+    /// This checkout started the server.
+    first_checkout: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -338,12 +376,19 @@ impl LspPool {
         // Outside the slot lock, and with the guard already holding the
         // server checked out: waiting here blocks only this caller, not the
         // other languages or the reclaim monitor.
-        if !self.inner.config.ready_timeout.is_zero()
-            && !guard.wait_until_ready(self.inner.config.ready_timeout)
+        //
+        // Only the checkout that started the server waits. Once that wait
+        // has run out, later callers get the server's current answers right
+        // away (marked incomplete while it is busy) rather than each paying
+        // the full timeout again during a long import.
+        let ready_timeout = config_for(&self.inner.config, language).ready_timeout;
+        if guard.first_checkout
+            && !ready_timeout.is_zero()
+            && !guard.wait_until_ready(ready_timeout)
         {
             tracing::warn!(
                 language = language.name(),
-                timeout_ms = self.inner.config.ready_timeout.as_millis() as u64,
+                timeout_ms = ready_timeout.as_millis() as u64,
                 "language server still indexing after timeout; answers may be incomplete"
             );
         }
@@ -489,6 +534,7 @@ impl Inner {
                 server,
                 language,
                 generation,
+                first_checkout: false,
             });
         }
 
@@ -529,6 +575,7 @@ impl Inner {
                     server,
                     language,
                     generation,
+                    first_checkout: true,
                 })
             }
             Err(err) => {
@@ -581,7 +628,8 @@ impl Inner {
 
         let memory = peeked.server.memory_bytes();
         let busy = peeked.server.is_busy();
-        if !self.should_reclaim(peeked.idle_for, memory, busy) {
+        let config = config_for(&self.config, language);
+        if !should_reclaim(&config, peeked.idle_for, memory, busy) {
             return;
         }
 
@@ -593,7 +641,7 @@ impl Inner {
             if state.server.is_none() {
                 return;
             }
-            if !self.should_reclaim(state.last_used.elapsed(), memory, busy) {
+            if !should_reclaim(&config, state.last_used.elapsed(), memory, busy) {
                 return;
             }
             let idle_for = state.last_used.elapsed();
@@ -607,7 +655,7 @@ impl Inner {
             return;
         };
         let idle_for = taken.1;
-        let reason = reclaim_reason(&self.config, idle_for, memory, busy);
+        let reason = reclaim_reason(&config, idle_for, memory, busy);
         let memory_before = memory.unwrap_or(0);
         tracing::info!(
             language = language.name(),
@@ -615,7 +663,7 @@ impl Inner {
             idle_ms = idle_for.as_millis() as u64,
             memory_before_bytes = memory_before,
             memory_after_bytes = 0u64,
-            memory_limit_bytes = self.config.memory_limit_bytes,
+            memory_limit_bytes = config.memory_limit_bytes,
             idle_ttl_ms = self.config.idle_ttl.as_millis() as u64,
             "reclaiming language server"
         );
@@ -634,11 +682,6 @@ impl Inner {
                 "language server shutdown failed during reclaim"
             ),
         }
-    }
-
-    fn should_reclaim(&self, idle_for: Duration, memory: Option<u64>, busy: bool) -> bool {
-        let idle_hit = !self.config.idle_ttl.is_zero() && idle_for >= self.config.idle_ttl;
-        idle_hit || memory_over_budget(&self.config, memory, busy)
     }
 
     fn shutdown_all(&self, force: bool) {
@@ -691,6 +734,29 @@ impl Inner {
     }
 }
 
+/// Idle reclaim waits out background work (bounded by [`BUSY_IDLE_GRACE`]);
+/// memory reclaim applies the busy/steady ceilings of [`memory_over_budget`].
+fn should_reclaim(
+    config: &LspPoolConfig,
+    idle_for: Duration,
+    memory: Option<u64>,
+    busy: bool,
+) -> bool {
+    idle_expired(config, idle_for, busy) || memory_over_budget(config, memory, busy)
+}
+
+fn idle_expired(config: &LspPoolConfig, idle_for: Duration, busy: bool) -> bool {
+    if config.idle_ttl.is_zero() {
+        return false;
+    }
+    let ttl = if busy {
+        config.idle_ttl.max(BUSY_IDLE_GRACE)
+    } else {
+        config.idle_ttl
+    };
+    idle_for >= ttl
+}
+
 struct Peeked {
     server: Arc<dyn LanguageServer>,
     generation: u64,
@@ -721,7 +787,7 @@ fn reclaim_reason(
     busy: bool,
 ) -> &'static str {
     let memory_hit = memory_over_budget(config, memory, busy);
-    let idle_hit = !config.idle_ttl.is_zero() && idle_for >= config.idle_ttl;
+    let idle_hit = idle_expired(config, idle_for, busy);
     match (memory_hit, idle_hit) {
         (true, true) => "idle+memory",
         (true, false) => "memory",

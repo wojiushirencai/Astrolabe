@@ -72,6 +72,9 @@ pub struct Discovery {
     /// `None` skips cache probing (default for [`Discovery::new`] / tests).
     cache_root: Option<PathBuf>,
     auto_install: AutoInstallMode,
+    /// Install roots searched for an unpacked kotlin-lsp distribution when
+    /// none is on PATH. Empty for [`Discovery::new`] (hermetic tests).
+    kotlin_roots: Vec<PathBuf>,
 }
 
 /// One language's probe outcome. Missing is a row, not an omitted row.
@@ -254,11 +257,21 @@ const VUE: &[Candidate] = &[Candidate {
 }];
 
 /// Kotlin — JetBrains kotlin-lsp first, fwcd kotlin-language-server fallback.
+///
+/// `intellij-server` is the launcher name inside the standalone archive since
+/// v262.4739 (`kotlin-lsp.sh` is a deprecated forwarder); Homebrew links it as
+/// `kotlin-lsp`. Unpacked archives and editor-extension copies that are not
+/// on PATH are found through [`super::kotlin::well_known_roots`].
 const KOTLIN: &[Candidate] = &[
     Candidate {
         bin: "kotlin-lsp",
         args: &["--stdio"],
-        install: "kotlin-lsp (JetBrains, preview): brew install JetBrains/utils/kotlin-lsp  # or download from https://github.com/Kotlin/kotlin-lsp/releases; set ASTROLABE_LSP_KOTLIN",
+        install: KOTLIN_LSP_INSTALL,
+    },
+    Candidate {
+        bin: "intellij-server",
+        args: &["--stdio"],
+        install: KOTLIN_LSP_INSTALL,
     },
     Candidate {
         bin: "kotlin-language-server",
@@ -266,6 +279,8 @@ const KOTLIN: &[Candidate] = &[
         install: "kotlin-language-server (fwcd): brew install kotlin-language-server  # or https://github.com/fwcd/kotlin-language-server/releases",
     },
 ];
+
+const KOTLIN_LSP_INSTALL: &str = "kotlin-lsp (JetBrains): brew install JetBrains/utils/kotlin-lsp  # or unpack the standalone archive from https://github.com/Kotlin/kotlin-lsp/releases and set ASTROLABE_LSP_KOTLIN to the unpacked directory or its bin/intellij-server. First open of a Gradle project imports it (minutes on large repos; cached afterwards); Astrolabe answers from its syntax index meanwhile";
 
 const SHELL: &[Candidate] = &[Candidate {
     bin: "bash-language-server",
@@ -353,6 +368,11 @@ impl Discovery {
             windows: cfg!(windows),
             cache_root: Some(installer::default_servers_dir()),
             auto_install: AutoInstallMode::from_env(),
+            kotlin_roots: super::kotlin::well_known_roots(
+                home_dir().as_deref(),
+                |k| std::env::var(k).ok(),
+                cfg!(windows),
+            ),
         }
     }
 
@@ -366,12 +386,19 @@ impl Discovery {
             windows: cfg!(windows),
             cache_root: None,
             auto_install: AutoInstallMode::Off,
+            kotlin_roots: Vec::new(),
         }
     }
 
     /// Add or replace one environment variable (overrides or `PATHEXT`).
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Add an install root searched for a kotlin-lsp distribution.
+    pub fn with_kotlin_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.kotlin_roots.push(root.into());
         self
     }
 
@@ -412,9 +439,15 @@ impl Discovery {
             return self.probe_roslyn(language);
         }
         if let Some((key, value)) = self.override_value(language) {
-            match self.resolve_override(&value) {
+            let resolved = self.resolve_override(&value).or_else(|| {
+                (language == Language::Kotlin && Path::new(&value).is_dir())
+                    .then(|| super::kotlin::launcher_in(Path::new(&value), self.windows))
+                    .flatten()
+            });
+            match resolved {
                 Some(command) => {
                     let spec = spec_for_resolved(language, command);
+                    let spec = self.kotlin_upgrade(spec);
                     let install_hint = spec.install_hint.clone();
                     return ProbeResult {
                         language,
@@ -434,8 +467,15 @@ impl Discovery {
         }
 
         for candidate in candidates(language) {
+            if candidate.bin == "kotlin-language-server" {
+                // Unpacked JetBrains distributions beat the fwcd fallback.
+                if let Some(found) = self.probe_kotlin_roots() {
+                    return found;
+                }
+            }
             if let Some(command) = self.find_on_path(candidate.bin) {
                 let spec = spec_from_candidate(language, command, candidate);
+                let spec = self.kotlin_upgrade(spec);
                 let install_hint = spec.install_hint.clone();
                 return ProbeResult {
                     language,
@@ -529,6 +569,46 @@ impl Discovery {
         }
 
         self.unavailable(language, self.missing_hint(language))
+    }
+
+    /// Upgrade a kotlin-lsp spec that points at the deprecated wrapper (or a
+    /// symlink to it) to the `bin/intellij-server` next to it. Other
+    /// languages pass through untouched.
+    fn kotlin_upgrade(&self, mut spec: ServerSpec) -> ServerSpec {
+        if spec.language != Language::Kotlin || !super::kotlin::is_jetbrains_server(&spec.command) {
+            return spec;
+        }
+        spec.command = super::kotlin::prefer_launcher(&spec.command, self.windows);
+        if spec.args.is_empty() {
+            spec.args = vec!["--stdio".to_string()];
+        }
+        spec
+    }
+
+    /// kotlin-lsp unpacked somewhere off PATH (archive, Homebrew libexec,
+    /// editor extension, Astrolabe's own server cache).
+    fn probe_kotlin_roots(&self) -> Option<ProbeResult> {
+        let cache = self
+            .cache_root
+            .as_ref()
+            .map(|c| vec![c.join("kotlin-lsp"), c.join("kotlin-server")])
+            .unwrap_or_default();
+        let command = cache
+            .iter()
+            .chain(self.kotlin_roots.iter())
+            .find_map(|root| super::kotlin::launcher_in(root, self.windows))?;
+        let spec = self.kotlin_upgrade(ServerSpec {
+            language: Language::Kotlin,
+            command,
+            args: vec!["--stdio".to_string()],
+            install_hint: KOTLIN_LSP_INSTALL.to_string(),
+        });
+        Some(ProbeResult {
+            language: Language::Kotlin,
+            install_hint: spec.install_hint.clone(),
+            spec: Some(spec),
+            needs_install: None,
+        })
     }
 
     fn unavailable(&self, language: Language, hint: String) -> ProbeResult {
@@ -1059,6 +1139,10 @@ fn find_candidate_by_bin(bin: &str) -> Option<&'static Candidate> {
         .chain(VUE)
         .chain(DART)
         .chain(CSHARP)
+        .chain(KOTLIN)
+        .chain(SHELL)
+        .chain(RUBY)
+        .chain(LUA)
         .find(|c| c.bin == bin)
 }
 
@@ -1068,6 +1152,13 @@ fn extra_args_for_unknown_stem(stem: &str) -> Vec<String> {
         "clangd" => vec!["--background-index".into()],
         _ => Vec::new(),
     }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 fn bin_stem(path: &Path) -> String {
@@ -2000,5 +2091,74 @@ mod tests {
         assert_eq!(spec.args[0], dll.to_string_lossy());
         assert_eq!(spec.args[1], "--stdio");
         assert_eq!(spec.language, Language::VisualBasic);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kotlin_path_symlink_to_deprecated_wrapper_runs_intellij_server() {
+        let tmp = scratch();
+        let dist = tmp.0.join("kotlin-server-263.6379.0");
+        fs::create_dir_all(dist.join("bin")).unwrap();
+        write_fake_executable(&dist.join("kotlin-lsp.sh"));
+        write_fake_executable(&dist.join("bin/intellij-server"));
+        let path_dir = tmp.0.join("path");
+        fs::create_dir_all(&path_dir).unwrap();
+        std::os::unix::fs::symlink(dist.join("kotlin-lsp.sh"), path_dir.join("kotlin-lsp"))
+            .unwrap();
+        let spec = Discovery::new(&path_dir)
+            .discover(Language::Kotlin)
+            .unwrap();
+        assert_eq!(
+            fs::canonicalize(&spec.command).unwrap(),
+            fs::canonicalize(dist.join("bin/intellij-server")).unwrap()
+        );
+        assert_eq!(spec.args, vec!["--stdio".to_string()]);
+    }
+
+    #[test]
+    fn kotlin_intellij_server_on_path_is_accepted() {
+        let tmp = scratch();
+        write_fake_executable(&tmp.0.join("intellij-server"));
+        let spec = Discovery::new(&tmp.0).discover(Language::Kotlin).unwrap();
+        assert!(spec.command.ends_with("intellij-server"));
+        assert_eq!(spec.args, vec!["--stdio".to_string()]);
+    }
+
+    #[test]
+    fn kotlin_override_may_name_the_unpacked_directory() {
+        let tmp = scratch();
+        let dist = tmp.0.join("kotlin-server-263.6379.0");
+        fs::create_dir_all(dist.join("bin")).unwrap();
+        write_fake_executable(&dist.join("bin/intellij-server"));
+        let spec = Discovery::new("")
+            .with_env("ASTROLABE_LSP_KOTLIN", dist.to_string_lossy())
+            .discover(Language::Kotlin)
+            .unwrap();
+        assert_eq!(spec.command, dist.join("bin/intellij-server"));
+        assert_eq!(spec.args, vec!["--stdio".to_string()]);
+    }
+
+    #[test]
+    fn kotlin_unpacked_distribution_beats_fwcd_fallback() {
+        let tmp = scratch();
+        let path_dir = tmp.0.join("path");
+        fs::create_dir_all(&path_dir).unwrap();
+        write_fake_executable(&path_dir.join("kotlin-language-server"));
+        let ext = tmp.0.join("extensions");
+        let launcher =
+            ext.join("jetbrains.kotlin-server-0.0.13-linux-x64/server/bin/intellij-server");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        write_fake_executable(&launcher);
+        let spec = Discovery::new(&path_dir)
+            .with_kotlin_root(&ext)
+            .discover(Language::Kotlin)
+            .unwrap();
+        assert_eq!(spec.command, launcher);
+        // Without the root, fwcd is still the fallback.
+        let spec = Discovery::new(&path_dir)
+            .discover(Language::Kotlin)
+            .unwrap();
+        assert!(spec.command.ends_with("kotlin-language-server"));
+        assert!(spec.args.is_empty());
     }
 }

@@ -177,6 +177,23 @@ fn timeout_fallback(
     ))
 }
 
+/// Whole-word text matches for the symbol at `target`, labelled syntactic,
+/// for callers that need an answer while the server cannot give one yet
+/// (still importing / indexing). `None` when no identifier can be read.
+pub fn text_fallback_references(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    reason: &str,
+) -> Option<Precise<Vec<Location>>> {
+    timeout_fallback(repo_root, path, target, reason)
+}
+
+/// Identifier under `position` in `path` (UTF-16 column), if any.
+pub fn identifier_at(repo_root: &Path, path: &RelPath, position: Position) -> Option<String> {
+    super::fallback::identifier_at(repo_root, path, position)
+}
+
 /// Refuse to call an empty result authoritative while the server is still
 /// indexing.
 ///

@@ -35,6 +35,7 @@ pub mod discovery;
 mod fallback;
 pub mod install;
 pub mod installer;
+pub mod kotlin;
 pub mod pool;
 pub mod queries;
 pub mod router;
