@@ -48,7 +48,7 @@ for test_name in "${tests[@]}"; do
   fi
 done
 
-# 七门新语言声明召回门（Swift/ObjC/Kotlin/Ruby/Shell/Lua/Vue），见 scripts/recall-gate。
+# 新语言声明召回门（Swift/ObjC/ObjC++/Kotlin/Ruby/Shell/Lua/Vue，15 个语料），见 scripts/recall-gate。
 # 语料由 scripts/fetch-corpora.sh 拉到 corpus/lang8/<lang>；RECALL_GATE=0 跳过。
 recall_status=0
 if [[ "${RECALL_GATE:-1}" != "0" ]]; then

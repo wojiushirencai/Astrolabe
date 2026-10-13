@@ -30,6 +30,7 @@ use astrolabe_core::rewrite::scope_js::JsScopeResolver;
 use astrolabe_core::rewrite::scope_ts::TreeSitterScopeResolver;
 use astrolabe_core::rewrite::{ByteRange, Evidence, RewritePlan, ScopeResolver};
 use astrolabe_core::types::{Confidence, Language, RelPath};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::index::RepoIndex;
 use crate::precise_tools::PreciseCapability;
@@ -46,6 +47,10 @@ pub(crate) struct LiveBackend {
     /// Syntax index used to answer while a server is still importing or
     /// indexing (kotlin-lsp's first Gradle import runs for many minutes).
     syntax: Option<SyntaxIndex>,
+    /// Set while a slow-starting server (kotlin-lsp: JVM boot + Gradle
+    /// import) is being started on a background thread. Queries meanwhile
+    /// get the syntactic fallback instead of blocking on the start.
+    starting: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for LiveBackend {
@@ -69,6 +74,7 @@ impl LiveBackend {
             root,
             pool: Arc::new(pool),
             syntax: None,
+            starting: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -134,8 +140,51 @@ impl LiveBackend {
         language: Language,
         op: impl FnOnce(Option<&dyn LanguageServer>) -> T,
     ) -> Result<T, LspError> {
+        if language == Language::Kotlin
+            && self.syntax.is_some()
+            && self.start_in_background(language)
+        {
+            // `None` = server still starting; callers treat it as warming
+            // and answer from the syntax index.
+            return Ok(op(None));
+        }
         let guard = self.pool.acquire(language)?;
         Ok(op(Some(&guard as &dyn LanguageServer)))
+    }
+
+    /// For servers whose start alone takes seconds (kotlin-lsp boots a JVM
+    /// before it even answers `initialize`): start it on a background thread
+    /// and report `true` while that is in progress, so the first queries are
+    /// not held up by the start plus the first-checkout ready wait.
+    fn start_in_background(&self, language: Language) -> bool {
+        if self.starting.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.pool.is_resident(language) {
+            return false;
+        }
+        if self
+            .starting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return true;
+        }
+        let pool = Arc::clone(&self.pool);
+        let starting = Arc::clone(&self.starting);
+        let spawned = std::thread::Builder::new()
+            .name(format!("lsp-start-{}", language.name()))
+            .spawn(move || {
+                if let Err(error) = pool.acquire(language) {
+                    tracing::warn!(language = language.name(), %error, "background start failed");
+                }
+                starting.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.starting.store(false, Ordering::Release);
+            return false;
+        }
+        true
     }
 
     fn resolver_for(language: Language) -> Box<dyn ScopeResolver> {
@@ -277,7 +326,7 @@ impl PreciseCapability for LiveBackend {
         };
         let result = match self.with_server(language, |server| {
             let result = find_references(server, &self.root, &rel, target);
-            (result, server.is_some_and(|s| s.is_busy()))
+            (result, server.is_none_or(|s| s.is_busy()))
         }) {
             Ok((result, busy)) if busy && warming_unknown(&result.value, &result) => {
                 let reason = warming_note(language, 0, "");
@@ -326,7 +375,7 @@ impl PreciseCapability for LiveBackend {
                 SymbolAt::Name(symbol),
                 |server, path, position| server.hover(&path, position),
             );
-            (result, server.is_some_and(|s| s.is_busy()))
+            (result, server.is_none_or(|s| s.is_busy()))
         }) {
             Ok((result, busy))
                 if result.value.is_none()
@@ -386,7 +435,7 @@ impl PreciseCapability for LiveBackend {
         };
         match self.with_server(language, |server| {
             let result = goto_definition(server, &self.root, &rel, target);
-            (result, server.is_some_and(|s| s.is_busy()))
+            (result, server.is_none_or(|s| s.is_busy()))
         }) {
             Ok((result, busy))
                 if result.value.is_empty()

@@ -106,8 +106,18 @@ pub const BUSY_IDLE_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// First-checkout wait cap for servers whose initial project import is far
 /// longer than any caller should block on. Callers get the syntactic
-/// fallback (with an "importing" note) immediately instead.
-const SLOW_IMPORT_READY_CAP: Duration = Duration::from_secs(15);
+/// fallback (with an "importing" note) almost immediately instead. The
+/// server keeps importing in the background; a later query gets the exact
+/// answer once it is ready. `ASTROLABE_KOTLIN_READY_WAIT_MS` overrides it.
+const SLOW_IMPORT_READY_CAP: Duration = Duration::from_secs(2);
+
+fn slow_import_ready_cap() -> Duration {
+    std::env::var("ASTROLABE_KOTLIN_READY_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(SLOW_IMPORT_READY_CAP)
+}
 
 /// Steady-state RSS floor for JVM-hosted servers. kotlin-lsp ships with
 /// `-Xmx2048m` plus a 512 MiB code cache, so the generic 2 GiB ceiling
@@ -127,7 +137,7 @@ fn config_for(config: &LspPoolConfig, language: Language) -> LspPoolConfig {
         if c.memory_hard_limit_bytes > 0 {
             c.memory_hard_limit_bytes = c.memory_hard_limit_bytes.max(JVM_MEMORY_HARD_LIMIT_BYTES);
         }
-        c.ready_timeout = c.ready_timeout.min(SLOW_IMPORT_READY_CAP);
+        c.ready_timeout = c.ready_timeout.min(slow_import_ready_cap());
     }
     c
 }

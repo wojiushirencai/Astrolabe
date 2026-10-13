@@ -39,6 +39,15 @@ CORPORA=(
   "lang8/shell|https://github.com/bats-core/bats-core.git|0c92eb4c418d59fcb1a1a8c1d7a015f8149689f2|"
   "lang8/lua|https://github.com/neovim/nvim-lspconfig.git|6d27c288ff951e1e94cb5f91c800adeddf0dc0c2|"
   "lang8/vue|https://github.com/vbenjs/vue-vben-admin.git|4634655c621338abd97386350e5dc3d9119dab2c|"
+  # larger lang8 corpora, pins = recall-bench clones (2026-10-12)
+  "lang8/swift-alamofire|https://github.com/Alamofire/Alamofire.git|bda9ed57d72988a3a2ada33d824583541f86eac6|--filter=blob:none"
+  "lang8/objc-sdwebimage|https://github.com/SDWebImage/SDWebImage.git|c3ad5e1a9bf55c9b76d4c362430b5fcded96c502|--filter=blob:none"
+  "lang8/objcpp-mmkv|https://github.com/Tencent/MMKV.git|ad7657ef9d120dbcdd7432d75aa6c59391149b22|--filter=blob:none"
+  "lang8/kotlin-coroutines|https://github.com/Kotlin/kotlinx.coroutines.git|113ee1f3c0b0ca0b7a809e75dd8d2340290121c6|--filter=blob:none"
+  "lang8/ruby-rubocop|https://github.com/rubocop/rubocop.git|103a818b5c37f0d043fcce4eb6f1b858ec46aa51|--filter=blob:none"
+  "lang8/shell-nvm|https://github.com/nvm-sh/nvm.git|b1b3a0038c0666c7436cb5d383608b4b72c8300b|--filter=blob:none"
+  "lang8/lua-luals|https://github.com/LuaLS/lua-language-server.git|66d6405138fd472334d87785c1f90388eabfa9d7|--filter=blob:none"
+  "lang8/vue-element-plus|https://github.com/element-plus/element-plus.git|0a56b818fb879092b6bd8e0a2916b161fa760796|--filter=blob:none"
 )
 
 is_sha() {
