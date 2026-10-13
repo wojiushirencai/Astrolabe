@@ -14,6 +14,7 @@
 #   serena           commit 701e7c84…         origin/main; local feat HEAD
 #                                             48609832 is unpublished
 #   openvisio-oss    commit bdb1d2a3…         local HEAD == origin/main
+#   lang8/*          commits = HEADs of the PR #51 (2026-10-12) recall-bench clones
 #   flutter-packages tag webview_flutter_wkwebview-v3.27.0 local corpus/dart (GitHub tag)
 set -euo pipefail
 
@@ -30,6 +31,14 @@ CORPORA=(
   "python|https://github.com/oraios/serena.git|701e7c843f46c6a649203a488cece1bf19f1df90|--filter=blob:none"
   "typescript|https://github.com/syntaxPriest/openvisio-oss.git|bdb1d2a366d74ec92cc6d8968aed384ffad0c508|--filter=blob:none"
   "dart|https://github.com/flutter/packages.git|webview_flutter_wkwebview-v3.27.0|"
+  # lang8 declaration-recall gate (scripts/recall-gate), pins = PR #51 bench HEADs
+  "lang8/swift|https://github.com/apple/swift-argument-parser.git|efd239f0055b3d6b6cc122a786c46a0ea8d0235b|"
+  "lang8/objc|https://github.com/AFNetworking/AFNetworking.git|d9f589cc2c1fe9d55eb5eea00558010afea7a41e|"
+  "lang8/kotlin|https://github.com/square/okhttp.git|42e5888d45623662c138ed27e80ea28bbe0aa5cc|"
+  "lang8/ruby|https://github.com/sinatra/sinatra.git|cb22afd7902b566b6eaba6c4ea89739494a65d12|"
+  "lang8/shell|https://github.com/bats-core/bats-core.git|0c92eb4c418d59fcb1a1a8c1d7a015f8149689f2|"
+  "lang8/lua|https://github.com/neovim/nvim-lspconfig.git|6d27c288ff951e1e94cb5f91c800adeddf0dc0c2|"
+  "lang8/vue|https://github.com/vbenjs/vue-vben-admin.git|4634655c621338abd97386350e5dc3d9119dab2c|"
 )
 
 is_sha() {
@@ -125,6 +134,8 @@ for entry in "${CORPORA[@]}"; do
   if [[ -n "$TARGET" && "$TARGET" != "all" ]]; then
     if [[ "$dest_name" != "$TARGET" ]]; then
       if [[ "$dest_name" == "dart" && "$TARGET" == "flutter-packages" ]]; then
+        :
+      elif [[ "$TARGET" == "lang8" && "$dest_name" == lang8/* ]]; then
         :
       else
         continue
