@@ -233,27 +233,32 @@ const APPLE_SWIFT: &[Candidate] = &[Candidate {
     install: "xcode-select --install  # Xcode CLT ships sourcekit-lsp; or install full Xcode / Swift toolchain",
 }];
 
-/// ObjC/ObjC++ — sourcekit-lsp first (RFC), clangd second (Serena-shaped fallback).
+/// ObjC/ObjC++ — clangd first, sourcekit-lsp second.
+///
+/// sourcekit-lsp only forwards ObjC to the clangd it bundles, and for a
+/// SwiftPM/Xcode-less checkout it has no flags to give it. Astrolabe starts
+/// clangd directly so it can hand it a synthetic `compile_commands.json`
+/// (`-x objective-c`, `-fobjc-arc`, header search paths; see `apple.rs`).
 const APPLE_OBJC: &[Candidate] = &[
+    Candidate {
+        bin: "clangd",
+        args: &["--background-index"],
+        install: "brew install llvm  # or Xcode CLT (`xcode-select --install`); Linux: apt-get install clangd",
+    },
     Candidate {
         bin: "sourcekit-lsp",
         args: &[],
         install: "xcode-select --install  # Xcode CLT ships sourcekit-lsp; or install full Xcode",
     },
-    Candidate {
-        bin: "clangd",
-        args: &[],
-        install:
-            "brew install llvm  # clangd fallback for ObjC/ObjC++ when sourcekit-lsp is absent",
-    },
 ];
 
-// TODO(p0-followup): dual-server / @vue/typescript-plugin with a companion
-// typescript-language-server (Serena-shaped hybridMode). P0 is single Volar only.
+// Volar 2.x runs alone (hybridMode=false). Volar 3.x is detected and run as
+// a dual server by `lsp::vue_bridge` (typescript-language-server with
+// @vue/typescript-plugin, relaying Volar's `tsserver/request`).
 const VUE: &[Candidate] = &[Candidate {
     bin: "vue-language-server",
     args: &["--stdio"],
-    install: "npm i -g @vue/language-server@2 typescript@5  # Volar 3.x needs a tsserver bridge Astrolabe does not provide yet; 2.x runs with hybridMode=false",
+    install: "npm i -g @vue/language-server typescript-language-server typescript  # Volar 3.x is bridged to typescript-language-server + @vue/typescript-plugin; 2.x runs with hybridMode=false",
 }];
 
 /// Kotlin — JetBrains kotlin-lsp first, fwcd kotlin-language-server fallback.
@@ -767,13 +772,13 @@ impl Discovery {
                 " Intelephense premium features need a purchased INTELEPHENSE_LICENSE_KEY;                   never use a pirated key. Phpactor is MIT and needs PHP 8.1+."
             }
             Language::Vue => {
-                " Volar (`@vue/language-server`) is the P0 Vue server; a dual-server                   TypeScript arrangement is a follow-up, not a silent fallback."
+                " Volar (`@vue/language-server`) is the P0 Vue server; 3.x is run as a bridge: typescript-language-server with @vue/typescript-plugin answers script queries and relays Volar's tsserver requests."
             }
             Language::Swift => {
                 " sourcekit-lsp is the RFC-primary Swift server; it ships with                   Xcode / Command Line Tools (`xcode-select --install`)."
             }
             Language::ObjC | Language::ObjCpp => {
-                " Prefer sourcekit-lsp (RFC); clangd is a practical fallback for                   .m/.mm (Serena routes ObjC there). Pure .h headers remain                   Language::C unless content-aware ObjC header detection lands."
+                " clangd is the primary ObjC server: Astrolabe writes a synthetic                   compile_commands.json (ObjC flags, header paths) when the repo has none,                   and ObjC-looking .h headers are routed here too. sourcekit-lsp is the fallback."
             }
             Language::Dart => {
                 " dart language-server 随 Dart SDK 自带；Flutter 工程安装 Flutter SDK 即可获得。"
@@ -1711,16 +1716,9 @@ mod tests {
             "install hint should point at @vue/language-server, got {}",
             spec.install_hint
         );
-        // P0 is single-server Volar; dual-server/TS plugin is follow-up only.
-        assert!(
-            !spec
-                .install_hint
-                .to_ascii_lowercase()
-                .contains("typescript-language-server")
-                || spec.install_hint.contains("follow-up")
-                || spec.install_hint.contains("dual-server"),
-            "P0 must not silently require a companion TS server"
-        );
+        // Volar 3.x is bridged through typescript-language-server, so the
+        // hint must name it.
+        assert!(spec.install_hint.contains("typescript-language-server"));
     }
 
     #[test]
@@ -1822,30 +1820,30 @@ mod tests {
     }
 
     #[test]
-    fn sourcekit_is_primary_for_swift_and_objc_family() {
+    fn sourcekit_for_swift_and_clangd_for_objc_family() {
         let dir = scratch();
         fake_bin(&dir.0, "sourcekit-lsp");
         fake_bin(&dir.0, "clangd");
         let d = discovery_with_dirs(&[&dir.0]);
-        for language in [Language::Swift, Language::ObjC, Language::ObjCpp] {
+        let stem = |language| {
             let spec = d.discover(language).unwrap();
             assert_eq!(spec.language, language);
-            assert!(
-                spec.command
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("sourcekit-lsp"),
-                "{language:?} must prefer sourcekit-lsp, got {:?}",
-                spec.command
-            );
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(stem(Language::Swift).starts_with("sourcekit-lsp"));
+        for language in [Language::ObjC, Language::ObjCpp] {
+            assert!(stem(language).starts_with("clangd"), "{language:?}");
         }
     }
 
     #[test]
-    fn objc_falls_back_to_clangd_when_sourcekit_missing() {
+    fn objc_falls_back_to_sourcekit_when_clangd_missing() {
         let dir = scratch();
-        fake_bin(&dir.0, "clangd");
+        fake_bin(&dir.0, "sourcekit-lsp");
         let d = discovery_with_dirs(&[&dir.0]);
         for language in [Language::ObjC, Language::ObjCpp] {
             let spec = d.discover(language).unwrap();
@@ -1854,11 +1852,18 @@ mod tests {
                     .file_stem()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with("clangd"),
-                "{language:?} should fall back to clangd, got {:?}",
+                    .starts_with("sourcekit-lsp"),
+                "{language:?} should fall back to sourcekit-lsp, got {:?}",
                 spec.command
             );
         }
+    }
+
+    #[test]
+    fn swift_without_sourcekit_is_unavailable() {
+        let dir = scratch();
+        fake_bin(&dir.0, "clangd");
+        let d = discovery_with_dirs(&[&dir.0]);
         let err = d.discover(Language::Swift).unwrap_err();
         let (lang, hint) = unavailable_hint(err);
         assert_eq!(lang, Language::Swift);

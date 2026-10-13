@@ -73,6 +73,29 @@ pub fn position_in_comment_or_string(
     Some(in_comment_or_string(node))
 }
 
+/// For each position in `source`, whether it is code (not inside a comment
+/// or string literal). One parse for the whole batch. `None` when the file
+/// has no grammar.
+pub(crate) fn code_mask(path: &RelPath, source: &str, positions: &[Position]) -> Option<Vec<bool>> {
+    let lang = Language::from_path(path).and_then(grammar)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).ok()?;
+    let tree = parser.parse(source, None)?;
+    Some(
+        positions
+            .iter()
+            .map(|&position| {
+                let Some(byte) = byte_offset(source, position) else {
+                    return true;
+                };
+                tree.root_node()
+                    .descendant_for_byte_range(byte, byte.saturating_add(1).min(source.len()))
+                    .is_none_or(|node| !in_comment_or_string(node))
+            })
+            .collect(),
+    )
+}
+
 fn locate_in_tree(tree: &tree_sitter::Tree, source: &str, name: &str) -> Anchor {
     let mut defs = Vec::new();
     let mut first_code: Option<Position> = None;

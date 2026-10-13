@@ -124,6 +124,62 @@ fn describe_sites(sites: &[(RelPath, Position)]) -> String {
         .join(", ")
 }
 
+/// Swift / Objective-C answer of last resort for [`find_references`].
+///
+/// sourcekit-lsp and clangd answer `[]` (or nothing) whenever they have no
+/// index for the file: no SwiftPM package or build, no compile flags, code
+/// inside an `#if` that is inactive on this host (`canImport(Security)` on
+/// Linux), or the server is not installed. Rather than an empty Unknown that
+/// sends an agent off to grep by hand, return the tree-sitter code
+/// occurrences of the name, labelled [`Confidence::Syntactic`] with a note
+/// that says why. Any other result (including a non-empty or `Exact` one) is
+/// returned unchanged, and other languages are never touched.
+pub fn apple_references_fallback(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    result: Precise<Vec<Location>>,
+) -> Precise<Vec<Location>> {
+    if !result.value.is_empty() || result.confidence != Confidence::Unknown {
+        return result;
+    }
+    if !is_apple_source(repo_root, path) {
+        return result;
+    }
+    let name = match target {
+        SymbolAt::Name(name) if !name.is_empty() => name.to_string(),
+        SymbolAt::Name(_) => return result,
+        SymbolAt::Position(pos) => match super::fallback::identifier_at(repo_root, path, pos) {
+            Some(name) => name,
+            None => return result,
+        },
+    };
+    let reason = result
+        .note
+        .as_deref()
+        .and_then(|n| n.split(['\n', ';']).next())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or("language server returned no references")
+        .to_string();
+    super::fallback::syntactic_references(repo_root, path, &name, &reason)
+}
+
+fn is_apple_source(repo_root: &Path, path: &RelPath) -> bool {
+    match Language::from_path(path) {
+        Some(Language::Swift | Language::ObjC | Language::ObjCpp) => true,
+        Some(Language::C) => {
+            std::fs::read_to_string(repo_root.join(path.as_str())).is_ok_and(|src| {
+                matches!(
+                    Language::from_path_and_source(path, &src),
+                    Some(Language::ObjC | Language::ObjCpp)
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
 /// Positions a references query should be issued at, plus anything the
 /// caller must be told about how they were chosen.
 struct QuerySites {
@@ -967,6 +1023,57 @@ mod tests {
     use crate::lsp::{Diagnostic, Range, WorkspaceEdit};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn apple_fallback_replaces_only_empty_unknown_swift_and_objc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("A.swift"),
+            "struct Widget {}\nlet w = Widget()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("B.swift"),
+            "// Widget\nfunc f(_ w: Widget) {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a.go"), "type Widget struct{}\n").unwrap();
+        let unknown = || Precise::unknown(Vec::new(), "language server returned no references; x");
+        let swift = RelPath::new("A.swift");
+
+        let r = apple_references_fallback(dir.path(), &swift, SymbolAt::Name("Widget"), unknown());
+        assert_eq!(r.confidence, Confidence::Syntactic);
+        assert_eq!(r.value.len(), 3, "{:?}", r.value);
+        assert!(r
+            .note
+            .unwrap()
+            .starts_with("language server returned no references."));
+
+        // By position too.
+        let pos = Position {
+            line: 1,
+            character: 8,
+        };
+        let r = apple_references_fallback(dir.path(), &swift, SymbolAt::Position(pos), unknown());
+        assert_eq!(r.value.len(), 3);
+
+        // Exact answers (even empty ones) and other languages are untouched.
+        let exact = apple_references_fallback(
+            dir.path(),
+            &swift,
+            SymbolAt::Name("Widget"),
+            Precise::exact(Vec::new()),
+        );
+        assert_eq!(exact.confidence, Confidence::Exact);
+        let go = apple_references_fallback(
+            dir.path(),
+            &RelPath::new("a.go"),
+            SymbolAt::Name("Widget"),
+            unknown(),
+        );
+        assert_eq!(go.confidence, Confidence::Unknown);
+        assert!(go.value.is_empty());
+    }
 
     #[derive(Clone)]
     enum Script {

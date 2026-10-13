@@ -29,6 +29,7 @@ use std::time::Duration;
 use crate::types::{Confidence, Language, RelPath};
 
 pub mod anchor;
+pub mod apple;
 pub mod csharp;
 pub mod diagnostics;
 pub mod discovery;
@@ -40,6 +41,7 @@ pub mod pool;
 pub mod queries;
 pub mod router;
 pub mod transport;
+pub mod vue_bridge;
 
 pub use install::{
     parse_language_name, InstallError as SessionInstallError, InstallPlan, InstallRecord,

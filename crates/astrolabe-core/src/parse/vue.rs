@@ -4,13 +4,13 @@
 //! pin, so P0 follows the OpenVisio-shaped approach: peel `<script>` /
 //! `<script setup>` blocks out of the SFC and reuse the JS/TS/TSX parsers.
 //! Template/style symbols are deferred; Volar (`vue-language-server`) covers
-//! those via LSP as a **single** process (see `lsp::discovery` `VUE` candidates).
+//! those via LSP (2.x single process, 3.x bridged; see `lsp::vue_bridge`).
 //!
 //! # Gaps / follow-ups
 //!
 //! - No template/custom-block symbol extraction yet.
-//! - Dual-server Volar + `typescript-language-server` with `@vue/typescript-plugin`
-//!   (Serena `hybridMode`) is **TODO** — not a P0 fallback.
+//! - Volar 3.x runs as a dual server (Volar + `typescript-language-server` with
+//!   `@vue/typescript-plugin`); see `lsp::vue_bridge`.
 
 use crate::types::{CodeSymbol, FileId, Language, RelPath, SymbolId, SymbolKind};
 
