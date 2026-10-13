@@ -744,12 +744,15 @@ impl SpawnServer for StdioSpawn {
         if spec.language == Language::Vue {
             return crate::lsp::vue_bridge::spawn_vue(spec, root, self.timeout, self.query_timeout);
         }
-        let transport = LspTransport::connect(spec, root, self.timeout)?;
-        Ok(Box::new(LspSession::new(
-            transport,
-            root.to_path_buf(),
-            self.query_timeout,
-        )))
+        let spec = super::apple::prepare_spec(spec, root);
+        let transport = LspTransport::connect(&spec, root, self.timeout)?;
+        let session = LspSession::new(transport, root.to_path_buf(), self.query_timeout);
+        if let Some(file) = super::apple::warm_up_file(&spec, root) {
+            // Best effort: a failure here only means indexing starts on the
+            // first real query instead.
+            let _ = session.ensure_open(&file);
+        }
+        Ok(Box::new(session))
     }
 }
 
@@ -1094,6 +1097,17 @@ pub(crate) fn initialization_options_for(
             Some(json!({ "tsserver": { "path": tsserver.to_string_lossy() } }))
         }
         Language::Shell => Some(shell_settings()),
+        // sourcekit-lsp only answers cross-file queries from its index, and on
+        // a bare checkout (no prior `swift build` / Xcode build) that index is
+        // empty: references come back `[]`. Background indexing makes the
+        // server run SwiftPM's prepare step and index the package itself; it
+        // reports progress through `$/progress`, which `is_busy` tracks.
+        Language::Swift | Language::ObjC | Language::ObjCpp if is_sourcekit(command) => {
+            Some(json!({
+                "backgroundIndexing": true,
+                "backgroundPreparationMode": "enabled",
+            }))
+        }
         // Volar 2.x. `hybridMode: false` makes it run its own embedded TS
         // service; sent even when the workspace ships TypeScript, otherwise
         // 2.x defaults to hybrid mode and waits for a TS client that never
@@ -1119,6 +1133,12 @@ pub(crate) fn initialization_options_for(
         })),
         _ => None,
     }
+}
+
+fn is_sourcekit(command: &Path) -> bool {
+    command
+        .file_stem()
+        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("sourcekit-lsp"))
 }
 
 /// Locate a `typescript/lib/tsserver.js` when the workspace has none.
@@ -2378,6 +2398,21 @@ while True:
         ] {
             assert!(send_root_uri(language), "{language:?} must keep its root");
         }
+    }
+
+    #[test]
+    fn sourcekit_lsp_gets_background_indexing() {
+        let nowhere = Path::new("/nonexistent-astrolabe-root");
+        let sk = Path::new("/usr/bin/sourcekit-lsp");
+        for language in [Language::Swift, Language::ObjC, Language::ObjCpp] {
+            let opts = initialization_options_for(language, nowhere, sk).expect("options");
+            assert_eq!(opts["backgroundIndexing"], json!(true));
+        }
+        // clangd serving ObjC takes flags, not initializationOptions.
+        assert_eq!(
+            initialization_options_for(Language::ObjC, nowhere, Path::new("clangd")),
+            None
+        );
     }
 
     #[test]

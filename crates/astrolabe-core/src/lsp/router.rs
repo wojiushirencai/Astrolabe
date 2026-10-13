@@ -250,7 +250,7 @@ pub fn install_hint_for(language: Language) -> &'static str {
             "sourcekit-lsp (`xcode-select --install` / Xcode; set ASTROLABE_LSP_SWIFT)"
         }
         Language::ObjC | Language::ObjCpp => {
-            "sourcekit-lsp (preferred) or clangd (`xcode-select --install` / `brew install llvm`)"
+            "clangd (preferred; `brew install llvm` / `apt-get install clangd`) or sourcekit-lsp (`xcode-select --install`)"
         }
         Language::C | Language::Cpp => "clangd (`brew install llvm` or set ASTROLABE_LSP_C)",
         Language::Php => "intelephense (`npm i -g intelephense` or set ASTROLABE_LSP_PHP)",
@@ -284,8 +284,8 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Java => "jdtls",
         Language::Rust => "rust-analyzer",
         Language::TypeScript | Language::Tsx | Language::JavaScript => "typescript-language-server",
-        Language::Swift | Language::ObjC | Language::ObjCpp => "sourcekit-lsp",
-        Language::C | Language::Cpp => "clangd",
+        Language::Swift => "sourcekit-lsp",
+        Language::C | Language::Cpp | Language::ObjC | Language::ObjCpp => "clangd",
         Language::Php => "intelephense",
         Language::Vue => "vue-language-server",
         Language::Dart => "dart language-server",

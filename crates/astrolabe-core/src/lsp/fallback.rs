@@ -62,9 +62,82 @@ pub(crate) fn text_references(
     reason: &str,
 ) -> Precise<Vec<Location>> {
     let language = Language::from_path(origin);
+    let (hits, truncated) = collect(
+        repo_root,
+        origin,
+        name,
+        |f| Language::from_path(f) == language,
+        false,
+    );
+    let mut note = format!(
+        "{reason}; fell back to a whole-word text search for `{name}`. \
+         These are textual matches (may include comments, strings, and \
+         unrelated symbols with the same name), not language-server results"
+    );
+    if truncated {
+        note.push_str("; the text search hit its size/time budget and may be incomplete");
+    }
+    Precise {
+        value: hits,
+        confidence: Confidence::Syntactic,
+        note: Some(note),
+    }
+}
+
+/// Code (non-comment, non-string) occurrences of `name` across the Swift or
+/// Objective-C family `origin` belongs to, located with tree-sitter.
+///
+/// Used when sourcekit-lsp / clangd answer without an index (no SwiftPM
+/// build, no compile flags, code inside an inactive `#if`). Objective-C
+/// includes `.m`, `.mm` and `.h`, since an ObjC symbol is declared in a
+/// header and used in implementation files.
+pub(crate) fn syntactic_references(
+    repo_root: &Path,
+    origin: &RelPath,
+    name: &str,
+    reason: &str,
+) -> Precise<Vec<Location>> {
+    let swift = Language::from_path(origin) == Some(Language::Swift);
+    let (hits, truncated) = collect(
+        repo_root,
+        origin,
+        name,
+        |f| {
+            if swift {
+                Language::from_path(f) == Some(Language::Swift)
+            } else {
+                matches!(
+                    Language::from_path(f),
+                    Some(Language::ObjC | Language::ObjCpp)
+                ) || f.extension().is_some_and(|e| e.eq_ignore_ascii_case("h"))
+            }
+        },
+        true,
+    );
+    let mut note = format!(
+        "{reason}. 已退回 tree-sitter 语法检索：以下是 `{name}` 在代码中（已排除注释和字符串）的同名出现，\
+         不是语言服务器的语义结果，可能包含同名但无关的符号（confidence: Syntactic）"
+    );
+    if truncated {
+        note.push_str("；检索达到文件数/时间上限，结果可能不完整");
+    }
+    Precise {
+        value: hits,
+        confidence: Confidence::Syntactic,
+        note: Some(note),
+    }
+}
+
+fn collect(
+    repo_root: &Path,
+    origin: &RelPath,
+    name: &str,
+    keep: impl Fn(&RelPath) -> bool,
+    code_only: bool,
+) -> (Vec<Location>, bool) {
     let started = Instant::now();
     let mut files = scan(repo_root, &ScanOptions::default()).files;
-    files.retain(|f| Language::from_path(f) == language);
+    files.retain(|f| keep(f));
     files.sort();
     // Origin first: if the budget runs out, the local hits survive.
     if let Some(pos) = files.iter().position(|f| f == origin) {
@@ -81,6 +154,7 @@ pub(crate) fn text_references(
         let Ok(source) = std::fs::read_to_string(repo_root.join(file.as_str())) else {
             continue;
         };
+        let mut file_hits = Vec::new();
         for (line_idx, line) in source.split('\n').enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
             for column in word_columns(line, name) {
@@ -92,26 +166,22 @@ pub(crate) fn text_references(
                     line: line_idx as u32,
                     character: column + name.encode_utf16().count() as u32,
                 };
-                hits.push(Location {
+                file_hits.push(Location {
                     path: file.clone(),
                     range: Range { start, end },
                 });
             }
         }
+        if code_only && !file_hits.is_empty() {
+            let starts: Vec<Position> = file_hits.iter().map(|l| l.range.start).collect();
+            if let Some(mask) = super::anchor::code_mask(file, &source, &starts) {
+                let mut keep = mask.into_iter();
+                file_hits.retain(|_| keep.next().unwrap_or(true));
+            }
+        }
+        hits.extend(file_hits);
     }
-    let mut note = format!(
-        "{reason}; fell back to a whole-word text search for `{name}`. \
-         These are textual matches (may include comments, strings, and \
-         unrelated symbols with the same name), not language-server results"
-    );
-    if truncated {
-        note.push_str("; the text search hit its size/time budget and may be incomplete");
-    }
-    Precise {
-        value: hits,
-        confidence: Confidence::Syntactic,
-        note: Some(note),
-    }
+    (hits, truncated)
 }
 
 fn word_columns(line: &str, name: &str) -> Vec<u32> {
@@ -155,6 +225,54 @@ mod tests {
             .map(|l| l.path.as_str().to_string())
             .collect();
         assert_eq!(paths, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn syntactic_references_skip_comments_and_span_objc_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &str, b: &str| std::fs::write(dir.path().join(p), b).unwrap();
+        w(
+            "A.h",
+            "// Widget is documented here\n@interface Widget : NSObject\n@end\n",
+        );
+        w("A.m", "#import \"A.h\"\n@implementation Widget\n- (void)f { NSLog(@\"Widget\"); [Widget new]; }\n@end\n");
+        w("B.mm", "void g() { Widget *w = nil; }\n");
+        w("C.swift", "let Widget = 1\n");
+        let r = syntactic_references(
+            dir.path(),
+            &RelPath::new("A.h"),
+            "Widget",
+            "clangd has no index",
+        );
+        assert_eq!(r.confidence, Confidence::Syntactic);
+        assert!(r.note.as_deref().unwrap().contains("tree-sitter"));
+        let got: Vec<_> = r
+            .value
+            .iter()
+            .map(|l| (l.path.as_str().to_string(), l.range.start.line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("A.h".to_string(), 1),
+                ("A.m".to_string(), 1),
+                ("A.m".to_string(), 2),
+                ("B.mm".to_string(), 0),
+            ],
+            "comment / string hits dropped, swift excluded"
+        );
+
+        w(
+            "D.swift",
+            "/// Widget doc\nstruct Gadget { let w: Widget }\n",
+        );
+        let r = syntactic_references(dir.path(), &RelPath::new("C.swift"), "Widget", "no index");
+        let got: Vec<_> = r
+            .value
+            .iter()
+            .map(|l| l.path.as_str().to_string())
+            .collect();
+        assert_eq!(got, vec!["C.swift", "D.swift"]);
     }
 
     #[test]

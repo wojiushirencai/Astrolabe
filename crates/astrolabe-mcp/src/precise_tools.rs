@@ -1051,7 +1051,7 @@ fn install_hint_one(language: Language) -> String {
             "Swift（sourcekit-lsp）：`xcode-select --install` 或完整 Xcode；可用 ASTROLABE_LSP_SWIFT 覆盖。".into()
         }
         Language::ObjC | Language::ObjCpp => {
-            "ObjC/ObjC++：优先 sourcekit-lsp（`xcode-select --install`），回退 clangd（`brew install llvm`）。".into()
+            "ObjC/ObjC++：优先 clangd（`brew install llvm` / `apt-get install clangd`），回退 sourcekit-lsp（`xcode-select --install`）。".into()
         }
         Language::C | Language::Cpp => {
             "C/C++（clangd）：`brew install llvm`，或设置 ASTROLABE_LSP_C。".into()

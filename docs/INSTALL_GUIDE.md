@@ -210,7 +210,7 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 | 语言 | 扩展名 | 语言服务器（优先 → 回退） | 安装 | 覆盖变量 |
 |---|---|---|---|---|
 | Swift | `.swift` | `sourcekit-lsp` | macOS：`xcode-select --install`；Linux / Windows：安装 [Swift 工具链](https://www.swift.org/install/) | `ASTROLABE_LSP_SWIFT` |
-| Objective-C / ObjC++ | `.m`, `.mm`, ObjC `.h` | `sourcekit-lsp` → `clangd` | `xcode-select --install`；或 `brew install llvm` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` |
+| Objective-C / ObjC++ | `.m`, `.mm`, ObjC `.h` | `clangd` → `sourcekit-lsp` | `brew install llvm`（Linux：`apt-get install clangd`）；或 `xcode-select --install` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` |
 | Vue | `.vue` | `vue-language-server --stdio` | `npm i -g @vue/language-server` | `ASTROLABE_LSP_VUE` |
 | Kotlin | `.kt`, `.kts` | `kotlin-lsp` → `kotlin-language-server` | `brew install JetBrains/utils/kotlin-lsp`（预览版）或 [Releases](https://github.com/Kotlin/kotlin-lsp/releases)；回退 `brew install kotlin-language-server` | `ASTROLABE_LSP_KOTLIN` |
 | Shell / Bash | `.sh`, `.bash`, sh/bash shebang 脚本 | `bash-language-server start` | `npm i -g bash-language-server`（可选 `shellcheck`） | `ASTROLABE_LSP_SHELL` |

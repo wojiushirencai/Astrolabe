@@ -111,6 +111,7 @@ pub(super) fn parse_with(
     if pre.text == source {
         let mut parsed = raw(source)?;
         recover_headers(&pre, source, &mut parsed, &mut raw);
+        recover_file_scope(&pre, source, &mut parsed, &mut raw);
         return Ok(parsed);
     }
     let mut parsed = raw(&pre.text)?;
@@ -121,22 +122,13 @@ pub(super) fn parse_with(
         }
     }
     let lines: Vec<&str> = source.lines().collect();
-    let mut extra = Vec::new();
+    let extra: Vec<crate::types::CodeSymbol> = Vec::new();
     for symbol in &mut parsed.symbols {
         let row = symbol.start_line;
         if symbol.name == BATS_SENTINEL {
             if let Some((_, name)) = pre.tests.iter().find(|(l, _)| *l == row) {
                 symbol.name = name.clone();
                 symbol.kind = SymbolKind::Function;
-            }
-        }
-        if let Some((_, names)) = pre.multi_names.iter().find(|(l, _)| *l == row) {
-            if names.first() == Some(&symbol.name) {
-                for n in &names[1..] {
-                    let mut clone = symbol.clone();
-                    clone.name = n.clone();
-                    extra.push(clone);
-                }
             }
         }
         if let Some(orig) = lines.get((row as usize).wrapping_sub(1)) {
@@ -149,6 +141,8 @@ pub(super) fn parse_with(
     parsed.symbols.retain(|s| s.name != BATS_SENTINEL);
     parsed.symbols.extend(extra);
     recover_headers(&pre, source, &mut parsed, &mut raw);
+    recover_file_scope(&pre, source, &mut parsed, &mut raw);
+    expand_multi_names(&pre, &mut parsed);
     parsed.symbols.sort_by_key(|s| (s.start_line, s.end_line));
     Ok(parsed)
 }
@@ -167,6 +161,98 @@ fn header_name(line: &str) -> Option<&str> {
             b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.' | b'@' | b'+')
         });
     (ok && rest.trim_start().starts_with(')')).then_some(name)
+}
+
+/// zsh `function a b c {`: bash only saw `a`; add `b`, `c` on their own
+/// lines (continuation lines keep each name's row) with `a`'s body span.
+fn expand_multi_names(pre: &Pre, parsed: &mut super::ParsedFile) {
+    let mut extra = Vec::new();
+    for (line, names) in &pre.multi_names {
+        let Some((first, _)) = names.first() else {
+            continue;
+        };
+        let Some(base) = parsed
+            .symbols
+            .iter()
+            .find(|s| s.start_line == *line && &s.name == first)
+        else {
+            continue;
+        };
+        for (name, row) in &names[1..] {
+            let mut clone = base.clone();
+            clone.name = name.clone();
+            clone.start_line = *row;
+            clone.end_line = clone.end_line.max(*row);
+            extra.push(clone);
+        }
+    }
+    parsed.symbols.extend(extra);
+    parsed.symbols.sort_by_key(|s| (s.start_line, s.end_line));
+}
+
+/// File-scope assignments in the gaps between functions that an earlier
+/// grammar error hid (`gallois.zsh-theme`): re-parse each such gap alone.
+fn recover_file_scope(
+    pre: &Pre,
+    source: &str,
+    parsed: &mut super::ParsedFile,
+    raw: &mut impl FnMut(&str) -> Result<super::ParsedFile, super::ParseError>,
+) {
+    let lines: Vec<&str> = pre.text.split('\n').collect();
+    let code = code_line_starts(&pre.text);
+    let mut covered = vec![false; lines.len()];
+    let mut have = vec![false; lines.len()];
+    for s in &parsed.symbols {
+        let a = (s.start_line as usize).saturating_sub(1);
+        if let Some(h) = have.get_mut(a) {
+            *h = true;
+        }
+        if s.kind == SymbolKind::Function {
+            let b = (s.end_line as usize).min(lines.len());
+            for c in covered.iter_mut().take(b).skip(a) {
+                *c = true;
+            }
+        }
+    }
+    let wanted =
+        |r: usize| !covered[r] && !have[r] && code.get(r) == Some(&true) && looks_assign(lines[r]);
+    let orig: Vec<&str> = source.lines().collect();
+    let mut r = 0;
+    while r < lines.len() {
+        if covered[r] {
+            r += 1;
+            continue;
+        }
+        let start = r;
+        while r < lines.len() && !covered[r] {
+            r += 1;
+        }
+        if !(start..r).any(wanted) {
+            continue;
+        }
+        let mut chunk = "\n".repeat(start);
+        chunk.push_str(&lines[start..r].join("\n"));
+        let Ok(part) = raw(&chunk) else { continue };
+        for mut symbol in part.symbols {
+            let row = (symbol.start_line as usize).wrapping_sub(1);
+            if symbol.kind == SymbolKind::Function || row < start || row >= r || have[row] {
+                continue;
+            }
+            if let Some(o) = orig.get(row) {
+                symbol.signature = super::signature_from_row(o.trim_start(), 0);
+            }
+            parsed.symbols.push(symbol);
+        }
+    }
+    parsed.symbols.sort_by_key(|s| (s.start_line, s.end_line));
+}
+
+/// Column-0 `NAME=…` / `export|declare|typeset|readonly …=…` line.
+fn looks_assign(l: &str) -> bool {
+    let w = l.split(['=', ' ']).next().unwrap_or("");
+    l.contains('=')
+        && (matches!(w, "export" | "declare" | "typeset" | "readonly")
+            || (!w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')))
 }
 
 /// Per line: does it start outside any string / heredoc body? Headers found
@@ -322,7 +408,7 @@ pub(super) struct Pre {
     /// `(line, test name)` for each `.bats` `@test`.
     pub tests: Vec<(u32, String)>,
     /// `(line, names)` for zsh `function a b c {` (bash keeps only `a`).
-    pub multi_names: Vec<(u32, Vec<String>)>,
+    pub multi_names: Vec<(u32, Vec<(String, u32)>)>,
 }
 
 /// Whether the text is zsh rather than bash/sh: `.zsh` / `.zsh-theme`, a zsh
@@ -480,7 +566,7 @@ fn brace_end(out: &[u8], i: usize) -> Option<usize> {
 /// Length- and line-preserving rewrite of zsh-only syntax into bash the
 /// tree-sitter-bash grammar accepts. Strings, comments and heredoc bodies are
 /// skipped; expansions inside double quotes are rewritten.
-fn sanitize_zsh(out: &mut [u8], multi_names: &mut Vec<(u32, Vec<String>)>) {
+fn sanitize_zsh(out: &mut [u8], multi_names: &mut Vec<(u32, Vec<(String, u32)>)>) {
     let n = out.len();
     let mut i = 0usize;
     let mut in_dq = false;
@@ -534,6 +620,9 @@ fn sanitize_zsh(out: &mut [u8], multi_names: &mut Vec<(u32, Vec<String>)>) {
             line_start = false;
         }
         if c == b'\\' {
+            if out.get(i + 1) == Some(&b'\n') {
+                line_no += 1;
+            }
             i += 2;
             continue;
         }
@@ -854,7 +943,12 @@ fn rewrite_for(out: &mut [u8], mut j: usize) {
 
 /// zsh `function a b c {` → bash `function a     {`; the extra names are
 /// re-added after parsing.
-fn function_names(out: &mut [u8], mut j: usize, line: u32, multi: &mut Vec<(u32, Vec<String>)>) {
+fn function_names(
+    out: &mut [u8],
+    mut j: usize,
+    line: u32,
+    multi: &mut Vec<(u32, Vec<(String, u32)>)>,
+) {
     let n = out.len();
     let mut names = Vec::new();
     loop {
@@ -885,7 +979,14 @@ fn function_names(out: &mut [u8], mut j: usize, line: u32, multi: &mut Vec<(u32,
     }
     let text =
         |(s, e): (usize, usize), out: &[u8]| String::from_utf8_lossy(&out[s..e]).into_owned();
-    let list: Vec<String> = names.iter().map(|&r| text(r, out)).collect();
+    let start = names[0].0;
+    let list: Vec<(String, u32)> = names
+        .iter()
+        .map(|&r| {
+            let nl = out[start..r.0].iter().filter(|&&b| b == b'\n').count() as u32;
+            (text(r, out), line + nl)
+        })
+        .collect();
     for &(s, e) in &names[1..] {
         blank(out, s, e, b' ');
     }
@@ -1041,6 +1142,47 @@ after_all() {
             !sig.contains("___"),
             "signature shows sanitised text: {sig}"
         );
+    }
+
+    #[test]
+    fn file_scope_vars_before_a_broken_first_function_survive() {
+        let src = "#!/usr/bin/env zsh\n\nTHEMES_DIR=\"$ZSH/themes\"\nFAVLIST=\"${HOME}/.zsh_favlist\"\n\nfunction preview() {\n    NAME=`echo $THEME | sed s/\\.zsh-theme$//`\n    cols=$(tput cols)\n}\n";
+        let got = names("tools/theme_chooser.sh", src);
+        for (n, l) in [("THEMES_DIR", 3), ("FAVLIST", 4), ("preview", 6)] {
+            assert!(got.contains(&(n.to_string(), l)), "{n} missing: {got:?}");
+        }
+        // Function-local assignments are not file-scope variables.
+        assert!(
+            !got.iter().any(|(n, _)| n == "cols" || n == "NAME"),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn zsh_multi_name_functions_keep_each_names_line() {
+        let src = "#!/usr/bin/env zsh\nls -l \\\n  x\nfunction a_info \\\n  b_info \\\n  c_info \\\n{\n  return 1\n}\nfunction mkcd takedir() {\n  mkdir -p $@ && cd ${@:$#}\n}\n";
+        let got = names("lib/p.zsh", src);
+        for (n, l) in [
+            ("a_info", 4),
+            ("b_info", 5),
+            ("c_info", 6),
+            ("mkcd", 10),
+            ("takedir", 10),
+        ] {
+            assert!(
+                got.contains(&(n.to_string(), l)),
+                "{n}@{l} missing: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_scope_vars_after_an_inline_function_survive() {
+        let src = "(( $+functions[wip] )) || wip() {}\n\nPREFIX=\"%{$fg[cyan]%}[\"\nexport VCS_PROMPT=x\nf() {\n  echo ${(%):-%N}\n}\nPROMPT='$(f)'\n";
+        let got = names("t.zsh-theme", src);
+        for (n, l) in [("PREFIX", 3), ("VCS_PROMPT", 4), ("PROMPT", 8)] {
+            assert!(got.contains(&(n.to_string(), l)), "{n} missing: {got:?}");
+        }
     }
 
     #[test]
