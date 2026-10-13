@@ -1497,14 +1497,64 @@ fn classify_shell(bytes: &[u8], kind: &mut [SliceKind]) {
     }
 }
 
-/// Ruby: `#` line comments, `=begin` … `=end` blocks at line start, and
-/// `'…'` / `"…"` / `` `…` `` strings with backslash escapes. Heredocs and
-/// `%w[]`-style literals are left as code.
+/// Ruby: `#` line comments, `=begin` … `=end` blocks at line start,
+/// `'…'` / `"…"` / `` `…` `` strings with backslash escapes, heredoc bodies
+/// (`<<~ID`, `<<-ID`, `<<ID`, quoted delimiters, several per line) and
+/// `%w[]` / `%i[]` / `%q()` / `%Q{}` / `%()`-style literals (nested pairs).
 fn classify_ruby(bytes: &[u8], kind: &mut [SliceKind]) {
     let n = bytes.len();
     let mut i = 0;
+    // Heredocs opened on the current line: (delimiter, squiggly/dash).
+    let mut heredocs: Vec<(Vec<u8>, bool)> = Vec::new();
     while i < n {
         let c = bytes[i];
+        if c == b'\n' && !heredocs.is_empty() {
+            i += 1;
+            for (idx, (delim, indented)) in std::mem::take(&mut heredocs).into_iter().enumerate() {
+                if idx > 0 && i < n && bytes[i] == b'\n' {
+                    i += 1;
+                }
+                let start = i;
+                loop {
+                    let end = bytes[i..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(n, |p| i + p);
+                    let line = &bytes[i..end];
+                    let line = if indented {
+                        line.trim_ascii()
+                    } else {
+                        line.trim_ascii_end()
+                    };
+                    if line == delim.as_slice() {
+                        mark(kind, start, i, SliceKind::String);
+                        i = end;
+                        break;
+                    }
+                    if end >= n {
+                        mark(kind, start, n, SliceKind::String);
+                        i = n;
+                        break;
+                    }
+                    i = end + 1;
+                }
+            }
+            continue;
+        }
+        if c == b'<' {
+            if let Some((len, delim, indented)) = ruby_heredoc_opener(bytes, i) {
+                heredocs.push((delim, indented));
+                i += len;
+                continue;
+            }
+        }
+        if c == b'%' {
+            if let Some(end) = ruby_percent_literal(bytes, i) {
+                mark(kind, i, end, SliceKind::String);
+                i = end;
+                continue;
+            }
+        }
         let line_start = i == 0 || bytes[i - 1] == b'\n';
         if line_start && bytes[i..].starts_with(b"=begin") {
             let start = i;
@@ -1545,6 +1595,104 @@ fn classify_ruby(bytes: &[u8], kind: &mut [SliceKind]) {
         }
         i += 1;
     }
+}
+
+/// `<<~ID` / `<<-ID` / `<<ID` / `<<~'ID'` at `i`: (opener length,
+/// delimiter, indented terminator allowed). A bare `<<ID` must start with an
+/// uppercase letter so `a << b` / `arr <<x` shifts stay code.
+fn ruby_heredoc_opener(bytes: &[u8], i: usize) -> Option<(usize, Vec<u8>, bool)> {
+    if !bytes[i..].starts_with(b"<<") {
+        return None;
+    }
+    let mut j = i + 2;
+    let indented = matches!(bytes.get(j), Some(b'~' | b'-'));
+    if indented {
+        j += 1;
+    }
+    let quote = match bytes.get(j) {
+        Some(&q @ (b'\'' | b'"' | b'`')) => {
+            j += 1;
+            Some(q)
+        }
+        _ => None,
+    };
+    let start = j;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    if j == start {
+        return None;
+    }
+    let first = bytes[start];
+    if quote.is_none() && !indented && !first.is_ascii_uppercase() {
+        return None;
+    }
+    if quote.is_none() && first.is_ascii_digit() {
+        return None;
+    }
+    let delim = bytes[start..j].to_vec();
+    if let Some(q) = quote {
+        if bytes.get(j) != Some(&q) {
+            return None;
+        }
+        j += 1;
+    }
+    Some((j - i, delim, indented))
+}
+
+/// End (exclusive) of a `%w[…]`-style literal at `i`, or `None` when `%` is
+/// the modulo / format operator.
+fn ruby_percent_literal(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    let typed = matches!(
+        bytes.get(j),
+        Some(b'w' | b'W' | b'i' | b'I' | b'q' | b'Q' | b'r' | b's' | b'x')
+    );
+    if typed {
+        j += 1;
+    }
+    let open = *bytes.get(j)?;
+    if open.is_ascii_alphanumeric() || open.is_ascii_whitespace() || open == b'=' {
+        return None;
+    }
+    if !typed {
+        // Bare `%(…)`: only where an operand is expected, not after a value.
+        if !matches!(open, b'(' | b'[' | b'{' | b'<' | b'|' | b'!' | b'/') {
+            return None;
+        }
+        let prev = bytes[..i].iter().rev().find(|b| !matches!(b, b' ' | b'\t'));
+        if let Some(&p) = prev {
+            if p.is_ascii_alphanumeric() || matches!(p, b'_' | b')' | b']' | b'}' | b'"' | b'\'') {
+                return None;
+            }
+        }
+    }
+    let close = match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        other => other,
+    };
+    let mut depth = 1usize;
+    let mut k = j + 1;
+    while k < bytes.len() {
+        let b = bytes[k];
+        if b == b'\\' {
+            k += 2;
+            continue;
+        }
+        if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k + 1);
+            }
+        } else if b == open && open != close {
+            depth += 1;
+        }
+        k += 1;
+    }
+    Some(bytes.len())
 }
 
 fn python_raw_prefix(bytes: &[u8], quote_at: usize) -> bool {
@@ -1798,6 +1946,34 @@ mod tests {
         assert_eq!(at("hidden"), SliceKind::Comment);
         assert_eq!(at("b ="), SliceKind::Code);
         assert_eq!(at("+ 1"), SliceKind::Code);
+    }
+
+    #[test]
+    fn ruby_heredocs_and_percent_literals() {
+        let src = "a = <<~SQL, <<-'RAW'\n  select foo\n  SQL\n  raw #{foo}\n  RAW\nfoo(1)\nb = x << y\nc = <<EOS\nplain foo\nEOS\nfoo\n";
+        let k = classify(src, Some(Language::Ruby));
+        let at = |needle: &str| k[src.find(needle).unwrap()];
+        assert_eq!(at("select foo"), SliceKind::String);
+        assert_eq!(at("raw #{foo}"), SliceKind::String);
+        assert_eq!(at("foo(1)"), SliceKind::Code);
+        assert_eq!(at("x << y"), SliceKind::Code);
+        assert_eq!(at("y\n"), SliceKind::Code);
+        assert_eq!(at("plain foo"), SliceKind::String);
+        assert_eq!(k[src.rfind("foo\n").unwrap()], SliceKind::Code);
+
+        let src = "w = %w[foo bar] + %i(foo [x]) + %q(it's (foo)) + %Q{a {foo} b}\nr = 10 % foo\ns = %(foo)\nt = %r{foo}i\nfoo\n";
+        let k = classify(src, Some(Language::Ruby));
+        let at = |needle: &str| k[src.find(needle).unwrap()];
+        assert_eq!(at("foo bar"), SliceKind::String);
+        assert_eq!(at("foo [x]"), SliceKind::String);
+        assert_eq!(at("(foo))"), SliceKind::String);
+        assert_eq!(at("{foo}"), SliceKind::String);
+        assert_eq!(at("foo\ns"), SliceKind::Code);
+        assert_eq!(at("(foo)\n"), SliceKind::String);
+        assert_eq!(at("{foo}i"), SliceKind::String);
+        assert_eq!(k[src.rfind("foo\n").unwrap()], SliceKind::Code);
+        // `it's` inside %q must not open a string that swallows the rest.
+        assert_eq!(at("r = 10"), SliceKind::Code);
     }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
