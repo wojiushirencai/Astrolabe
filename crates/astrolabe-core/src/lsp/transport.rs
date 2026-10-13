@@ -532,10 +532,10 @@ impl LspTransport {
             self.force_stop();
             return Ok(());
         }
-        let result = self.request("shutdown", Value::Null);
+        let result = self.request_timeout("shutdown", Value::Null, SHUTDOWN_REQUEST_TIMEOUT);
         self.shared.life.store(LIFE_SHUTDOWN, Ordering::SeqCst);
         let _ = self.notify("exit", Value::Null);
-        self.force_stop();
+        self.stop_with_grace(exit_grace(self.shared.spec.language));
         match result {
             Ok(_) | Err(LspError::Crashed) | Err(LspError::Timeout(_)) => Ok(()),
             Err(err) => Err(err),
@@ -622,6 +622,12 @@ impl LspTransport {
     }
 
     fn force_stop(&self) {
+        self.stop_with_grace(Duration::from_millis(200));
+    }
+
+    /// Close stdin and give the child `grace` to exit on its own before it
+    /// is killed.
+    fn stop_with_grace(&self, grace: Duration) {
         self.shared.ready_confirmed.store(false, Ordering::Release);
         let previous = self.shared.life.swap(LIFE_SHUTDOWN, Ordering::SeqCst);
         if previous == LIFE_DEAD {
@@ -632,7 +638,7 @@ impl LspTransport {
         }
         {
             let mut child = lock(&self.shared.child);
-            reap_child(&mut child, Duration::from_millis(200));
+            reap_child(&mut child, grace);
         }
         self.shared.life.store(LIFE_DEAD, Ordering::SeqCst);
         fail_pending(&self.shared);
@@ -644,6 +650,27 @@ impl LspTransport {
         }
     }
 }
+
+/// How long a server gets after `exit` before it is killed. kotlin-lsp
+/// persists its index (RocksDB) on exit; the flush of a freshly built okhttp
+/// index takes a few seconds, and killing it after 200 ms threw the whole
+/// index away, so the next start re-indexed ~400k files (~90 s).
+/// `ASTROLABE_KOTLIN_EXIT_GRACE_MS` overrides the Kotlin value.
+fn exit_grace(language: Language) -> Duration {
+    match language {
+        Language::Kotlin => std::env::var("ASTROLABE_KOTLIN_EXIT_GRACE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(KOTLIN_EXIT_GRACE),
+        _ => Duration::from_millis(500),
+    }
+}
+
+const KOTLIN_EXIT_GRACE: Duration = Duration::from_secs(10);
+
+/// The `shutdown` request on exit; a wedged server must not hold the exit.
+const SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Drop for LspTransport {
     fn drop(&mut self) {
@@ -2021,6 +2048,14 @@ fn rss_bytes(pid: u32) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn exit_grace_is_long_only_for_kotlin() {
+        assert_eq!(exit_grace(Language::Kotlin), KOTLIN_EXIT_GRACE);
+        assert!(exit_grace(Language::Rust) <= Duration::from_millis(500));
+        assert!(exit_grace(Language::Python) <= Duration::from_millis(500));
+    }
+
     use super::*;
     use crate::types::Confidence;
     use std::fs;

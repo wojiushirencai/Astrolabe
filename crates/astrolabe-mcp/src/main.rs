@@ -146,15 +146,44 @@ async fn main() -> anyhow::Result<()> {
     let service = serve_directly::<RoleServer, _, _, _, _>(server, rmcp::transport::stdio(), None);
     let cancellation = service.cancellation_token();
     let signal_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received shutdown signal");
-            cancellation.cancel();
-        }
+        shutdown_signal().await;
+        tracing::info!("received shutdown signal");
+        cancellation.cancel();
     });
 
-    service.waiting().await?;
+    let served = service.waiting().await;
     signal_task.abort();
+    // Client closed stdin, the transport dropped, or SIGINT/SIGTERM: stop the
+    // language servers properly (LSP shutdown + exit) so they can persist
+    // their state (kotlin-lsp flushes its index), bounded so the client
+    // never hangs on us.
+    let deadline = astrolabe_core::lsp::pool::exit_deadline();
+    let started = std::time::Instant::now();
+    let _ = tokio::task::spawn_blocking(move || {
+        astrolabe_core::lsp::pool::shutdown_all_pools(deadline)
+    })
+    .await;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "language servers stopped"
+    );
+    served?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn boot_single(root: std::path::PathBuf, context: astrolabe_mcp::ClientContext) -> AstrolabeServer {
