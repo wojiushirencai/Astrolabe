@@ -119,7 +119,7 @@ Before PR #51, Swift, ObjC/ObjC++ and Vue were routed to language servers only: 
 | Language | Extensions | Storage tag added | LSP (first → fallback) | Override |
 |---|---|---|---|---|
 | Swift | `.swift` | existing | `sourcekit-lsp` | `ASTROLABE_LSP_SWIFT` |
-| ObjC / ObjC++ | `.m`, `.mm`, ObjC-sniffed `.h` | existing | `sourcekit-lsp` → `clangd` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` |
+| ObjC / ObjC++ | `.m`, `.mm`, ObjC-sniffed `.h` | existing | `clangd` (synthetic compile_commands.json) → `sourcekit-lsp` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` |
 | Vue | `.vue` | existing | `vue-language-server --stdio` | `ASTROLABE_LSP_VUE` |
 | Kotlin | `.kt`, `.kts` | new | `kotlin-lsp --stdio` → `kotlin-language-server` | `ASTROLABE_LSP_KOTLIN` |
 | Shell | `.sh`, `.bash`, sh/bash/dash/ksh shebang | new | `bash-language-server start` | `ASTROLABE_LSP_SHELL` |

@@ -230,18 +230,22 @@ const APPLE_SWIFT: &[Candidate] = &[Candidate {
     install: "xcode-select --install  # Xcode CLT ships sourcekit-lsp; or install full Xcode / Swift toolchain",
 }];
 
-/// ObjC/ObjC++ — sourcekit-lsp first (RFC), clangd second (Serena-shaped fallback).
+/// ObjC/ObjC++ — clangd first, sourcekit-lsp second.
+///
+/// sourcekit-lsp only forwards ObjC to the clangd it bundles, and for a
+/// SwiftPM/Xcode-less checkout it has no flags to give it. Astrolabe starts
+/// clangd directly so it can hand it a synthetic `compile_commands.json`
+/// (`-x objective-c`, `-fobjc-arc`, header search paths; see `apple.rs`).
 const APPLE_OBJC: &[Candidate] = &[
+    Candidate {
+        bin: "clangd",
+        args: &["--background-index"],
+        install: "brew install llvm  # or Xcode CLT (`xcode-select --install`); Linux: apt-get install clangd",
+    },
     Candidate {
         bin: "sourcekit-lsp",
         args: &[],
         install: "xcode-select --install  # Xcode CLT ships sourcekit-lsp; or install full Xcode",
-    },
-    Candidate {
-        bin: "clangd",
-        args: &[],
-        install:
-            "brew install llvm  # clangd fallback for ObjC/ObjC++ when sourcekit-lsp is absent",
     },
 ];
 
@@ -693,7 +697,7 @@ impl Discovery {
                 " sourcekit-lsp is the RFC-primary Swift server; it ships with                   Xcode / Command Line Tools (`xcode-select --install`)."
             }
             Language::ObjC | Language::ObjCpp => {
-                " Prefer sourcekit-lsp (RFC); clangd is a practical fallback for                   .m/.mm (Serena routes ObjC there). Pure .h headers remain                   Language::C unless content-aware ObjC header detection lands."
+                " clangd is the primary ObjC server: Astrolabe writes a synthetic                   compile_commands.json (ObjC flags, header paths) when the repo has none,                   and ObjC-looking .h headers are routed here too. sourcekit-lsp is the fallback."
             }
             Language::Dart => {
                 " dart language-server 随 Dart SDK 自带；Flutter 工程安装 Flutter SDK 即可获得。"
@@ -1731,30 +1735,30 @@ mod tests {
     }
 
     #[test]
-    fn sourcekit_is_primary_for_swift_and_objc_family() {
+    fn sourcekit_for_swift_and_clangd_for_objc_family() {
         let dir = scratch();
         fake_bin(&dir.0, "sourcekit-lsp");
         fake_bin(&dir.0, "clangd");
         let d = discovery_with_dirs(&[&dir.0]);
-        for language in [Language::Swift, Language::ObjC, Language::ObjCpp] {
+        let stem = |language| {
             let spec = d.discover(language).unwrap();
             assert_eq!(spec.language, language);
-            assert!(
-                spec.command
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("sourcekit-lsp"),
-                "{language:?} must prefer sourcekit-lsp, got {:?}",
-                spec.command
-            );
+            spec.command
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(stem(Language::Swift).starts_with("sourcekit-lsp"));
+        for language in [Language::ObjC, Language::ObjCpp] {
+            assert!(stem(language).starts_with("clangd"), "{language:?}");
         }
     }
 
     #[test]
-    fn objc_falls_back_to_clangd_when_sourcekit_missing() {
+    fn objc_falls_back_to_sourcekit_when_clangd_missing() {
         let dir = scratch();
-        fake_bin(&dir.0, "clangd");
+        fake_bin(&dir.0, "sourcekit-lsp");
         let d = discovery_with_dirs(&[&dir.0]);
         for language in [Language::ObjC, Language::ObjCpp] {
             let spec = d.discover(language).unwrap();
@@ -1763,11 +1767,18 @@ mod tests {
                     .file_stem()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with("clangd"),
-                "{language:?} should fall back to clangd, got {:?}",
+                    .starts_with("sourcekit-lsp"),
+                "{language:?} should fall back to sourcekit-lsp, got {:?}",
                 spec.command
             );
         }
+    }
+
+    #[test]
+    fn swift_without_sourcekit_is_unavailable() {
+        let dir = scratch();
+        fake_bin(&dir.0, "clangd");
+        let d = discovery_with_dirs(&[&dir.0]);
         let err = d.discover(Language::Swift).unwrap_err();
         let (lang, hint) = unavailable_hint(err);
         assert_eq!(lang, Language::Swift);
