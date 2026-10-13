@@ -8,6 +8,7 @@
 #   * 仓库内：Python 以 pyproject 推导的 source root + 命名空间包存在性；
 #     Go 以 go.mod 模块前缀；Java 以 Maven 惯例根下的 FQN 文件；
 #     Rust 以 Cargo.toml crate 名 / crate|self|super；TS 以相对路径落点存在。
+# 之后跑七门新语言声明召回门（scripts/recall-gate）。
 # 任一语言不达标（测试失败或结果行不是 PASS）则退出码非零。
 set -uo pipefail
 
@@ -46,6 +47,20 @@ for test_name in "${tests[@]}"; do
     failed=1
   fi
 done
+
+# 七门新语言声明召回门（Swift/ObjC/Kotlin/Ruby/Shell/Lua/Vue），见 scripts/recall-gate。
+# 语料由 scripts/fetch-corpora.sh 拉到 corpus/lang8/<lang>；RECALL_GATE=0 跳过。
+recall_status=0
+if [[ "${RECALL_GATE:-1}" != "0" ]]; then
+  if cargo build -p astrolabe-mcp --bin astrolabe; then
+    bin_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug"
+    python3 scripts/recall-gate/recall_gate.py "$bin_dir/astrolabe"
+    recall_status=$?
+  else
+    recall_status=1
+  fi
+  [[ $recall_status -ne 0 ]] && failed=1
+fi
 
 printf '\n口径: 注释/字符串中的伪 import 不计; 仓库内判定独立于 ResolverSet。\n'
 printf '\n%-12s | %-14s | %8s | %8s | %8s | %s\n' \
