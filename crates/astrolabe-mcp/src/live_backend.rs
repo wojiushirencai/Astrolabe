@@ -17,7 +17,9 @@ use std::sync::Arc;
 use astrolabe_core::lsp::diagnostics::{query_server, FetchOptions};
 use astrolabe_core::lsp::discovery::Discovery;
 use astrolabe_core::lsp::pool::{LspPool, LspPoolConfig};
-use astrolabe_core::lsp::queries::{find_references, goto_definition, hover, SymbolAt};
+use astrolabe_core::lsp::queries::{
+    apple_references_fallback, find_references, goto_definition, hover, SymbolAt,
+};
 use astrolabe_core::lsp::transport::StdioSpawn;
 use astrolabe_core::lsp::Position;
 use astrolabe_core::lsp::{Diagnostic, LanguageServer, Location, LspError, Precise};
@@ -106,6 +108,33 @@ fn language_from_opt_path(path: Option<&str>, what: &str) -> Result<Language, St
     Language::from_path(&RelPath::new(path)).ok_or_else(|| unknown_language(what, path))
 }
 
+/// Language whose server should answer for `path`: like
+/// [`Language::from_path`], except a `.h` header follows its content
+/// ([`Language::from_path_and_source`]), so an Objective-C header goes to the
+/// ObjC server (clangd in ObjC mode) instead of the C one.
+fn server_language(root: &Path, path: &str) -> Option<Language> {
+    let rel = RelPath::new(path);
+    let lang = Language::from_path(&rel)?;
+    if lang == Language::C {
+        if let Ok(source) = std::fs::read_to_string(root.join(path)) {
+            return Language::from_path_and_source(&rel, &source);
+        }
+    }
+    Some(lang)
+}
+
+/// [`language_from_opt_path`] for language-server routing.
+fn server_language_from_opt_path(
+    root: &Path,
+    path: Option<&str>,
+    what: &str,
+) -> Result<Language, String> {
+    let Some(path) = path else {
+        return Err(needs_path(what));
+    };
+    server_language(root, path).ok_or_else(|| unknown_language(what, path))
+}
+
 impl PreciseCapability for LiveBackend {
     fn files_changed(&self, changes: &astrolabe_core::watch::ChangeSet) {
         use astrolabe_core::lsp::{FileChange, FileChangeKind};
@@ -130,27 +159,30 @@ impl PreciseCapability for LiveBackend {
         path: Option<&str>,
         position: Option<Position>,
     ) -> Precise<Vec<Location>> {
-        let language = match language_from_opt_path(path, "精确引用查询") {
+        let language = match server_language_from_opt_path(&self.root, path, "精确引用查询") {
             Ok(lang) => lang,
             Err(note) => return Precise::unknown(Vec::new(), note),
         };
         let rel = RelPath::new(path.expect("language resolved"));
-        match self.with_server(language, |server| {
-            let target = match position {
-                Some(position) => SymbolAt::Position(position),
-                None => SymbolAt::Name(symbol),
-            };
+        let target = match position {
+            Some(position) => SymbolAt::Position(position),
+            None => SymbolAt::Name(symbol),
+        };
+        let result = match self.with_server(language, |server| {
             find_references(server, &self.root, &rel, target)
         }) {
             Ok(result) => result,
             // The error already carries discovery's install hint; passing it
             // through verbatim is what makes "not found" actionable.
             Err(error) => Precise::unknown(Vec::new(), error.to_string()),
-        }
+        };
+        // Swift / ObjC servers without an index answer nothing; fall back to
+        // a clearly labelled tree-sitter search instead of an empty Unknown.
+        apple_references_fallback(&self.root, &rel, target, result)
     }
 
     fn info(&self, symbol: &str, path: Option<&str>) -> Precise<Option<String>> {
-        let language = match language_from_opt_path(path, "符号信息查询") {
+        let language = match server_language_from_opt_path(&self.root, path, "符号信息查询") {
             Ok(lang) => lang,
             Err(note) => return Precise::unknown(None, note),
         };
@@ -176,7 +208,7 @@ impl PreciseCapability for LiveBackend {
         line: Option<u32>,
         character: Option<u32>,
     ) -> Precise<Vec<Location>> {
-        let Some(language) = Language::from_path(&RelPath::new(path)) else {
+        let Some(language) = server_language(&self.root, path) else {
             return Precise::unknown(Vec::new(), unknown_language("精确定义查询", path));
         };
         let rel = RelPath::new(path);
@@ -200,7 +232,7 @@ impl PreciseCapability for LiveBackend {
 
     fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>> {
         let rel = RelPath::new(path);
-        let Some(language) = Language::from_path(&rel) else {
+        let Some(language) = server_language(&self.root, path) else {
             return Precise::unknown(Vec::new(), unknown_language("诊断", path));
         };
         match self.with_server(language, |server| {
