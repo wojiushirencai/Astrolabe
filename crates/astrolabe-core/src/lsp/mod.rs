@@ -39,6 +39,7 @@ pub mod pool;
 pub mod queries;
 pub mod router;
 pub mod transport;
+pub mod vue_bridge;
 
 pub use install::{
     parse_language_name, InstallError as SessionInstallError, InstallPlan, InstallRecord,

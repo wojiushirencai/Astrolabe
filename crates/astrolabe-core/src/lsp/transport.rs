@@ -95,6 +95,9 @@ struct Shared {
     /// `initialize` can say why (missing Gemfile.lock, no tsserver, ...)
     /// instead of a bare "exited unexpectedly".
     stderr_tail: Mutex<Vec<u8>>,
+    /// Server notifications handed to another thread instead of the log
+    /// (Volar 3.x `tsserver/request`, answered by the Vue bridge).
+    relays: Mutex<HashMap<String, mpsc::Sender<Value>>>,
     cwd: Option<PathBuf>,
     /// Whether the server has ever announced background work.
     ///
@@ -219,6 +222,7 @@ impl LspTransport {
             workspace_folders: Mutex::new(None),
             stderr_bytes: AtomicU64::new(0),
             stderr_tail: Mutex::new(Vec::new()),
+            relays: Mutex::new(HashMap::new()),
             cwd: cwd.map(Path::to_path_buf),
         });
 
@@ -298,6 +302,23 @@ impl LspTransport {
             }
             other => other,
         }
+    }
+
+    /// Route every `method` notification from the server to `tx` instead of
+    /// the notification log. Used by the Vue 3.x bridge, which must answer
+    /// Volar's `tsserver/request` from a separate thread so the reader never
+    /// blocks on another server.
+    pub fn set_notification_relay(&self, method: &str, tx: mpsc::Sender<Value>) {
+        lock(&self.shared.relays).insert(method.to_string(), tx);
+    }
+
+    /// `serverInfo.version` from the `initialize` result, when reported.
+    pub fn server_version(&self) -> Option<String> {
+        lock(&self.shared.initialize_result)
+            .as_ref()?
+            .pointer("/serverInfo/version")?
+            .as_str()
+            .map(str::to_string)
     }
 
     /// Bytes the stderr thread has consumed. Used by tests; also a cheap
@@ -720,6 +741,9 @@ impl SpawnServer for StdioSpawn {
         spec: &ServerSpec,
         root: &std::path::Path,
     ) -> Result<Box<dyn LanguageServer>, LspError> {
+        if spec.language == Language::Vue {
+            return crate::lsp::vue_bridge::spawn_vue(spec, root, self.timeout, self.query_timeout);
+        }
         let transport = LspTransport::connect(spec, root, self.timeout)?;
         Ok(Box::new(LspSession::new(
             transport,
@@ -773,6 +797,18 @@ impl LspSession {
         path_to_file_uri(&self.root.join(path.as_str()))
     }
 
+    pub fn transport(&self) -> &LspTransport {
+        &self.transport
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn query_timeout(&self) -> Duration {
+        self.query_timeout
+    }
+
     fn query(&self, method: &str, params: Value) -> Result<Value, LspError> {
         self.transport
             .request_timeout(method, params, self.query_timeout)
@@ -784,7 +820,7 @@ impl LspSession {
     /// a full-text `didChange` with a bumped version when it moved. A file
     /// that vanished is `didClose`d so the server stops answering from a
     /// ghost buffer.
-    fn ensure_open(&self, path: &RelPath) -> Result<(), LspError> {
+    pub(crate) fn ensure_open(&self, path: &RelPath) -> Result<(), LspError> {
         let key = path.as_str().to_string();
         let abs = self.root.join(path.as_str());
         let text = match std::fs::read_to_string(&abs) {
@@ -1047,24 +1083,33 @@ fn send_root_uri(language: Language) -> bool {
 /// labels, Dart and Flutter outlines) are switched off so the analysis server
 /// does the minimum work. `None` means "no options" and `initialize` then
 /// omits the field entirely, exactly as before this hook existed.
-fn initialization_options_for(language: Language, root: &Path, command: &Path) -> Option<Value> {
+pub(crate) fn initialization_options_for(
+    language: Language,
+    root: &Path,
+    command: &Path,
+) -> Option<Value> {
     match language {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             let tsserver = find_tsserver(root, command)?;
             Some(json!({ "tsserver": { "path": tsserver.to_string_lossy() } }))
         }
         Language::Shell => Some(shell_settings()),
+        // Volar 2.x. `hybridMode: false` makes it run its own embedded TS
+        // service; sent even when the workspace ships TypeScript, otherwise
+        // 2.x defaults to hybrid mode and waits for a TS client that never
+        // comes. Volar 3.x is started by `vue_bridge` with its own options.
         Language::Vue => {
-            let tsserver = find_tsserver(root, command)?;
-            let tsdk = tsserver.parent()?;
-            // `hybridMode: false` makes Volar 2.x run its own embedded TS
-            // service. Volar 3.x dropped that mode and instead expects the
-            // client to forward `tsserver/request` to a tsserver running
-            // @vue/typescript-plugin, which Astrolabe does not bridge yet.
-            Some(json!({
-                "typescript": { "tsdk": tsdk.to_string_lossy() },
-                "vue": { "hybridMode": false },
-            }))
+            let mut options = json!({ "vue": { "hybridMode": false } });
+            let tsdk = find_tsserver(root, command)
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .or_else(|| {
+                    let local = root.join("node_modules/typescript/lib");
+                    local.is_dir().then_some(local)
+                });
+            if let Some(tsdk) = tsdk {
+                options["typescript"] = json!({ "tsdk": tsdk.to_string_lossy() });
+            }
+            Some(options)
         }
         Language::Dart => Some(json!({
             "onlyAnalyzeProjectsWithOpenFiles": false,
@@ -1085,7 +1130,7 @@ fn initialization_options_for(language: Language, root: &Path, command: &Path) -
 /// `npm i -g typescript-language-server typescript` puts `typescript` next to
 /// the server package; point the server at it. Returns `None` when the
 /// workspace already ships TypeScript so its own version wins.
-fn find_tsserver(root: &Path, command: &Path) -> Option<PathBuf> {
+pub(crate) fn find_tsserver(root: &Path, command: &Path) -> Option<PathBuf> {
     const REL: &str = "typescript/lib/tsserver.js";
     if root.join("node_modules").join(REL).is_file() {
         return None;
@@ -1562,6 +1607,10 @@ fn handle_response(shared: &Shared, id: &Value, msg: &Value) {
 
 fn handle_notification(shared: &Shared, method: &str, params: Option<&Value>) {
     let params = params.cloned().unwrap_or(Value::Null);
+    if let Some(tx) = lock(&shared.relays).get(method) {
+        let _ = tx.send(params);
+        return;
+    }
     if method == "$/progress" {
         track_progress(shared, &params);
     }
