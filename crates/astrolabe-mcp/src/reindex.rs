@@ -76,7 +76,7 @@ pub(crate) fn mcp_index_options(persist: bool, parse_cache_bytes: u64) -> IndexO
 }
 
 /// Keep `added`/`modified` only when [`Language::from_path`] recognizes the
-/// file, or it has no extension and is (or just stopped being) a shebang
+/// file, or it has no real extension ([`Language::is_shebang_candidate`]) and is (or just stopped being) a shebang
 /// script. Editing `LICENSE` / `Makefile` therefore never triggers a rebuild;
 /// the `#!` probe is cached by mtime/size so it costs a stat. A script that
 /// lost its shebang is turned into a removal so its symbols are dropped.
@@ -88,7 +88,7 @@ pub(crate) fn filter_changeset(root: &Path, changes: ChangeSet) -> ChangeSet {
         if Language::from_path(path).is_some() {
             return true;
         }
-        if path.extension().is_some() {
+        if !Language::is_shebang_candidate(path) {
             return false;
         }
         let state = astrolabe_core::index::shebang_state(&root.join(path.as_str()));

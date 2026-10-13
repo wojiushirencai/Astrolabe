@@ -13,6 +13,37 @@ use crate::types::{Language, SymbolKind};
 #[allow(dead_code)]
 const LANG: Language = Language::Shell;
 
+/// `\\. FILE` (nvm's alias-proof `source`) at the start of a line that
+/// follows another statement is mis-parsed by tree-sitter-bash 0.25: the
+/// external scanner reads `\\` + newline context as a continuation and glues
+/// `\\.` onto the previous command as plain arguments, so the `source` is
+/// lost. Rewrite a line-leading `\\.` followed by whitespace to ` .` — same
+/// byte length, so every line / column the extractor reports is unchanged.
+/// Returns `None` when there is nothing to rewrite.
+pub(super) fn normalize_backslash_dot(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut line_start = 0usize;
+    while line_start < bytes.len() {
+        let mut i = line_start;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'\\')
+            && bytes.get(i + 1) == Some(&b'.')
+            && matches!(bytes.get(i + 2), Some(b' ' | b'\t'))
+        {
+            out.get_or_insert_with(|| bytes.to_vec())[i] = b' ';
+        }
+        line_start = match bytes[i..].iter().position(|&b| b == b'\n') {
+            Some(n) => i + n + 1,
+            None => bytes.len(),
+        };
+    }
+    // Only an ASCII byte was replaced by another, so UTF-8 stays valid.
+    out.map(|v| String::from_utf8(v).expect("ascii-for-ascii rewrite"))
+}
+
 /// Final symbol name / kind for one `@definition.*` match.
 pub(super) fn symbol_name(
     definition: tree_sitter::Node<'_>,
@@ -180,5 +211,22 @@ mod tests {
             "DUMP files={files} bytes={bytes} errs={errs} ms={}",
             t0.elapsed().as_millis()
         );
+    }
+}
+
+#[cfg(test)]
+mod backslash_dot_tests {
+    use super::normalize_backslash_dot;
+
+    #[test]
+    fn rewrites_only_line_leading_backslash_dot() {
+        let src = ": nvm.sh\n\\. ../nvm.sh\n  \\.\t./a.sh\necho \\. x\n\\.x\n";
+        let got = normalize_backslash_dot(src).expect("rewritten");
+        assert_eq!(
+            got,
+            ": nvm.sh\n . ../nvm.sh\n   .\t./a.sh\necho \\. x\n\\.x\n"
+        );
+        assert_eq!(got.len(), src.len());
+        assert_eq!(normalize_backslash_dot("source a.sh\n"), None);
     }
 }

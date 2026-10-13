@@ -339,7 +339,7 @@ fn read_starts_with_shebang(path: &Path) -> bool {
 
 /// Extension-less path (no language by path) that is a shebang script.
 fn is_extensionless_script(root: &Path, path: &RelPath) -> bool {
-    path.extension().is_none()
+    Language::is_shebang_candidate(path)
         && Language::from_path(path).is_none()
         && has_shebang(&root.join(path.as_str()))
 }
@@ -418,7 +418,7 @@ fn parse_one(
     let by_path = Language::from_path(path);
     // Extension-less files may still be scripts (`#!/usr/bin/env bash`);
     // only those are sniffed. Anything else without a known extension is skipped.
-    if by_path.is_none() && path.extension().is_some() {
+    if by_path.is_none() && !Language::is_shebang_candidate(path) {
         return None;
     }
     // Cheap cached `#!` probe first: a `LICENSE` / `Makefile` is never read
@@ -999,7 +999,7 @@ pub fn index_repo_incremental(
         }
         // Keep in step with `parse_one`: extension-less files may be shebang
         // scripts, so they are not dropped here (no previous product → re-parse).
-        if Language::from_path(path).is_none() && path.extension().is_some() {
+        if Language::from_path(path).is_none() && !Language::is_shebang_candidate(path) {
             continue;
         }
         // Extension-less non-scripts never have a product; skip them without
