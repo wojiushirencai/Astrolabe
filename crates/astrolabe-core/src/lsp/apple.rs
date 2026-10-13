@@ -15,7 +15,7 @@
 //!   (enabled through `initializationOptions`, see `transport.rs`) runs the
 //!   SwiftPM "prepare" step itself.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -167,6 +167,9 @@ pub fn write_objc_compile_db(root: &Path, sdk: Option<&str>) -> std::io::Result<
 
     let mut base: Vec<String> = vec![
         "-fobjc-arc".into(),
+        // Blocks are on by default only for Apple targets; ObjC APIs are
+        // full of block-typed parameters and properties.
+        "-fblocks".into(),
         "-ferror-limit=0".into(),
         "-Wno-everything".into(),
     ];
@@ -220,6 +223,21 @@ pub fn write_objc_compile_db(root: &Path, sdk: Option<&str>) -> std::io::Result<
     Ok(dir)
 }
 
+/// Apple SDK headers imported without a framework prefix. Off macOS they do
+/// not exist, and a missing `#import <TargetConditionals.h>` is a *fatal*
+/// error: clang stops the translation unit there and nothing after it (nor
+/// any file that includes the header) is indexed. Plain C/POSIX headers are
+/// deliberately absent so real system headers are never shadowed.
+const APPLE_BARE_HEADERS: &[&str] = &[
+    "TargetConditionals.h",
+    "Availability.h",
+    "AvailabilityMacros.h",
+    "AvailabilityInternal.h",
+    "AvailabilityVersions.h",
+    "MacTypes.h",
+    "AssertMacros.h",
+];
+
 /// `<Framework/Header.h>` imports that the repository does not provide.
 fn collect_angle_imports(source: &str, out: &mut BTreeSet<String>) {
     for line in source.lines() {
@@ -234,7 +252,8 @@ fn collect_angle_imports(source: &str, out: &mut BTreeSet<String>) {
         };
         let Some(end) = rest.find('>') else { continue };
         let header = &rest[..end];
-        if header.contains('/') && !header.contains("..") && !header.starts_with('/') {
+        let framework = header.contains('/') && !header.contains("..") && !header.starts_with('/');
+        if framework || APPLE_BARE_HEADERS.contains(&header) {
             out.insert(header.to_string());
         }
     }
@@ -243,50 +262,70 @@ fn collect_angle_imports(source: &str, out: &mut BTreeSet<String>) {
 fn write_shim(root: &Path, shim: &Path, imports: &BTreeSet<String>) -> std::io::Result<()> {
     std::fs::create_dir_all(shim)?;
     write_if_changed(&shim.join(PRELUDE), OBJC_PRELUDE)?;
+    let mut headers = BTreeMap::new();
+    if !imports.is_empty() {
+        index_headers(root, 8, &mut headers);
+    }
     for header in imports {
-        // Framework-style imports of the project's own headers
-        // (`<AFNetworking/AFURLSessionManager.h>`) resolve through the
-        // project's `-I` dirs; only stub what the repo cannot provide.
-        let file_name = header.rsplit('/').next().unwrap_or(header);
-        if find_named(root, file_name) {
-            continue;
-        }
         let path = shim.join(header);
-        if path.is_file() {
-            continue;
-        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, format!("#include \"{PRELUDE}\"\n"))?;
+        // Framework-style imports of the project's own headers
+        // (`<SDWebImage/SDImageCache.h>` while the file lives in
+        // `SDWebImage/Core/`) cannot resolve through plain `-I` dirs, and the
+        // miss is fatal. Forward them to the real file; stub only what the
+        // repository cannot provide.
+        let body = match find_own_header(root, &headers, header) {
+            Some(real) => format!("#import \"{}\"\n", real.display()),
+            None => format!("#include \"{PRELUDE}\"\n"),
+        };
+        write_if_changed(&path, &body)?;
     }
     Ok(())
 }
 
-fn find_named(root: &Path, file_name: &str) -> bool {
-    // Cheap: only the immediate layout most ObjC repos use.
-    walk_has(root, file_name, 4)
+/// The repository file a `<Framework/Header.h>` import means, if any:
+/// a file named `Header.h`, preferring one under a directory named
+/// `Framework`.
+fn find_own_header(
+    root: &Path,
+    headers: &BTreeMap<String, Vec<PathBuf>>,
+    header: &str,
+) -> Option<PathBuf> {
+    let mut parts = header.rsplit('/');
+    let found = headers.get(parts.next()?)?;
+    let framework = parts.next_back();
+    framework
+        .and_then(|fw| {
+            found.iter().find(|p| {
+                p.strip_prefix(root)
+                    .is_ok_and(|r| r.components().any(|c| c.as_os_str() == fw))
+            })
+        })
+        .or_else(|| found.first())
+        .cloned()
 }
 
-fn walk_has(dir: &Path, file_name: &str, depth: u32) -> bool {
+/// File name -> paths of every `.h` in the repository (bounded depth).
+fn index_headers(dir: &Path, depth: u32, out: &mut BTreeMap<String, Vec<PathBuf>>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+        return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || matches!(name.as_str(), "Pods" | "build" | "node_modules") {
             continue;
         }
         let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_file() && name == file_name {
-            return true;
-        }
-        if ft.is_dir() && depth > 0 && walk_has(&entry.path(), file_name, depth - 1) {
-            return true;
+        if ft.is_file() && name.ends_with(".h") {
+            out.entry(name).or_default().push(entry.path());
+        } else if ft.is_dir() && depth > 0 {
+            index_headers(&entry.path(), depth - 1, out);
         }
     }
-    false
 }
 
 fn write_if_changed(path: &Path, body: &str) -> std::io::Result<()> {
@@ -301,6 +340,9 @@ fn write_if_changed(path: &Path, body: &str) -> std::io::Result<()> {
 /// classes, protocols and methods still get indexed.
 const OBJC_PRELUDE: &str = r#"#pragma once
 // Generated by Astrolabe: minimal Apple SDK stand-in for indexing off macOS.
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
 typedef signed char BOOL;
 typedef long NSInteger;
 typedef unsigned long NSUInteger;
@@ -310,10 +352,87 @@ typedef struct CGPoint { CGFloat x, y; } CGPoint;
 typedef struct CGSize { CGFloat width, height; } CGSize;
 typedef struct CGRect { CGPoint origin; CGSize size; } CGRect;
 typedef struct _NSRange { NSUInteger location, length; } NSRange;
-@class NSString, NSArray, NSMutableArray, NSDictionary, NSMutableDictionary, NSSet,
-    NSError, NSURL, NSData, NSNumber, NSDate, NSCoder, NSBundle, NSOperationQueue,
-    NSURLRequest, NSURLResponse, NSURLSession, NSURLSessionTask, NSProgress, NSIndexSet,
-    UIImage, UIView, UIViewController, UIColor, NSImage, NSView;
+typedef double CFTimeInterval;
+typedef long dispatch_once_t;
+typedef unsigned long long dispatch_time_t;
+typedef struct _NSZone NSZone;
+typedef struct objc_method *Method;
+typedef id (*IMP)(id, SEL, ...);
+#define __unused __attribute__((unused))
+#define IBOutlet
+#define IBAction void
+#define IBInspectable
+#define IB_DESIGNABLE
+typedef NSInteger UIControlState;
+typedef NSInteger UIControlEvents;
+typedef NSInteger UIViewContentMode;
+typedef NSInteger UITableViewCellStyle;
+typedef NSInteger UIImageOrientation;
+typedef NSInteger UIUserInterfaceStyle;
+typedef NSInteger NSURLRequestCachePolicy;
+typedef NSInteger NSURLRequestNetworkServiceType;
+typedef NSInteger NSURLSessionAuthChallengeDisposition;
+typedef NSInteger NSURLSessionResponseDisposition;
+typedef NSInteger NSURLSessionTaskState;
+typedef NSInteger NSURLSessionMultipathServiceType;
+typedef NSInteger NSStreamStatus;
+typedef NSInteger NSStreamEvent;
+typedef NSInteger NSQualityOfService;
+typedef NSInteger NSOperationQueuePriority;
+typedef NSInteger NSDataReadingOptions;
+typedef NSInteger NSDataWritingOptions;
+typedef NSInteger NSStringCompareOptions;
+typedef NSInteger NSEnumerationOptions;
+typedef NSInteger NSKeyValueObservingOptions;
+typedef NSInteger NSSearchPathDirectory;
+typedef NSInteger NSSearchPathDomainMask;
+typedef NSInteger SCNetworkReachabilityFlags;
+typedef NSInteger CFStringEncoding;
+typedef NSInteger CFIndex;
+typedef NSInteger CFOptionFlags;
+typedef NSInteger OSStatus;
+typedef struct __astrolabe_CFTypeRef *CFTypeRef;
+typedef struct __astrolabe_CFStringRef *CFStringRef;
+typedef struct __astrolabe_CFMutableStringRef *CFMutableStringRef;
+typedef struct __astrolabe_CFDataRef *CFDataRef;
+typedef struct __astrolabe_CFMutableDataRef *CFMutableDataRef;
+typedef struct __astrolabe_CFArrayRef *CFArrayRef;
+typedef struct __astrolabe_CFMutableArrayRef *CFMutableArrayRef;
+typedef struct __astrolabe_CFDictionaryRef *CFDictionaryRef;
+typedef struct __astrolabe_CFMutableDictionaryRef *CFMutableDictionaryRef;
+typedef struct __astrolabe_CFURLRef *CFURLRef;
+typedef struct __astrolabe_CFAllocatorRef *CFAllocatorRef;
+typedef struct __astrolabe_CFRunLoopRef *CFRunLoopRef;
+typedef struct __astrolabe_CFReadStreamRef *CFReadStreamRef;
+typedef struct __astrolabe_CFWriteStreamRef *CFWriteStreamRef;
+typedef struct __astrolabe_CGImageRef *CGImageRef;
+typedef struct __astrolabe_CGContextRef *CGContextRef;
+typedef struct __astrolabe_CGColorSpaceRef *CGColorSpaceRef;
+typedef struct __astrolabe_CGColorRef *CGColorRef;
+typedef struct __astrolabe_CGDataProviderRef *CGDataProviderRef;
+typedef struct __astrolabe_CGImageSourceRef *CGImageSourceRef;
+typedef struct __astrolabe_CGImageDestinationRef *CGImageDestinationRef;
+typedef struct __astrolabe_SecKeyRef *SecKeyRef;
+typedef struct __astrolabe_SCNetworkReachabilityRef *SCNetworkReachabilityRef;
+typedef struct __astrolabe_dispatch_queue_t *dispatch_queue_t;
+typedef struct __astrolabe_dispatch_group_t *dispatch_group_t;
+typedef struct __astrolabe_dispatch_semaphore_t *dispatch_semaphore_t;
+typedef struct __astrolabe_dispatch_source_t *dispatch_source_t;
+typedef unsigned char UInt8;
+typedef unsigned short UInt16;
+typedef unsigned int UInt32;
+typedef unsigned long long UInt64;
+typedef signed char SInt8;
+typedef short SInt16;
+typedef int SInt32;
+typedef long long SInt64;
+typedef NSUInteger NSJSONReadingOptions;
+typedef NSUInteger NSJSONWritingOptions;
+typedef NSUInteger NSPropertyListReadOptions;
+typedef NSUInteger NSPropertyListWriteOptions;
+typedef NSUInteger NSPropertyListFormat;
+typedef NSInteger NSComparisonResult;
+typedef NSUInteger NSStringEncoding;
 @protocol NSObject
 @end
 @protocol NSCopying
@@ -329,8 +448,320 @@ typedef struct _NSRange { NSUInteger location, length; } NSRange;
 __attribute__((objc_root_class))
 @interface NSObject <NSObject>
 + (instancetype)alloc;
++ (Class)class;
+- (Class)class;
++ (BOOL)isKindOfClass:(Class)cls;
+- (BOOL)isKindOfClass:(Class)cls;
+- (BOOL)respondsToSelector:(SEL)sel;
+- (BOOL)isEqual:(id)object;
+- (NSUInteger)hash;
 + (instancetype)new;
 - (instancetype)init;
+@end
+// Common SDK classes: real (empty) interfaces, not forward @class, so class
+// messages and lightweight generics (`NSArray<NSString *>`) keep parsing.
+@interface NSString : NSObject
+@end
+@interface NSMutableString : NSObject
+@end
+@interface NSAttributedString : NSObject
+@end
+@interface NSMutableAttributedString : NSObject
+@end
+@interface NSError : NSObject
+@end
+@interface NSURL : NSObject
+@end
+@interface NSURLComponents : NSObject
+@end
+@interface NSURLQueryItem : NSObject
+@end
+@interface NSData : NSObject
+@end
+@interface NSMutableData : NSObject
+@end
+@interface NSNumber : NSObject
+@end
+@interface NSValue : NSObject
+@end
+@interface NSDecimalNumber : NSObject
+@end
+@interface NSDate : NSObject
+@end
+@interface NSDateFormatter : NSObject
+@end
+@interface NSNumberFormatter : NSObject
+@end
+@interface NSCalendar : NSObject
+@end
+@interface NSLocale : NSObject
+@end
+@interface NSTimeZone : NSObject
+@end
+@interface NSCoder : NSObject
+@end
+@interface NSKeyedArchiver : NSObject
+@end
+@interface NSKeyedUnarchiver : NSObject
+@end
+@interface NSBundle : NSObject
+@end
+@interface NSOperation : NSObject
+@end
+@interface NSBlockOperation : NSObject
+@end
+@interface NSOperationQueue : NSObject
+@end
+@interface NSThread : NSObject
+@end
+@interface NSRunLoop : NSObject
+@end
+@interface NSTimer : NSObject
+@end
+@interface NSLock : NSObject
+@end
+@interface NSRecursiveLock : NSObject
+@end
+@interface NSCondition : NSObject
+@end
+@interface NSNotification : NSObject
+@end
+@interface NSNotificationCenter : NSObject
+@end
+@interface NSUserDefaults : NSObject
+@end
+@interface NSFileManager : NSObject
+@end
+@interface NSFileHandle : NSObject
+@end
+@interface NSInputStream : NSObject
+@end
+@interface NSOutputStream : NSObject
+@end
+@interface NSStream : NSObject
+@end
+@interface NSUUID : NSObject
+@end
+@interface NSIndexSet : NSObject
+@end
+@interface NSMutableIndexSet : NSObject
+@end
+@interface NSIndexPath : NSObject
+@end
+@interface NSProgress : NSObject
+@end
+@interface NSPredicate : NSObject
+@end
+@interface NSRegularExpression : NSObject
+@end
+@interface NSScanner : NSObject
+@end
+@interface NSCharacterSet : NSObject
+@end
+@interface NSHTTPCookie : NSObject
+@end
+@interface NSHTTPCookieStorage : NSObject
+@end
+@interface NSURLRequest : NSObject
+@end
+@interface NSMutableURLRequest : NSObject
+@end
+@interface NSURLResponse : NSObject
+@end
+@interface NSHTTPURLResponse : NSObject
+@end
+@interface NSCachedURLResponse : NSObject
+@end
+@interface NSURLCache : NSObject
+@end
+@interface NSURLCredential : NSObject
+@end
+@interface NSURLProtectionSpace : NSObject
+@end
+@interface NSURLAuthenticationChallenge : NSObject
+@end
+@interface NSURLSession : NSObject
+@end
+@interface NSURLSessionConfiguration : NSObject
+@end
+@interface NSURLSessionTask : NSObject
+@end
+@interface NSURLSessionDataTask : NSObject
+@end
+@interface NSURLSessionUploadTask : NSObject
+@end
+@interface NSURLSessionDownloadTask : NSObject
+@end
+@interface NSURLSessionStreamTask : NSObject
+@end
+@interface NSURLSessionTaskMetrics : NSObject
+@end
+@interface NSJSONSerialization : NSObject
+@end
+@interface NSPropertyListSerialization : NSObject
+@end
+@interface NSProcessInfo : NSObject
+@end
+@interface NSException : NSObject
+@end
+@interface NSInvocation : NSObject
+@end
+@interface NSMethodSignature : NSObject
+@end
+@interface NSNull : NSObject
+@end
+@interface NSProxy : NSObject
+@end
+@interface NSSecureUnarchiveFromDataTransformer : NSObject
+@end
+@interface NSValueTransformer : NSObject
+@end
+@interface UIImage : NSObject
+@end
+@interface UIImageView : NSObject
+@end
+@interface UIView : NSObject
+@end
+@interface UIViewController : NSObject
+@end
+@interface UIColor : NSObject
+@end
+@interface UIFont : NSObject
+@end
+@interface UIScreen : NSObject
+@end
+@interface UIApplication : NSObject
+@end
+@interface UIWindow : NSObject
+@end
+@interface UIButton : NSObject
+@end
+@interface UILabel : NSObject
+@end
+@interface UIControl : NSObject
+@end
+@interface UIScrollView : NSObject
+@end
+@interface UITableView : NSObject
+@end
+@interface UITableViewCell : NSObject
+@end
+@interface UICollectionView : NSObject
+@end
+@interface UICollectionViewCell : NSObject
+@end
+@interface UIGraphicsImageRenderer : NSObject
+@end
+@interface UIGraphicsImageRendererFormat : NSObject
+@end
+@interface UIActivityIndicatorView : NSObject
+@end
+@interface UIProgressView : NSObject
+@end
+@interface UIRefreshControl : NSObject
+@end
+@interface UIWebView : NSObject
+@end
+@interface UIEvent : NSObject
+@end
+@interface UITouch : NSObject
+@end
+@interface UIGestureRecognizer : NSObject
+@end
+@interface UIBezierPath : NSObject
+@end
+@interface NSImage : NSObject
+@end
+@interface NSImageView : NSObject
+@end
+@interface NSView : NSObject
+@end
+@interface NSButton : NSObject
+@end
+@interface NSColor : NSObject
+@end
+@interface NSScreen : NSObject
+@end
+@interface NSWindow : NSObject
+@end
+@interface NSGraphicsContext : NSObject
+@end
+@interface NSBitmapImageRep : NSObject
+@end
+@interface NSImageRep : NSObject
+@end
+@interface CALayer : NSObject
+@end
+@interface CAAnimation : NSObject
+@end
+@interface CABasicAnimation : NSObject
+@end
+@interface CATransition : NSObject
+@end
+@interface CADisplayLink : NSObject
+@end
+@interface AVAsset : NSObject
+@end
+@interface AVPlayer : NSObject
+@end
+@interface PHAsset : NSObject
+@end
+@interface MKAnnotationView : NSObject
+@end
+@interface WKWebView : NSObject
+@end
+@interface UINavigationController : NSObject
+@end
+@interface UITableViewController : NSObject
+@end
+@interface UITabBarController : NSObject
+@end
+@interface NSTableView : NSObject
+@end
+@interface NSArrayController : NSObject
+@end
+@interface NSApplication : NSObject
+@end
+@interface WKNavigation : NSObject
+@end
+@interface WKNavigationAction : NSObject
+@end
+@interface WKNavigationResponse : NSObject
+@end
+@interface XCTKVOExpectation : NSObject
+@end
+@interface XCTNSPredicateExpectation : NSObject
+@end
+typedef NSString *NSErrorDomain;
+typedef NSString *NSNotificationName;
+typedef NSString *NSRunLoopMode;
+@interface NSArray<ObjectType> : NSObject
+@end
+@interface NSMutableArray<ObjectType> : NSObject
+@end
+@interface NSSet<ObjectType> : NSObject
+@end
+@interface NSMutableSet<ObjectType> : NSObject
+@end
+@interface NSOrderedSet<ObjectType> : NSObject
+@end
+@interface NSMutableOrderedSet<ObjectType> : NSObject
+@end
+@interface NSHashTable<ObjectType> : NSObject
+@end
+@interface NSPointerArray<ObjectType> : NSObject
+@end
+@interface NSEnumerator<ObjectType> : NSObject
+@end
+@interface NSCountedSet<ObjectType> : NSObject
+@end
+@interface NSDictionary<KeyType, ObjectType> : NSObject
+@end
+@interface NSMutableDictionary<KeyType, ObjectType> : NSObject
+@end
+@interface NSMapTable<KeyType, ObjectType> : NSObject
+@end
+@interface NSCache<KeyType, ObjectType> : NSObject
 @end
 #define NS_ASSUME_NONNULL_BEGIN _Pragma("clang assume_nonnull begin")
 #define NS_ASSUME_NONNULL_END _Pragma("clang assume_nonnull end")
@@ -338,6 +769,22 @@ __attribute__((objc_root_class))
 #define NS_UNAVAILABLE
 #define NS_REQUIRES_SUPER
 #define NS_SWIFT_NAME(...)
+#define NS_SWIFT_NOTHROW
+#define NS_SWIFT_UI_ACTOR
+#define NS_SWIFT_SENDABLE
+#define NS_NOESCAPE __attribute__((noescape))
+#define NS_FORMAT_FUNCTION(...)
+#define NS_RETURNS_RETAINED
+#define NS_RETURNS_NOT_RETAINED
+#define NS_REQUIRES_NIL_TERMINATION
+#define NS_EXTENSION_UNAVAILABLE_IOS(...)
+#define NS_EXTENSION_UNAVAILABLE(...)
+#define API_AVAILABLE_BEGIN(...)
+#define API_AVAILABLE_END
+#define NS_HEADER_AUDIT_BEGIN(...)
+#define NS_HEADER_AUDIT_END(...)
+#define CF_RETURNS_RETAINED
+#define CF_RETURNS_NOT_RETAINED
 #define NS_SWIFT_UNAVAILABLE(...)
 #define NS_REFINED_FOR_SWIFT
 #define NS_EXTENSIBLE_STRING_ENUM
@@ -362,6 +809,45 @@ __attribute__((objc_root_class))
 #define __IOS_AVAILABLE(...)
 #define __TVOS_PROHIBITED
 #define __WATCHOS_PROHIBITED
+// XCTest assertions: keep the arguments as expressions so references inside
+// test assertions (`XCTAssertEqual(x, obj.prop)`) are still indexed.
+#define XCTAssert(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertTrue(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertFalse(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNil(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNotNil(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertEqual(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNotEqual(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertEqualObjects(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNotEqualObjects(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertEqualWithAccuracy(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNotEqualWithAccuracy(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertGreaterThan(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertGreaterThanOrEqual(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertLessThan(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertLessThanOrEqual(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertIdentical(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNotIdentical(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertThrows(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNoThrow(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertThrowsSpecific(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertThrowsSpecificNamed(...) ((void)0, ##__VA_ARGS__)
+#define XCTAssertNoThrowSpecific(...) ((void)0, ##__VA_ARGS__)
+#define XCTFail(...) ((void)0, ##__VA_ARGS__)
+typedef struct __SecTrust *SecTrustRef;
+typedef struct __SecCertificate *SecCertificateRef;
+typedef struct __SecPolicy *SecPolicyRef;
+typedef struct __SecIdentity *SecIdentityRef;
+typedef void (^XCWaitCompletionHandler)(NSError *error);
+@interface XCTestExpectation : NSObject
+- (void)fulfill;
+@end
+@interface XCTestCase : NSObject
+- (XCTestExpectation *)expectationWithDescription:(NSString *)description;
+- (void)waitForExpectationsWithTimeout:(NSTimeInterval)timeout handler:(XCWaitCompletionHandler)handler;
+- (void)setUp;
+- (void)tearDown;
+@end
 #define YES ((BOOL)1)
 #define NO ((BOOL)0)
 #ifndef nil
@@ -460,8 +946,10 @@ mod tests {
         if apple_sdk().is_none() {
             let shim = Path::new(dir).join("shim");
             assert!(shim.join("Foundation/Foundation.h").is_file());
-            // The project's own framework-style header is not stubbed.
-            assert!(!shim.join("Lib/B.h").exists());
+            // The project's own framework-style header forwards to the
+            // real file instead of being stubbed.
+            let fwd = std::fs::read_to_string(shim.join("Lib/B.h")).unwrap();
+            assert!(fwd.contains("#import") && fwd.contains("B.h") && !fwd.contains(PRELUDE));
             assert!(args.contains(&"-fobjc-runtime=macosx".to_string()));
         }
     }
@@ -493,5 +981,27 @@ mod tests {
             out.into_iter().collect::<Vec<_>>(),
             vec!["A/B.h".to_string(), "UIKit/UIKit.h".to_string()]
         );
+    }
+
+    #[test]
+    fn bare_apple_sdk_headers_are_stubbed_but_libc_is_not() {
+        let mut out = BTreeSet::new();
+        collect_angle_imports(
+            "#import <TargetConditionals.h>\n#include <Availability.h>\n#include <stdlib.h>\n",
+            &mut out,
+        );
+        assert_eq!(
+            out.into_iter().collect::<Vec<_>>(),
+            vec![
+                "Availability.h".to_string(),
+                "TargetConditionals.h".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn prelude_keeps_xctest_assertion_arguments() {
+        assert!(OBJC_PRELUDE.contains("#define XCTAssertEqual(...) ((void)0, ##__VA_ARGS__)"));
+        assert!(OBJC_PRELUDE.contains("@interface XCTestCase : NSObject"));
     }
 }
