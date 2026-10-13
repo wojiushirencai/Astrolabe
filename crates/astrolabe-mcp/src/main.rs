@@ -145,9 +145,12 @@ async fn main() -> anyhow::Result<()> {
     // immediately. Classic `initialize` is still handled in the request loop.
     let service = serve_directly::<RoleServer, _, _, _, _>(server, rmcp::transport::stdio(), None);
     let cancellation = service.cancellation_token();
+    let signaled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_flag = std::sync::Arc::clone(&signaled);
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!("received shutdown signal");
+        signal_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         cancellation.cancel();
     });
 
@@ -167,6 +170,11 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "language servers stopped"
     );
+    if signaled.load(std::sync::atomic::Ordering::SeqCst) {
+        // The stdio reader is parked in a blocking read of a stdin that is
+        // still open; runtime teardown would wait on it forever.
+        std::process::exit(0);
+    }
     served?;
     Ok(())
 }
