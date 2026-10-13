@@ -440,7 +440,14 @@ fn parse_one(
     };
     let language = Language::from_path_and_source(path, &source).or(by_path)?;
     let (sha, loc) = digest(&source);
-    let cache_key = store::parse_cache_key(language, &sha);
+    let mut cache_key = store::parse_cache_key(language, &sha);
+    // Path-dependent extractors must not share a content-addressed product:
+    // two identical `.vue` files at different paths get different component
+    // symbols (named after the file stem).
+    if let Some(salt) = crate::parse::path_cache_salt(language, path) {
+        cache_key.push(':');
+        cache_key.push_str(&salt);
+    }
 
     if let Some(store) = store {
         match store.cached_parse(&cache_key) {
@@ -1476,6 +1483,40 @@ mod tests {
         assert_eq!(graph.files.len(), 1);
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn identical_vue_files_keep_their_own_component_names_across_cache() {
+        let root = scratch("vuedup");
+        let body = "<template>\n  <el-affix :offset=\"120\" />\n</template>\n";
+        write(&root, "docs/examples/affix/basic.vue", body);
+        write(&root, "ssr-testing/cases/affix.vue", body);
+        let opts = IndexOptions {
+            persist: true,
+            ..IndexOptions::default()
+        };
+        for run in 0..2 {
+            let (graph, _) = index_repo(&root, &opts);
+            for (file, name) in [
+                ("docs/examples/affix/basic.vue", "basic"),
+                ("ssr-testing/cases/affix.vue", "affix"),
+            ] {
+                let fid = graph
+                    .files
+                    .iter()
+                    .find(|f| f.path.as_str() == file)
+                    .unwrap()
+                    .id;
+                assert!(
+                    graph
+                        .symbols
+                        .iter()
+                        .any(|s| s.file == fid && s.name == name),
+                    "run {run}: {file} must expose component `{name}`"
+                );
+            }
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
