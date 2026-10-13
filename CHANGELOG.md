@@ -6,6 +6,68 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-13
+
+### 1、具体是什么问题？如何解决的。
+
+1. **Kotlin 首次查询要等约 20 秒才有回答**
+   - 原因：第一次查询要先同步启动 kotlin-lsp（JVM 启动约 5 秒），再等它就绪，最长 15 秒。
+   - 解决：kotlin-lsp 改到后台线程启动，查询不再等它；首次等待上限从 15 秒降到 2 秒，可用 `ASTROLABE_KOTLIN_READY_WAIT_MS` 调整。启动和导入期间的查询直接给出 tree-sitter 语法结果，标为 Syntactic，并注明“仍在导入”。（#63）
+2. **Kotlin 空结果被标成 Exact；每次重启都要重跑 Gradle 同步**
+   - 解决：空结果改为回退到语法结果，不再标 Exact。kotlin-lsp 按仓库缓存系统目录，并复用导出的项目模型；构建文件没变时，重启后约 12 秒就有精确结果。（#62）
+3. **Linux 和 macOS 上 Swift/ObjC 的 find_references 返回空**
+   - 解决：sourcekit-lsp 开启后台索引；clangd 用合成的编译数据库；仍为空时回退到 tree-sitter，并标明 Syntactic。（#59）
+4. **Volar 3.x 下 Vue 没有语言服务结果**
+   - 解决：新增 Volar 3.x 桥接，接到 typescript-language-server 加 `@vue/typescript-plugin`；Volar 2.x 继续走 hybridMode=false。另外修正了 typescript@5 的 tsserver 路径。（#61、#58）
+5. **zsh 顶层变量被语法错误吞掉；一次定义多个名字的函数定位不准**
+   - 解决：从出错节点里恢复文件级变量；多名函数按行分别定位。（#60、#57）
+6. **导入解析漏项**
+   - Kotlin 多行 `@file` 注解、Shell 的 `\.` source、Ruby `require_relative` 以及 spec/test 加载路径，这些情况的导入之前会漏掉，现已修复。（#55）
+7. **客户端断开或收到 SIGTERM 时，语言服务器没有被正常关闭**
+   - 原因：Astrolabe 收到断开后 0.03 秒就退出，语言服务器的 `shutdown`/`exit` 根本没发出去，语言服务器只能靠 stdin 断开自己退出，没人看管（gopls 会多活约 3 秒）。原来的 SIGINT 路径还会卡在读 stdin 上。
+   - 解决：退出前先把所有语言服务器并行关闭（`shutdown` 最多等 2 秒，再发 `exit`），整个过程最多 12 秒（`ASTROLABE_EXIT_TIMEOUT_MS`）。kotlin-lsp 退出后保存索引需要 4.7–5.8 秒，现在给它 10 秒宽限（`ASTROLABE_KOTLIN_EXIT_GRACE_MS`），其他语言 500 ms。SIGTERM 也走这套流程。（#64）
+8. **其他**
+   - find_symbol 支持按偏移分页。
+   - 无扩展名脚本的 shebang 探测结果会缓存。（#53）
+   - Vue 缓存按路径加盐。（#54）
+
+### 2、新增了哪些支持（sql、xml、toml等）？如何支持的
+
+- **8 门新语言的符号索引**：Swift、ObjC、ObjC++、Vue、Kotlin、Bash/Shell（含 zsh、.bats）、Ruby、Lua。
+  - 实现：tree-sitter 查询加各语言的解析钩子；查询编译结果按语言缓存，冷索引快 5–20 倍；无扩展名文件用 shebang 识别。
+  - ObjC++（.mm）先做掩码改写，再用两套语法分别解析。（#51、#56）
+- **这些语言的语言服务器**：sourcekit-lsp、clangd、Volar（2.x/3.x）、kotlin-lsp（另有 kotlin-language-server 作为兜底）。（#58、#59、#61、#62）
+- **召回门**：CI 召回门从 7 个语料扩到 15 个，每门新语言再加一个大型真实仓库（ObjC++ 也有一个）：
+  - Alamofire、SDWebImage、MMKV、kotlinx.coroutines、rubocop、nvm、lua-language-server、element-plus。
+  - 新增的 8 个语料在本机共跑约 23 秒。（#63）
+
+### 3、调整后整体的覆盖和性能情况
+
+| 项目 | 改动前 | 改动后 |
+|---|---|---|
+| Kotlin 首次启动：首个可用回答（okhttp） | 249 s（v0.10.2）；20.7 s（#62 之后） | **0.2 s**（Syntactic） |
+| Kotlin 重启：首个可用回答 | 13.3 s | **0.2 s** |
+| Kotlin 重启：首个 Exact | 14.3 s | **10.8 s** |
+| Kotlin 首次启动：首个 Exact（含 Gradle 同步） | 343 s（#62 之前）；426 s（#62 之后） | 412–450 s（受 Gradle 同步限制，基本不变） |
+| 召回门语料数 | 7 | **15** |
+| 客户端断开：go/gin 退出 | 0.03 s（gopls 自己拖到 2.96 s 才退） | **1.07 s**（先关好 gopls，不留残余进程） |
+| 客户端断开：okhttp（kotlin-lsp）退出 | 0.03 s（JVM 0.48 s 后才自己退） | **0.51 s**（先关好 kotlin-lsp） |
+| 已有语言冷索引：zod / Polly / fmt | 5.28 s / 8.29 s / 1.77 s | **0.76 s / 1.27 s / 0.76 s** |
+| Swift 召回（Alamofire / argument-parser） | 0% / 0% | **100% / 100%** |
+| ObjC 召回（SDWebImage / AFNetworking） | 1.11% / 0.41% | **100% / 100%** |
+| ObjC++ 召回（MMKV） | 2.62% | **100%** |
+| Kotlin 召回（kotlinx.coroutines / okhttp） | 0% / 0% | **100% / 100%** |
+| Ruby 召回（rubocop / sinatra） | 0% / 0% | **100% / 100%** |
+| Shell 召回（nvm / bats-core） | 0% / 0% | **100% / 100%** |
+| Lua 召回（lua-language-server / nvim-lspconfig） | 0% / 0% | **100% / 100%** |
+| Vue 召回（element-plus / vue-vben-admin） | 94.69% / 90.09% | **99.96% / 99.98%** |
+| find_symbol 200 名抽样（全部新语料） | 0–183/200 | **200/200** |
+| 冷索引：element-plus / rubocop | 19.3 s / 23.6 s | **1.0 s / 1.8 s** |
+
+### 已知问题
+- okhttp 这类“多平台 + Android 库”模块：即使装了 Android SDK，kotlin-lsp 的导入也不会带上 commonJvmAndroid 源码目录，所以这类模块的跳转定义和找引用只能给 Syntactic 结果；悬停仍是 Exact。普通 Android 模块装了 SDK 之后可以拿到源码目录。
+- element-plus（Vue）召回率 99.96%：漏掉的 2 条是 `docs/examples/table-v2` 里的局部变量 `i`。
+
 ## [0.10.2] - 2026-10-12
 
 ### 1、具体是什么问题？如何解决的。
