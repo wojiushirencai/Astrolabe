@@ -484,18 +484,18 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 | **Rust** | `.rs` | `rust-analyzer` | `ASTROLABE_LSP_RUST` | `rustup component add rust-analyzer`；支持 Cargo workspace |
 | **Java** | `.java` | `jdtls` | `ASTROLABE_LSP_JAVA` | `brew install jdtls`；支持 Maven、Gradle 源根解析 |
 | **TypeScript / JS** | `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs` | `typescript-language-server` | `ASTROLABE_LSP_TYPESCRIPT` | 支持 `tsconfig.json` paths、Node workspace `package.json` |
-| **C / C++** | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.ipp` | `clangd` / `ccls` | `ASTROLABE_LSP_C`, `ASTROLABE_LSP_CXX` | `clangd --background-index`；支持 `#include` 路径解析 |
-| **Swift** | `.swift` | `sourcekit-lsp` | `ASTROLABE_LSP_SWIFT` | macOS Command Line Tools 自带 `sourcekit-lsp`（Linux / Windows 需另装 Swift 工具链）。tree-sitter 符号抽取：class / struct / enum / protocol / extension / actor / func / init / 属性 / typealias；带大段属性（如 `@Test(arguments:)`）的声明锚点落在名字所在行 |
-| **Objective-C / ObjC++** | `.m`, `.mm` | `sourcekit-lsp` / `clangd` | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` | tree-sitter 符号抽取：`@interface` / `@implementation` / `@protocol` / category / 方法 / 属性；`.mm` 使用 ObjC 语法（C++ 构造可能产生 ERROR 节点）；ObjC 可回退 `clangd` |
+| **C / C++** | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++`, `.ipp`, `.inl`, `.tpp`, `.tcc`, `.cu`, `.cuh`, `.cppm`, `.ixx` | `clangd` / `ccls` | `ASTROLABE_LSP_C`, `ASTROLABE_LSP_CXX` | `clangd --background-index`；支持 `#include` 路径解析；`.h` 按内容判定：含 `@interface` / `#import` 等 ObjC 标记归 ObjC，含 C++ 构造归 C++，否则为 C；C++ 抽取含析构函数与嵌套命名空间 |
+| **Swift** | `.swift` | `sourcekit-lsp` | `ASTROLABE_LSP_SWIFT` | `xcode-select --install`：macOS Command Line Tools 自带 `sourcekit-lsp`（Linux / Windows 需另装 [Swift 工具链](https://www.swift.org/install/)）。tree-sitter 符号抽取：class / struct / enum / protocol / extension / actor / func / init / 属性 / typealias；带大段属性（如 `@Test(arguments:)`）的声明锚点落在名字所在行 |
+| **Objective-C / ObjC++** | `.m`, `.mm`，以及判定为 ObjC 的 `.h` | `sourcekit-lsp`（回退 `clangd`） | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` | `xcode-select --install`；无 sourcekit-lsp 时 `brew install llvm` 用 clangd。tree-sitter 符号抽取：`@interface` / `@implementation` / `@protocol` / category / 方法（完整 selector）/ 属性。解析前把 Cocoa 宏（`NS_ASSUME_NONNULL_*`、弃用 / 可用性宏等）与 `#if` 分支改写成可解析形式（行号不变）；`.mm` 先把 range-for、`auto`、lambda、引用等 C++ 写法改写后走 ObjC 语法，再用 C++ 语法解析一遍合并结果。签名从原始源码截取。`RCT_ENUM_CONVERTER` 这类复杂宏内的声明仍可能漏 |
 | **PHP** | `.php` | `intelephense` / `phpactor` | `ASTROLABE_LSP_PHP` | `npm i -g intelephense`；支持 include/require 路径解析 |
-| **Vue** | `.vue` | `vue-language-server` (Volar) | `ASTROLABE_LSP_VUE` | SFC 内嵌 `<script>` / `<script setup>` 走 TS/JS 语法抽取；另抽组件名、`defineProps` / `defineEmits` / `defineModel` 与选项式 API 的 props / emits |
+| **Vue** | `.vue` | `vue-language-server` (Volar) | `ASTROLABE_LSP_VUE` | `npm i -g @vue/language-server`。SFC 内嵌 `<script>` / `<script setup>` 走 TS/JS 语法抽取；另抽组件名、`defineProps` / `defineEmits` / `defineModel` 与选项式 API 的 props / emits |
 | **Dart** | `.dart` | `dart language-server` | `ASTROLABE_LSP_DART` | 随 Dart / Flutter SDK 自带；`pubspec.yaml` 行级解析与多 pubspec monorepo 支持；`rootUri` 置 `null` 规避重复分析 |
 | **C#** | `.cs`, `.csx`, `.razor`, `.cshtml` | `Microsoft.CodeAnalysis.LanguageServer`（可选 Roslyn） | `ASTROLABE_LSP_CSHARP` | `.cs` / `.csx` / `.razor` / `.cshtml` 同为 C#（不另建语言变体，没有 Razor 语言）。`.csx` 用 C# 语法（含顶层语句与 local function）。`.razor` / `.cshtml` 在 tree-sitter 之前抽出 C#（`@code`、`@{ }`、行首 `@using` / `@inherits`；标记不当成 C# 符号；换行保留，列号不映射）。没有工程时 Roslyn 加载不了松散 `.csx`，这类脚本只走语法索引。命名空间 using 扇出到每个声明文件（不进 PageRank），`_ViewImports.cshtml` 的 `@using` 走同一解析（仅仓内命名空间；`System` / NuGet 为 None）。`ProjectReference` 记为 Import。Roslyn 为 `dotnet <dll> --stdio`，需要 .NET 10 runtime（工程目标框架可更旧），不静默下载，不是 OmniSharp / csharp-ls。Razor 没有语言服务器：现有启动器只认 Roslyn 的 `solution/open` / `project/open`，不是 Razor 协议，因此没有 `ASTROLABE_LSP_RAZOR`。 |
 | **Visual Basic .NET** | `.vb` | 同一个 `Microsoft.CodeAnalysis.LanguageServer` | `ASTROLABE_LSP_CSHARP`（与 C# 共用，无第二个变量） | 只索引 `.vb`（不含 `.bas` / `.frm`）。`Imports` 命名空间扇出到每个声明文件（Namespace，不进 PageRank）；类型 `Imports` 仅在恰好一个仓内目标时记为 Import。`.vbproj` 的 `ProjectReference` 与 C# 一样记在项目元数据上，工程文件本身不是图节点，不伪造边。`.sln` / `.vbproj` 走同一 `dotnet <dll> --stdio`。 |
-| **Kotlin** | `.kt`, `.kts` | `kotlin-lsp`（回退 `kotlin-language-server`） | `ASTROLABE_LSP_KOTLIN` | class / interface / object / companion / fun / 属性 / typealias / enum entry；import 按文件声明的 `package` 解析（包名不必与目录一致），支持与 Java 混写项目 |
-| **Shell / Bash** | `.sh`, `.bash`，以及 `#!` 为 sh/bash/dash/ksh 的无后缀脚本 | `bash-language-server` | `ASTROLABE_LSP_SHELL` | 函数定义（含 `a::b` 风格名字）与 `source` / `.` 相对路径；`.bats` 暂按纯文本；zsh 专有语法不在 bash 语法覆盖范围内 |
-| **Ruby** | `.rb`, `.rake`, `.gemspec`，`Rakefile` / `Gemfile` 等，以及 ruby shebang 脚本 | `ruby-lsp`（回退 `solargraph`） | `ASTROLABE_LSP_RUBY` | class / module / def / `def self.x` / 常量；`define_method`、`alias_method`、`attr_*` 与 `A::B` 嵌套命名；`require_relative` / `require`（经 `lib/`）解析 |
-| **Lua** | `.lua`，以及 lua/luajit shebang 脚本 | `lua-language-server` | `ASTROLABE_LSP_LUA` | `function a.b:c()`、`local function`、表字段函数与模块表；`require("a.b")` → `a/b.lua` / `a/b/init.lua` |
+| **Kotlin** | `.kt`, `.kts` | `kotlin-lsp`（回退 `kotlin-language-server`） | `ASTROLABE_LSP_KOTLIN` | `brew install JetBrains/utils/kotlin-lsp`（预览版，或从 [Releases](https://github.com/Kotlin/kotlin-lsp/releases) 下载）；回退 `brew install kotlin-language-server`。class / interface / object / companion / fun / 属性 / typealias / enum entry；import 按文件声明的 `package` 解析（包名不必与目录一致），支持与 Java 混写项目 |
+| **Shell / Bash** | `.sh`, `.bash`，以及 `#!` 为 sh/bash/dash/ksh 的无后缀脚本 | `bash-language-server` | `ASTROLABE_LSP_SHELL` | `npm i -g bash-language-server`（可选 `shellcheck` 提供诊断）。函数定义（含 `a::b` 风格名字）与 `source` / `.` 相对路径；`.bats` 暂按纯文本；zsh 专有语法不在 bash 语法覆盖范围内 |
+| **Ruby** | `.rb`, `.rake`, `.gemspec`，`Rakefile` / `Gemfile` 等，以及 ruby shebang 脚本 | `ruby-lsp`（回退 `solargraph`） | `ASTROLABE_LSP_RUBY` | `gem install ruby-lsp`（回退 `gem install solargraph`）。class / module / def / `def self.x` / 常量；`define_method`、`alias_method`、`attr_*` 与 `A::B` 嵌套命名；`require_relative` / `require`（经 `lib/`）解析 |
+| **Lua** | `.lua`，以及 lua/luajit shebang 脚本 | `lua-language-server` | `ASTROLABE_LSP_LUA` | `brew install lua-language-server`（或从 [Releases](https://github.com/LuaLS/lua-language-server/releases) 下载）。`function a.b:c()`、`local function`、表字段函数与模块表；`require("a.b")` → `a/b.lua` / `a/b/init.lua` |
 
 ---
 
@@ -512,9 +512,9 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 
 ---
 
-## 八、质量契约：五大主流语言 100% 真实解析验收
+## 八、质量契约：真实开源仓库验收
 
-质量不是口号，必须经得起真实复杂开源仓库的考验。Astrolabe 包含严苛的自动化质量验收门禁（`scripts/verify.sh`）：
+质量不是口号，必须经得起真实复杂开源仓库的考验。Astrolabe 在 CI 的 `five-language corpus gate` 里跑两道门禁：五门主流语言的 import 解析验收（`scripts/verify.sh`），以及 v0.11 新增七门语言的声明召回验收（`scripts/recall-gate/recall_gate.py`，由 `verify.sh` 构建 debug 二进制后调用）。所有语料都锁定 commit，浅克隆并缓存。
 
 ### 1. 真实开源项目内部 Import 解析率（2985 条依赖语句基准）
 
@@ -536,6 +536,22 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 - **Java**: 96.51%
 - **TypeScript**: 93.97%
 
+### 3. 新增语言声明召回门禁（每门一个锁定语料）
+
+启动真实 MCP 服务，对冻结的全部声明清单（`scripts/recall-gate/gt/*.json.gz`）逐个调用 `find_symbol` 精确查询，锚点落在声明所在文件、行号 −3 至 +20 范围内算命中；另抽 200 个名字，每个名字的所有定义都要找到。
+
+| 语言 | 测试语料项目 | 锁定 Commit | 声明数 | v0.10.2 | 当前 | CI 门槛 |
+|---|---|---|---:|---:|---:|---:|
+| **Swift** | swift-argument-parser | `efd239f0` | 4132 | 0% | **100%** | ≥99.9%，200/200 |
+| **Objective-C** | AFNetworking | `d9f589cc` | 1473 | 0.54% | **100%** | ≥99.9%，200/200 |
+| **Kotlin** | okhttp | `42e5888d` | 11732 | 0% | **100%** | ≥99.9%，200/200 |
+| **Ruby** | sinatra | `cb22afd7` | 1342 | 0% | **100%** | ≥99.9%，200/200 |
+| **Shell** | bats-core | `0c92eb4c` | 463 | 0% | **100%** | ≥99.9%，200/200 |
+| **Lua** | nvim-lspconfig | `6d27c288` | 3312 | 0% | **100%** | ≥99.9%，200/200 |
+| **Vue** | vue-vben-admin | `4634655c` | 4620 | 90.2% | **99.98%** | ≥99.9%，200/200 |
+
+> 更大语料上的结果（PR #51）：Alamofire、kotlinx.coroutines、rubocop、nvm、LuaLS、Kong、element-plus、vuejs/core、SDWebImage、MMKV、React Native 均在 99.14%–100%。Vue 唯一漏项是模块顶层 `for` 循环计数变量，本不算声明。
+
 ---
 
 ## 九、本地开发与构建命令
@@ -543,7 +559,8 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 ```bash
 cargo build                                          # 构建开发版本
 cargo test --workspace                               # 运行全部单元与集成测试（190+ 项）
-bash scripts/verify.sh                               # 运行真实开源项目语料验收
+bash scripts/fetch-corpora.sh                        # 拉取锁定版本的验收语料到 corpus/
+bash scripts/verify.sh                               # 五语言 import 解析 + 七门新语言声明召回验收（RECALL_GATE=0 只跑前者）
 cargo run --release --example index_bench -- <repo>  # 测试任意指定仓库的索引耗时与内存
 ```
 

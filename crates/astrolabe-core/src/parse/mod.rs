@@ -270,6 +270,15 @@ fn language_index(lang: Language) -> Option<usize> {
     })
 }
 
+/// Extra parse-cache key material for extractors whose output depends on
+/// the path, not just the content (Vue SFC component name = file stem).
+pub(crate) fn path_cache_salt(lang: Language, path: &RelPath) -> Option<String> {
+    match lang {
+        Language::Vue => Some(vue::component_name(path)),
+        _ => None,
+    }
+}
+
 pub(crate) fn grammar(lang: Language) -> Option<tree_sitter::Language> {
     Some(match lang {
         Language::Python => tree_sitter_python::LANGUAGE.into(),

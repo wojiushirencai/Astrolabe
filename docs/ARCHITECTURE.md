@@ -177,7 +177,7 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 | `types` | 跨工作流契约。视为冻结 | `RelPath`, `Language`, `FileId`, `SymbolId`, `Confidence`, `FileIndex`, `ProjectMeta`, `ModuleResolver`, `CodeFile` / `CodeSymbol` / `CodeEdge` | 被所有人依赖，不依赖本 crate 其他模块 |
 | `scan` | gitignore、默认排除、大小、二进制嗅探 | `ScanOptions`, `ScanResult`, `SkipReason` | `types` |
 | `parse` | tree-sitter、符号/import/call 抽取、Parser 池 | `ParserPool`, `ParsedFile`, `ParseError` | `types`；queries 内嵌 `.scm` |
-| `parse::queries` | 每语言 symbols/imports/calls | `LanguageQueries` | 符号召回门槛 ≥90% |
+| `parse::queries` | 每语言 symbols/imports/calls | `LanguageQueries` | 符号召回门槛 ≥90%（v0.11 新增七门语言 CI 门槛 ≥99.9%） |
 | `resolvers` | 五语言模块路径 → 仓库文件 | `ResolverSet`；每语言一个无字段 unit struct | `types`；语言之间禁止互调 |
 | `graph` | import 图、PageRank、任务排序、可达性 | `CodeGraph`, `Centrality` | 只依赖 `types` |
 | `index` | 编排 scan→parse→resolve→graph；增量 `IncrementalIndex` | `IndexOptions`, `index_repo`, `IncrementalIndex` | scan / parse / resolvers / store / graph / watch::ChangeSet |
@@ -249,7 +249,7 @@ Cursor 会静默丢弃只有 `structuredContent`、没有文本的工具响应�
 
 **验收测试的 Python 解析阈值在代码里是 0.95，契约是 100%。** `tests/import_resolution.rs` 里 Python 写的是 `threshold: 0.95`，其余四门是 `1.0`。产品与 README 的验收契约是五门都 100%。0.95 不是允许退步的空间。
 
-**CI 默认不跑五语言验收。** `.github/workflows/ci.yml` 在 push/PR 上跑 fmt、clippy `-D warnings`、`cargo test --workspace`、`cargo deny`。`scripts/verify.sh` 需要 gitignore 掉的 `corpus/{go,java,rust}` 以及同级的 `serena` / `openvisio-oss`。workflow_dispatch 的 `corpus` job 只 clone Go/Java/Rust。改解析器却只看 GitHub 绿勾，不够。
+**CI 的语料门禁。** `.github/workflows/ci.yml` 在 push/PR 上跑 fmt、clippy `-D warnings`、`cargo test --workspace`、`cargo deny`，以及必过检查 `five-language corpus gate`。后者先用 `scripts/fetch-corpora.sh` 按锁定 commit / tag 浅克隆语料到 gitignore 的 `corpus/`（按脚本哈希缓存），再跑 `scripts/verify.sh`，里面两道门：Python / Go / Java / Rust / TypeScript import 解析，以及 `scripts/recall-gate/recall_gate.py`（Swift / ObjC / Kotlin / Ruby / Shell / Lua / Vue 声明召回，门槛 ≥99.9% 且 200 名抽查全中）。召回门的 ground truth 冻结在 `scripts/recall-gate/gt/`；语料 pin 变了要同步重生成 GT。新语言门约 45 秒（debug 构建，不含编译）。C# / VB / Dart / C / C++ / PHP 还没进 CI 门禁，改它们的解析器仍要本地跑召回基准。
 
 **Phase 2 已接线；Phase 3 写入经 gated `apply_rename` 接到 MCP。** MCP 暴露 `find_references`、`goto_definition`、`get_diagnostics`、`plan_rename`、`apply_rename`（`TOOL_COUNT=13`）。默认低于 `scoped` 拒绝写盘；`force=true` 可强制。继续遵守：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
 

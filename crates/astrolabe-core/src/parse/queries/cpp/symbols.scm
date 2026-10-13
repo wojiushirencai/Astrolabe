@@ -121,3 +121,44 @@
 ;; C++17 nested namespaces `namespace facebook::react {`.
 (namespace_definition
   name: (nested_namespace_specifier) @name) @definition.module
+
+;; Reference / pointer returning methods: `std::mutex &mutex() {…}` in a
+;; class body, `T &Cls::get() {…}` out of line, `T *field() {…}`.
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (field_identifier) @name))) @definition.method
+
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (field_identifier) @name))) @definition.method
+
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (qualified_identifier
+        name: (identifier) @name)))) @definition.method
+
+;; Deeper out-of-line qualification: `ns::Cls::method`, `A::B::B(…)`,
+;; `a::b::C::~C()` (the name nests one qualified_identifier per scope).
+(function_definition
+  declarator: (_
+    declarator: (qualified_identifier
+      name: (qualified_identifier
+        name: [(identifier) (destructor_name)] @name)))) @definition.method
+
+(function_definition
+  declarator: (_
+    declarator: (qualified_identifier
+      name: (qualified_identifier
+        name: (qualified_identifier
+          name: [(identifier) (destructor_name)] @name))))) @definition.method
+
+(function_definition
+  declarator: (_
+    declarator: (qualified_identifier
+      name: (qualified_identifier
+        name: (qualified_identifier
+          name: (qualified_identifier
+            name: [(identifier) (destructor_name)] @name)))))) @definition.method

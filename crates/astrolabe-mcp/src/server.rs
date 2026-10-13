@@ -107,26 +107,6 @@ fn render_search_mode_header(regex: bool, query: &str) -> String {
     header
 }
 
-/// Claude Code 默认丢弃 structuredContent，截断声明必须出现在正文。
-/// shown=0 且 omitted>0 是最坏情形：一条都没展示，必须专门诊断"首条
-/// 结果单项超预算"，否则输出只剩元信息，读起来像服务故障/吞内容。
-fn render_budget_status(shown: usize, omitted: usize, budget_tokens: usize) -> String {
-    let truncated = omitted > 0;
-    let mut status = format!("shown={shown} omitted={omitted} truncated={truncated}\n");
-    if truncated {
-        if shown == 0 {
-            status.push_str(&format!(
-                "这不是全集：共找到 {omitted} 条匹配，但首条结果单项超过 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查；本工具没有翻页。\n"
-            ));
-        } else {
-            status.push_str(&format!(
-                "这不是全集：{omitted} 条因 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查；本工具没有翻页。\n"
-            ));
-        }
-    }
-    status
-}
-
 /// search_code 的分页状态行：保留 `shown= omitted= truncated=` 机器可读格式，
 /// 另给出总数、本页范围和下一页的精确 offset。
 fn render_search_page_status(
@@ -307,7 +287,16 @@ pub(crate) struct QueryParams {
     )]
     pub depth: u8,
     #[serde(default = "default_budget")]
+    #[schemars(
+        description = "Maximum approximate tokens in the rendered result (default 2500). Overflow drops later matches and sets truncated=true; call again with offset=next_offset to fetch the next page."
+    )]
     pub budget_tokens: usize,
+    /// 0 起始的翻页偏移（与 search_code 一致）。
+    #[serde(default)]
+    #[schemars(
+        description = "0-based index of the first match to return (default 0). When a result is truncated it reports total and next_offset; pass that value here to fetch the next page. Ordering is stable (exact > prefix > substring, then anchor)."
+    )]
+    pub offset: usize,
 }
 
 /// Valid `kind` filter names for path queries (case-insensitive).
@@ -1203,7 +1192,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them."
+        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -1286,19 +1275,18 @@ impl AstrolabeServer {
                 .map(|(_, line, idx)| (line, idx))
                 .collect();
             let lines: Vec<String> = hits.iter().map(|(line, _)| line.clone()).collect();
+            let total = lines.len();
+            let offset = params.offset.min(total);
             let (kept, omitted) =
-                truncate_ranked(&lines, params.budget_tokens, |line| format!("{line}\n"));
+                truncate_ranked(&lines[offset..], params.budget_tokens, |line| format!("{line}\n"));
             let kept_count = kept.len();
             let truncated = omitted > 0;
+            let next_offset = truncated.then_some(offset + kept_count);
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
             if let Some(ignored) = &normalized.ignored {
                 body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
             }
-            body.push_str(&render_budget_status(
-                kept_count,
-                omitted,
-                params.budget_tokens,
-            ));
+            body.push_str(&render_search_page_status(total, offset, kept_count, omitted, params.budget_tokens, params.offset));
             for line in kept {
                 body.push_str(line);
                 body.push('\n');
@@ -1318,7 +1306,7 @@ impl AstrolabeServer {
                     &session.root,
                     index,
                     &mut body,
-                    &hits,
+                    &hits[offset..],
                     kept_count,
                     params.budget_tokens,
                 );
@@ -1329,7 +1317,7 @@ impl AstrolabeServer {
                 body,
                 json!({
                     "confidence": "syntactic",
-                    "matches": lines.len(),
+                    "matches": lines.len(), "total": total, "offset": offset, "next_offset": next_offset,
                     "shown": kept_count,
                     "omitted": omitted,
                     "truncated": truncated,
@@ -2073,10 +2061,14 @@ impl AstrolabeServer {
             }
         }
         let lines: Vec<String> = hits.iter().map(|(line, _)| line.clone()).collect();
-        let (kept, omitted) =
-            truncate_ranked(&lines, params.budget_tokens, |line| format!("{line}\n"));
+        let total = lines.len();
+        let offset = params.offset.min(total);
+        let (kept, omitted) = truncate_ranked(&lines[offset..], params.budget_tokens, |line| {
+            format!("{line}\n")
+        });
         let kept_count = kept.len();
         let truncated = omitted > 0;
+        let next_offset = truncated.then_some(offset + kept_count);
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
                 .to_string();
@@ -2086,10 +2078,13 @@ impl AstrolabeServer {
         if receiver_fallback {
             body.push_str("注意：层级由接收者类型/签名/路径段推断（非行范围嵌套）\n");
         }
-        body.push_str(&render_budget_status(
+        body.push_str(&render_search_page_status(
+            total,
+            offset,
             kept_count,
             omitted,
             params.budget_tokens,
+            params.offset,
         ));
         for line in kept {
             body.push_str(line);
@@ -2115,7 +2110,7 @@ impl AstrolabeServer {
                 root,
                 index,
                 &mut body,
-                &hits,
+                &hits[offset..],
                 kept_count,
                 params.budget_tokens,
             );
@@ -2126,7 +2121,7 @@ impl AstrolabeServer {
             body,
             json!({
                 "confidence": "syntactic",
-                "matches": lines.len(),
+                "matches": lines.len(), "total": total, "offset": offset, "next_offset": next_offset,
                 "shown": kept_count,
                 "omitted": omitted,
                 "truncated": truncated,
@@ -3060,6 +3055,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 100,
+            offset: 0,
         })));
         assert_first_text(server.search_code(Parameters(SearchParams {
             query: "definitely absent".into(),
@@ -3095,6 +3091,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 0,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("truncated=true"), "{text}");
@@ -3640,6 +3637,75 @@ mod tests {
     }
 
     #[test]
+    fn find_symbol_pages_concatenate_to_full_match_set() {
+        let dir = unique_temp_dir();
+        let mut expected = std::collections::BTreeSet::new();
+        for f in 0..4 {
+            let mut src = String::new();
+            for i in 0..40 {
+                src.push_str(&format!("def pager_{f}_{i}():\n    pass\n"));
+                expected.insert(format!("pager_{f}_{i}"));
+            }
+            std::fs::write(dir.join(format!("m{f}.py")), src).unwrap();
+        }
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 << 20);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+        let page = |offset: usize, path: bool| {
+            let r = server.find_symbol(Parameters(QueryParams {
+                query: if path {
+                    "/pager".into()
+                } else {
+                    "pager".into()
+                },
+                include_body: false,
+                substring: Some(true),
+                path_filter: None,
+                kind: None,
+                depth: 0,
+                budget_tokens: 300,
+                offset,
+            }));
+            r.content[0].as_text().unwrap().text.clone()
+        };
+        for path in [false, true] {
+            let mut got = Vec::new();
+            let mut offset = 0;
+            let mut pages = 0;
+            loop {
+                let text = page(offset, path);
+                pages += 1;
+                assert!(text.contains("total=160"), "{text}");
+                assert!(!text.contains("blocked: true"), "{text}");
+                for name in text
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|w| w.starts_with("pager_"))
+                {
+                    got.push(name.to_string());
+                }
+                let Some(next) = text
+                    .split("next_offset=")
+                    .nth(1)
+                    .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+                    .and_then(|n| n.parse::<usize>().ok())
+                else {
+                    assert!(text.contains("truncated=false"), "{text}");
+                    break;
+                };
+                assert!(next > offset, "{text}");
+                offset = next;
+                assert!(pages < 100);
+            }
+            assert!(pages > 2, "fixture should need several pages");
+            let unique: std::collections::BTreeSet<_> = got.iter().cloned().collect();
+            assert_eq!(unique, expected, "path={path}");
+        }
+        let past = page(10_000, false);
+        assert!(past.contains("超出总数"), "{past}");
+    }
+
+    #[test]
     fn search_code_pages_concatenate_to_full_match_set() {
         let dir = unique_temp_dir();
         let mut expected = std::collections::BTreeSet::new();
@@ -3980,6 +4046,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 2500,
+            offset: 0,
         }
     }
 
@@ -4138,6 +4205,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 1000,
+            offset: 0,
         }));
         let named_text = named.content[0].as_text().unwrap().text.as_str();
         assert!(named_text.contains("(未找到匹配的符号)"), "{named_text}");
@@ -4152,6 +4220,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 1000,
+            offset: 0,
         }));
         let path_text = by_path.content[0].as_text().unwrap().text.as_str();
         assert!(path_text.contains("(未找到匹配的符号)"), "{path_text}");
@@ -4183,6 +4252,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 300,
+            offset: 0,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
 
@@ -4326,6 +4396,7 @@ mod tests {
                 kind: None,
                 depth: 0,
                 budget_tokens: 500,
+                offset: 0,
             })));
             if text.contains("during_build_xyz") {
                 break;
@@ -4357,6 +4428,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 500,
+            offset: 0,
         })));
         assert!(text.contains("alpha"), "{text}");
         assert!(
@@ -4391,6 +4463,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 500,
+            offset: 0,
         })));
         assert!(
             text.contains("alpha_v2"),
@@ -4421,6 +4494,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 500,
+            offset: 0,
         })));
         assert!(
             text.contains("索引可能过期") && text.contains("confidence: unknown"),
@@ -4436,6 +4510,7 @@ mod tests {
                 kind: None,
                 depth: 0,
                 budget_tokens: 500,
+                offset: 0,
             })));
             if probe.contains("alpha_v3") {
                 break;
@@ -4490,6 +4565,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 500,
+            offset: 0,
         }));
         let start = std::time::Instant::now();
         while log.watermark() <= before {
@@ -4539,6 +4615,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 500,
+            offset: 0,
         }));
         let priming_text = first_text(priming);
         if priming_text.contains("索引正在后台构建") {
@@ -4565,6 +4642,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 500,
+            offset: 0,
         })));
         assert!(
             text.starts_with(&format!("index_root: {}", session.root.display())),
@@ -4618,6 +4696,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 200,
+            offset: 0,
         }));
         let alpha_key = alpha.canonicalize().unwrap_or(alpha.clone());
         let session = server
@@ -4646,6 +4725,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 200,
+            offset: 0,
         }));
         let start = std::time::Instant::now();
         loop {
@@ -4692,6 +4772,7 @@ mod tests {
             kind: None,
             depth: 0,
             budget_tokens: 500,
+            offset: 0,
         })));
         assert!(text.contains("alpha") && text.contains("beta"), "{text}");
         assert!(text.contains("confidence: unknown"), "{text}");
@@ -4806,6 +4887,7 @@ mod tests {
         let symbol_miss = server.find_symbol(Parameters(QueryParams {
             query: "NonExistentSymbol".into(),
             budget_tokens: 2500,
+            offset: 0,
             depth: 0,
             substring: None,
             path_filter: None,
@@ -5072,6 +5154,7 @@ mod tests {
         let symbol_miss = server.find_symbol(Parameters(QueryParams {
             query: "NonExistent".into(),
             budget_tokens: 2500,
+            offset: 0,
             depth: 0,
             substring: None,
             path_filter: None,

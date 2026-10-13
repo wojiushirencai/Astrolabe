@@ -234,13 +234,124 @@ fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
     .collect()
 }
 
+/// Last observed `#!` verdict per extension-less path, keyed by
+/// `(mtime, len)` so an untouched `LICENSE` is never reopened.
+#[derive(Clone, Copy)]
+struct ShebangEntry {
+    mtime: std::time::SystemTime,
+    len: u64,
+    script: bool,
+}
+
+const SHEBANG_CACHE_CAP: usize = 100_000;
+/// Same-size writes inside this window can share an mtime; never trust a
+/// cached verdict that young.
+const SHEBANG_UNTRUSTED_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+static SHEBANG_CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, ShebangEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Verdict of [`shebang_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShebangState {
+    /// The file exists and starts with `#!` (optionally after a UTF-8 BOM).
+    pub script: bool,
+    /// The last cached verdict for this path said it was a script.
+    pub was_script: bool,
+    /// The file could not be stat'ed (deleted / racing).
+    pub missing: bool,
+}
+
+/// Whether an extension-less file is a shebang script. Reads at most 5
+/// bytes, and only when `(mtime, len)` changed since the last check.
+pub fn has_shebang(path: &Path) -> bool {
+    shebang_state(path).script
+}
+
+/// [`has_shebang`] plus the previously cached verdict, so the watcher can
+/// tell "a script lost its shebang" (drop its symbols) from "a non-script
+/// was edited" (nothing to do).
+pub fn shebang_state(path: &Path) -> ShebangState {
+    let cached = || {
+        SHEBANG_CACHE
+            .lock()
+            .expect("shebang cache poisoned")
+            .get(path)
+            .copied()
+    };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return ShebangState {
+            script: false,
+            was_script: cached().is_some_and(|e| e.script),
+            missing: true,
+        };
+    };
+    let mtime = metadata.modified().ok();
+    let trusted = mtime.is_some_and(|m| {
+        std::time::SystemTime::now()
+            .duration_since(m)
+            .is_ok_and(|age| age >= SHEBANG_UNTRUSTED_WINDOW)
+    });
+    let previous = cached();
+    if let Some(e) = previous {
+        if trusted && Some(e.mtime) == mtime && e.len == metadata.len() {
+            return ShebangState {
+                script: e.script,
+                was_script: e.script,
+                missing: false,
+            };
+        }
+    }
+    let script = metadata.is_file() && read_starts_with_shebang(path);
+    if let Some(mtime) = mtime {
+        let mut cache = SHEBANG_CACHE.lock().expect("shebang cache poisoned");
+        if cache.len() >= SHEBANG_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_path_buf(),
+            ShebangEntry {
+                mtime,
+                len: metadata.len(),
+                script,
+            },
+        );
+    }
+    ShebangState {
+        script,
+        was_script: previous.is_some_and(|e| e.script),
+        missing: false,
+    }
+}
+
+fn read_starts_with_shebang(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(5);
+    if file.take(5).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&head);
+    head.starts_with(b"#!")
+}
+
+/// Extension-less path (no language by path) that is a shebang script.
+fn is_extensionless_script(root: &Path, path: &RelPath) -> bool {
+    Language::is_shebang_candidate(path)
+        && Language::from_path(path).is_none()
+        && has_shebang(&root.join(path.as_str()))
+}
+
 /// Source-language files the scanner dropped for exceeding the size cap.
-fn too_large_sources(scanned: &ScanResult) -> Vec<RelPath> {
+fn too_large_sources(root: &Path, scanned: &ScanResult) -> Vec<RelPath> {
     scanned
         .skipped
         .iter()
         .filter(|(path, reason)| {
-            *reason == scan::SkipReason::TooLarge && Language::from_path(path).is_some()
+            *reason == scan::SkipReason::TooLarge
+                && (Language::from_path(path).is_some() || is_extensionless_script(root, path))
         })
         .map(|(path, _)| path.clone())
         .collect()
@@ -307,7 +418,12 @@ fn parse_one(
     let by_path = Language::from_path(path);
     // Extension-less files may still be scripts (`#!/usr/bin/env bash`);
     // only those are sniffed. Anything else without a known extension is skipped.
-    if by_path.is_none() && path.extension().is_some() {
+    if by_path.is_none() && !Language::is_shebang_candidate(path) {
+        return None;
+    }
+    // Cheap cached `#!` probe first: a `LICENSE` / `Makefile` is never read
+    // in full, and an unchanged one is not even reopened.
+    if by_path.is_none() && !has_shebang(&root.join(path.as_str())) {
         return None;
     }
     let source = match crate::text::read_source(&root.join(path.as_str())) {
@@ -324,7 +440,14 @@ fn parse_one(
     };
     let language = Language::from_path_and_source(path, &source).or(by_path)?;
     let (sha, loc) = digest(&source);
-    let cache_key = store::parse_cache_key(language, &sha);
+    let mut cache_key = store::parse_cache_key(language, &sha);
+    // Path-dependent extractors must not share a content-addressed product:
+    // two identical `.vue` files at different paths get different component
+    // symbols (named after the file stem).
+    if let Some(salt) = crate::parse::path_cache_salt(language, path) {
+        cache_key.push(':');
+        cache_key.push_str(&salt);
+    }
 
     if let Some(store) = store {
         match store.cached_parse(&cache_key) {
@@ -702,7 +825,7 @@ pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) 
     let (scanned, files, resolvers, _) = discover(root, opts);
     let mut report = IndexReport {
         files_scanned: scanned.files.len(),
-        too_large: too_large_sources(&scanned),
+        too_large: too_large_sources(root, &scanned),
         ..IndexReport::default()
     };
     let outcome = parse_paths(root, &scanned.files, opts);
@@ -757,7 +880,7 @@ impl IncrementalIndex {
         let (scanned, files, resolvers, excluded_sources) = discover(root, opts);
         let mut report = IndexReport {
             files_scanned: scanned.files.len(),
-            too_large: too_large_sources(&scanned),
+            too_large: too_large_sources(root, &scanned),
             ..IndexReport::default()
         };
         let outcome = parse_paths(root, &scanned.files, opts);
@@ -876,7 +999,15 @@ pub fn index_repo_incremental(
         }
         // Keep in step with `parse_one`: extension-less files may be shebang
         // scripts, so they are not dropped here (no previous product → re-parse).
-        if Language::from_path(path).is_none() && path.extension().is_some() {
+        if Language::from_path(path).is_none() && !Language::is_shebang_candidate(path) {
+            continue;
+        }
+        // Extension-less non-scripts never have a product; skip them without
+        // re-reading (the `#!` probe is cached by mtime/size).
+        if Language::from_path(path).is_none()
+            && previous.products.get(path).is_none()
+            && !has_shebang(&root.join(path.as_str()))
+        {
             continue;
         }
         if let Some(product) = previous.products.get(path) {
@@ -1081,6 +1212,36 @@ mod tests {
             next.graph.symbols.iter().any(|s| s.name == "gbk_added"),
             "edited non-UTF-8 file must be re-indexed"
         );
+    }
+
+    #[test]
+    fn oversized_extensionless_scripts_are_reported_non_scripts_are_not() {
+        let root = scratch("bigscript");
+        let mut body = "#!/usr/bin/env bash\n".to_string();
+        body.push_str(&"echo hi\n".repeat(400_000));
+        write(&root, "bin/huge-tool", &body);
+        write(&root, "BIGDATA", &"x\n".repeat(1_000_000));
+        write(&root, "small.py", "def small():\n    pass\n");
+        let inc = IncrementalIndex::build(&root, &IndexOptions::default());
+        assert_eq!(inc.report.too_large, vec![RelPath::new("bin/huge-tool")]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn shebang_probe_is_cheap_and_tracks_changes() {
+        let root = scratch("probe");
+        write(&root, "LICENSE", "MIT License\n");
+        write(&root, "tool", "#!/bin/sh\n");
+        write(&root, "bom", "\u{feff}#!/usr/bin/env ruby\n");
+        assert!(!has_shebang(&root.join("LICENSE")));
+        assert!(has_shebang(&root.join("tool")));
+        assert!(has_shebang(&root.join("bom")));
+        write(&root, "tool", "plain text now\n");
+        let state = shebang_state(&root.join("tool"));
+        assert!(!state.script && state.was_script && !state.missing);
+        let gone = shebang_state(&root.join("nope"));
+        assert!(gone.missing && !gone.script);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1322,6 +1483,40 @@ mod tests {
         assert_eq!(graph.files.len(), 1);
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn identical_vue_files_keep_their_own_component_names_across_cache() {
+        let root = scratch("vuedup");
+        let body = "<template>\n  <el-affix :offset=\"120\" />\n</template>\n";
+        write(&root, "docs/examples/affix/basic.vue", body);
+        write(&root, "ssr-testing/cases/affix.vue", body);
+        let opts = IndexOptions {
+            persist: true,
+            ..IndexOptions::default()
+        };
+        for run in 0..2 {
+            let (graph, _) = index_repo(&root, &opts);
+            for (file, name) in [
+                ("docs/examples/affix/basic.vue", "basic"),
+                ("ssr-testing/cases/affix.vue", "affix"),
+            ] {
+                let fid = graph
+                    .files
+                    .iter()
+                    .find(|f| f.path.as_str() == file)
+                    .unwrap()
+                    .id;
+                assert!(
+                    graph
+                        .symbols
+                        .iter()
+                        .any(|s| s.file == fid && s.name == name),
+                    "run {run}: {file} must expose component `{name}`"
+                );
+            }
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
