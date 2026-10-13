@@ -145,16 +145,53 @@ async fn main() -> anyhow::Result<()> {
     // immediately. Classic `initialize` is still handled in the request loop.
     let service = serve_directly::<RoleServer, _, _, _, _>(server, rmcp::transport::stdio(), None);
     let cancellation = service.cancellation_token();
+    let signaled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_flag = std::sync::Arc::clone(&signaled);
     let signal_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received shutdown signal");
-            cancellation.cancel();
-        }
+        shutdown_signal().await;
+        tracing::info!("received shutdown signal");
+        signal_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        cancellation.cancel();
     });
 
-    service.waiting().await?;
+    let served = service.waiting().await;
     signal_task.abort();
+    // Client closed stdin, the transport dropped, or SIGINT/SIGTERM: stop the
+    // language servers properly (LSP shutdown + exit) so they can persist
+    // their state (kotlin-lsp flushes its index), bounded so the client
+    // never hangs on us.
+    let deadline = astrolabe_core::lsp::pool::exit_deadline();
+    let started = std::time::Instant::now();
+    let _ = tokio::task::spawn_blocking(move || {
+        astrolabe_core::lsp::pool::shutdown_all_pools(deadline)
+    })
+    .await;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "language servers stopped"
+    );
+    if signaled.load(std::sync::atomic::Ordering::SeqCst) {
+        // The stdio reader is parked in a blocking read of a stdin that is
+        // still open; runtime teardown would wait on it forever.
+        std::process::exit(0);
+    }
+    served?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn boot_single(root: std::path::PathBuf, context: astrolabe_mcp::ClientContext) -> AstrolabeServer {

@@ -142,6 +142,49 @@ fn config_for(config: &LspPoolConfig, language: Language) -> LspPoolConfig {
     c
 }
 
+/// Every pool built in this process, so the binary's exit path can shut
+/// their servers down properly instead of leaving them to die with stdin.
+static POOLS: Mutex<Vec<Weak<Inner>>> = Mutex::new(Vec::new());
+
+fn register_pool(inner: &Arc<Inner>) {
+    let mut pools = lock(&POOLS);
+    pools.retain(|p| p.strong_count() > 0);
+    pools.push(Arc::downgrade(inner));
+}
+
+/// Default bound on the whole exit-time shutdown.
+pub const DEFAULT_EXIT_DEADLINE: Duration = Duration::from_secs(12);
+
+/// `ASTROLABE_EXIT_TIMEOUT_MS` or [`DEFAULT_EXIT_DEADLINE`].
+pub fn exit_deadline() -> Duration {
+    std::env::var("ASTROLABE_EXIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_EXIT_DEADLINE)
+}
+
+/// Process exit: shut down the servers of every live pool, all in parallel,
+/// within `deadline` overall. Returns how many pools were visited.
+pub fn shutdown_all_pools(deadline: Duration) -> usize {
+    let pools: Vec<Arc<Inner>> = lock(&POOLS).iter().filter_map(Weak::upgrade).collect();
+    let end = Instant::now() + deadline;
+    let handles: Vec<_> = pools
+        .iter()
+        .map(|inner| {
+            let inner = Arc::clone(inner);
+            let left = end.saturating_duration_since(Instant::now());
+            thread::spawn(move || inner.shutdown_parallel(left))
+        })
+        .collect();
+    let n = handles.len();
+    for h in handles {
+        // Each shutdown_parallel is itself bounded by `deadline`.
+        let _ = h.join();
+    }
+    n
+}
+
 /// Wait after a failed start before trying again.
 pub const DEFAULT_START_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -361,10 +404,19 @@ impl LspPool {
             },
         });
         let monitor = spawn_monitor(Arc::clone(&inner));
+        register_pool(&inner);
         LspPool {
             inner,
             monitor: Mutex::new(monitor),
         }
+    }
+
+    /// Shut every resident server down in parallel (LSP `shutdown` +
+    /// `exit`, then each server's own exit grace), waiting at most
+    /// `deadline` overall. Returns `true` when all of them finished in time;
+    /// stragglers are left to their own reaper threads.
+    pub fn shutdown_within(&self, deadline: Duration) -> bool {
+        self.inner.shutdown_parallel(deadline)
     }
 
     /// Production constructor: `discovery` finds a [`ServerSpec`],
@@ -694,6 +746,52 @@ impl Inner {
         }
     }
 
+    fn shutdown_parallel(&self, deadline: Duration) -> bool {
+        let servers: Vec<(Language, Arc<dyn LanguageServer>)> = {
+            let slots: Vec<(Language, Arc<Slot>)> = lock(&self.slots)
+                .iter()
+                .map(|(l, s)| (*l, Arc::clone(s)))
+                .collect();
+            slots
+                .into_iter()
+                .filter_map(|(language, slot)| {
+                    let mut state = lock(&slot.state);
+                    let server = state.server.take()?;
+                    state.generation += 1;
+                    state.in_flight = 0;
+                    Some((language, server))
+                })
+                .collect()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut started = 0usize;
+        for (language, server) in servers {
+            let tx = tx.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("lsp-exit-{}", language.name()))
+                .spawn(move || {
+                    tracing::info!(language = language.name(), "shutting down language server (exit)");
+                    if let Err(err) = server.shutdown() {
+                        tracing::warn!(language = language.name(), error = %err, "language server shutdown failed on exit");
+                    }
+                    let _ = tx.send(());
+                });
+            if spawned.is_ok() {
+                started += 1;
+            }
+        }
+        drop(tx);
+        let end = Instant::now() + deadline;
+        for _ in 0..started {
+            let left = end.saturating_duration_since(Instant::now());
+            if rx.recv_timeout(left).is_err() {
+                tracing::warn!("language servers still stopping at exit deadline; leaving them");
+                return false;
+            }
+        }
+        true
+    }
+
     fn shutdown_all(&self, force: bool) {
         let snapshot: Vec<(Language, Arc<Slot>)> = {
             let slots = lock(&self.slots);
@@ -1013,6 +1111,7 @@ mod tests {
         memory: Arc<AtomicU64>,
         fail_starts: Arc<AtomicBool>,
         crash_on_use: Arc<AtomicBool>,
+        shutdown_delay_ms: Arc<AtomicU64>,
     }
 
     struct FakeServer {
@@ -1020,6 +1119,7 @@ mod tests {
         memory: Arc<AtomicU64>,
         shutdowns: Arc<AtomicUsize>,
         crash_on_use: bool,
+        shutdown_delay_ms: u64,
     }
 
     impl FakeFactory {
@@ -1030,6 +1130,7 @@ mod tests {
                 memory: Arc::new(AtomicU64::new(1_048_576)),
                 fail_starts: Arc::new(AtomicBool::new(false)),
                 crash_on_use: Arc::new(AtomicBool::new(false)),
+                shutdown_delay_ms: Arc::new(AtomicU64::new(0)),
             }
         }
 
@@ -1056,6 +1157,7 @@ mod tests {
                 memory: Arc::clone(&self.memory),
                 shutdowns: Arc::clone(&self.shutdowns),
                 crash_on_use: self.crash_on_use.load(Ordering::SeqCst),
+                shutdown_delay_ms: self.shutdown_delay_ms.load(Ordering::SeqCst),
             }))
         }
     }
@@ -1122,6 +1224,7 @@ mod tests {
         }
 
         fn shutdown(&self) -> Result<(), LspError> {
+            std::thread::sleep(Duration::from_millis(self.shutdown_delay_ms));
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1147,6 +1250,49 @@ mod tests {
 
     fn dummy_path() -> RelPath {
         RelPath::new("src/lib.rs")
+    }
+
+    #[test]
+    fn exit_shutdown_stops_every_resident_server_in_parallel() {
+        let factory = FakeFactory::new();
+        factory.shutdown_delay_ms.store(300, Ordering::SeqCst);
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+        drop(pool.acquire(Language::Kotlin).expect("start"));
+        drop(pool.acquire(Language::Python).expect("start"));
+        drop(pool.acquire(Language::Rust).expect("start"));
+        let t = Instant::now();
+        assert!(pool.shutdown_within(Duration::from_secs(5)));
+        // Parallel: three 300 ms shutdowns finish well under 900 ms.
+        assert!(
+            t.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(factory.shutdowns(), 3);
+        assert!(!pool.is_resident(Language::Kotlin));
+    }
+
+    #[test]
+    fn exit_shutdown_is_bounded_by_the_deadline() {
+        let factory = FakeFactory::new();
+        factory.shutdown_delay_ms.store(3_000, Ordering::SeqCst);
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+        drop(pool.acquire(Language::Kotlin).expect("start"));
+        let t = Instant::now();
+        assert!(!pool.shutdown_within(Duration::from_millis(200)));
+        assert!(
+            t.elapsed() < Duration::from_millis(1_000),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn exit_shutdown_without_servers_returns_at_once() {
+        let pool = LspPool::with_factory_and_config(FakeFactory::new(), quiet_config());
+        let t = Instant::now();
+        assert!(pool.shutdown_within(Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_millis(50));
     }
 
     #[test]
