@@ -57,6 +57,8 @@ Volar is the first Vue implementation and the P0 default for Vue language intell
 
 A dual-server arrangement (Volar plus a separate TypeScript server, with routing/coordination rules) is a **follow-up**. It may be designed and evaluated after the P0 path is stable, but it is not part of the P0 acceptance criteria and must not be introduced implicitly as a fallback.
 
+> Update (post-P0): Volar 3.x removed `hybridMode: false`, so the dual-server arrangement is now implemented for 3.x only (`lsp::vue_bridge`): the installed major version is detected and 3.x is paired with `typescript-language-server` + `@vue/typescript-plugin`; 2.x keeps the single-server path.
+
 ## 6. Apple sequencing
 
 For ObjC, ObjCpp, and Swift, `sourcekit-lsp` is the primary server direction. Apple-platform discovery and lifecycle work should optimize for that server first; an alternate implementation is not a P0 prerequisite.

@@ -249,12 +249,13 @@ const APPLE_OBJC: &[Candidate] = &[
     },
 ];
 
-// TODO(p0-followup): dual-server / @vue/typescript-plugin with a companion
-// typescript-language-server (Serena-shaped hybridMode). P0 is single Volar only.
+// Volar 2.x runs alone (hybridMode=false). Volar 3.x is detected and run as
+// a dual server by `lsp::vue_bridge` (typescript-language-server with
+// @vue/typescript-plugin, relaying Volar's `tsserver/request`).
 const VUE: &[Candidate] = &[Candidate {
     bin: "vue-language-server",
     args: &["--stdio"],
-    install: "npm i -g @vue/language-server@2 typescript@5  # Volar 3.x needs a tsserver bridge Astrolabe does not provide yet; 2.x runs with hybridMode=false",
+    install: "npm i -g @vue/language-server typescript-language-server typescript  # Volar 3.x is bridged to typescript-language-server + @vue/typescript-plugin; 2.x runs with hybridMode=false",
 }];
 
 /// Kotlin — JetBrains kotlin-lsp first, fwcd kotlin-language-server fallback.
@@ -691,7 +692,7 @@ impl Discovery {
                 " Intelephense premium features need a purchased INTELEPHENSE_LICENSE_KEY;                   never use a pirated key. Phpactor is MIT and needs PHP 8.1+."
             }
             Language::Vue => {
-                " Volar (`@vue/language-server`) is the P0 Vue server; a dual-server                   TypeScript arrangement is a follow-up, not a silent fallback."
+                " Volar (`@vue/language-server`) is the P0 Vue server; 3.x is run as a bridge: typescript-language-server with @vue/typescript-plugin answers script queries and relays Volar's tsserver requests."
             }
             Language::Swift => {
                 " sourcekit-lsp is the RFC-primary Swift server; it ships with                   Xcode / Command Line Tools (`xcode-select --install`)."
@@ -1624,16 +1625,9 @@ mod tests {
             "install hint should point at @vue/language-server, got {}",
             spec.install_hint
         );
-        // P0 is single-server Volar; dual-server/TS plugin is follow-up only.
-        assert!(
-            !spec
-                .install_hint
-                .to_ascii_lowercase()
-                .contains("typescript-language-server")
-                || spec.install_hint.contains("follow-up")
-                || spec.install_hint.contains("dual-server"),
-            "P0 must not silently require a companion TS server"
-        );
+        // Volar 3.x is bridged through typescript-language-server, so the
+        // hint must name it.
+        assert!(spec.install_hint.contains("typescript-language-server"));
     }
 
     #[test]
