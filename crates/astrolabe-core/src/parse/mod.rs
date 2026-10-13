@@ -134,6 +134,19 @@ impl ParserPool {
         if matches!(lang, Language::ObjC | Language::ObjCpp) {
             return objc::parse_with(lang, source, |l, s| self.parse_raw(l, path, s));
         }
+        // Shell: zsh-only syntax and `.bats` `@test` blocks are rewritten
+        // (line-preserving) for the bash grammar; nvm-style `\. file` source
+        // lines are normalized (same length) on every parse pass.
+        if lang == Language::Shell {
+            return shell::parse_with(
+                path.as_str(),
+                source,
+                |s| match shell::normalize_backslash_dot(s) {
+                    Some(fixed) => self.parse_raw(lang, path, &fixed),
+                    None => self.parse_raw(lang, path, s),
+                },
+            );
+        }
         self.parse_raw(lang, path, source)
     }
 
@@ -409,6 +422,9 @@ fn extract_imports(
     // Other languages keep the raw specifier. C# must emit the forms
     // `resolvers/csharp.rs` documents (`static:`, `alias:`, or a bare
     // namespace name) or namespace usings and type usings collapse together.
+    if lang == Language::Ruby {
+        return extract_ruby_imports(query, root, source);
+    }
     if lang != Language::CSharp && lang != Language::VisualBasic {
         return extract_named_captures(query, root, source, |name| {
             name == "import" || name == "source" || name == "module"
@@ -450,6 +466,40 @@ fn extract_imports(
             text.to_owned()
         };
         output.push(spec);
+    }
+    output
+}
+
+/// Ruby: `require_relative "x"` is emitted as `relative:x` so the resolver
+/// resolves it against the requiring file only — never a same-named file on
+/// the `$LOAD_PATH` (`lib/x.rb`). `require` / `load` / `autoload` stay raw.
+fn extract_ruby_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, root, source.as_bytes());
+    let mut output = Vec::new();
+    while let Some(query_match) = matches.next() {
+        let mut import_text: Option<&str> = None;
+        let mut relative = false;
+        for capture in query_match.captures() {
+            let Ok(text) = capture.node.utf8_text(source.as_bytes()) else {
+                continue;
+            };
+            match capture_names[capture.index as usize] {
+                "import" => import_text = Some(text),
+                "_m" => relative = text == "require_relative",
+                _ => {}
+            }
+        }
+        let Some(text) = import_text else {
+            continue;
+        };
+        let text = unquote(text.trim());
+        output.push(if relative {
+            format!("{}{text}", crate::resolvers::ruby::RELATIVE_PREFIX)
+        } else {
+            text.to_owned()
+        });
     }
     output
 }
@@ -2942,5 +2992,26 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             }
         }
         s
+    }
+
+    #[test]
+    fn ruby_require_relative_is_marked_and_shell_backslash_dot_is_a_source() {
+        let pool = ParserPool::new();
+        let rb = pool
+            .parse(
+                Language::Ruby,
+                &RelPath::new("a.rb"),
+                "require \"json\"\nrequire_relative \"helper\"\nload 'x.rb'\n",
+            )
+            .expect("parse ruby");
+        assert_eq!(rb.imports, ["json", "relative:helper", "x.rb"]);
+        let sh = pool
+            .parse(
+                Language::Shell,
+                &RelPath::new("t"),
+                "#!/bin/sh\n: nvm.sh\n\\. ../../nvm.sh\n. ./a.sh\nsource b.sh\n",
+            )
+            .expect("parse shell");
+        assert_eq!(sh.imports, ["../../nvm.sh", "./a.sh", "b.sh"]);
     }
 }

@@ -277,7 +277,7 @@ fn start_watching(session: &Arc<RootSession>, mode: WatchMode) {
     std::thread::Builder::new()
         .name("astrolabe-reindex".into())
         .spawn(move || {
-            crate::reindex::for_each_reindex_batch(rx, throttle, |changes| {
+            crate::reindex::for_each_reindex_batch(&session.root, rx, throttle, |changes| {
                 tracing::info!(
                     added = changes.added.len(),
                     modified = changes.modified.len(),

@@ -1,17 +1,24 @@
 //! Ruby (`.rb`, `Rakefile`, `Gemfile`) import resolution (lang-batch-8).
 //!
-//! The parser hands over the raw path of `require` / `require_relative` /
-//! `load` / `autoload` without saying which call it came from, so:
+//! The parser hands over the path of `require` / `load` / `autoload` as
+//! written, and `require_relative "x"` as `relative:x` ([`RELATIVE_PREFIX`]):
 //!
-//! * `./x`, `../x` — relative to the requiring file (only).
+//! * `relative:x`, `./x`, `../x` — relative to the requiring file (only), so
+//!   `require_relative "version"` never lands on a same-named `lib/version.rb`.
 //! * otherwise, in order: the `$LOAD_PATH` roots Bundler / gemspecs set up
 //!   (every `lib/` directory, the one enclosing the requiring file first),
-//!   then the requiring file's directory (`require_relative "helper"`), then
-//!   the repo root (`require "spec/support/x"` with `-I .`).
+//!   the `spec/` / `test/` root enclosing the requiring file (RSpec and
+//!   Rake's test task put it on the load path: `require "support/x"`), then
+//!   the requiring file's directory, then the repo root
+//!   (`require "spec/support/x"` with `-I .`).
 //!
 //! `.rb` is appended unless present. Gems (`require "json"`) are `None`.
 
 use crate::types::{join_rel, FileIndex, Language, ModuleResolver, ProjectMeta, RelPath};
+
+/// Marks a `require_relative` specifier (set by the parser's Ruby import
+/// extraction).
+pub const RELATIVE_PREFIX: &str = "relative:";
 
 pub struct RubyResolver;
 
@@ -61,6 +68,10 @@ impl ModuleResolver for RubyResolver {
         meta: &ProjectMeta,
     ) -> Option<RelPath> {
         let spec = spec.trim();
+        let (relative, spec) = match spec.strip_prefix(RELATIVE_PREFIX) {
+            Some(rest) => (true, rest.trim()),
+            None => (false, spec),
+        };
         if spec.is_empty() || spec.contains("#{") {
             return None;
         }
@@ -69,7 +80,7 @@ impl ModuleResolver for RubyResolver {
             let joined = join_rel(base, &format!("{spec}.rb"))?;
             files.contains(&joined).then(|| RelPath::new(&joined))
         };
-        if spec.starts_with("./") || spec.starts_with("../") {
+        if relative || spec.starts_with("./") || spec.starts_with("../") {
             return probe(from.dir());
         }
         if spec.starts_with('/') {
@@ -90,8 +101,26 @@ impl ModuleResolver for RubyResolver {
                 return Some(hit);
             }
         }
-        probe(from.dir()).or_else(|| probe(""))
+        test_root(from_s)
+            .and_then(&probe)
+            .or_else(|| probe(from.dir()))
+            .or_else(|| probe(""))
     }
+}
+
+/// Innermost `spec` / `test` directory enclosing `from` (`spec/a/b_spec.rb`
+/// → `spec`, `gems/x/test/y.rb` → `gems/x/test`).
+fn test_root(from: &str) -> Option<&str> {
+    let mut end = None;
+    let mut offset = 0;
+    for seg in from.split('/') {
+        let next = offset + seg.len();
+        if next < from.len() && (seg == "spec" || seg == "test") {
+            end = Some(next);
+        }
+        offset = next + 1;
+    }
+    end.map(|e| &from[..e])
 }
 
 #[cfg(test)]
@@ -149,6 +178,58 @@ mod tests {
             Some("rack-protection/lib/rack/protection/base.rb")
         );
         assert_eq!(r("test/base_test.rb", "json"), None);
+        assert_eq!(
+            r("test/base_test.rb", "relative:test_helper").as_deref(),
+            Some("test/test_helper.rb")
+        );
+        assert_eq!(r("test/base_test.rb", "relative:sinatra/base"), None);
         assert_eq!(r("lib/sinatra.rb", "#{x}/y"), None);
+    }
+
+    #[test]
+    fn require_relative_never_falls_back_to_load_path() {
+        let files = FileIndex::new(
+            "/nonexistent",
+            ["lib/version.rb", "gems/x/version.rb", "gems/x/x.rb"].map(RelPath::new),
+        );
+        let meta = RubyResolver.detect(&files);
+        let res = |spec: &str| {
+            RubyResolver
+                .resolve(&RelPath::new("gems/x/x.rb"), spec, &files, &meta)
+                .map(|p| p.as_str().to_owned())
+        };
+        // Unmarked, `version` is a load-path require and hits `lib/`.
+        assert_eq!(res("version").as_deref(), Some("lib/version.rb"));
+        assert_eq!(
+            res("relative:version").as_deref(),
+            Some("gems/x/version.rb")
+        );
+        assert_eq!(res("relative:missing"), None);
+    }
+
+    #[test]
+    fn spec_root_is_on_the_load_path() {
+        let files = FileIndex::new(
+            "/nonexistent",
+            [
+                "lib/rubocop.rb",
+                "spec/support/file_helper.rb",
+                "spec/rubocop/rake_task_spec.rb",
+            ]
+            .map(RelPath::new),
+        );
+        let meta = RubyResolver.detect(&files);
+        let got = RubyResolver
+            .resolve(
+                &RelPath::new("spec/rubocop/rake_task_spec.rb"),
+                "support/file_helper",
+                &files,
+                &meta,
+            )
+            .map(|p| p.as_str().to_owned());
+        assert_eq!(got.as_deref(), Some("spec/support/file_helper.rb"));
+        assert_eq!(test_root("spec/a/b_spec.rb"), Some("spec"));
+        assert_eq!(test_root("gems/x/test/y.rb"), Some("gems/x/test"));
+        assert_eq!(test_root("lib/spec.rb"), None);
     }
 }

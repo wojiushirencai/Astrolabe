@@ -150,7 +150,7 @@ impl Language {
             "cs" | "csx" | "razor" | "cshtml" => Language::CSharp,
             "vb" => Language::VisualBasic,
             "kt" | "kts" => Language::Kotlin,
-            "sh" | "bash" => Language::Shell,
+            "sh" | "bash" | "zsh" | "zsh-theme" | "bats" => Language::Shell,
             "rb" | "rake" | "gemspec" => Language::Ruby,
             "lua" => Language::Lua,
             _ => return None,
@@ -171,25 +171,39 @@ impl Language {
     /// Language implied by a `#!` shebang line (`bash`, `sh`, `ruby`, `lua`).
     /// Used only for extension-less files; see [`Language::from_path_and_source`].
     pub fn from_shebang(source: &str) -> Option<Self> {
-        let first = source.lines().next()?.strip_prefix("#!")?.trim();
-        let mut parts = first.split_whitespace();
-        let mut interp = parts.next()?.rsplit('/').next()?;
-        if interp == "env" {
-            interp = parts.find(|p| !p.starts_with('-'))?;
-        }
-        match interp {
-            "sh" | "bash" | "dash" | "ksh" => Some(Language::Shell),
+        match Self::shebang_interpreter(source)? {
+            "sh" | "bash" | "dash" | "ksh" | "zsh" | "bats" => Some(Language::Shell),
             "ruby" => Some(Language::Ruby),
             "lua" | "luajit" => Some(Language::Lua),
             _ => None,
         }
     }
 
+    /// Interpreter basename named by a `#!` line (`#!/usr/bin/env zsh` → `zsh`).
+    pub fn shebang_interpreter(source: &str) -> Option<&str> {
+        let first = source.lines().next()?.strip_prefix("#!")?.trim();
+        let mut parts = first.split_whitespace();
+        let mut interp = parts.next()?.rsplit('/').next()?;
+        if interp == "env" {
+            interp = parts.find(|p| !p.starts_with('-'))?;
+        }
+        Some(interp)
+    }
+
+    /// Whether `p` has no real extension, so its language may come from a
+    /// shebang. `Sourcing nvm.sh global alias bug` counts: a "suffix" that is
+    /// not a plain alphanumeric token (`sh global alias bug`) is part of the
+    /// name, not an extension.
+    pub fn is_shebang_candidate(p: &RelPath) -> bool {
+        p.extension()
+            .is_none_or(|e| e.is_empty() || !e.bytes().all(|b| b.is_ascii_alphanumeric()))
+    }
+
     /// Like [`Language::from_path`], but a `.h` header whose text uses C++
     /// constructs (`class`, `namespace`, `template<`, `::`, …) is C++.
     pub fn from_path_and_source(p: &RelPath, source: &str) -> Option<Self> {
         let Some(lang) = Self::from_path(p) else {
-            return if p.extension().is_none() {
+            return if Self::is_shebang_candidate(p) {
                 Self::from_shebang(source)
             } else {
                 None
@@ -612,6 +626,9 @@ mod tests {
             ("build.gradle.kts", Language::Kotlin),
             ("x.sh", Language::Shell),
             ("x.bash", Language::Shell),
+            ("x.zsh", Language::Shell),
+            ("x.zsh-theme", Language::Shell),
+            ("x.bats", Language::Shell),
             ("a.rb", Language::Ruby),
             ("tasks.rake", Language::Ruby),
             ("Rakefile", Language::Ruby),
@@ -644,6 +661,15 @@ mod tests {
             Language::from_path_and_source(&RelPath::new("x.txt"), "#!/bin/sh\n"),
             None
         );
+        assert_eq!(
+            Language::from_path_and_source(
+                &RelPath::new("test/Sourcing nvm.sh global alias bug"),
+                "#!/bin/sh\n"
+            ),
+            Some(Language::Shell)
+        );
+        assert!(!Language::is_shebang_candidate(&RelPath::new("a/b.txt")));
+        assert!(Language::is_shebang_candidate(&RelPath::new("bin/run")));
         for name in ["kotlin", "shell", "ruby", "lua"] {
             assert_eq!(Language::from_name(name).map(|l| l.name()), Some(name));
         }
