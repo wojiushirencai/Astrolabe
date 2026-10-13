@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Declaration-recall gate for the languages added in v0.11 (lang8 batch).
 
+Two corpora per language: the original small pin and a larger real repo
+(Alamofire, SDWebImage, MMKV/ObjC++, kotlinx.coroutines, rubocop, nvm,
+lua-language-server, element-plus); all 15 run in well under a minute.
+
 For each pinned corpus (see scripts/fetch-corpora.sh, dest lang8/<lang>) this
 starts the real MCP server over stdio, waits for the symbol index, then asks
 find_symbol(exact) for every ground-truth declaration in gt/<lang>.json.gz
@@ -30,6 +34,17 @@ GATES = {
     "shell":  ("bats-core",             99.9, 200),
     "lua":    ("nvim-lspconfig",        99.9, 200),
     "vue":    ("vue-vben-admin",        99.9, 200),
+    # Larger real-repo corpora (one per new language, plus ObjC++). GT is the
+    # independent per-language extractor output from the lang8 bench
+    # (deduplicated); thresholds sit just under the locally measured recall.
+    "swift-alamofire":   ("Alamofire",          99.9, 200),
+    "objc-sdwebimage":   ("SDWebImage",         99.9, 200),
+    "objcpp-mmkv":       ("MMKV (.mm)",         99.9, 200),
+    "kotlin-coroutines": ("kotlinx.coroutines", 99.9, 200),
+    "ruby-rubocop":      ("rubocop",            99.9, 200),
+    "shell-nvm":         ("nvm",                99.9, 200),
+    "lua-luals":         ("lua-language-server", 99.9, 200),
+    "vue-element-plus":  ("element-plus",       99.9, 200),
 }
 
 
