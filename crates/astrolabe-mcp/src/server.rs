@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,7 +13,7 @@ use astrolabe_core::{
     cache::DEFAULT_MEMORY_BUDGET_BYTES,
     graph::{compute_centrality, dependencies, dependents, rank_for_task},
     render::{confidence_note, symbol_line},
-    Confidence, EdgeKind, FileId,
+    CodeSymbol, Confidence, EdgeKind, FileId,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -126,14 +126,174 @@ const MAX_SEARCH_CONTEXT: usize = 10;
 const CONTEXT_LINE_COLUMNS: usize = 160;
 
 /// Context lines per match: the caller's value (capped), or adaptive by
-/// match count so broad queries stay compact pages.
+/// match count. Few hits get enclosing bodies instead (see
+/// [`smart_body_max_hits`]); these lines are the fallback for them.
 fn search_context_lines(requested: Option<usize>, total: usize) -> usize {
     match requested {
         Some(n) => n.min(MAX_SEARCH_CONTEXT),
-        None if total <= 15 => 3,
-        None if total <= 60 => 1,
+        None if total <= smart_body_max_hits() => 3,
+        None if total <= 20 => 1,
         None => 0,
     }
+}
+
+/// Hits at or below this count are shown inside their enclosing symbol body
+/// (`ASTROLABE_SEARCH_BODY_HITS`, default 5; 0 disables).
+fn smart_body_max_hits() -> usize {
+    env_usize("ASTROLABE_SEARCH_BODY_HITS").unwrap_or(5)
+}
+
+/// Above this many hits an unpaged query gets a per-file summary
+/// (`ASTROLABE_SEARCH_BROAD_HITS`, default 60).
+fn broad_hits() -> usize {
+    env_usize("ASTROLABE_SEARCH_BROAD_HITS").unwrap_or(60)
+}
+
+/// Enclosing bodies longer than this fall back to line context.
+const SMART_BODY_MAX_LINES: u32 = 160;
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.trim().parse().ok()
+}
+
+fn session_dedup_enabled(param: Option<bool>) -> bool {
+    param.unwrap_or(true)
+        && !matches!(
+            std::env::var("ASTROLABE_SESSION_DEDUP").as_deref(),
+            Ok("0") | Ok("false")
+        )
+}
+
+/// Smallest symbol in `file` that encloses `line` with at least 3 lines.
+fn enclosing_symbol(index: &RepoIndex, path: &str, line: usize) -> Option<CodeSymbol> {
+    let file = index.file_id(path)?;
+    let line = line as u32;
+    index
+        .graph()
+        .symbols
+        .iter()
+        .filter(|s| s.file == file && s.start_line <= line && line <= s.end_line)
+        .filter(|s| s.end_line >= s.start_line + 2)
+        .min_by_key(|s| s.end_line - s.start_line)
+        .cloned()
+}
+
+/// Per-file and per-directory hit counts for a broad query.
+fn render_search_summary(hits: &[SearchHit], path_filter: Option<&str>) -> String {
+    let mut files: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut dirs: BTreeMap<String, usize> = BTreeMap::new();
+    for hit in hits {
+        *files.entry(hit.path.as_str()).or_default() += 1;
+        let dir: Vec<&str> = hit.path.split('/').collect();
+        let key = if dir.len() > 2 {
+            dir[..2].join("/")
+        } else if dir.len() == 2 {
+            dir[0].to_string()
+        } else {
+            ".".into()
+        };
+        *dirs.entry(key).or_default() += 1;
+    }
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = format!(
+        "宽查询：{} 处命中分布在 {} 个文件。未列出逐条结果；请用 path_filter 收窄（或换更具体的字面量 / 用 find_symbol），确需逐条时传 page=true（再用 offset 翻页）。\n",
+        hits.len(),
+        files.len()
+    );
+    out.push_str("按目录：\n");
+    for (dir, n) in dirs.iter().take(10) {
+        out.push_str(&format!("  {n:>5}  {dir}/\n"));
+    }
+    out.push_str("按文件（前 15）：\n");
+    for (file, n) in files.iter().take(15) {
+        out.push_str(&format!("  {n:>5}  {file}\n"));
+    }
+    if files.len() > 15 {
+        out.push_str(&format!("  …其余 {} 个文件\n", files.len() - 15));
+    }
+    if let Some((dir, _)) = dirs.first() {
+        let suggest = if path_filter.is_some_and(|f| dir.starts_with(f) && dir.len() <= f.len()) {
+            files
+                .first()
+                .map(|(f, _)| f.to_string())
+                .unwrap_or_default()
+        } else {
+            dir.clone()
+        };
+        out.push_str(&format!("建议：path_filter=\"{suggest}\"\n"));
+    }
+    out
+}
+
+/// Render few hits inside their enclosing symbol bodies. Hits in the same
+/// symbol share one body; a body sent earlier this session (`seen` returns
+/// the earlier call ordinal) is referenced instead of resent. Hits without a
+/// usable symbol get `fallback` lines of context. `None` when it does not fit
+/// in `limit` tokens.
+fn render_symbol_hits(
+    hits: &[SearchHit],
+    limit: usize,
+    fallback: usize,
+    enclosing: &dyn Fn(&SearchHit) -> Option<CodeSymbol>,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+    seen: &mut dyn FnMut(&str, u32, u32) -> Option<u64>,
+) -> Option<(String, bool)> {
+    let mut out = String::new();
+    let mut used_symbol = false;
+    let mut i = 0;
+    while i < hits.len() {
+        let hit = &hits[i];
+        let symbol = if hit.text_only { None } else { enclosing(hit) }
+            .filter(|s| s.end_line - s.start_line < SMART_BODY_MAX_LINES);
+        let Some(symbol) = symbol else {
+            let (text, _) = render_search_hits(&hits[i..=i], fallback, usize::MAX, file_lines);
+            out.push_str(&text);
+            i += 1;
+            continue;
+        };
+        let (start, end) = (symbol.start_line as usize, symbol.end_line as usize);
+        let mut j = i + 1;
+        while j < hits.len()
+            && hits[j].path == hit.path
+            && hits[j].line >= start
+            && hits[j].line <= end
+        {
+            j += 1;
+        }
+        let group = &hits[i..j];
+        used_symbol = true;
+        let kind = format!("{:?}", symbol.kind).to_lowercase();
+        if let Some(call) = seen(&hit.path, symbol.start_line, symbol.end_line) {
+            for h in group {
+                out.push_str(&format!("@{}:{} {}\n", h.path, h.line, h.text));
+            }
+            out.push_str(&format!(
+                "  （所在 {kind} {} {}:{start}-{end} 已在本会话第 {call} 次调用中返回，文件未改动，不再重发；需要时传 dedup=false）\n",
+                symbol.name, hit.path
+            ));
+        } else if let Some(lines) = file_lines(hit) {
+            out.push_str(&format!(
+                "── {kind} {} · {}:{start}-{end} ──\n",
+                symbol.name, hit.path
+            ));
+            for n in start..=end.min(lines.len()) {
+                if let Some(h) = group.iter().find(|h| h.line == n) {
+                    out.push_str(&format!("@{}:{} {}\n", h.path, h.line, h.text));
+                } else {
+                    render_context_line(&mut out, n, &lines[n - 1]);
+                }
+            }
+        } else {
+            for h in group {
+                out.push_str(&format!("@{}:{} {}\n", h.path, h.line, h.text));
+            }
+        }
+        i = j;
+    }
+    (estimate_tokens(&out) <= limit).then_some((out, used_symbol))
 }
 
 fn render_context_line(out: &mut String, line_no: usize, text: &str) {
@@ -441,6 +601,25 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct ExplainParams {
+    #[schemars(description = "Exact symbol name (case-insensitive fallback).")]
+    pub name: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional repo-relative path substring to pick among same-named definitions."
+    )]
+    pub path_filter: Option<String>,
+    #[serde(default = "default_budget")]
+    #[schemars(description = "Maximum approximate tokens in the result (default 2500).")]
+    pub budget_tokens: usize,
+    #[serde(default)]
+    #[schemars(
+        description = "Default true: bodies already returned this session are referenced, not resent."
+    )]
+    pub dedup: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
     #[schemars(
         description = "Search string. Literal case-insensitive substring unless regex=true. Do not put A|B here without regex=true — that searches for a vertical bar."
@@ -476,6 +655,16 @@ pub(crate) struct SearchParams {
         description = "Lines of surrounding source shown above and below each match (0-10). Omitted: adaptive — 3 when the query has at most 15 matches, 1 up to 60, 0 (bare lines) beyond that. Overlapping windows in one file are merged. Use the context to answer directly instead of a follow-up Read; for a whole function or class use find_symbol include_body=true."
     )]
     pub context_lines: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Force a match page even when the query is broad (more than 60 hits). Default false: a broad query returns per-file / per-directory hit counts so you can narrow with path_filter."
+    )]
+    pub page: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "Default true: a symbol body already returned earlier in this session (file unchanged) is referenced by location instead of resent. false resends it."
+    )]
+    pub dedup: Option<bool>,
 }
 
 fn default_direction() -> String {
@@ -581,6 +770,11 @@ pub struct AstrolabeServer {
     structured_output: bool,
     loop_guard: Arc<Mutex<LoopGuard<CallToolResult>>>,
     tool_router: ToolRouter<Self>,
+    /// Code ranges (symbol bodies) already returned in this MCP session,
+    /// keyed by root+path+range, with the index generation they were read at
+    /// and the ordinal of the call that sent them.
+    sent_ranges: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    call_seq: Arc<AtomicU64>,
 }
 
 impl AstrolabeServer {
@@ -696,6 +890,8 @@ impl AstrolabeServer {
             structured_output,
             loop_guard: Arc::new(Mutex::new(LoopGuard::new(loop_guard_config))),
             tool_router: Self::tool_router(),
+            sent_ranges: Arc::new(Mutex::new(HashMap::new())),
+            call_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -817,6 +1013,9 @@ impl AstrolabeServer {
     fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| !self.context.excludes(tool.name.as_ref()));
+        if self.context.slim() {
+            return crate::slim::slim_catalog(tools);
+        }
         if self.context.openai_tool_compatible() {
             for tool in &mut tools {
                 let schema = Value::Object((*tool.input_schema).clone());
@@ -1566,6 +1765,34 @@ impl AstrolabeServer {
                 let remaining = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS);
                 let total = matches.len();
                 let offset = params.offset.min(total);
+                let broad = total > broad_hits()
+                    && params.offset == 0
+                    && !params.page
+                    && params.context_lines.is_none();
+                if broad {
+                    let mut body = format!(
+                        "confidence: exact (磁盘源码字面匹配)\n{}",
+                        render_search_mode_header(params.regex, &params.query)
+                    );
+                    body.push_str(&format!(
+                        "shown=0 omitted={total} truncated=true total={total} offset=0 summary=true\n"
+                    ));
+                    body.push_str(&render_search_summary(&matches, params.path_filter.as_deref()));
+                    return self.result_on(
+                        &session.root,
+                        "search_code",
+                        body,
+                        json!({
+                            "confidence": "exact",
+                            "summary": true,
+                            "total": total,
+                            "truncated": true,
+                            "next_offset": 0,
+                            "budget_tokens": params.budget_tokens,
+                        }),
+                        Some(params.budget_tokens),
+                    );
+                }
                 let context = search_context_lines(params.context_lines, total);
                 let mut file_lines = |hit: &SearchHit| -> Option<Arc<Vec<String>>> {
                     if hit.text_only {
@@ -1578,8 +1805,48 @@ impl AstrolabeServer {
                             .map(|(lines, _)| lines)
                     }
                 };
-                let (rendered, shown) =
-                    render_search_hits(&matches[offset..], context, remaining, &mut file_lines);
+                let smart = params.context_lines.is_none()
+                    && offset == 0
+                    && total > 0
+                    && total <= smart_body_max_hits();
+                let dedup = session_dedup_enabled(params.dedup);
+                let generation = index.generation();
+                let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let root_key = session.root.display().to_string();
+                let sent = Arc::clone(&self.sent_ranges);
+                let mut seen = |path: &str, start: u32, end: u32| -> Option<u64> {
+                    let key = format!("{root_key}|{path}:{start}-{end}");
+                    let mut map = sent.lock().unwrap_or_else(|e| e.into_inner());
+                    match map.get(&key) {
+                        Some((generation_then, call_then))
+                            if dedup && *generation_then == generation =>
+                        {
+                            Some(*call_then)
+                        }
+                        _ => {
+                            map.insert(key, (generation, call));
+                            None
+                        }
+                    }
+                };
+                let enclosing = |hit: &SearchHit| enclosing_symbol(index, &hit.path, hit.line);
+                let smart_rendered = if smart {
+                    render_symbol_hits(
+                        &matches,
+                        remaining,
+                        context,
+                        &enclosing,
+                        &mut file_lines,
+                        &mut seen,
+                    )
+                } else {
+                    None
+                };
+                let bodies = smart_rendered.as_ref().is_some_and(|(_, used)| *used);
+                let (rendered, shown) = match smart_rendered {
+                    Some((text, _)) => (text, total),
+                    None => render_search_hits(&matches[offset..], context, remaining, &mut file_lines),
+                };
                 let omitted = total - offset - shown;
                 let truncated = omitted > 0;
                 let next_offset = truncated.then_some(offset + shown);
@@ -1596,7 +1863,9 @@ impl AstrolabeServer {
                     clamped_budget,
                     params.offset,
                 ));
-                if context > 0 && shown > 0 {
+                if bodies {
+                    body.push_str("上下文：命中所在的函数/类型整体给出（`── kind 名字 · 路径:起-止 ──`，`  行号| 源码`，命中行为 `@路径:行`），无需再 Read。\n");
+                } else if context > 0 && shown > 0 {
                     body.push_str(&format!(
                         "上下文：每处命中前后 {context} 行（`  行号| 源码`），同一文件内重叠窗口已合并。\n"
                     ));
@@ -1633,6 +1902,7 @@ impl AstrolabeServer {
                         "unindexed_hint": unindexed_hint,
                         "text_only_matches": text_matches,
                         "context_lines": context,
+                        "bodies": bodies,
                         "text_only_files_searched": text_paths.len()
                     }),
                     Some(params.budget_tokens),
@@ -1679,6 +1949,132 @@ impl AstrolabeServer {
                 "get_dependents",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
+            )
+        })
+    }
+
+    #[tool(
+        description = "One call for a named function/method/type: its definition body (up to 3 same-named definitions) plus the callers found by the syntactic call graph. Use instead of find_symbol + search_code + Read. Callers are name-matched (syntactic); for the precise set before an edit use find_references."
+    )]
+    pub(crate) fn explain_symbol(
+        &self,
+        Parameters(params): Parameters<ExplainParams>,
+    ) -> CallToolResult {
+        self.with_fresh_index(&params.name, |session, index| {
+            let budget = clamp_budget(params.budget_tokens);
+            let in_filter = |symbol: &CodeSymbol| {
+                params.path_filter.as_deref().is_none_or(|filter| {
+                    index
+                        .file(symbol.file)
+                        .is_some_and(|file| file.path.as_str().contains(filter))
+                })
+            };
+            let symbols = &index.graph().symbols;
+            let mut defs: Vec<&CodeSymbol> = symbols
+                .iter()
+                .filter(|s| s.name == params.name && in_filter(s))
+                .collect();
+            if defs.is_empty() {
+                defs = symbols
+                    .iter()
+                    .filter(|s| s.name.eq_ignore_ascii_case(&params.name) && in_filter(s))
+                    .collect();
+            }
+            if defs.is_empty() {
+                return self.result_on(
+                    &session.root,
+                    "explain_symbol",
+                    format!("未找到名为 {} 的定义。可用 find_symbol 做子串查找，或 search_code 查字面量。\n", params.name),
+                    json!({"definitions": 0}),
+                    Some(params.budget_tokens),
+                );
+            }
+            // Prefer exported, larger definitions (implementations over decls).
+            defs.sort_by_key(|s| (!s.exported, std::cmp::Reverse(s.end_line - s.start_line)));
+            let total_defs = defs.len();
+            defs.truncate(3);
+            let dedup = session_dedup_enabled(params.dedup);
+            let generation = index.generation();
+            let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let root_key = session.root.display().to_string();
+            let mut body = String::from("confidence: definitions exact; callers syntactic (名字匹配)\n");
+            if total_defs > 3 {
+                body.push_str(&format!("同名定义 {total_defs} 个，显示前 3 个；用 path_filter 指定。\n"));
+            }
+            let body_budget = budget.saturating_sub(SEARCH_HEADER_TOKENS) * 3 / 4;
+            for def in &defs {
+                let Some(file) = index.file(def.file) else { continue };
+                let path = file.path.as_str();
+                let kind = format!("{:?}", def.kind).to_lowercase();
+                body.push_str(&format!(
+                    "── {kind} {} · {path}:{}-{} ──\n",
+                    def.name, def.start_line, def.end_line
+                ));
+                let key = format!("{root_key}|{path}:{}-{}", def.start_line, def.end_line);
+                let earlier = {
+                    let mut map = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
+                    match map.get(&key) {
+                        Some((g, c)) if dedup && *g == generation => Some(*c),
+                        _ => {
+                            map.insert(key, (generation, call));
+                            None
+                        }
+                    }
+                };
+                if let Some(c) = earlier {
+                    body.push_str(&format!(
+                        "  （本会话第 {c} 次调用已返回此定义，文件未改动，不再重发；需要时传 dedup=false）\n"
+                    ));
+                    continue;
+                }
+                match astrolabe_core::body::symbol_body(&session.root.join(path), def) {
+                    Ok(text) => {
+                        let used = estimate_tokens(&body);
+                        if used + estimate_tokens(&text) > body_budget.max(used + 1) && body_budget > 0 {
+                            let keep = body_budget.saturating_sub(used) * 4;
+                            let mut cut: String = text.chars().take(keep).collect();
+                            cut.push_str("\n…(定义体超出 budget_tokens 已截断；加大 budget_tokens 查看全部)\n");
+                            body.push_str(&cut);
+                        } else {
+                            body.push_str(&text);
+                            if !text.ends_with('\n') {
+                                body.push('\n');
+                            }
+                        }
+                    }
+                    Err(err) => body.push_str(&format!("  (读取定义体失败：{err})\n")),
+                }
+            }
+            let wanted: BTreeSet<_> = defs.iter().map(|s| s.id.0).collect();
+            let mut callers = BTreeSet::new();
+            for edge in index.graph().edges.iter().filter(|e| e.kind == EdgeKind::Call && wanted.contains(&e.to)) {
+                if let Some(from) = symbols.iter().find(|s| s.id.0 == edge.from) {
+                    if let Some(file) = index.file(from.file) {
+                        callers.insert(symbol_line(from, &file.path));
+                    }
+                }
+            }
+            let callers: Vec<_> = callers.into_iter().collect();
+            body.push_str(&format!("调用者（syntactic，{} 个）：\n", callers.len()));
+            let remaining = budget.saturating_sub(estimate_tokens(&body));
+            let (kept, omitted) = truncate_ranked(&callers[..callers.len().min(15)], remaining, |l| format!("{l}\n"));
+            for line in kept {
+                body.push_str("  ");
+                body.push_str(line);
+                body.push('\n');
+            }
+            let hidden = omitted + callers.len().saturating_sub(15);
+            if hidden > 0 {
+                body.push_str(&format!("  …另有 {hidden} 个；完整/精确集合用 find_references。\n"));
+            } else if callers.is_empty() {
+                body.push_str("  (调用图中无调用者；动态分派/反射调用请用 find_references 核验)\n");
+            }
+            self.result_on(
+                &session.root,
+                "explain_symbol",
+                body,
+                json!({"definitions": total_defs, "callers": callers.len(), "budget_tokens": params.budget_tokens}),
                 Some(params.budget_tokens),
             )
         })
@@ -2555,10 +2951,11 @@ impl ServerHandler for AstrolabeServer {
         )
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
         .with_server_info(Implementation::new("astrolabe", env!("CARGO_PKG_VERSION")))
-        .with_instructions(crate::instructions::connection_instructions(
-            &self.context.name,
-            &self.root,
-        ))
+        .with_instructions(if self.context.slim() {
+            crate::slim::slim_instructions(&self.root)
+        } else {
+            crate::instructions::connection_instructions(&self.context.name, &self.root)
+        })
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -3201,6 +3598,8 @@ mod tests {
             budget_tokens: 100,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         })));
         assert_first_text(server.get_dependents(Parameters(DependentsParams {
             target: "src/lib.rs".into(),
@@ -3461,6 +3860,8 @@ mod tests {
             budget_tokens: 2_500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         let rendered = text
@@ -3499,6 +3900,8 @@ mod tests {
             budget_tokens: 1,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("shown=0"), "{text}");
@@ -3619,6 +4022,172 @@ mod tests {
         (server, dir)
     }
 
+    fn smart_server(files: &[(&str, String)]) -> (AstrolabeServer, PathBuf) {
+        let dir = unique_temp_dir();
+        for (name, text) in files {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+        (server, dir)
+    }
+
+    fn search(query: &str) -> SearchParams {
+        SearchParams {
+            query: query.into(),
+            regex: false,
+            path_filter: None,
+            case_sensitive: None,
+            budget_tokens: 2500,
+            offset: 0,
+            context_lines: None,
+            page: false,
+            dedup: None,
+        }
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
+    const CALC_PY: &str = "def compute(a, b):\n    total = a + b\n    total *= 2\n    marker_x = total - 1\n    return marker_x\n\n\ndef caller():\n    return compute(1, 2)\n";
+
+    #[test]
+    fn search_code_few_hits_expand_to_enclosing_symbol_once() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let text = text_of(&server.search_code(Parameters(search("marker_x"))));
+        // Two hits in one function share a single body with both anchors.
+        assert_eq!(
+            text.matches("── function compute · calc.py:1-5 ──").count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("  1| def compute(a, b):"), "{text}");
+        assert!(text.contains("@calc.py:4 marker_x = total - 1"), "{text}");
+        assert!(text.contains("@calc.py:5 return marker_x"), "{text}");
+        assert!(text.contains("命中所在的函数/类型整体给出"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_session_dedup_references_resent_bodies() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let _ = server.search_code(Parameters(search("marker_x")));
+        let again = text_of(&server.search_code(Parameters(search("total *= 2"))));
+        assert!(!again.contains("  1| def compute"), "{again}");
+        assert!(again.contains("@calc.py:3 total *= 2"), "{again}");
+        assert!(
+            again.contains("calc.py:1-5 已在本会话第 1 次调用中返回"),
+            "{again}"
+        );
+        let mut opt_out = search("total = a");
+        opt_out.dedup = Some(false);
+        let full = text_of(&server.search_code(Parameters(opt_out)));
+        assert!(full.contains("  1| def compute(a, b):"), "{full}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_broad_query_returns_counts_and_paging_still_works() {
+        let many: String = (0..70).map(|i| format!("NEEDLE_{i} = {i}\n")).collect();
+        let few: String = (0..5).map(|i| format!("NEEDLE_b{i} = {i}\n")).collect();
+        let (server, dir) = smart_server(&[("pkg/a/one.py", many), ("pkg/b/two.py", few)]);
+        let text = text_of(&server.search_code(Parameters(search("NEEDLE_"))));
+        assert!(text.contains("宽查询：75 处命中分布在 2 个文件"), "{text}");
+        assert!(text.contains("     70  pkg/a/one.py"), "{text}");
+        assert!(text.contains("建议：path_filter=\"pkg/a\""), "{text}");
+        assert!(!text.contains("@pkg/a/one.py:1 "), "{text}");
+        let mut paged = search("NEEDLE_");
+        paged.page = true;
+        let page = text_of(&server.search_code(Parameters(paged)));
+        assert!(page.contains("@pkg/a/one.py:1 NEEDLE_0 = 0"), "{page}");
+        let mut second = search("NEEDLE_");
+        second.offset = 70;
+        let second = text_of(&server.search_code(Parameters(second)));
+        assert!(second.contains("@pkg/b/two.py:1 NEEDLE_b0 = 0"), "{second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_symbol_returns_body_and_callers() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let params = || ExplainParams {
+            name: "compute".into(),
+            path_filter: None,
+            budget_tokens: 2500,
+            dedup: None,
+        };
+        let text = text_of(&server.explain_symbol(Parameters(params())));
+        assert!(
+            text.contains("── function compute · calc.py:1-5 ──"),
+            "{text}"
+        );
+        assert!(text.contains("marker_x = total - 1"), "{text}");
+        assert!(text.contains("调用者（syntactic，1 个）"), "{text}");
+        assert!(text.contains("caller"), "{text}");
+        let again = text_of(&server.explain_symbol(Parameters(params())));
+        assert!(again.contains("已返回此定义"), "{again}");
+        assert!(!again.contains("total *= 2"), "{again}");
+        let missing = text_of(&server.explain_symbol(Parameters(ExplainParams {
+            name: "nope".into(),
+            ..params()
+        })));
+        assert!(missing.contains("未找到名为 nope 的定义"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_code_context_lists_slim_catalog() {
+        let ctx = crate::ClientContext::builtin("claude-code").unwrap();
+        assert!(ctx.slim_catalog);
+        let slim = AstrolabeServer::new_with_cache_budget_and_context(
+            PathBuf::from("."),
+            DEFAULT_MEMORY_BUDGET_BYTES,
+            ctx,
+        );
+        let tools = slim.listed_tools();
+        let names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "search_code",
+                "find_symbol",
+                "explain_symbol",
+                "find_references",
+                "goto_definition"
+            ]
+        );
+        let full = AstrolabeServer::new_with_cache_budget_and_context(
+            PathBuf::from("."),
+            DEFAULT_MEMORY_BUDGET_BYTES,
+            crate::ClientContext::default_builtin(),
+        );
+        let bytes = |t: &[rmcp::model::Tool]| serde_json::to_string(t).unwrap().len();
+        assert!(
+            bytes(&tools) * 4 < bytes(&full.listed_tools()),
+            "slim catalog should be far smaller"
+        );
+        let search = tools.iter().find(|t| t.name == "search_code").unwrap();
+        let props = search
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(props.contains_key("path_filter") && !props.contains_key("budget_tokens"));
+        let info = slim.get_info();
+        let instructions = info.instructions.unwrap();
+        assert!(instructions.contains("explain_symbol"), "{instructions}");
+        assert!(
+            !instructions.contains("initial_instructions"),
+            "{instructions}"
+        );
+    }
+
     #[test]
     fn cache_budget_env_parsing() {
         assert_eq!(parse_cache_budget_mb(None), DEFAULT_MEMORY_BUDGET_BYTES);
@@ -3659,6 +4228,8 @@ mod tests {
             budget_tokens: 1000,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         };
 
         let first = server.search_code(Parameters(params.clone()));
@@ -3707,6 +4278,8 @@ mod tests {
             budget_tokens: 200,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
 
         let weighted = server.primary.file_cache.weighted_size();
@@ -3733,6 +4306,8 @@ mod tests {
             budget_tokens: 1000,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3750,6 +4325,8 @@ mod tests {
             budget_tokens: 1000,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("fresh-content"), "{text}");
@@ -3776,6 +4353,8 @@ mod tests {
             budget_tokens: budget,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         result.content[0].as_text().unwrap().text.clone()
     }
@@ -3877,6 +4456,8 @@ mod tests {
         let page = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
                 context_lines: Some(0),
+                page: false,
+                dedup: None,
                 query: "needle".into(),
                 regex: false,
                 path_filter: None,
@@ -3931,6 +4512,8 @@ mod tests {
         let at = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
                 context_lines: Some(0),
+                page: false,
+                dedup: None,
                 query: "needle-a".into(),
                 regex: false,
                 path_filter: None,
@@ -4005,6 +4588,8 @@ mod tests {
                 budget_tokens: 1000,
                 offset: 0,
                 context_lines: Some(0),
+                page: false,
+                dedup: None,
             }))
         };
         for _ in 0..3 {
@@ -4069,9 +4654,10 @@ mod tests {
     #[test]
     fn search_context_defaults_adapt_to_match_count() {
         assert_eq!(search_context_lines(None, 1), 3);
-        assert_eq!(search_context_lines(None, 15), 3);
-        assert_eq!(search_context_lines(None, 16), 1);
-        assert_eq!(search_context_lines(None, 61), 0);
+        assert_eq!(search_context_lines(None, 5), 3);
+        assert_eq!(search_context_lines(None, 6), 1);
+        assert_eq!(search_context_lines(None, 20), 1);
+        assert_eq!(search_context_lines(None, 21), 0);
         assert_eq!(search_context_lines(Some(0), 1), 0);
         assert_eq!(search_context_lines(Some(99), 1), MAX_SEARCH_CONTEXT);
     }
@@ -4125,6 +4711,8 @@ mod tests {
             budget_tokens: 1000,
             offset: 0,
             context_lines,
+            page: false,
+            dedup: None,
         };
         let result = server.search_code(Parameters(params(None)));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -4151,6 +4739,8 @@ mod tests {
             budget_tokens: 1000,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         // 零命中必须显式声明，避免"只剩元信息、疑似服务故障"的歧义输出。
@@ -4177,6 +4767,8 @@ mod tests {
             budget_tokens: 1000,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -4212,6 +4804,8 @@ mod tests {
             budget_tokens: 20,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -4409,6 +5003,8 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         assert_eq!(result.is_error, Some(true));
         assert!(
@@ -5053,6 +5649,8 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
@@ -5082,6 +5680,8 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
             .as_text()
@@ -5107,6 +5707,8 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let filter_miss_text = search_filter_miss.content[0]
             .as_text()
@@ -5201,6 +5803,8 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
         assert!(dart_text.contains("@service.dart:2"), "{dart_text}");
@@ -5225,6 +5829,8 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         (text, result.structured_content.expect("structured"))
@@ -5386,6 +5992,8 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
             context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(

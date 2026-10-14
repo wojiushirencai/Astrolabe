@@ -4,3 +4,7 @@ name: claude-code
 notes: Claude Code replaces text with structuredContent; never send a metadata-only stub.
 structured_tool_output: false
 excluded_tools: []
+# Minimal catalog: search_code / find_symbol / find_references /
+# explain_symbol / goto_definition with terse schemas (schema tax: every
+# request resends the tool list). ASTROLABE_FULL_CATALOG=1 restores all tools.
+slim_catalog: true
