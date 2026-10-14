@@ -174,6 +174,11 @@ pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
         -> Precise<RewritePlan>;
     /// Files changed on disk; keeps running language servers in sync.
     fn files_changed(&self, _changes: &astrolabe_core::watch::ChangeSet) {}
+    /// Whether a language server for `path` is already running (queries
+    /// will not wait for a cold start).
+    fn is_warm(&self, _path: &str) -> bool {
+        false
+    }
 }
 
 /// Backend with no language server behind it.

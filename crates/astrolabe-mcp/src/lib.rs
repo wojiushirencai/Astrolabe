@@ -10,6 +10,7 @@
 mod cli;
 mod context;
 mod ensure_ls;
+mod explain;
 mod knobs;
 mod session;
 // hooks / instructions 对 bin（main.rs 的子命令分发）公开：hook 协议入口

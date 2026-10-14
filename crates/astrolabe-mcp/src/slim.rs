@@ -36,10 +36,11 @@ pub(crate) const SLIM_TOOLS: &[SlimTool] = &[
     ),
     (
         "explain_symbol",
-        "One call for a named symbol: definition body plus its callers. Prefer over find_symbol + search_code + Read.",
+        "One call for a named symbol: definition body plus every call site (path:line + code line, non-test first; tests collapsed). Prefer over find_symbol + search_code + Read.",
         &[
             ("name", "Exact symbol name"),
             ("path_filter", "Repo-relative path substring to pick a definition"),
+            ("include_tests", "Also list call sites in tests"),
         ],
     ),
     (
@@ -102,7 +103,10 @@ pub(crate) fn slim_catalog(tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::To
 /// L1 instructions for slim clients: the doctrine itself, no bootstrap call.
 /// Ablation: `ASTROLABE_NO_EXPLAIN=1` hides explain_symbol.
 pub(crate) fn explain_disabled() -> bool {
-    matches!(std::env::var("ASTROLABE_NO_EXPLAIN").as_deref(), Ok("1") | Ok("true"))
+    matches!(
+        std::env::var("ASTROLABE_NO_EXPLAIN").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 pub(crate) fn slim_instructions(root: &std::path::Path) -> String {
