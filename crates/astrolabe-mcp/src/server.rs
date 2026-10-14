@@ -109,6 +109,122 @@ fn render_search_mode_header(regex: bool, query: &str) -> String {
 
 /// search_code 的分页状态行：保留 `shown= omitted= truncated=` 机器可读格式，
 /// 另给出总数、本页范围和下一页的精确 offset。
+/// One `search_code` match before rendering.
+#[derive(Debug, Clone)]
+struct SearchHit {
+    path: String,
+    /// 1-based.
+    line: usize,
+    /// Clipped matching line.
+    text: String,
+    text_only: bool,
+}
+
+/// Upper bound on `context_lines`.
+const MAX_SEARCH_CONTEXT: usize = 10;
+/// Columns kept per context line.
+const CONTEXT_LINE_COLUMNS: usize = 160;
+
+/// Context lines per match: the caller's value (capped), or adaptive by
+/// match count so broad queries stay compact pages.
+fn search_context_lines(requested: Option<usize>, total: usize) -> usize {
+    match requested {
+        Some(n) => n.min(MAX_SEARCH_CONTEXT),
+        None if total <= 15 => 3,
+        None if total <= 60 => 1,
+        None => 0,
+    }
+}
+
+fn render_context_line(out: &mut String, line_no: usize, text: &str) {
+    let text = text.trim_end();
+    let clipped: String = text.chars().take(CONTEXT_LINE_COLUMNS).collect();
+    let ellipsis = if clipped.len() < text.len() {
+        "…"
+    } else {
+        ""
+    };
+    out.push_str(&format!("  {line_no}| {clipped}{ellipsis}\n"));
+}
+
+/// Render hits in order within `limit` tokens. Each hit keeps its
+/// `@path:line text` anchor line; with `context > 0` the surrounding lines
+/// follow as `  N| source`, merged per file so overlapping windows print each
+/// line once (a later match inside an earlier window is still printed as its
+/// own anchor line). Returns the text and how many hits it covers.
+fn render_search_hits(
+    hits: &[SearchHit],
+    context: usize,
+    limit: usize,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+) -> (String, usize) {
+    let mut budget = TokenBudget::new(limit);
+    let mut out = String::new();
+    let mut current: Option<(String, Option<Arc<Vec<String>>>)> = None;
+    // Last line (1-based) already printed for the current file.
+    let mut printed = 0usize;
+    for (i, hit) in hits.iter().enumerate() {
+        let anchor = if hit.text_only {
+            format!("@{}:{} [text-only] {}\n", hit.path, hit.line, hit.text)
+        } else {
+            format!("@{}:{} {}\n", hit.path, hit.line, hit.text)
+        };
+        let same_file = current.as_ref().is_some_and(|(p, _)| *p == hit.path);
+        let lines = if context == 0 {
+            None
+        } else if same_file {
+            current.as_ref().and_then(|(_, l)| l.clone())
+        } else {
+            file_lines(hit)
+        };
+        let mut chunk = String::new();
+        let mut last = if same_file { printed } else { 0 };
+        if let Some(lines) = &lines {
+            let start = hit.line.saturating_sub(context).max(1).max(last + 1);
+            if same_file && start > last + 1 && last > 0 {
+                chunk.push_str("  …\n");
+            }
+            for n in start..hit.line {
+                if let Some(text) = lines.get(n - 1) {
+                    render_context_line(&mut chunk, n, text);
+                }
+            }
+            chunk.push_str(&anchor);
+            // Stop before the next match in this file: it prints its own anchor.
+            let next_same = hits
+                .get(i + 1)
+                .filter(|n| n.path == hit.path)
+                .map(|n| n.line);
+            let mut end = (hit.line + context).min(lines.len());
+            if let Some(next) = next_same {
+                end = end.min(next.saturating_sub(1));
+            }
+            for n in hit.line + 1..=end {
+                render_context_line(&mut chunk, n, &lines[n - 1]);
+            }
+            last = end.max(hit.line);
+        } else {
+            chunk.push_str(&anchor);
+            last = hit.line;
+        }
+        if !budget.try_add(&chunk) {
+            // A window too big for what is left: fall back to the bare line
+            // so the page is not cut short by context alone.
+            if context > 0 && budget.try_add(&anchor) {
+                out.push_str(&anchor);
+                current = Some((hit.path.clone(), lines));
+                printed = hit.line;
+                continue;
+            }
+            return (out, i);
+        }
+        out.push_str(&chunk);
+        current = Some((hit.path.clone(), lines));
+        printed = last;
+    }
+    (out, hits.len())
+}
+
 fn render_search_page_status(
     total: usize,
     offset: usize,
@@ -258,7 +374,7 @@ pub(crate) struct QueryParams {
     /// 对展示列表前 5 个命中符号附带源码体（include_body，对齐 Serena）。
     #[serde(default)]
     #[schemars(
-        description = "Include source bodies for up to 5 displayed matches (Serena include_body equivalent; bodies count against budget_tokens)"
+        description = "Include source bodies for up to 5 displayed matches (bodies count against budget_tokens). Use this instead of a follow-up Read when you need the implementation of a named function, method or class."
     )]
     pub include_body: bool,
     /// 子串开关。名称查询：省略=子串匹配（精确名优先排序），false=只要精确名，
@@ -355,6 +471,11 @@ pub(crate) struct SearchParams {
         description = "0-based index of the first match to return (default 0). When a result is truncated it reports total and next_offset; pass that value here to fetch the next page. Ordering is stable: code hits (index file order) then [text-only] hits."
     )]
     pub offset: usize,
+    #[serde(default)]
+    #[schemars(
+        description = "Lines of surrounding source shown above and below each match (0-10). Omitted: adaptive — 3 when the query has at most 15 matches, 1 up to 60, 0 (bare lines) beyond that. Overlapping windows in one file are merged. Use the context to answer directly instead of a follow-up Read; for a whole function or class use find_symbol include_body=true."
+    )]
+    pub context_lines: Option<usize>,
 }
 
 fn default_direction() -> String {
@@ -1084,7 +1205,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings."
+        description = "精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings. Also the right tool for who-calls / who-uses-X questions: one call returns every call site, instead of search_code on the name and Reading each hit."
     )]
     pub(crate) fn find_references(
         &self,
@@ -1192,7 +1313,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
+        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Need the code itself? Pass include_body=true to get the full body of each hit (function, method, class) in the same call instead of search_code + Read. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -1329,7 +1450,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
+        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns each match as a path:line anchor plus a few surrounding source lines (context_lines; adaptive default, overlapping windows merged), so the answer is usually visible without a follow-up Read. Best for literals (strings, error messages, config keys, routes): set path_filter to the directory you care about. For a named function/class body use find_symbol include_body=true; for callers/usages use find_references. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
     )]
     pub(crate) fn search_code(
         &self,
@@ -1364,10 +1485,10 @@ impl AstrolabeServer {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(format!("无效正则表达式：{error}")),
                 };
-                let mut matches = Vec::new();
+                let mut matches: Vec<SearchHit> = Vec::new();
                 let mut hits = 0u64;
                 let mut misses = 0u64;
-                let mut scan_file = |path: &str, matches: &mut Vec<String>| {
+                let mut scan_file = |path: &str, matches: &mut Vec<SearchHit>| {
                     let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
                         return;
                     };
@@ -1381,12 +1502,12 @@ impl AstrolabeServer {
                             // P0：超长行先做单行安全切片（Unicode 边界安全），
                             // 单条 match 不会把 budget 一口气吃光，也不会在
                             // 大小写折叠差异上 panic。
-                            matches.push(format!(
-                                "@{}:{} {}",
-                                path,
-                                line_no + 1,
-                                clip_match_line(line, &params.query, Some(&matcher))
-                            ));
+                            matches.push(SearchHit {
+                                path: path.to_string(),
+                                line: line_no + 1,
+                                text: clip_match_line(line, &params.query, Some(&matcher)),
+                                text_only: false,
+                            });
                         }
                     }
                 };
@@ -1420,12 +1541,12 @@ impl AstrolabeServer {
                     );
                     for (idx, file_hits) in found {
                         for hit in file_hits {
-                            matches.push(format!(
-                                "@{}:{} [text-only] {}",
-                                rels[idx],
-                                hit.line,
-                                clip_match_line(&hit.text, &params.query, Some(&matcher))
-                            ));
+                            matches.push(SearchHit {
+                                path: rels[idx].to_string(),
+                                line: hit.line as usize,
+                                text: clip_match_line(&hit.text, &params.query, Some(&matcher)),
+                                text_only: true,
+                            });
                         }
                     }
                 }
@@ -1445,9 +1566,21 @@ impl AstrolabeServer {
                 let remaining = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS);
                 let total = matches.len();
                 let offset = params.offset.min(total);
-                let (kept, omitted) =
-                    truncate_ranked(&matches[offset..], remaining, |line| format!("{line}\n"));
-                let shown = kept.len();
+                let context = search_context_lines(params.context_lines, total);
+                let mut file_lines = |hit: &SearchHit| -> Option<Arc<Vec<String>>> {
+                    if hit.text_only {
+                        let text =
+                            std::fs::read_to_string(session.root.join(&hit.path)).ok()?;
+                        Some(Arc::new(text.lines().map(str::to_string).collect()))
+                    } else {
+                        index
+                            .cached_lines(&session.file_cache, &hit.path)
+                            .map(|(lines, _)| lines)
+                    }
+                };
+                let (rendered, shown) =
+                    render_search_hits(&matches[offset..], context, remaining, &mut file_lines);
+                let omitted = total - offset - shown;
                 let truncated = omitted > 0;
                 let next_offset = truncated.then_some(offset + shown);
                 let mode = if params.regex { "regex" } else { "literal" };
@@ -1463,10 +1596,12 @@ impl AstrolabeServer {
                     clamped_budget,
                     params.offset,
                 ));
-                for line in kept {
-                    body.push_str(line);
-                    body.push('\n');
+                if context > 0 && shown > 0 {
+                    body.push_str(&format!(
+                        "上下文：每处命中前后 {context} 行（`  行号| 源码`），同一文件内重叠窗口已合并。\n"
+                    ));
                 }
+                body.push_str(&rendered);
                 // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
                 // （对齐 find_references 的 `未找到对 … 的引用。` 空结果约定）。
                 let mut unindexed_hint = false;
@@ -1497,6 +1632,7 @@ impl AstrolabeServer {
                         "budget_tokens": params.budget_tokens,
                         "unindexed_hint": unindexed_hint,
                         "text_only_matches": text_matches,
+                        "context_lines": context,
                         "text_only_files_searched": text_paths.len()
                     }),
                     Some(params.budget_tokens),
@@ -3064,6 +3200,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 100,
             offset: 0,
+            context_lines: Some(0),
         })));
         assert_first_text(server.get_dependents(Parameters(DependentsParams {
             target: "src/lib.rs".into(),
@@ -3323,6 +3460,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2_500,
             offset: 0,
+            context_lines: Some(0),
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         let rendered = text
@@ -3360,6 +3498,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1,
             offset: 0,
+            context_lines: Some(0),
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("shown=0"), "{text}");
@@ -3519,6 +3658,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
         };
 
         let first = server.search_code(Parameters(params.clone()));
@@ -3566,6 +3706,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 200,
             offset: 0,
+            context_lines: Some(0),
         }));
 
         let weighted = server.primary.file_cache.weighted_size();
@@ -3591,6 +3732,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
         }));
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3607,6 +3749,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("fresh-content"), "{text}");
@@ -3632,6 +3775,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: budget,
             offset: 0,
+            context_lines: Some(0),
         }));
         result.content[0].as_text().unwrap().text.clone()
     }
@@ -3732,6 +3876,7 @@ mod tests {
         server.structured_output = false;
         let page = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
+                context_lines: Some(0),
                 query: "needle".into(),
                 regex: false,
                 path_filter: None,
@@ -3785,6 +3930,7 @@ mod tests {
         let (server, dir) = loop_guard_server(1);
         let at = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
+                context_lines: Some(0),
                 query: "needle-a".into(),
                 regex: false,
                 path_filter: None,
@@ -3858,6 +4004,7 @@ mod tests {
                 case_sensitive: None,
                 budget_tokens: 1000,
                 offset: 0,
+                context_lines: Some(0),
             }))
         };
         for _ in 0..3 {
@@ -3906,6 +4053,93 @@ mod tests {
         );
     }
 
+    fn hit(path: &str, line: usize) -> SearchHit {
+        SearchHit {
+            path: path.into(),
+            line,
+            text: format!("match{line}"),
+            text_only: false,
+        }
+    }
+
+    fn numbered(n: usize) -> Arc<Vec<String>> {
+        Arc::new((1..=n).map(|i| format!("line{i}")).collect())
+    }
+
+    #[test]
+    fn search_context_defaults_adapt_to_match_count() {
+        assert_eq!(search_context_lines(None, 1), 3);
+        assert_eq!(search_context_lines(None, 15), 3);
+        assert_eq!(search_context_lines(None, 16), 1);
+        assert_eq!(search_context_lines(None, 61), 0);
+        assert_eq!(search_context_lines(Some(0), 1), 0);
+        assert_eq!(search_context_lines(Some(99), 1), MAX_SEARCH_CONTEXT);
+    }
+
+    #[test]
+    fn search_context_windows_merge_and_anchor_every_match() {
+        let lines = numbered(30);
+        let hits = vec![
+            hit("a.rs", 5),
+            hit("a.rs", 7),
+            hit("a.rs", 20),
+            hit("b.rs", 1),
+        ];
+        let (out, shown) = render_search_hits(&hits, 2, 10_000, &mut |_| Some(Arc::clone(&lines)));
+        assert_eq!(shown, 4);
+        let expected = "  3| line3\n  4| line4\n@a.rs:5 match5\n  6| line6\n@a.rs:7 match7\n  8| line8\n  9| line9\n  …\n  18| line18\n  19| line19\n@a.rs:20 match20\n  21| line21\n  22| line22\n@b.rs:1 match1\n  2| line2\n  3| line3\n";
+        assert_eq!(out, expected);
+        // Each source line at most once per file window.
+        assert_eq!(out.matches("  6| ").count(), 1);
+    }
+
+    #[test]
+    fn search_context_zero_is_bare_anchor_lines() {
+        let hits = vec![hit("a.rs", 5), hit("a.rs", 7)];
+        let (out, shown) = render_search_hits(&hits, 0, 10_000, &mut |_| panic!("not read"));
+        assert_eq!(shown, 2);
+        assert_eq!(out, "@a.rs:5 match5\n@a.rs:7 match7\n");
+    }
+
+    #[test]
+    fn search_context_respects_budget_and_falls_back_to_bare_lines() {
+        let lines = numbered(400);
+        let hits: Vec<_> = (1..=40).map(|i| hit("a.rs", i * 10)).collect();
+        let (out, shown) = render_search_hits(&hits, 3, 120, &mut |_| Some(Arc::clone(&lines)));
+        assert!(shown > 0 && shown < 40, "{shown}");
+        assert!(estimate_tokens(&out) <= 120, "{}", estimate_tokens(&out));
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("@a.rs:")).count(),
+            shown
+        );
+    }
+
+    #[test]
+    fn search_code_shows_context_by_default_for_narrow_queries() {
+        let (server, dir) = ready_server_with_disk();
+        let params = |context_lines| SearchParams {
+            query: "cache-me".into(),
+            regex: false,
+            path_filter: None,
+            case_sensitive: None,
+            budget_tokens: 1000,
+            offset: 0,
+            context_lines,
+        };
+        let result = server.search_code(Parameters(params(None)));
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            text.contains("  1| def greet():\n@hello.py:2 return 'cache-me'"),
+            "{text}"
+        );
+        assert!(text.contains("上下文：每处命中前后 3 行"), "{text}");
+        let bare = server.search_code(Parameters(params(Some(0))));
+        let bare = bare.content[0].as_text().unwrap().text.as_str();
+        assert!(!bare.contains("1| def greet"), "{bare}");
+        assert!(bare.contains("@hello.py:2 return 'cache-me'"), "{bare}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn search_code_empty_result_states_no_match_explicitly() {
         let (server, dir) = ready_server_with_disk();
@@ -3916,6 +4150,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         // 零命中必须显式声明，避免"只剩元信息、疑似服务故障"的歧义输出。
@@ -3941,6 +4176,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -3975,6 +4211,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 20,
             offset: 0,
+            context_lines: Some(0),
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -4171,6 +4408,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
         }));
         assert_eq!(result.is_error, Some(true));
         assert!(
@@ -4814,6 +5052,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
@@ -4842,6 +5081,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
             .as_text()
@@ -4866,6 +5106,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
         }));
         let filter_miss_text = search_filter_miss.content[0]
             .as_text()
@@ -4959,6 +5200,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
         assert!(dart_text.contains("@service.dart:2"), "{dart_text}");
@@ -4982,6 +5224,7 @@ mod tests {
             case_sensitive: cs,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         (text, result.structured_content.expect("structured"))
@@ -5142,6 +5385,7 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(

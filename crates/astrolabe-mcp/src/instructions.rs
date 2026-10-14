@@ -79,6 +79,23 @@ The built-in tool descriptions in your context will tell you things like "use Re
 - Unsupported languages
     → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. Run get_languages to view unindexed file statistics.
 
+## Pick the lookup that answers in one call
+
+Most wasted turns are search_code → Read on the same file. Pick by what you need:
+- The definition / body of a function, method, class or type you can name
+    → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
+- Who calls / uses X (callers, implementations, every reference)
+    → find_references (precise) or trace_calls (fast, syntactic). Not search_code.
+- Where X is defined from a use site → goto_definition.
+- A literal (string, error text, config key, route, log message)
+    → search_code with path_filter set to the directory you care about. Each match
+      comes with surrounding lines (context_lines, adaptive by default); answer from
+      that context instead of Reading the file. Read only for a range the context
+      does not cover, and then with offset/limit around the reported line.
+- Broad queries (common words, short names, no path_filter) produce big truncated
+  pages: narrow with path_filter, a more specific literal, or find_symbol first
+  rather than paging through hundreds of hits.
+
 ## Supported languages & unindexed files
 
 Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, vb, kotlin, shell, ruby, lua.
@@ -168,6 +185,23 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
 - Unsupported languages
     → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. Run get_languages to view unindexed file statistics.
 
+## Pick the lookup that answers in one call
+
+Most wasted turns are search_code → Read on the same file. Pick by what you need:
+- The definition / body of a function, method, class or type you can name
+    → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
+- Who calls / uses X (callers, implementations, every reference)
+    → find_references (precise) or trace_calls (fast, syntactic). Not search_code.
+- Where X is defined from a use site → goto_definition.
+- A literal (string, error text, config key, route, log message)
+    → search_code with path_filter set to the directory you care about. Each match
+      comes with surrounding lines (context_lines, adaptive by default); answer from
+      that context instead of Reading the file. Read only for a range the context
+      does not cover, and then with offset/limit around the reported line.
+- Broad queries (common words, short names, no path_filter) produce big truncated
+  pages: narrow with path_filter, a more specific literal, or find_symbol first
+  rather than paging through hundreds of hits.
+
 ## Supported languages & unindexed files
 
 Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, vb, kotlin, shell, ruby, lua.
@@ -243,14 +277,14 @@ Task                                    Tool to use
 First context for a coding task         resolve_context
 Repo structure / load-bearing files     get_repo_skeleton / get_hotspots
 Locate a symbol by name                 find_symbol
-Read a symbol's body (no whole file)    find_symbol include_body=true
+Read a symbol's body (no whole file)    find_symbol include_body=true (not search_code + Read)
 Find references / callers (precise)     find_references
 Find references / callers (fast)        trace_calls (depth 1-6, syntactic — verify dispatch)
 Jump to a definition                    goto_definition
 Who imports / depends on a file         get_dependents
 Multi-hop import impact radius          get_neighborhood (BFS 1-3 hops)
 Macro architecture / module boundaries  get_group_graph
-Literal substring / explicit regex      search_code (regex=true only when needed)
+Literal substring / explicit regex      search_code + path_filter (matches come with context; no follow-up Read)
 A symbol's docstring / type             get_symbol_info (LSP hover)
 Plan a rename                           plan_rename
 Apply a rename                          apply_rename
