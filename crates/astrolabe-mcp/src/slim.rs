@@ -100,14 +100,25 @@ pub(crate) fn slim_catalog(tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::To
 }
 
 /// L1 instructions for slim clients: the doctrine itself, no bootstrap call.
+/// Ablation: `ASTROLABE_NO_EXPLAIN=1` hides explain_symbol.
+pub(crate) fn explain_disabled() -> bool {
+    matches!(std::env::var("ASTROLABE_NO_EXPLAIN").as_deref(), Ok("1") | Ok("true"))
+}
+
 pub(crate) fn slim_instructions(root: &std::path::Path) -> String {
+    let named = if explain_disabled() {
+        "find_symbol include_body=true"
+    } else {
+        "explain_symbol (body + callers) or find_symbol include_body=true"
+    };
     format!(
         "Astrolabe indexes this repo ({}). Prefer it over Grep/Read for code:\n\
-         - a named function/class: explain_symbol (body + callers) or find_symbol include_body=true\n\
+         - a named function/class: {named}\n\
          - callers/usages for an edit: find_references\n\
          - literals (strings, errors, keys): search_code with path_filter; few hits arrive inside their enclosing body — don't Read again\n\
          - many hits: search_code returns per-file counts; narrow path_filter instead of paging\n\
          Bodies already sent this session are referenced by location, not resent.",
-        root.display()
+        root.display(),
+        named = named
     )
 }

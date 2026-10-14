@@ -131,6 +131,8 @@ const CONTEXT_LINE_COLUMNS: usize = 160;
 fn search_context_lines(requested: Option<usize>, total: usize) -> usize {
     match requested {
         Some(n) => n.min(MAX_SEARCH_CONTEXT),
+        // Ablation: ASTROLABE_SEARCH_ADAPTIVE=0 → bare lines by default.
+        None if matches!(std::env::var("ASTROLABE_SEARCH_ADAPTIVE").as_deref(), Ok("0")) => 0,
         None if total <= smart_body_max_hits() => 3,
         None if total <= 20 => 1,
         None => 0,
@@ -1013,6 +1015,9 @@ impl AstrolabeServer {
     fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| !self.context.excludes(tool.name.as_ref()));
+        if crate::slim::explain_disabled() {
+            tools.retain(|tool| tool.name != "explain_symbol");
+        }
         if self.context.slim() {
             return crate::slim::slim_catalog(tools);
         }
