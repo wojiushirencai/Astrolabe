@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,7 +13,7 @@ use astrolabe_core::{
     cache::DEFAULT_MEMORY_BUDGET_BYTES,
     graph::{compute_centrality, dependencies, dependents, rank_for_task},
     render::{confidence_note, symbol_line},
-    Confidence, EdgeKind, FileId,
+    CodeSymbol, Confidence, EdgeKind, FileId,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -109,6 +109,597 @@ fn render_search_mode_header(regex: bool, query: &str) -> String {
 
 /// search_code 的分页状态行：保留 `shown= omitted= truncated=` 机器可读格式，
 /// 另给出总数、本页范围和下一页的精确 offset。
+/// One `search_code` match before rendering.
+#[derive(Debug, Clone)]
+struct SearchHit {
+    path: String,
+    /// 1-based.
+    line: usize,
+    /// Clipped matching line.
+    text: String,
+    text_only: bool,
+}
+
+/// Upper bound on `context_lines`.
+const MAX_SEARCH_CONTEXT: usize = 10;
+/// Columns kept per context line.
+const CONTEXT_LINE_COLUMNS: usize = 160;
+
+/// Context lines per match: the caller's value (capped), or adaptive by
+/// match count. Few hits get enclosing bodies instead (see
+/// [`smart_body_max_hits`]); these lines are the fallback for them.
+fn search_context_lines(requested: Option<usize>, total: usize) -> usize {
+    match requested {
+        Some(n) => n.min(MAX_SEARCH_CONTEXT),
+        // Ablation: ASTROLABE_SEARCH_ADAPTIVE=0 → bare lines by default.
+        None if matches!(
+            std::env::var("ASTROLABE_SEARCH_ADAPTIVE").as_deref(),
+            Ok("0")
+        ) =>
+        {
+            0
+        }
+        None if total <= smart_body_max_hits() => 3,
+        None if total <= 20 => 1,
+        None => 0,
+    }
+}
+
+/// Hits at or below this count are shown inside their enclosing symbol body
+/// (`ASTROLABE_SEARCH_BODY_HITS`, default 5; 0 disables).
+fn smart_body_max_hits() -> usize {
+    env_usize("ASTROLABE_SEARCH_BODY_HITS").unwrap_or(5)
+}
+
+/// Above this many hits an unpaged query gets a per-file summary
+/// (`ASTROLABE_SEARCH_BROAD_HITS`, default 60).
+fn broad_hits() -> usize {
+    env_usize("ASTROLABE_SEARCH_BROAD_HITS").unwrap_or(60)
+}
+
+/// Enclosing bodies longer than this fall back to line context.
+const SMART_BODY_MAX_LINES: u32 = 160;
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.trim().parse().ok()
+}
+
+fn session_dedup_enabled(param: Option<bool>) -> bool {
+    param.unwrap_or(true)
+        && !matches!(
+            std::env::var("ASTROLABE_SESSION_DEDUP").as_deref(),
+            Ok("0") | Ok("false")
+        )
+}
+
+/// Data / fixture / test-vector file (json, yaml, toml …) by extension and
+/// directory: a literal changed in code usually has copies here.
+fn is_data_fixture(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    let ext = p.rsplit_once('.').map_or("", |(_, e)| e);
+    let data_ext = matches!(
+        ext,
+        "json"
+            | "jsonl"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "csv"
+            | "tsv"
+            | "xml"
+            | "txt"
+            | "golden"
+            | "snap"
+            | "ini"
+            | "proto"
+            | "hex"
+    );
+    let dirs = [
+        "test",
+        "tests",
+        "testdata",
+        "fixtures",
+        "fixture",
+        "vectors",
+        "golden",
+        "snapshots",
+        "__snapshots__",
+        "spec",
+        "data",
+        "testvectors",
+    ];
+    data_ext && p.split('/').any(|seg| dirs.contains(&seg))
+}
+
+/// Compact list of literal hits in data/fixture files outside `filter`.
+fn data_hits_outside(
+    index: &RepoIndex,
+    root: &Path,
+    filter: &str,
+    query: &str,
+    sensitive: bool,
+) -> String {
+    let rels: Vec<&str> = index
+        .text_only_paths(None)
+        .into_iter()
+        .map(|p| p.as_str())
+        .filter(|p| !p.contains(filter) && is_data_fixture(p))
+        .collect();
+    if rels.is_empty() {
+        return String::new();
+    }
+    let Ok(matcher) = astrolabe_core::text_search::build_matcher(query, false, sensitive) else {
+        return String::new();
+    };
+    let found = astrolabe_core::text_search::search_files(
+        root,
+        &rels,
+        &matcher,
+        TEXT_SEARCH_MAX_FILE_BYTES,
+    );
+    let mut files: Vec<(String, Vec<u64>)> = found
+        .into_iter()
+        .filter(|(_, hits)| !hits.is_empty())
+        .map(|(i, hits)| (rels[i].to_string(), hits.iter().map(|h| h.line).collect()))
+        .collect();
+    if files.is_empty() {
+        return String::new();
+    }
+    files.sort();
+    let total: usize = files.iter().map(|(_, l)| l.len()).sum();
+    let mut out = format!(
+        "path_filter 之外的数据/夹具文件中另有 {total} 处字面命中（改字面量时通常要同步）：\n"
+    );
+    for (path, lines) in files.iter().take(8) {
+        let shown: Vec<String> = lines.iter().take(5).map(u64::to_string).collect();
+        let more = if lines.len() > 5 {
+            format!(" …共 {} 处", lines.len())
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("  {path}: 行 {}{more}\n", shown.join(",")));
+    }
+    if files.len() > 8 {
+        out.push_str(&format!("  …另有 {} 个文件\n", files.len() - 8));
+    }
+    out
+}
+
+/// One explain_symbol call site.
+#[derive(Debug, Clone)]
+struct ExplainSite {
+    path: String,
+    line: usize,
+    caller: String,
+    code: String,
+    test: bool,
+    target: String,
+}
+
+impl ExplainSite {
+    fn render(&self, show_target: bool) -> String {
+        let target = if show_target {
+            format!(" → {}", self.target)
+        } else {
+            String::new()
+        };
+        format!(
+            "@{}:{}  in {}{target} │ {}",
+            self.path, self.line, self.caller, self.code
+        )
+    }
+}
+
+/// Call sites of `defs`: language-server references when that server is
+/// already running (exact), else the syntactic call graph narrowed to the
+/// actual call lines and filtered by call form (method vs function).
+fn explain_call_sites(
+    session: &RootSession,
+    index: &RepoIndex,
+    defs: &[&CodeSymbol],
+    params: &ExplainParams,
+) -> (Vec<ExplainSite>, bool) {
+    let symbols = &index.graph().symbols;
+    let file_syms = |file: astrolabe_core::types::FileId| -> Vec<&CodeSymbol> {
+        symbols.iter().filter(|s| s.file == file).collect()
+    };
+    let lines_of = |path: &str| {
+        index
+            .cached_lines(&session.file_cache, path)
+            .map(|(l, _)| l)
+    };
+    let clip = |text: &str| -> String {
+        let t = text.trim();
+        let c: String = t.chars().take(120).collect();
+        if c.len() < t.len() {
+            format!("{c}…")
+        } else {
+            c
+        }
+    };
+    let caller_label = |path: &str, line: usize| -> String {
+        match enclosing_symbol(index, path, line) {
+            Some(sym) => {
+                let same = file_syms(sym.file);
+                crate::explain::qualified_name(&sym, &same)
+            }
+            None => "(top level)".to_string(),
+        }
+    };
+    let mut out: Vec<ExplainSite> = Vec::new();
+    let mut lsp_used = false;
+    let lsp_allowed = params.precise.unwrap_or(true)
+        && !matches!(std::env::var("ASTROLABE_EXPLAIN_LSP").as_deref(), Ok("0"));
+    let mut lsp_done = BTreeSet::new();
+    if lsp_allowed {
+        for def in defs {
+            let Some(file) = index.file(def.file) else {
+                continue;
+            };
+            let path = file.path.as_str();
+            if !session.precise.is_warm(path) {
+                continue;
+            }
+            let Some(lines) = lines_of(path) else {
+                continue;
+            };
+            let decl = lines
+                .get(def.start_line as usize - 1)
+                .cloned()
+                .unwrap_or_default();
+            let Some(col) = decl.find(&def.name) else {
+                continue;
+            };
+            let result = session.precise.references(
+                &def.name,
+                Some(path),
+                Some(astrolabe_core::lsp::Position {
+                    line: def.start_line - 1,
+                    character: decl[..col].chars().count() as u32,
+                }),
+            );
+            if result.confidence != Confidence::Exact {
+                continue;
+            }
+            let same = file_syms(def.file);
+            let target = crate::explain::qualified_name(def, &same);
+            for loc in &result.value {
+                let p = loc.path.as_str().to_string();
+                let line = loc.range.start.line as usize + 1;
+                if p == path && line == def.start_line as usize {
+                    continue;
+                }
+                let code = lines_of(&p)
+                    .and_then(|l| l.get(line - 1).cloned())
+                    .unwrap_or_default();
+                let caller = caller_label(&p, line);
+                let test = crate::explain::is_test_caller(
+                    &p,
+                    caller.rsplit('.').next().unwrap_or(&caller),
+                );
+                out.push(ExplainSite {
+                    path: p,
+                    line,
+                    caller,
+                    code: clip(&code),
+                    test,
+                    target: target.clone(),
+                });
+            }
+            lsp_done.insert(def.id.0);
+            lsp_used = true;
+        }
+    }
+    let pending: Vec<&&CodeSymbol> = defs
+        .iter()
+        .filter(|d| !lsp_done.contains(&d.id.0))
+        .collect();
+    if !pending.is_empty() {
+        let wanted: BTreeSet<u32> = pending.iter().map(|d| d.id.0).collect();
+        let mut callers: Vec<&CodeSymbol> = Vec::new();
+        let mut seen_caller = BTreeSet::new();
+        for edge in index
+            .graph()
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Call && wanted.contains(&e.to))
+        {
+            if seen_caller.insert(edge.from) {
+                if let Some(from) = symbols.iter().find(|s| s.id.0 == edge.from) {
+                    callers.push(from);
+                }
+            }
+        }
+        let def_info: Vec<(&CodeSymbol, String, bool, String)> = pending
+            .iter()
+            .filter_map(|d| {
+                let file = index.file(d.file)?;
+                let same = file_syms(d.file);
+                Some((
+                    **d,
+                    crate::explain::qualified_name(d, &same),
+                    crate::explain::is_method(d, &same),
+                    file.path.as_str().to_string(),
+                ))
+            })
+            .collect();
+        let mut seen_site = BTreeSet::new();
+        for caller in callers {
+            let Some(file) = index.file(caller.file) else {
+                continue;
+            };
+            let path = file.path.as_str();
+            let Some(lines) = lines_of(path) else {
+                continue;
+            };
+            let same = file_syms(caller.file);
+            let label = crate::explain::qualified_name(caller, &same);
+            let test = crate::explain::is_test_caller(path, &caller.name);
+            let skip = (caller.name == params.name
+                || def_info.iter().any(|(d, ..)| d.id == caller.id))
+            .then_some(caller.start_line as usize);
+            let name = &def_info
+                .first()
+                .map(|(d, ..)| d.name.clone())
+                .unwrap_or_default();
+            for (line, form) in crate::explain::call_sites(
+                &lines,
+                caller.start_line as usize,
+                caller.end_line as usize,
+                name,
+                skip,
+            ) {
+                for (def, target, method, def_path) in &def_info {
+                    let same_dir = crate::explain::dir_of(def_path) == crate::explain::dir_of(path);
+                    let go = def_path.ends_with(".go");
+                    if !crate::explain::form_matches(form, *method, same_dir, go) {
+                        continue;
+                    }
+                    if !seen_site.insert((path.to_string(), line, def.id.0)) {
+                        continue;
+                    }
+                    out.push(ExplainSite {
+                        path: path.to_string(),
+                        line,
+                        caller: label.clone(),
+                        code: clip(&lines[line - 1]),
+                        test,
+                        target: target.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.test
+            .cmp(&b.test)
+            .then(a.path.cmp(&b.path))
+            .then(a.line.cmp(&b.line))
+    });
+    (out, lsp_used)
+}
+
+/// Smallest symbol in `file` that encloses `line` with at least 3 lines.
+fn enclosing_symbol(index: &RepoIndex, path: &str, line: usize) -> Option<CodeSymbol> {
+    let file = index.file_id(path)?;
+    let line = line as u32;
+    index
+        .graph()
+        .symbols
+        .iter()
+        .filter(|s| s.file == file && s.start_line <= line && line <= s.end_line)
+        .filter(|s| s.end_line >= s.start_line + 2)
+        .min_by_key(|s| s.end_line - s.start_line)
+        .cloned()
+}
+
+/// Per-file and per-directory hit counts for a broad query.
+fn render_search_summary(hits: &[SearchHit], path_filter: Option<&str>) -> String {
+    let mut files: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut dirs: BTreeMap<String, usize> = BTreeMap::new();
+    for hit in hits {
+        *files.entry(hit.path.as_str()).or_default() += 1;
+        let dir: Vec<&str> = hit.path.split('/').collect();
+        let key = if dir.len() > 2 {
+            dir[..2].join("/")
+        } else if dir.len() == 2 {
+            dir[0].to_string()
+        } else {
+            ".".into()
+        };
+        *dirs.entry(key).or_default() += 1;
+    }
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = format!(
+        "宽查询：{} 处命中分布在 {} 个文件。未列出逐条结果；请用 path_filter 收窄（或换更具体的字面量 / 用 find_symbol），确需逐条时传 page=true（再用 offset 翻页）。\n",
+        hits.len(),
+        files.len()
+    );
+    out.push_str("按目录：\n");
+    for (dir, n) in dirs.iter().take(10) {
+        out.push_str(&format!("  {n:>5}  {dir}/\n"));
+    }
+    out.push_str("按文件（前 15）：\n");
+    for (file, n) in files.iter().take(15) {
+        out.push_str(&format!("  {n:>5}  {file}\n"));
+    }
+    if files.len() > 15 {
+        out.push_str(&format!("  …其余 {} 个文件\n", files.len() - 15));
+    }
+    if let Some((dir, _)) = dirs.first() {
+        let suggest = if path_filter.is_some_and(|f| dir.starts_with(f) && dir.len() <= f.len()) {
+            files
+                .first()
+                .map(|(f, _)| f.to_string())
+                .unwrap_or_default()
+        } else {
+            dir.clone()
+        };
+        out.push_str(&format!("建议：path_filter=\"{suggest}\"\n"));
+    }
+    out
+}
+
+/// Render few hits inside their enclosing symbol bodies. Hits in the same
+/// symbol share one body; a body sent earlier this session (`seen` returns
+/// the earlier call ordinal) is referenced instead of resent. Hits without a
+/// usable symbol get `fallback` lines of context. `None` when it does not fit
+/// in `limit` tokens.
+fn render_symbol_hits(
+    hits: &[SearchHit],
+    limit: usize,
+    fallback: usize,
+    enclosing: &dyn Fn(&SearchHit) -> Option<CodeSymbol>,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+    seen: &mut dyn FnMut(&str, u32, u32) -> Option<u64>,
+) -> Option<(String, bool)> {
+    let mut out = String::new();
+    let mut used_symbol = false;
+    let mut i = 0;
+    while i < hits.len() {
+        let hit = &hits[i];
+        let symbol = if hit.text_only { None } else { enclosing(hit) }
+            .filter(|s| s.end_line - s.start_line < SMART_BODY_MAX_LINES);
+        let Some(symbol) = symbol else {
+            let (text, _) = render_search_hits(&hits[i..=i], fallback, usize::MAX, file_lines);
+            out.push_str(&text);
+            i += 1;
+            continue;
+        };
+        let (start, end) = (symbol.start_line as usize, symbol.end_line as usize);
+        let mut j = i + 1;
+        while j < hits.len()
+            && hits[j].path == hit.path
+            && hits[j].line >= start
+            && hits[j].line <= end
+        {
+            j += 1;
+        }
+        let group = &hits[i..j];
+        used_symbol = true;
+        let kind = format!("{:?}", symbol.kind).to_lowercase();
+        if let Some(call) = seen(&hit.path, symbol.start_line, symbol.end_line) {
+            for h in group {
+                out.push_str(&format!("@{}:{} {}\n", h.path, h.line, h.text));
+            }
+            out.push_str(&format!(
+                "  （所在 {kind} {} {}:{start}-{end} 已在本会话第 {call} 次调用中返回，文件未改动，不再重发；需要时传 dedup=false）\n",
+                symbol.name, hit.path
+            ));
+        } else if let Some(lines) = file_lines(hit) {
+            out.push_str(&format!(
+                "── {kind} {} · {}:{start}-{end} ──\n",
+                symbol.name, hit.path
+            ));
+            for n in start..=end.min(lines.len()) {
+                if let Some(h) = group.iter().find(|h| h.line == n) {
+                    out.push_str(&format!("@{}:{} {}\n", h.path, h.line, h.text));
+                } else {
+                    render_context_line(&mut out, n, &lines[n - 1]);
+                }
+            }
+        } else {
+            for h in group {
+                out.push_str(&format!("@{}:{} {}\n", h.path, h.line, h.text));
+            }
+        }
+        i = j;
+    }
+    (estimate_tokens(&out) <= limit).then_some((out, used_symbol))
+}
+
+fn render_context_line(out: &mut String, line_no: usize, text: &str) {
+    let text = text.trim_end();
+    let clipped: String = text.chars().take(CONTEXT_LINE_COLUMNS).collect();
+    let ellipsis = if clipped.len() < text.len() {
+        "…"
+    } else {
+        ""
+    };
+    out.push_str(&format!("  {line_no}| {clipped}{ellipsis}\n"));
+}
+
+/// Render hits in order within `limit` tokens. Each hit keeps its
+/// `@path:line text` anchor line; with `context > 0` the surrounding lines
+/// follow as `  N| source`, merged per file so overlapping windows print each
+/// line once (a later match inside an earlier window is still printed as its
+/// own anchor line). Returns the text and how many hits it covers.
+fn render_search_hits(
+    hits: &[SearchHit],
+    context: usize,
+    limit: usize,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+) -> (String, usize) {
+    let mut budget = TokenBudget::new(limit);
+    let mut out = String::new();
+    let mut current: Option<(String, Option<Arc<Vec<String>>>)> = None;
+    // Last line (1-based) already printed for the current file.
+    let mut printed = 0usize;
+    for (i, hit) in hits.iter().enumerate() {
+        let anchor = if hit.text_only {
+            format!("@{}:{} [text-only] {}\n", hit.path, hit.line, hit.text)
+        } else {
+            format!("@{}:{} {}\n", hit.path, hit.line, hit.text)
+        };
+        let same_file = current.as_ref().is_some_and(|(p, _)| *p == hit.path);
+        let lines = if context == 0 {
+            None
+        } else if same_file {
+            current.as_ref().and_then(|(_, l)| l.clone())
+        } else {
+            file_lines(hit)
+        };
+        let mut chunk = String::new();
+        let mut last = if same_file { printed } else { 0 };
+        if let Some(lines) = &lines {
+            let start = hit.line.saturating_sub(context).max(1).max(last + 1);
+            if same_file && start > last + 1 && last > 0 {
+                chunk.push_str("  …\n");
+            }
+            for n in start..hit.line {
+                if let Some(text) = lines.get(n - 1) {
+                    render_context_line(&mut chunk, n, text);
+                }
+            }
+            chunk.push_str(&anchor);
+            // Stop before the next match in this file: it prints its own anchor.
+            let next_same = hits
+                .get(i + 1)
+                .filter(|n| n.path == hit.path)
+                .map(|n| n.line);
+            let mut end = (hit.line + context).min(lines.len());
+            if let Some(next) = next_same {
+                end = end.min(next.saturating_sub(1));
+            }
+            for n in hit.line + 1..=end {
+                render_context_line(&mut chunk, n, &lines[n - 1]);
+            }
+            last = end.max(hit.line);
+        } else {
+            chunk.push_str(&anchor);
+            last = hit.line;
+        }
+        if !budget.try_add(&chunk) {
+            // A window too big for what is left: fall back to the bare line
+            // so the page is not cut short by context alone.
+            if context > 0 && budget.try_add(&anchor) {
+                out.push_str(&anchor);
+                current = Some((hit.path.clone(), lines));
+                printed = hit.line;
+                continue;
+            }
+            return (out, i);
+        }
+        out.push_str(&chunk);
+        current = Some((hit.path.clone(), lines));
+        printed = last;
+    }
+    (out, hits.len())
+}
+
 fn render_search_page_status(
     total: usize,
     offset: usize,
@@ -258,7 +849,7 @@ pub(crate) struct QueryParams {
     /// 对展示列表前 5 个命中符号附带源码体（include_body，对齐 Serena）。
     #[serde(default)]
     #[schemars(
-        description = "Include source bodies for up to 5 displayed matches (Serena include_body equivalent; bodies count against budget_tokens)"
+        description = "Include source bodies for up to 5 displayed matches (bodies count against budget_tokens). Use this instead of a follow-up Read when you need the implementation of a named function, method or class."
     )]
     pub include_body: bool,
     /// 子串开关。名称查询：省略=子串匹配（精确名优先排序），false=只要精确名，
@@ -325,6 +916,35 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub(crate) struct ExplainParams {
+    #[schemars(description = "Exact symbol name (case-insensitive fallback).")]
+    pub name: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional repo-relative path substring to pick among same-named definitions."
+    )]
+    pub path_filter: Option<String>,
+    #[serde(default = "default_budget")]
+    #[schemars(description = "Maximum approximate tokens in the result (default 2500).")]
+    pub budget_tokens: usize,
+    #[serde(default)]
+    #[schemars(
+        description = "Default true: bodies already returned this session are referenced, not resent."
+    )]
+    pub dedup: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "List call sites inside test code too (default false: tests are collapsed to a count)."
+    )]
+    pub include_tests: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "Default true: when the language server is already running, callers come from its references (exact)."
+    )]
+    pub precise: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
     #[schemars(
         description = "Search string. Literal case-insensitive substring unless regex=true. Do not put A|B here without regex=true — that searches for a vertical bar."
@@ -355,6 +975,21 @@ pub(crate) struct SearchParams {
         description = "0-based index of the first match to return (default 0). When a result is truncated it reports total and next_offset; pass that value here to fetch the next page. Ordering is stable: code hits (index file order) then [text-only] hits."
     )]
     pub offset: usize,
+    #[serde(default)]
+    #[schemars(
+        description = "Lines of surrounding source shown above and below each match (0-10). Omitted: adaptive — 3 when the query has at most 15 matches, 1 up to 60, 0 (bare lines) beyond that. Overlapping windows in one file are merged. Use the context to answer directly instead of a follow-up Read; for a whole function or class use find_symbol include_body=true."
+    )]
+    pub context_lines: Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Force a match page even when the query is broad (more than 60 hits). Default false: a broad query returns per-file / per-directory hit counts so you can narrow with path_filter."
+    )]
+    pub page: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "Default true: a symbol body already returned earlier in this session (file unchanged) is referenced by location instead of resent. false resends it."
+    )]
+    pub dedup: Option<bool>,
 }
 
 fn default_direction() -> String {
@@ -460,6 +1095,11 @@ pub struct AstrolabeServer {
     structured_output: bool,
     loop_guard: Arc<Mutex<LoopGuard<CallToolResult>>>,
     tool_router: ToolRouter<Self>,
+    /// Code ranges (symbol bodies) already returned in this MCP session,
+    /// keyed by root+path+range, with the index generation they were read at
+    /// and the ordinal of the call that sent them.
+    sent_ranges: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    call_seq: Arc<AtomicU64>,
 }
 
 impl AstrolabeServer {
@@ -575,6 +1215,8 @@ impl AstrolabeServer {
             structured_output,
             loop_guard: Arc::new(Mutex::new(LoopGuard::new(loop_guard_config))),
             tool_router: Self::tool_router(),
+            sent_ranges: Arc::new(Mutex::new(HashMap::new())),
+            call_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -696,6 +1338,12 @@ impl AstrolabeServer {
     fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| !self.context.excludes(tool.name.as_ref()));
+        if crate::slim::explain_disabled() {
+            tools.retain(|tool| tool.name != "explain_symbol");
+        }
+        if self.context.slim() {
+            return crate::slim::slim_catalog(tools);
+        }
         if self.context.openai_tool_compatible() {
             for tool in &mut tools {
                 let schema = Value::Object((*tool.input_schema).clone());
@@ -1084,7 +1732,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings."
+        description = "精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings. Also the right tool for who-calls / who-uses-X questions: one call returns every call site, instead of search_code on the name and Reading each hit."
     )]
     pub(crate) fn find_references(
         &self,
@@ -1192,7 +1840,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
+        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Need the code itself? Pass include_body=true to get the full body of each hit (function, method, class) in the same call instead of search_code + Read. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -1329,7 +1977,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns matching lines as path:line anchors. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
+        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns each match as a path:line anchor plus a few surrounding source lines (context_lines; adaptive default, overlapping windows merged), so the answer is usually visible without a follow-up Read. Best for literals (strings, error messages, config keys, routes): set path_filter to the directory you care about. For a named function/class body use find_symbol include_body=true; for callers/usages use find_references. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
     )]
     pub(crate) fn search_code(
         &self,
@@ -1364,10 +2012,41 @@ impl AstrolabeServer {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(format!("无效正则表达式：{error}")),
                 };
-                let mut matches = Vec::new();
+                if session_dedup_enabled(params.dedup) {
+                    let mut probe = params.clone();
+                    probe.dedup = None;
+                    let key = format!("{}|search|{probe:?}", session.root.display());
+                    let generation = index.generation();
+                    // Same ordinal the body bookkeeping below takes.
+                    let call = self.call_seq.load(Ordering::Relaxed) + 1;
+                    let earlier = {
+                        let mut map = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
+                        match map.get(&key) {
+                            Some((g, c)) if *g == generation => Some(*c),
+                            _ => {
+                                map.insert(key, (generation, call));
+                                None
+                            }
+                        }
+                    };
+                    if let Some(c) = earlier {
+                        let body = format!(
+                            "confidence: exact (磁盘源码字面匹配)\n{}同一查询已在本会话第 {c} 次调用返回，文件未改动，不再重发；需要时传 dedup=false。\n",
+                            render_search_mode_header(params.regex, &params.query)
+                        );
+                        return self.result_on(
+                            &session.root,
+                            "search_code",
+                            body,
+                            json!({"confidence":"exact","deduplicated":true,"earlier_call":c,"budget_tokens":params.budget_tokens}),
+                            Some(params.budget_tokens),
+                        );
+                    }
+                }
+                let mut matches: Vec<SearchHit> = Vec::new();
                 let mut hits = 0u64;
                 let mut misses = 0u64;
-                let mut scan_file = |path: &str, matches: &mut Vec<String>| {
+                let mut scan_file = |path: &str, matches: &mut Vec<SearchHit>| {
                     let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
                         return;
                     };
@@ -1381,12 +2060,12 @@ impl AstrolabeServer {
                             // P0：超长行先做单行安全切片（Unicode 边界安全），
                             // 单条 match 不会把 budget 一口气吃光，也不会在
                             // 大小写折叠差异上 panic。
-                            matches.push(format!(
-                                "@{}:{} {}",
-                                path,
-                                line_no + 1,
-                                clip_match_line(line, &params.query, Some(&matcher))
-                            ));
+                            matches.push(SearchHit {
+                                path: path.to_string(),
+                                line: line_no + 1,
+                                text: clip_match_line(line, &params.query, Some(&matcher)),
+                                text_only: false,
+                            });
                         }
                     }
                 };
@@ -1420,16 +2099,25 @@ impl AstrolabeServer {
                     );
                     for (idx, file_hits) in found {
                         for hit in file_hits {
-                            matches.push(format!(
-                                "@{}:{} [text-only] {}",
-                                rels[idx],
-                                hit.line,
-                                clip_match_line(&hit.text, &params.query, Some(&matcher))
-                            ));
+                            matches.push(SearchHit {
+                                path: rels[idx].to_string(),
+                                line: hit.line as usize,
+                                text: clip_match_line(&hit.text, &params.query, Some(&matcher)),
+                                text_only: true,
+                            });
                         }
                     }
                 }
                 let text_matches = matches.len() - code_matches;
+                let data_note = if params.regex {
+                    String::new()
+                } else {
+                    params
+                        .path_filter
+                        .as_deref()
+                        .map(|filter| data_hits_outside(index, &session.root, filter, &params.query, sensitive))
+                        .unwrap_or_default()
+                };
                 session.cache_hits.fetch_add(hits, Ordering::Relaxed);
                 session.cache_misses.fetch_add(misses, Ordering::Relaxed);
                 tracing::debug!(
@@ -1445,9 +2133,90 @@ impl AstrolabeServer {
                 let remaining = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS);
                 let total = matches.len();
                 let offset = params.offset.min(total);
-                let (kept, omitted) =
-                    truncate_ranked(&matches[offset..], remaining, |line| format!("{line}\n"));
-                let shown = kept.len();
+                let broad = total > broad_hits()
+                    && params.offset == 0
+                    && !params.page
+                    && params.context_lines.is_none();
+                if broad {
+                    let mut body = format!(
+                        "confidence: exact (磁盘源码字面匹配)\n{}",
+                        render_search_mode_header(params.regex, &params.query)
+                    );
+                    body.push_str(&format!(
+                        "shown=0 omitted={total} truncated=true total={total} offset=0 summary=true\n"
+                    ));
+                    body.push_str(&render_search_summary(&matches, params.path_filter.as_deref()));
+                    body.push_str(&data_note);
+                    return self.result_on(
+                        &session.root,
+                        "search_code",
+                        body,
+                        json!({
+                            "confidence": "exact",
+                            "summary": true,
+                            "total": total,
+                            "truncated": true,
+                            "next_offset": 0,
+                            "budget_tokens": params.budget_tokens,
+                        }),
+                        Some(params.budget_tokens),
+                    );
+                }
+                let context = search_context_lines(params.context_lines, total);
+                let mut file_lines = |hit: &SearchHit| -> Option<Arc<Vec<String>>> {
+                    if hit.text_only {
+                        let text =
+                            std::fs::read_to_string(session.root.join(&hit.path)).ok()?;
+                        Some(Arc::new(text.lines().map(str::to_string).collect()))
+                    } else {
+                        index
+                            .cached_lines(&session.file_cache, &hit.path)
+                            .map(|(lines, _)| lines)
+                    }
+                };
+                let smart = params.context_lines.is_none()
+                    && offset == 0
+                    && total > 0
+                    && total <= smart_body_max_hits();
+                let dedup = session_dedup_enabled(params.dedup);
+                let generation = index.generation();
+                let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let root_key = session.root.display().to_string();
+                let sent = Arc::clone(&self.sent_ranges);
+                let mut seen = |path: &str, start: u32, end: u32| -> Option<u64> {
+                    let key = format!("{root_key}|{path}:{start}-{end}");
+                    let mut map = sent.lock().unwrap_or_else(|e| e.into_inner());
+                    match map.get(&key) {
+                        Some((generation_then, call_then))
+                            if dedup && *generation_then == generation =>
+                        {
+                            Some(*call_then)
+                        }
+                        _ => {
+                            map.insert(key, (generation, call));
+                            None
+                        }
+                    }
+                };
+                let enclosing = |hit: &SearchHit| enclosing_symbol(index, &hit.path, hit.line);
+                let smart_rendered = if smart {
+                    render_symbol_hits(
+                        &matches,
+                        remaining,
+                        context,
+                        &enclosing,
+                        &mut file_lines,
+                        &mut seen,
+                    )
+                } else {
+                    None
+                };
+                let bodies = smart_rendered.as_ref().is_some_and(|(_, used)| *used);
+                let (rendered, shown) = match smart_rendered {
+                    Some((text, _)) => (text, total),
+                    None => render_search_hits(&matches[offset..], context, remaining, &mut file_lines),
+                };
+                let omitted = total - offset - shown;
                 let truncated = omitted > 0;
                 let next_offset = truncated.then_some(offset + shown);
                 let mode = if params.regex { "regex" } else { "literal" };
@@ -1463,10 +2232,15 @@ impl AstrolabeServer {
                     clamped_budget,
                     params.offset,
                 ));
-                for line in kept {
-                    body.push_str(line);
-                    body.push('\n');
+                if bodies {
+                    body.push_str("上下文：命中所在的函数/类型整体给出（`── kind 名字 · 路径:起-止 ──`，`  行号| 源码`，命中行为 `@路径:行`），无需再 Read。\n");
+                } else if context > 0 && shown > 0 {
+                    body.push_str(&format!(
+                        "上下文：每处命中前后 {context} 行（`  行号| 源码`），同一文件内重叠窗口已合并。\n"
+                    ));
                 }
+                body.push_str(&rendered);
+                body.push_str(&data_note);
                 // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
                 // （对齐 find_references 的 `未找到对 … 的引用。` 空结果约定）。
                 let mut unindexed_hint = false;
@@ -1497,6 +2271,8 @@ impl AstrolabeServer {
                         "budget_tokens": params.budget_tokens,
                         "unindexed_hint": unindexed_hint,
                         "text_only_matches": text_matches,
+                        "context_lines": context,
+                        "bodies": bodies,
                         "text_only_files_searched": text_paths.len()
                     }),
                     Some(params.budget_tokens),
@@ -1543,6 +2319,159 @@ impl AstrolabeServer {
                 "get_dependents",
                 body,
                 json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
+                Some(params.budget_tokens),
+            )
+        })
+    }
+
+    #[tool(
+        description = "One call for a named function/method/type: its definition body (up to 3 same-named definitions, receiver/type-qualified) plus every call site as path:line with the calling function and the code line. Non-test call sites first; test call sites are collapsed to a count unless include_tests=true. Call sites come from the language server when it is already running (exact), otherwise from the syntactic call graph filtered by call form (method vs function). Use instead of find_symbol + search_code + Read; for the precise set before an edit use find_references."
+    )]
+    pub(crate) fn explain_symbol(
+        &self,
+        Parameters(params): Parameters<ExplainParams>,
+    ) -> CallToolResult {
+        self.with_fresh_index(&params.name, |session, index| {
+            let budget = clamp_budget(params.budget_tokens);
+            let in_filter = |symbol: &CodeSymbol| {
+                params.path_filter.as_deref().is_none_or(|filter| {
+                    index
+                        .file(symbol.file)
+                        .is_some_and(|file| file.path.as_str().contains(filter))
+                })
+            };
+            let symbols = &index.graph().symbols;
+            let mut defs: Vec<&CodeSymbol> = symbols
+                .iter()
+                .filter(|s| s.name == params.name && in_filter(s))
+                .collect();
+            if defs.is_empty() {
+                defs = symbols
+                    .iter()
+                    .filter(|s| s.name.eq_ignore_ascii_case(&params.name) && in_filter(s))
+                    .collect();
+            }
+            if defs.is_empty() {
+                return self.result_on(
+                    &session.root,
+                    "explain_symbol",
+                    format!("未找到名为 {} 的定义。可用 find_symbol 做子串查找，或 search_code 查字面量。\n", params.name),
+                    json!({"definitions": 0}),
+                    Some(params.budget_tokens),
+                );
+            }
+            // Prefer exported, larger definitions (implementations over decls).
+            defs.sort_by_key(|s| (!s.exported, std::cmp::Reverse(s.end_line - s.start_line)));
+            let total_defs = defs.len();
+            defs.truncate(3);
+            let dedup = session_dedup_enabled(params.dedup);
+            let generation = index.generation();
+            let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let root_key = session.root.display().to_string();
+            let mut body = String::from("confidence: definitions exact; callers syntactic (名字匹配)\n");
+            if total_defs > 3 {
+                body.push_str(&format!("同名定义 {total_defs} 个，显示前 3 个；用 path_filter 指定。\n"));
+            }
+            let body_budget = budget.saturating_sub(SEARCH_HEADER_TOKENS) * 3 / 4;
+            for def in &defs {
+                let Some(file) = index.file(def.file) else { continue };
+                let path = file.path.as_str();
+                let kind = format!("{:?}", def.kind).to_lowercase();
+                let same_file: Vec<&CodeSymbol> = symbols.iter().filter(|s| s.file == def.file).collect();
+                body.push_str(&format!(
+                    "── {kind} {} · {path}:{}-{} ──\n",
+                    crate::explain::qualified_name(def, &same_file),
+                    def.start_line,
+                    def.end_line
+                ));
+                let key = format!("{root_key}|{path}:{}-{}", def.start_line, def.end_line);
+                let earlier = {
+                    let mut map = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
+                    match map.get(&key) {
+                        Some((g, c)) if dedup && *g == generation => Some(*c),
+                        _ => {
+                            map.insert(key, (generation, call));
+                            None
+                        }
+                    }
+                };
+                if let Some(c) = earlier {
+                    body.push_str(&format!(
+                        "  （本会话第 {c} 次调用已返回此定义，文件未改动，不再重发；需要时传 dedup=false）\n"
+                    ));
+                    continue;
+                }
+                match astrolabe_core::body::symbol_body(&session.root.join(path), def) {
+                    Ok(text) => {
+                        let used = estimate_tokens(&body);
+                        if used + estimate_tokens(&text) > body_budget.max(used + 1) && body_budget > 0 {
+                            let keep = body_budget.saturating_sub(used) * 4;
+                            let mut cut: String = text.chars().take(keep).collect();
+                            cut.push_str("\n…(定义体超出 budget_tokens 已截断；加大 budget_tokens 查看全部)\n");
+                            body.push_str(&cut);
+                        } else {
+                            body.push_str(&text);
+                            if !text.ends_with('\n') {
+                                body.push('\n');
+                            }
+                        }
+                    }
+                    Err(err) => body.push_str(&format!("  (读取定义体失败：{err})\n")),
+                }
+            }
+            let (sites, lsp_used) = explain_call_sites(session, index, &defs, &params);
+            if lsp_used {
+                body = body.replacen("callers syntactic (名字匹配)", "callers exact (语言服务器引用)", 1);
+            }
+            let include_tests = params.include_tests.unwrap_or(false);
+            let (tests, code): (Vec<_>, Vec<_>) = sites.into_iter().partition(|s| s.test);
+            let code_fns: BTreeSet<_> = code.iter().map(|s| (s.path.clone(), s.caller.clone())).collect();
+            let test_fns: BTreeSet<_> = tests.iter().map(|s| (s.path.clone(), s.caller.clone())).collect();
+            let how = if lsp_used { "语言服务器引用" } else { "名字匹配 + 调用形式过滤" };
+            body.push_str(&format!(
+                "调用点（{how}，非测试 {} 处 / {} 个函数）：\n",
+                code.len(),
+                code_fns.len()
+            ));
+            let shown: Vec<&ExplainSite> = if include_tests {
+                code.iter().chain(tests.iter()).collect()
+            } else {
+                code.iter().collect()
+            };
+            let lines: Vec<String> = shown.iter().map(|s| s.render(defs.len() > 1)).collect();
+            let remaining = budget.saturating_sub(estimate_tokens(&body)).saturating_sub(40);
+            let cap = lines.len().min(40);
+            let (kept, omitted) = truncate_ranked(&lines[..cap], remaining, |l| format!("{l}\n"));
+            for line in kept {
+                body.push_str("  ");
+                body.push_str(line);
+                body.push('\n');
+            }
+            let hidden = omitted + lines.len().saturating_sub(cap);
+            if hidden > 0 {
+                body.push_str(&format!("  …另有 {hidden} 处；完整/精确集合用 find_references。\n"));
+            } else if code.is_empty() && (tests.is_empty() || !include_tests) {
+                body.push_str("  (未找到非测试调用点；动态分派/反射调用请用 find_references 核验)\n");
+            }
+            if !tests.is_empty() && !include_tests {
+                body.push_str(&format!(
+                    "测试调用 {} 处 / {} 个测试函数（已折叠；include_tests=true 展开）\n",
+                    tests.len(),
+                    test_fns.len()
+                ));
+            }
+            self.result_on(
+                &session.root,
+                "explain_symbol",
+                body,
+                json!({
+                    "definitions": total_defs,
+                    "call_sites": code.len(),
+                    "callers": code_fns.len(),
+                    "test_call_sites": tests.len(),
+                    "precise": lsp_used,
+                    "budget_tokens": params.budget_tokens
+                }),
                 Some(params.budget_tokens),
             )
         })
@@ -1898,12 +2827,39 @@ impl AstrolabeServer {
         let mut attached = 0usize;
         let mut failed = 0usize;
         let mut spent = estimate_tokens(body);
+        let dedup = session_dedup_enabled(None);
+        let generation = index.generation();
+        let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let root_key = root.display().to_string();
         for (line, idx) in hits.iter().take(kept_count).take(5) {
             let symbol = &index.graph().symbols[*idx];
             let Some(file) = index.file(symbol.file) else {
                 failed += 1;
                 continue;
             };
+            let key = format!(
+                "{root_key}|{}:{}-{}",
+                file.path.as_str(),
+                symbol.start_line,
+                symbol.end_line
+            );
+            let earlier = {
+                let mut map = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
+                match map.get(&key) {
+                    Some((g, c)) if dedup && *g == generation => Some(*c),
+                    _ => {
+                        map.insert(key, (generation, call));
+                        None
+                    }
+                }
+            };
+            if let Some(c) = earlier {
+                body.push_str(&format!(
+                    "\n----- body @ {line} -----\n（本会话第 {c} 次调用已返回此定义体，文件未改动，不再重发）\n"
+                ));
+                attached += 1;
+                continue;
+            }
             match astrolabe_core::body::symbol_body(&root.join(file.path.as_str()), symbol) {
                 Ok(text) if !text.is_empty() => {
                     let section = format!("\n----- body @ {line} -----\n{text}");
@@ -2419,10 +3375,11 @@ impl ServerHandler for AstrolabeServer {
         )
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
         .with_server_info(Implementation::new("astrolabe", env!("CARGO_PKG_VERSION")))
-        .with_instructions(crate::instructions::connection_instructions(
-            &self.context.name,
-            &self.root,
-        ))
+        .with_instructions(if self.context.slim() {
+            crate::slim::slim_instructions(&self.root)
+        } else {
+            crate::instructions::connection_instructions(&self.context.name, &self.root)
+        })
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -3064,6 +4021,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 100,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         })));
         assert_first_text(server.get_dependents(Parameters(DependentsParams {
             target: "src/lib.rs".into(),
@@ -3323,6 +4283,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2_500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         let rendered = text
@@ -3360,6 +4323,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("shown=0"), "{text}");
@@ -3480,6 +4446,303 @@ mod tests {
         (server, dir)
     }
 
+    fn smart_server(files: &[(&str, String)]) -> (AstrolabeServer, PathBuf) {
+        let dir = unique_temp_dir();
+        for (name, text) in files {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let mut server = AstrolabeServer::new_with_cache_budget(dir.clone(), 8 * 1024 * 1024);
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+        (server, dir)
+    }
+
+    fn search(query: &str) -> SearchParams {
+        SearchParams {
+            query: query.into(),
+            regex: false,
+            path_filter: None,
+            case_sensitive: None,
+            budget_tokens: 2500,
+            offset: 0,
+            context_lines: None,
+            page: false,
+            dedup: None,
+        }
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
+    const CALC_PY: &str = "def compute(a, b):\n    total = a + b\n    total *= 2\n    marker_x = total - 1\n    return marker_x\n\n\ndef caller():\n    return compute(1, 2)\n";
+
+    #[test]
+    fn search_code_few_hits_expand_to_enclosing_symbol_once() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let text = text_of(&server.search_code(Parameters(search("marker_x"))));
+        // Two hits in one function share a single body with both anchors.
+        assert_eq!(
+            text.matches("── function compute · calc.py:1-5 ──").count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("  1| def compute(a, b):"), "{text}");
+        assert!(text.contains("@calc.py:4 marker_x = total - 1"), "{text}");
+        assert!(text.contains("@calc.py:5 return marker_x"), "{text}");
+        assert!(text.contains("命中所在的函数/类型整体给出"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_session_dedup_references_resent_bodies() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let _ = server.search_code(Parameters(search("marker_x")));
+        let again = text_of(&server.search_code(Parameters(search("total *= 2"))));
+        assert!(!again.contains("  1| def compute"), "{again}");
+        assert!(again.contains("@calc.py:3 total *= 2"), "{again}");
+        assert!(
+            again.contains("calc.py:1-5 已在本会话第 1 次调用中返回"),
+            "{again}"
+        );
+        let mut opt_out = search("total = a");
+        opt_out.dedup = Some(false);
+        let full = text_of(&server.search_code(Parameters(opt_out)));
+        assert!(full.contains("  1| def compute(a, b):"), "{full}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_broad_query_returns_counts_and_paging_still_works() {
+        let many: String = (0..70).map(|i| format!("NEEDLE_{i} = {i}\n")).collect();
+        let few: String = (0..5).map(|i| format!("NEEDLE_b{i} = {i}\n")).collect();
+        let (server, dir) = smart_server(&[("pkg/a/one.py", many), ("pkg/b/two.py", few)]);
+        let text = text_of(&server.search_code(Parameters(search("NEEDLE_"))));
+        assert!(text.contains("宽查询：75 处命中分布在 2 个文件"), "{text}");
+        assert!(text.contains("     70  pkg/a/one.py"), "{text}");
+        assert!(text.contains("建议：path_filter=\"pkg/a\""), "{text}");
+        assert!(!text.contains("@pkg/a/one.py:1 "), "{text}");
+        let mut paged = search("NEEDLE_");
+        paged.page = true;
+        let page = text_of(&server.search_code(Parameters(paged)));
+        assert!(page.contains("@pkg/a/one.py:1 NEEDLE_0 = 0"), "{page}");
+        let mut second = search("NEEDLE_");
+        second.offset = 70;
+        let second = text_of(&server.search_code(Parameters(second)));
+        assert!(second.contains("@pkg/b/two.py:1 NEEDLE_b0 = 0"), "{second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const CMD_GO: &str = "package cobra\n\ntype Command struct{}\n\nfunc (c *Command) MarkFlagRequired(name string) error {\n\treturn MarkFlagRequired(nil, name)\n}\n\nfunc MarkFlagRequired(flags *int, name string) error {\n\treturn nil\n}\n\nfunc (c *Command) enforce() {\n\tx := 1\n\t_ = c.MarkFlagRequired(\"a\")\n\t_ = x\n\t_ = c.MarkFlagRequired(\"b\")\n}\n";
+    const CMD_TEST_GO: &str = "package cobra\n\nimport \"testing\"\n\nfunc TestRequired(t *testing.T) {\n\tc := &Command{}\n\t_ = c.MarkFlagRequired(\"x\")\n}\n";
+
+    fn explain(name: &str, include_tests: Option<bool>) -> ExplainParams {
+        ExplainParams {
+            name: name.into(),
+            path_filter: None,
+            budget_tokens: 4000,
+            dedup: Some(false),
+            include_tests,
+            precise: None,
+        }
+    }
+
+    #[test]
+    fn explain_symbol_call_sites_qualified_and_tests_collapsed() {
+        let (server, dir) = smart_server(&[
+            ("command.go", CMD_GO.into()),
+            ("command_test.go", CMD_TEST_GO.into()),
+        ]);
+        let text = text_of(&server.explain_symbol(Parameters(explain("MarkFlagRequired", None))));
+        // Receiver-qualified headers keep the method and the function apart.
+        assert!(
+            text.contains("(*Command).MarkFlagRequired · command.go:5-7"),
+            "{text}"
+        );
+        assert!(
+            text.contains("function MarkFlagRequired · command.go:9-11"),
+            "{text}"
+        );
+        // One entry per call line, bound by call form: c.X( → method, X( → func.
+        assert!(
+            text.contains("@command.go:15  in (*Command).enforce → (*Command).MarkFlagRequired"),
+            "{text}"
+        );
+        assert!(
+            text.contains("@command.go:17  in (*Command).enforce → (*Command).MarkFlagRequired"),
+            "{text}"
+        );
+        assert!(
+            text.contains("@command.go:6  in (*Command).MarkFlagRequired → MarkFlagRequired │"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("@command.go:15  in (*Command).enforce → MarkFlagRequired │"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("@command.go:6  in (*Command).MarkFlagRequired → (*Command)"),
+            "{text}"
+        );
+        // Tests collapsed by default, listed (after code) on request.
+        assert!(text.contains("测试调用 1 处 / 1 个测试函数"), "{text}");
+        assert!(!text.contains("command_test.go:7"), "{text}");
+        let all =
+            text_of(&server.explain_symbol(Parameters(explain("MarkFlagRequired", Some(true)))));
+        let test_at = all.find("@command_test.go:7  in TestRequired").expect(&all);
+        assert!(all.find("@command.go:15").unwrap() < test_at, "{all}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn find(query: &str) -> QueryParams {
+        QueryParams {
+            query: query.into(),
+            include_body: true,
+            substring: Some(false),
+            path_filter: None,
+            kind: None,
+            depth: 0,
+            budget_tokens: 2500,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn find_symbol_bodies_and_repeat_search_are_deduplicated() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let first = text_of(&server.find_symbol(Parameters(find("compute"))));
+        assert!(first.contains("total *= 2"), "{first}");
+        let again = text_of(&server.find_symbol(Parameters(find("compute"))));
+        assert!(again.contains("已返回此定义体"), "{again}");
+        assert!(!again.contains("total *= 2"), "{again}");
+        // A search whose body find_symbol already sent references it.
+        let hit = text_of(&server.search_code(Parameters(search("marker_x"))));
+        assert!(hit.contains("已在本会话第"), "{hit}");
+        // The identical query again is not resent at all.
+        let repeat = text_of(&server.search_code(Parameters(search("marker_x"))));
+        assert!(repeat.contains("同一查询已在本会话第"), "{repeat}");
+        let mut fresh = search("marker_x");
+        fresh.dedup = Some(false);
+        let full = text_of(&server.search_code(Parameters(fresh)));
+        assert!(full.contains("@calc.py:4 marker_x = total - 1"), "{full}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_lists_data_fixture_hits_outside_path_filter() {
+        let (server, dir) = smart_server(&[
+            (
+                "core/frame.rs",
+                "pub fn code() -> &'static str {\n    \"E_SHORT\"\n}\n".into(),
+            ),
+            (
+                "proto/vectors/frames.json",
+                "[{\"expect_error\": \"E_SHORT\"},\n {\"expect_error\": \"E_SHORT\"}]\n".into(),
+            ),
+            ("docs/notes.md", "E_SHORT is mentioned in prose\n".into()),
+        ]);
+        let mut q = search("E_SHORT");
+        q.path_filter = Some("core".into());
+        let text = text_of(&server.search_code(Parameters(q)));
+        assert!(text.contains("@core/frame.rs:2"), "{text}");
+        assert!(
+            text.contains("path_filter 之外的数据/夹具文件中另有 2 处"),
+            "{text}"
+        );
+        assert!(text.contains("proto/vectors/frames.json: 行 1,2"), "{text}");
+        assert!(!text.contains("docs/notes.md"), "{text}");
+        let mut rx = search("E_SHORT");
+        rx.path_filter = Some("core".into());
+        rx.regex = true;
+        let regex = text_of(&server.search_code(Parameters(rx)));
+        assert!(!regex.contains("数据/夹具"), "{regex}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_symbol_returns_body_and_callers() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let params = || ExplainParams {
+            name: "compute".into(),
+            path_filter: None,
+            budget_tokens: 2500,
+            dedup: None,
+            include_tests: None,
+            precise: None,
+        };
+        let text = text_of(&server.explain_symbol(Parameters(params())));
+        assert!(
+            text.contains("── function compute · calc.py:1-5 ──"),
+            "{text}"
+        );
+        assert!(text.contains("marker_x = total - 1"), "{text}");
+        assert!(text.contains("非测试 1 处 / 1 个函数"), "{text}");
+        assert!(
+            text.contains("@calc.py:9  in caller │ return compute(1, 2)"),
+            "{text}"
+        );
+        let again = text_of(&server.explain_symbol(Parameters(params())));
+        assert!(again.contains("已返回此定义"), "{again}");
+        assert!(!again.contains("total *= 2"), "{again}");
+        let missing = text_of(&server.explain_symbol(Parameters(ExplainParams {
+            name: "nope".into(),
+            ..params()
+        })));
+        assert!(missing.contains("未找到名为 nope 的定义"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_code_context_lists_slim_catalog() {
+        let ctx = crate::ClientContext::builtin("claude-code").unwrap();
+        assert!(ctx.slim_catalog);
+        let slim = AstrolabeServer::new_with_cache_budget_and_context(
+            PathBuf::from("."),
+            DEFAULT_MEMORY_BUDGET_BYTES,
+            ctx,
+        );
+        let tools = slim.listed_tools();
+        let names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "search_code",
+                "find_symbol",
+                "explain_symbol",
+                "find_references",
+                "goto_definition"
+            ]
+        );
+        let full = AstrolabeServer::new_with_cache_budget_and_context(
+            PathBuf::from("."),
+            DEFAULT_MEMORY_BUDGET_BYTES,
+            crate::ClientContext::default_builtin(),
+        );
+        let bytes = |t: &[rmcp::model::Tool]| serde_json::to_string(t).unwrap().len();
+        assert!(
+            bytes(&tools) * 4 < bytes(&full.listed_tools()),
+            "slim catalog should be far smaller"
+        );
+        let search = tools.iter().find(|t| t.name == "search_code").unwrap();
+        let props = search
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(props.contains_key("path_filter") && !props.contains_key("budget_tokens"));
+        let info = slim.get_info();
+        let instructions = info.instructions.unwrap();
+        assert!(instructions.contains("explain_symbol"), "{instructions}");
+        assert!(
+            !instructions.contains("initial_instructions"),
+            "{instructions}"
+        );
+    }
+
     #[test]
     fn cache_budget_env_parsing() {
         assert_eq!(parse_cache_budget_mb(None), DEFAULT_MEMORY_BUDGET_BYTES);
@@ -3519,6 +4782,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: Some(false),
         };
 
         let first = server.search_code(Parameters(params.clone()));
@@ -3566,6 +4832,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 200,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
 
         let weighted = server.primary.file_cache.weighted_size();
@@ -3591,6 +4860,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3607,6 +4879,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("fresh-content"), "{text}");
@@ -3632,6 +4907,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: budget,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         result.content[0].as_text().unwrap().text.clone()
     }
@@ -3732,6 +5010,9 @@ mod tests {
         server.structured_output = false;
         let page = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
+                context_lines: Some(0),
+                page: false,
+                dedup: None,
                 query: "needle".into(),
                 regex: false,
                 path_filter: None,
@@ -3785,6 +5066,9 @@ mod tests {
         let (server, dir) = loop_guard_server(1);
         let at = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
+                context_lines: Some(0),
+                page: false,
+                dedup: None,
                 query: "needle-a".into(),
                 regex: false,
                 path_filter: None,
@@ -3858,6 +5142,9 @@ mod tests {
                 case_sensitive: None,
                 budget_tokens: 1000,
                 offset: 0,
+                context_lines: Some(0),
+                page: false,
+                dedup: None,
             }))
         };
         for _ in 0..3 {
@@ -3906,6 +5193,96 @@ mod tests {
         );
     }
 
+    fn hit(path: &str, line: usize) -> SearchHit {
+        SearchHit {
+            path: path.into(),
+            line,
+            text: format!("match{line}"),
+            text_only: false,
+        }
+    }
+
+    fn numbered(n: usize) -> Arc<Vec<String>> {
+        Arc::new((1..=n).map(|i| format!("line{i}")).collect())
+    }
+
+    #[test]
+    fn search_context_defaults_adapt_to_match_count() {
+        assert_eq!(search_context_lines(None, 1), 3);
+        assert_eq!(search_context_lines(None, 5), 3);
+        assert_eq!(search_context_lines(None, 6), 1);
+        assert_eq!(search_context_lines(None, 20), 1);
+        assert_eq!(search_context_lines(None, 21), 0);
+        assert_eq!(search_context_lines(Some(0), 1), 0);
+        assert_eq!(search_context_lines(Some(99), 1), MAX_SEARCH_CONTEXT);
+    }
+
+    #[test]
+    fn search_context_windows_merge_and_anchor_every_match() {
+        let lines = numbered(30);
+        let hits = vec![
+            hit("a.rs", 5),
+            hit("a.rs", 7),
+            hit("a.rs", 20),
+            hit("b.rs", 1),
+        ];
+        let (out, shown) = render_search_hits(&hits, 2, 10_000, &mut |_| Some(Arc::clone(&lines)));
+        assert_eq!(shown, 4);
+        let expected = "  3| line3\n  4| line4\n@a.rs:5 match5\n  6| line6\n@a.rs:7 match7\n  8| line8\n  9| line9\n  …\n  18| line18\n  19| line19\n@a.rs:20 match20\n  21| line21\n  22| line22\n@b.rs:1 match1\n  2| line2\n  3| line3\n";
+        assert_eq!(out, expected);
+        // Each source line at most once per file window.
+        assert_eq!(out.matches("  6| ").count(), 1);
+    }
+
+    #[test]
+    fn search_context_zero_is_bare_anchor_lines() {
+        let hits = vec![hit("a.rs", 5), hit("a.rs", 7)];
+        let (out, shown) = render_search_hits(&hits, 0, 10_000, &mut |_| panic!("not read"));
+        assert_eq!(shown, 2);
+        assert_eq!(out, "@a.rs:5 match5\n@a.rs:7 match7\n");
+    }
+
+    #[test]
+    fn search_context_respects_budget_and_falls_back_to_bare_lines() {
+        let lines = numbered(400);
+        let hits: Vec<_> = (1..=40).map(|i| hit("a.rs", i * 10)).collect();
+        let (out, shown) = render_search_hits(&hits, 3, 120, &mut |_| Some(Arc::clone(&lines)));
+        assert!(shown > 0 && shown < 40, "{shown}");
+        assert!(estimate_tokens(&out) <= 120, "{}", estimate_tokens(&out));
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("@a.rs:")).count(),
+            shown
+        );
+    }
+
+    #[test]
+    fn search_code_shows_context_by_default_for_narrow_queries() {
+        let (server, dir) = ready_server_with_disk();
+        let params = |context_lines| SearchParams {
+            query: "cache-me".into(),
+            regex: false,
+            path_filter: None,
+            case_sensitive: None,
+            budget_tokens: 1000,
+            offset: 0,
+            context_lines,
+            page: false,
+            dedup: None,
+        };
+        let result = server.search_code(Parameters(params(None)));
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            text.contains("  1| def greet():\n@hello.py:2 return 'cache-me'"),
+            "{text}"
+        );
+        assert!(text.contains("上下文：每处命中前后 3 行"), "{text}");
+        let bare = server.search_code(Parameters(params(Some(0))));
+        let bare = bare.content[0].as_text().unwrap().text.as_str();
+        assert!(!bare.contains("1| def greet"), "{bare}");
+        assert!(bare.contains("@hello.py:2 return 'cache-me'"), "{bare}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn search_code_empty_result_states_no_match_explicitly() {
         let (server, dir) = ready_server_with_disk();
@@ -3916,6 +5293,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         // 零命中必须显式声明，避免"只剩元信息、疑似服务故障"的歧义输出。
@@ -3941,6 +5321,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 1000,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -3975,6 +5358,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 20,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -4171,6 +5557,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         assert_eq!(result.is_error, Some(true));
         assert!(
@@ -4814,6 +6203,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
@@ -4842,6 +6234,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
             .as_text()
@@ -4866,6 +6261,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let filter_miss_text = search_filter_miss.content[0]
             .as_text()
@@ -4959,6 +6357,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
         assert!(dart_text.contains("@service.dart:2"), "{dart_text}");
@@ -4982,6 +6383,9 @@ mod tests {
             case_sensitive: cs,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         (text, result.structured_content.expect("structured"))
@@ -5142,6 +6546,9 @@ mod tests {
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
+            context_lines: Some(0),
+            page: false,
+            dedup: None,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(

@@ -43,6 +43,10 @@ pub struct ClientContext {
     pub structured_tool_output: Option<bool>,
     pub excluded_tools: Vec<String>,
     pub notes: String,
+    /// Expose a minimal, terse tool catalog (claude-code): fewer tools and
+    /// shorter schemas, so every request carries less tool-definition text.
+    /// `ASTROLABE_FULL_CATALOG=1` turns it off.
+    pub slim_catalog: bool,
 }
 
 impl ClientContext {
@@ -86,6 +90,15 @@ impl ClientContext {
                 Self::builtin_names().join(", ")
             )
         })
+    }
+
+    /// `slim_catalog` unless `ASTROLABE_FULL_CATALOG=1`.
+    pub fn slim(&self) -> bool {
+        self.slim_catalog
+            && !matches!(
+                std::env::var("ASTROLABE_FULL_CATALOG").as_deref(),
+                Ok("1") | Ok("true")
+            )
     }
 
     pub fn excludes(&self, tool: &str) -> bool {
@@ -134,6 +147,7 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
     let mut excluded_tools = Vec::new();
     let mut list_key: Option<String> = None;
     let mut saw_structured = false;
+    let mut slim_catalog = false;
 
     for (idx, raw) in src.lines().enumerate() {
         let line_no = idx + 1;
@@ -173,6 +187,11 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
                     anyhow::anyhow!("line {line_no}: structured_tool_output: {err}")
                 })?;
             }
+            "slim_catalog" => {
+                slim_catalog = parse_bool_or_null(rest)
+                    .map_err(|err| anyhow::anyhow!("line {line_no}: slim_catalog: {err}"))?
+                    .unwrap_or(false);
+            }
             "excluded_tools" => {
                 // Re-key clears previous entries so the last block wins.
                 excluded_tools.clear();
@@ -208,6 +227,7 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
         structured_tool_output,
         excluded_tools,
         notes,
+        slim_catalog,
     })
 }
 

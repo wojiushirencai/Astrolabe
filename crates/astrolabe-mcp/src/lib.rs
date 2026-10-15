@@ -10,6 +10,7 @@
 mod cli;
 mod context;
 mod ensure_ls;
+mod explain;
 mod knobs;
 mod session;
 // hooks / instructions 对 bin（main.rs 的子命令分发）公开：hook 协议入口
@@ -26,6 +27,7 @@ mod reindex;
 mod root;
 pub mod roots;
 mod server;
+mod slim;
 
 pub use cli::{parse_launch, Launch, USAGE};
 pub use context::{resolve_context_name, ClientContext};
@@ -42,6 +44,6 @@ pub const TOOL_CATALOG_TTL_MS: u64 = 86_400_000;
 /// `goto_definition`/`get_diagnostics`/`get_symbol_info`/`plan_rename`/
 /// `apply_rename`), the `initial_instructions` bootstrap tool, the four
 /// memory tools, and `ensure_language_server` (session-gated install UX).
-pub const TOOL_COUNT: usize = 10 + PRECISE_TOOL_COUNT + 1 + 4 + 1;
+pub const TOOL_COUNT: usize = 10 + PRECISE_TOOL_COUNT + 1 + 4 + 1 + 1;
 /// Language-server-backed tools defined in `precise_tools`, mounted on the server.
 pub const PRECISE_TOOL_COUNT: usize = 6;

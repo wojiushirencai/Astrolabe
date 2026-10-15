@@ -292,6 +292,10 @@ fn server_language_from_opt_path(
 }
 
 impl PreciseCapability for LiveBackend {
+    fn is_warm(&self, path: &str) -> bool {
+        server_language(&self.root, path).is_some_and(|lang| self.pool.is_resident(lang))
+    }
+
     fn files_changed(&self, changes: &astrolabe_core::watch::ChangeSet) {
         use astrolabe_core::lsp::{FileChange, FileChangeKind};
         use astrolabe_core::watch::ChangeKind;
