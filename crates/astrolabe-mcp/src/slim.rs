@@ -15,12 +15,13 @@ type SlimTool = (
 pub(crate) const SLIM_TOOLS: &[SlimTool] = &[
     (
         "search_code",
-        "Literal (or regex=true) search over the repo. Few hits: each comes inside its enclosing function/class body, so no follow-up Read. Many hits: per-file counts; narrow with path_filter. offset pages.",
+        "Literal (or regex=true) search over the repo. Few hits: each comes inside its enclosing function/class body, so no follow-up Read. Many hits: counts plus top hits; narrow with path_filter. group=true: per-file, code vs tests, assert/load tags. offset pages.",
         &[
             ("query", "Text to find (literal unless regex=true)"),
             ("regex", "Treat query as regex"),
             ("path_filter", "Repo-relative path substring, e.g. src/api"),
             ("offset", "Page start (next_offset from a previous page)"),
+            ("group", "Group by file: code first, tests last, tagged assert/load (who asserts or loads this literal)"),
             ("context_lines", "Fixed lines of context instead of the automatic body/lines"),
         ],
     ),

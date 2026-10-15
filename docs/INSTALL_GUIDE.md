@@ -242,3 +242,24 @@ Hook 的读源码拦截按 41 个受支持扩展名判断（含上表的 `.kt` /
 | `opencode` | 宿主传入 tool 名称及 shell 命令 | 扁平 `{"decision":"deny","reason":...}` | `default`（温和级） | 插件桥接（.opencode/plugins/astrolabe-guard.ts TS 插件拦截） |
 | `codex` | shell grep/read 命令 | 结构化 `permissionDecision` | `codex` | 官方支持 |
 | `vscode` / `other` | 通用子串包含匹配 | 结构化 `hookSpecificOutput` | `default` | 通用回退 |
+
+## 可选：重复 Read 拦截（Claude Code，`hooks read-guard`，默认关闭）
+
+作用：模型常在 `search_code` / `explain_symbol` / `find_symbol include_body` 已经返回某段代码之后，又用 `Read` 读同一行区间。开启后，这类 `Read` 在 PreToolUse 阶段先得到一个指针，而不是再付一次同样的 token。
+
+**开启（两处都要带同一个环境变量）**
+
+1. MCP 服务端（记录已返回的区间，写在 `~/.astrolabe/served/<pid>.jsonl`，进程退出即删）：
+   ```json
+   {"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=claude-code"],"env":{"ASTROLABE_READ_HOOK":"1"}}}}
+   ```
+2. hook（`~/.claude/settings.json` 或项目 `.claude/settings.json`），hook 进程同样需要环境变量，可直接写在命令里：
+   ```json
+   {"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"ASTROLABE_READ_HOOK=1 astrolabe hooks read-guard"}]}]}}
+   ```
+
+**模式**（`ASTROLABE_READ_HOOK`）：`1` / `once`（默认）= deny-once；`warn` = 只加提示、从不拒绝；未设置 / `0` / `off` = 关闭。`ASTROLABE_READ_HOOK_MIN_LINES`（默认 10）：不足这个行数的 Read 不拦。
+
+**为什么不会挡住编辑**：Claude Code 要求 `Edit` 之前同一文件有过 `Read`。deny-once 只拒绝第一次，并在提示里写明“如果需要这次 Read（例如要编辑），原样重发即可”；同一会话里**完全相同**的 Read 第二次一定放行。代价是需要编辑时多一轮对话，不会失去编辑能力。拿不准时一律放行：没有记录、文件已改动（mtime 或大小变了）、请求区间只被部分覆盖、整文件 Read、少于最小行数、同一仓库有两个在线 MCP 进程（无法判断是哪个会话的结果）、payload 没有 session_id（记不住拒绝状态）。
+
+**覆盖范围**：只记录符号体整段返回的区间（search_code 少量命中展开的所在函数/类型、explain_symbol 的定义体、find_symbol include_body 完整附上的体）。上下文行窗口、被截断的体、被去重引用替代的体不计入（去重引用对应的区间在首次返回时已记录）。
