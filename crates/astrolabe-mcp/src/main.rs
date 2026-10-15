@@ -62,9 +62,6 @@ async fn main() -> anyhow::Result<()> {
         Launch::HooksRemind { client } => {
             std::process::exit(astrolabe_mcp::hooks::run_remind(&client));
         }
-        Launch::HooksReadGuard => {
-            std::process::exit(astrolabe_mcp::read_guard::run_read_guard());
-        }
         Launch::HooksCleanup => {
             std::process::exit(astrolabe_mcp::hooks::run_cleanup());
         }

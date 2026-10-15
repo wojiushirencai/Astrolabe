@@ -1266,9 +1266,9 @@ pub(crate) struct SearchParams {
     pub page: bool,
     #[serde(default)]
     #[schemars(
-        description = "Group hits by file, production code first then tests, each hit tagged [断言]/[引用] (tests) or [加载]/[定义]/[使用] (code) with its enclosing function. Use for 'who asserts or loads this literal' (config keys, error strings, route paths)."
+        description = "Group hits per file (production code first, then tests; each hit tagged [断言]/[引用] or [加载]/[定义]/[使用] with its enclosing function). Use it BEFORE editing or renaming a literal, or before asserting on it, to see who loads and who asserts it. Automatic (when omitted) if more than 5 hits span more than 3 files; false forces the plain list."
     )]
-    pub group: bool,
+    pub group: Option<bool>,
     #[serde(default)]
     #[schemars(
         description = "Default true: a symbol body already returned earlier in this session (file unchanged) is referenced by location instead of resent. false resends it."
@@ -1384,8 +1384,6 @@ pub struct AstrolabeServer {
     /// and the ordinal of the call that sent them.
     sent_ranges: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     call_seq: Arc<AtomicU64>,
-    /// Opt-in (`ASTROLABE_READ_HOOK`): ranges returned, for `hooks read-guard`.
-    served: Arc<crate::read_guard::ServedLog>,
 }
 
 impl AstrolabeServer {
@@ -1503,7 +1501,6 @@ impl AstrolabeServer {
             tool_router: Self::tool_router(),
             sent_ranges: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
-            served: Arc::new(crate::read_guard::ServedLog::new(&root)),
         }
     }
 
@@ -2019,7 +2016,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings. Also the right tool for who-calls / who-uses-X questions: one call returns every call site, instead of search_code on the name and Reading each hit."
+        description = "Prefer this over Grep/Read for code. 精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings. Also the right tool for who-calls / who-uses-X questions: one call returns every call site, instead of search_code on the name and Reading each hit."
     )]
     pub(crate) fn find_references(
         &self,
@@ -2032,7 +2029,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "精确定义跳转：语言服务器绑定解析；不要用 find_symbol 代替（那是句法名字匹配）。LSP Unavailable → ask user, then ensure_language_server. The sanctioned way to resolve a definition — not Read/grep."
+        description = "Prefer this over Grep/Read for code. 精确定义跳转：语言服务器绑定解析；不要用 find_symbol 代替（那是句法名字匹配）。LSP Unavailable → ask user, then ensure_language_server. The sanctioned way to resolve a definition — not Read/grep."
     )]
     pub(crate) fn goto_definition(
         &self,
@@ -2058,7 +2055,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "符号语义信息（LSP hover：docstring/类型/签名）。LSP Unavailable → ensure_language_server (ask user first). Docstrings without reading the file — pair with find_symbol anchors."
+        description = "Prefer this over Grep/Read for code. 符号语义信息（LSP hover：docstring/类型/签名）。LSP Unavailable → ensure_language_server (ask user first). Docstrings without reading the file — pair with find_symbol anchors."
     )]
     pub(crate) fn get_symbol_info(
         &self,
@@ -2127,7 +2124,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer over Read for locating symbols — no whole-file reads needed. Need the code itself? Pass include_body=true to get the full body of each hit (function, method, class) in the same call instead of search_code + Read. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
+        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer this over Grep/Read for code. Results are exhaustive for indexed languages: every symbol matching the name is listed (total/next_offset declare truncation), no need to re-grep the same name. Prefer over Read for locating symbols — no whole-file reads needed. Need the code itself? Pass include_body=true to get the full body of each hit (function, method, class) in the same call instead of search_code + Read. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -2264,7 +2261,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Search repository text for a literal substring (default) or a regex when regex=true. Returns each match as a path:line anchor plus a few surrounding source lines (context_lines; adaptive default, overlapping windows merged), so the answer is usually visible without a follow-up Read. Best for literals (strings, error messages, config keys, routes): set path_filter to the directory you care about. For a named function/class body use find_symbol include_body=true; for callers/usages use find_references. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
+        description = "Prefer this over Grep/Read for code. Results are exhaustive: every match of the literal in the scanned files is counted (total=; truncation is declared), so do not re-grep the same literal. Search repository text for a literal substring (default) or a regex when regex=true. Returns each match as a path:line anchor plus a few surrounding source lines (context_lines; adaptive default, overlapping windows merged), so the answer is usually visible without a follow-up Read. Best for literals (strings, error messages, config keys, routes): set path_filter to the directory you care about. Before editing or renaming a literal, or asserting on it, use group=true (also automatic when more than 5 hits span more than 3 files) to see who loads and who asserts it. For a named function/class body use find_symbol include_body=true; for callers/usages use find_references. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
     )]
     pub(crate) fn search_code(
         &self,
@@ -2420,7 +2417,19 @@ impl AstrolabeServer {
                 let remaining = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS);
                 let total = matches.len();
                 let offset = params.offset.min(total);
-                if params.group && total > 0 {
+                let auto_group = params.group.is_none()
+                    && params.context_lines.is_none()
+                    && !params.page
+                    && params.offset == 0
+                    && total > smart_body_max_hits()
+                    && total <= broad_hits()
+                    && matches
+                        .iter()
+                        .map(|m| m.path.as_str())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        > 3;
+                if (params.group == Some(true) || auto_group) && total > 0 {
                     let (grouped, shown) = render_grouped_hits(
                         index,
                         &matches,
@@ -2549,7 +2558,6 @@ impl AstrolabeServer {
                             (*start, *end),
                             generation,
                             call,
-                            "search_code",
                         );
                     }
                 }
@@ -2688,7 +2696,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "One call for a named function/method/type: its definition body (up to 3 same-named definitions, receiver/type-qualified) plus every call site as path:line with the calling function and the code line. Non-test call sites first; test call sites are collapsed to a count unless include_tests=true. Call sites come from the language server when it is already running (exact), otherwise from the syntactic call graph filtered by call form (method vs function). Use instead of find_symbol + search_code + Read; for the precise set before an edit use find_references."
+        description = "Prefer this over Grep/Read for code. One call for a named function/method/type: its definition body (up to 3 same-named definitions, receiver/type-qualified) plus every call site as path:line with the calling function and the code line. Non-test call sites first; test call sites are collapsed to a count unless include_tests=true. Call sites come from the language server when it is already running (exact), otherwise from the syntactic call graph filtered by call form (method vs function). Use instead of find_symbol + search_code + Read; for the precise set before an edit use find_references."
     )]
     pub(crate) fn explain_symbol(
         &self,
@@ -2768,7 +2776,6 @@ impl AstrolabeServer {
                                 (def.start_line, def.end_line),
                                 generation,
                                 call,
-                                "explain_symbol",
                             );
                         }
                         if used + estimate_tokens(&text) > body_budget.max(used + 1) && body_budget > 0 {
@@ -2845,7 +2852,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "追踪名字匹配得到的调用者/被调用者；结果是 syntactic，必须核验动态分派。For the precise set use find_references."
+        description = "Prefer this over Grep/Read for code. 追踪名字匹配得到的调用者/被调用者；结果是 syntactic，必须核验动态分派。For the precise set use find_references."
     )]
     pub(crate) fn trace_calls(
         &self,
@@ -3188,22 +3195,12 @@ impl AstrolabeServer {
     }
 
     /// Remember a range as fully returned (dedup table + opt-in served log).
-    fn commit_sent(
-        &self,
-        root: &Path,
-        path: &str,
-        range: (u32, u32),
-        generation: u64,
-        call: u64,
-        tool: &str,
-    ) {
+    fn commit_sent(&self, root: &Path, path: &str, range: (u32, u32), generation: u64, call: u64) {
         let key = format!("{}|{path}:{}-{}", root.display(), range.0, range.1);
         self.sent_ranges
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key, (generation, call));
-        self.served
-            .record(&root.join(path), range.0, range.1, tool, call);
     }
 
     /// include_body：对展示列表（kept）前 5 个符号附源码体，头带
@@ -3303,7 +3300,6 @@ impl AstrolabeServer {
                         (symbol.start_line, symbol.end_line),
                         generation,
                         call,
-                        "find_symbol",
                     );
                 }
                 _ => {
@@ -4418,7 +4414,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         })));
         assert_first_text(server.get_dependents(Parameters(DependentsParams {
@@ -4681,7 +4677,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
@@ -4722,7 +4718,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -4868,7 +4864,7 @@ mod tests {
             offset: 0,
             context_lines: None,
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }
     }
@@ -5214,7 +5210,7 @@ mod tests {
             ),
         ]);
         let mut p = search("MAGIC_KEY");
-        p.group = true;
+        p.group = Some(true);
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(text.contains("grouped=true total=4"), "{text}");
         let prod = text.find("## 生产代码（2 处 / 1 个文件）").expect(&text);
@@ -5237,48 +5233,102 @@ mod tests {
     }
 
     #[test]
-    fn served_log_records_only_bodies_that_shipped() {
-        let (mut server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let home = unique_temp_dir();
-        server.served = Arc::new(crate::read_guard::ServedLog::with_dir(
-            &std::fs::canonicalize(&dir).unwrap(),
-            Some(home.join("served")),
-        ));
-        let log_lines = || -> Vec<String> {
-            std::fs::read_dir(home.join("served"))
-                .map(|rd| {
-                    rd.flatten()
-                        .flat_map(|e| {
-                            std::fs::read_to_string(e.path())
-                                .unwrap()
-                                .lines()
-                                .skip(1)
-                                .map(str::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        // Budget too small for the body: falls back to line context, nothing recorded.
+    fn dedup_marks_only_bodies_that_actually_shipped() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        // Budget too small for the body: falls back to line context.
         let mut tiny = search("marker_x");
         tiny.budget_tokens = 1;
-        let _ = server.search_code(Parameters(tiny));
-        assert!(log_lines().is_empty(), "{:?}", log_lines());
-        // Normal call records the enclosing symbol range 1-5.
-        let _ = server.search_code(Parameters(search("marker_x")));
-        let lines = log_lines();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("\"start\":1,\"end\":5"), "{lines:?}");
-        assert!(lines[0].contains("\"tool\":\"search_code\""), "{lines:?}");
-        // explain_symbol adds its definition (same range, now deduped => no new line).
-        let _ = server.explain_symbol(Parameters(ExplainParams {
-            dedup: None,
-            ..explain("caller", None)
-        }));
-        assert_eq!(log_lines().len(), 2, "{:?}", log_lines());
+        let first = text_of(&server.search_code(Parameters(tiny)));
+        assert!(!first.contains("── function compute"), "{first}");
+        // The body never shipped, so it must not be replaced by a pointer.
+        let second = text_of(&server.search_code(Parameters(search("marker_x"))));
+        assert!(
+            second.contains("── function compute · calc.py:1-5 ──"),
+            "{second}"
+        );
+        assert!(!second.contains("已在本会话"), "{second}");
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn search_code_auto_groups_when_hits_span_more_than_three_files() {
+        let files: Vec<(String, String)> = (0..4)
+            .map(|i| (format!("pkg/f{i}.py"), format!("def f{i}():\n    return 'AUTO_KEY'\n\n\ndef g{i}():\n    return 'AUTO_KEY'\n")))
+            .collect();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(n, t)| (n.as_str(), t.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let text = text_of(&server.search_code(Parameters(search("AUTO_KEY"))));
+        assert!(text.contains("grouped=true total=8"), "{text}");
+        // Explicit false forces the plain list.
+        let mut plain = search("AUTO_KEY");
+        plain.group = Some(false);
+        let plain = text_of(&server.search_code(Parameters(plain)));
+        assert!(!plain.contains("grouped=true"), "{plain}");
+        // Few files: no auto grouping.
+        let (server2, dir2) = smart_server(&refs[..3]);
+        let three = text_of(&server2.search_code(Parameters(search("AUTO_KEY"))));
+        assert!(!three.contains("grouped=true"), "{three}");
+        // Few hits (<=5) keep enclosing bodies even across many files.
+        let (server3, dir3) = smart_server(&refs);
+        let few = text_of(&server3.search_code(Parameters(search("def f"))));
+        assert!(!few.contains("grouped=true"), "{few}");
+        for d in [dir, dir2, dir3] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn tool_descriptions_carry_prefer_over_grep_and_exhaustive_guidance() {
+        let full = AstrolabeServer::new_with_cache_budget_and_context(
+            PathBuf::from("."),
+            DEFAULT_MEMORY_BUDGET_BYTES,
+            crate::ClientContext::default_builtin(),
+        );
+        for tool in full.listed_tools() {
+            if [
+                "search_code",
+                "find_symbol",
+                "explain_symbol",
+                "find_references",
+                "goto_definition",
+            ]
+            .contains(&tool.name.as_ref())
+            {
+                let d = tool.description.as_deref().unwrap_or("");
+                assert!(
+                    d.contains("Prefer this over Grep/Read for code"),
+                    "{}: {d}",
+                    tool.name
+                );
+            }
+        }
+        let slim = AstrolabeServer::new_with_cache_budget_and_context(
+            PathBuf::from("."),
+            DEFAULT_MEMORY_BUDGET_BYTES,
+            crate::ClientContext::builtin("claude-code").unwrap(),
+        );
+        let tools = slim.listed_tools();
+        for tool in &tools {
+            let d = tool.description.as_deref().unwrap_or("");
+            assert!(d.contains("over Grep/Read for code"), "{}: {d}", tool.name);
+        }
+        let desc = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap()
+                .description
+                .as_deref()
+                .unwrap()
+                .to_string()
+        };
+        assert!(desc("search_code").contains("never re-grep"));
+        assert!(desc("search_code").contains("before editing/renaming a literal"));
+        assert!(desc("find_symbol").contains("no need to re-grep"));
+        let instructions = slim.get_info().instructions.unwrap();
+        assert!(instructions.contains("don't re-grep"), "{instructions}");
+        assert!(instructions.contains("group=true"), "{instructions}");
     }
 
     #[test]
@@ -5322,7 +5372,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: Some(false),
         };
 
@@ -5373,7 +5423,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
 
@@ -5402,7 +5452,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
 
@@ -5422,7 +5472,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
@@ -5451,7 +5501,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         result.content[0].as_text().unwrap().text.clone()
@@ -5555,7 +5605,7 @@ mod tests {
             let r = server.search_code(Parameters(SearchParams {
                 context_lines: Some(0),
                 page: false,
-                group: false,
+                group: None,
                 dedup: None,
                 query: "needle".into(),
                 regex: false,
@@ -5612,7 +5662,7 @@ mod tests {
             let r = server.search_code(Parameters(SearchParams {
                 context_lines: Some(0),
                 page: false,
-                group: false,
+                group: None,
                 dedup: None,
                 query: "needle-a".into(),
                 regex: false,
@@ -5689,7 +5739,7 @@ mod tests {
                 offset: 0,
                 context_lines: Some(0),
                 page: false,
-                group: false,
+                group: None,
                 dedup: None,
             }))
         };
@@ -5813,7 +5863,7 @@ mod tests {
             offset: 0,
             context_lines,
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         };
         let result = server.search_code(Parameters(params(None)));
@@ -5842,7 +5892,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -5871,7 +5921,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -5909,7 +5959,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -6109,7 +6159,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         assert_eq!(result.is_error, Some(true));
@@ -6756,7 +6806,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
@@ -6788,7 +6838,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
@@ -6816,7 +6866,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let filter_miss_text = search_filter_miss.content[0]
@@ -6913,7 +6963,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
@@ -6940,7 +6990,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
@@ -7104,7 +7154,7 @@ mod tests {
             offset: 0,
             context_lines: Some(0),
             page: false,
-            group: false,
+            group: None,
             dedup: None,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();

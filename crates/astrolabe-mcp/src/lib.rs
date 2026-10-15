@@ -23,7 +23,6 @@ mod loop_guard;
 mod memory;
 mod openai_schema;
 mod precise_tools;
-pub mod read_guard;
 mod reindex;
 mod root;
 pub mod roots;

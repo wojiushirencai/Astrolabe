@@ -31,10 +31,6 @@ ROOT 优先级：位置参数 → ASTROLABE_ROOT → .（从 cwd 探测）
                                （grokbuild/grok-build 亦映射为 grok；
                                 kimi-code/kimi_code/kimi→kimicode，z-code/zai→zcode，
                                 cursor-agent/cursor_agent/cursor-cli→cursor）
-  hooks read-guard             PreToolUse(Read) hook（需 ASTROLABE_READ_HOOK=1|once|warn 才生效）：
-                               请求的行区间已被 Astrolabe 完整返回过且文件未改动时，
-                               首次 Read 给出指针（deny-once；原样重发即放行，不妨碍 Edit）；
-                               warn 模式只提示。MCP 服务端需带同一环境变量以记录已返回区间。
   hooks cleanup                SessionEnd hook：按 stdin session_id 清理状态目录
   hooks gc                     清理超过 24h（ASTROLABE_HOOK_GC_HOURS 可调）未活动的
                                会话状态目录；remind 也会每小时机会式执行一次
@@ -51,8 +47,6 @@ pub enum Launch {
         client: String,
     },
     HooksCleanup,
-    /// `hooks read-guard`: opt-in PreToolUse(Read) guard (ASTROLABE_READ_HOOK)
-    HooksReadGuard,
     /// `hooks gc`：清理过期会话状态目录
     HooksGc,
     PrintCcSystemPromptOverride,
@@ -176,7 +170,7 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
         }
     }
     let Some(sub) = rest.first() else {
-        anyhow::bail!("hooks requires a subcommand: remind | read-guard | cleanup | gc\n{USAGE}");
+        anyhow::bail!("hooks requires a subcommand: remind | cleanup | gc\n{USAGE}");
     };
     match sub.to_string_lossy().as_ref() {
         "remind" => {
@@ -198,15 +192,6 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
             Ok(Launch::HooksRemind {
                 client: client.unwrap_or_else(|| "claude-code".to_string()),
             })
-        }
-        "read-guard" => {
-            if rest.len() > 1 {
-                anyhow::bail!(
-                    "unexpected extra argument: {}\n{USAGE}",
-                    rest[1].to_string_lossy()
-                );
-            }
-            Ok(Launch::HooksReadGuard)
         }
         "cleanup" => {
             if rest.len() > 1 {
@@ -274,20 +259,6 @@ mod tests {
         ));
         assert!(parse_launch_from(
             ["astrolabe", "hooks", "gc", "x"].iter().copied(),
-            None,
-            None
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn hooks_read_guard_subcommand() {
-        assert!(matches!(
-            parse(&["astrolabe", "hooks", "read-guard"]),
-            Launch::HooksReadGuard
-        ));
-        assert!(parse_launch_from(
-            ["astrolabe", "hooks", "read-guard", "x"].iter().copied(),
             None,
             None
         )

@@ -15,19 +15,19 @@ type SlimTool = (
 pub(crate) const SLIM_TOOLS: &[SlimTool] = &[
     (
         "search_code",
-        "Literal (or regex=true) search over the repo. Few hits: each comes inside its enclosing function/class body, so no follow-up Read. Many hits: counts plus top hits; narrow with path_filter. group=true: per-file, code vs tests, assert/load tags. offset pages.",
+        "Prefer over Grep/Read for code. Exhaustive literal (or regex=true) search: total= is the full count, so never re-grep the same literal. Few hits come inside their enclosing function (no Read). >3 files: auto-grouped code vs tests with assert/load tags; use group=true before editing/renaming a literal or asserting on it. Many hits: counts + top hits; narrow with path_filter.",
         &[
             ("query", "Text to find (literal unless regex=true)"),
             ("regex", "Treat query as regex"),
             ("path_filter", "Repo-relative path substring, e.g. src/api"),
             ("offset", "Page start (next_offset from a previous page)"),
-            ("group", "Group by file: code first, tests last, tagged assert/load (who asserts or loads this literal)"),
+            ("group", "Group per file, code then tests, tagged assert/load. Use before editing/renaming a literal or asserting on it; auto when >3 files"),
             ("context_lines", "Fixed lines of context instead of the automatic body/lines"),
         ],
     ),
     (
         "find_symbol",
-        "Find definitions by name. include_body=true returns the full bodies (use instead of Read).",
+        "Prefer over Grep/Read for code. Exhaustive: lists every symbol matching the name, so no need to re-grep it. include_body=true returns full bodies (use instead of Read).",
         &[
             ("query", "Symbol name or substring"),
             ("include_body", "Return source bodies"),
@@ -37,7 +37,7 @@ pub(crate) const SLIM_TOOLS: &[SlimTool] = &[
     ),
     (
         "explain_symbol",
-        "One call for a named symbol: definition body plus every call site (path:line + code line, non-test first; tests collapsed). Prefer over find_symbol + search_code + Read.",
+        "Prefer over Grep/Read for code. One call for a named symbol: definition body plus every call site (path:line + code line, non-test first; tests collapsed); replaces find_symbol + search_code + Read.",
         &[
             ("name", "Exact symbol name"),
             ("path_filter", "Repo-relative path substring to pick a definition"),
@@ -46,7 +46,7 @@ pub(crate) const SLIM_TOOLS: &[SlimTool] = &[
     ),
     (
         "find_references",
-        "Precise references/callers via the language server. Use for edits and renames.",
+        "Prefer over Grep/Read for code. Precise references/callers via the language server. Use for edits and renames.",
         &[
             ("symbol", "Symbol name"),
             ("path", "Repo-relative file declaring or using it"),
@@ -54,7 +54,7 @@ pub(crate) const SLIM_TOOLS: &[SlimTool] = &[
     ),
     (
         "goto_definition",
-        "Precise definition of the symbol at path:line:character (0-based).",
+        "Prefer over Grep/Read for code. Precise definition of the symbol at path:line:character (0-based).",
         &[
             ("path", "Repo-relative file"),
             ("line", "0-based line"),
@@ -120,7 +120,8 @@ pub(crate) fn slim_instructions(root: &std::path::Path) -> String {
         "Astrolabe indexes this repo ({}). Prefer it over Grep/Read for code:\n\
          - a named function/class: {named}\n\
          - callers/usages for an edit: find_references\n\
-         - literals (strings, errors, keys): search_code with path_filter; few hits arrive inside their enclosing body — don't Read again\n\
+         - literals (strings, errors, keys): search_code with path_filter; results are exhaustive (total= is the full count), so don't re-grep the same literal; few hits arrive inside their enclosing body — don't Read again\n\
+         - before editing/renaming a literal or asserting on it: search_code group=true (automatic when hits span >3 files) shows who loads and who asserts it\n\
          - many hits: search_code returns per-file counts; narrow path_filter instead of paging\n\
          Bodies already sent this session are referenced by location, not resent.",
         root.display(),

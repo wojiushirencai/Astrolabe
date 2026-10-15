@@ -359,7 +359,7 @@ pub(crate) enum Decision {
 }
 
 /// 获取秒级 UNIX 时间戳
-pub(crate) fn current_timestamp() -> f64 {
+fn current_timestamp() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -367,7 +367,7 @@ pub(crate) fn current_timestamp() -> f64 {
 }
 
 /// 读取用户主目录
-pub(crate) fn get_user_home() -> Option<PathBuf> {
+fn get_user_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().and_then(|h| {
         let trimmed = h.trim();
         if trimmed.is_empty() {
@@ -429,7 +429,7 @@ fn sanitize_agent_component(raw: &str) -> String {
 ///
 /// `session_id` 必须通过 [`sanitize_session_id`]；失败时返回错误信息。
 /// agent 分量由 [`sanitize_agent_component`] 收敛，永不失败。
-pub(crate) fn get_hook_data_dir(
+fn get_hook_data_dir(
     home: &Path,
     session_id: &str,
     agent_id: Option<&str>,
