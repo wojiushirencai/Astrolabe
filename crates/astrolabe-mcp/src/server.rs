@@ -493,6 +493,153 @@ fn enclosing_symbol(index: &RepoIndex, path: &str, line: usize) -> Option<CodeSy
         .cloned()
 }
 
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    ["test", "spec", "mock", "fixture", "__snapshots__", "e2e"]
+        .iter()
+        .any(|m| lower.contains(m))
+        || [
+            "docs/",
+            "doc/",
+            "examples/",
+            "example/",
+            "scripts/",
+            "probe",
+            "vendor/",
+            "third_party/",
+        ]
+        .iter()
+        .any(|m| lower.starts_with(m) || lower.contains(&format!("/{m}")))
+}
+
+/// Order broad-query hits for the preview: definition lines first, other
+/// non-test hits next, test/docs/example files last (stable within each class).
+fn rank_broad_hits<'a>(index: &RepoIndex, hits: &'a [SearchHit]) -> Vec<&'a SearchHit> {
+    let defs: std::collections::HashSet<(FileId, u32)> = index
+        .graph()
+        .symbols
+        .iter()
+        .filter(|s| {
+            !matches!(
+                s.kind,
+                astrolabe_core::SymbolKind::Variable
+                    | astrolabe_core::SymbolKind::Field
+                    | astrolabe_core::SymbolKind::Const
+            )
+        })
+        .map(|s| (s.file, s.start_line))
+        .collect();
+    let mut ranked: Vec<(u8, usize, &SearchHit)> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let class = if is_test_path(&h.path) {
+                2
+            } else if !h.text_only
+                && index
+                    .file_id(&h.path)
+                    .is_some_and(|f| defs.contains(&(f, h.line as u32)))
+            {
+                0
+            } else {
+                1
+            };
+            (class, i, h)
+        })
+        .collect();
+    ranked.sort_by_key(|(c, i, _)| (*c, *i));
+    ranked.into_iter().map(|(_, _, h)| h).collect()
+}
+
+const BROAD_PREVIEW_HITS: usize = 12;
+
+fn name_tokens(name: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower && !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_lowercase();
+        cur.push(c.to_ascii_lowercase());
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Symbols whose names are close to a zero-hit literal query: substring /
+/// prefix / shared word tokens / small edit distance. Best first, max `limit`.
+fn closest_symbols(
+    index: &RepoIndex,
+    query: &str,
+    path_filter: Option<&str>,
+    limit: usize,
+) -> Vec<String> {
+    let q = query.trim().to_lowercase();
+    if q.len() < 3 || q.len() > 80 {
+        return Vec::new();
+    }
+    let q_tokens = name_tokens(query);
+    let mut scored: Vec<(u32, String)> = Vec::new();
+    for sym in &index.graph().symbols {
+        let name = sym.name.to_lowercase();
+        let score = if name == q {
+            0
+        } else if name.starts_with(&q) || q.starts_with(&name) && name.len() >= 4 {
+            1
+        } else if name.contains(&q) || q.contains(&name) && name.len() >= 4 {
+            2
+        } else if edit_distance(&name, &q) <= (q.len() / 5).clamp(1, 2) {
+            3
+        } else {
+            let shared = name_tokens(&sym.name)
+                .iter()
+                .filter(|t| t.len() >= 3 && q_tokens.contains(t))
+                .count();
+            if shared >= 1 && shared >= q_tokens.len().min(2) {
+                4
+            } else {
+                continue;
+            }
+        };
+        let Some(file) = index.file(sym.file) else {
+            continue;
+        };
+        if let Some(f) = path_filter {
+            if !file.path.as_str().contains(f) {
+                continue;
+            }
+        }
+        let line = symbol_line(sym, &file.path);
+        let line = match line.rsplit_once("  @") {
+            Some((sig, loc)) => format!("{sig}  {loc}"),
+            None => line,
+        };
+        scored.push((score, line));
+    }
+    scored.sort();
+    scored.dedup_by(|a, b| a.1 == b.1);
+    scored.into_iter().take(limit).map(|(_, l)| l).collect()
+}
+
+/// Parent of the first path segment run of a filter: `a/b/c` -> `a/b`.
+fn loosened_filter(filter: &str) -> Option<String> {
+    let trimmed = filter.trim_end_matches('/');
+    trimmed
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+}
+
 /// Per-file and per-directory hit counts for a broad query.
 fn render_search_summary(hits: &[SearchHit], path_filter: Option<&str>) -> String {
     let mut files: BTreeMap<&str, usize> = BTreeMap::new();
@@ -514,7 +661,7 @@ fn render_search_summary(hits: &[SearchHit], path_filter: Option<&str>) -> Strin
     let mut dirs: Vec<_> = dirs.into_iter().collect();
     dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut out = format!(
-        "宽查询：{} 处命中分布在 {} 个文件。未列出逐条结果；请用 path_filter 收窄（或换更具体的字面量 / 用 find_symbol），确需逐条时传 page=true（再用 offset 翻页）。\n",
+        "宽查询：{} 处命中分布在 {} 个文件。下面只列最相关的几处，不是全集；请用 path_filter 收窄（或换更具体的字面量 / 用 find_symbol），确需逐条时传 page=true（再用 offset 翻页）。\n",
         hits.len(),
         files.len()
     );
@@ -586,8 +733,10 @@ fn render_symbol_hits(
                 out.push_str(&format!("@{}:{} {}\n", h.path, h.line, h.text));
             }
             out.push_str(&format!(
-                "  （所在 {kind} {} {}:{start}-{end} 已在本会话第 {call} 次调用中返回，文件未改动，不再重发；需要时传 dedup=false）\n",
-                symbol.name, hit.path
+                "  （所在 {kind} {} {}:{start}-{end} 已在本会话第 {call} 次调用中返回，文件未改动，不再重发；需要时传 dedup=false）\n  签名：{}\n",
+                symbol.name,
+                hit.path,
+                symbol.signature.lines().next().unwrap_or("").trim()
             ));
         } else if let Some(lines) = file_lines(hit) {
             out.push_str(&format!(
@@ -2142,10 +2291,28 @@ impl AstrolabeServer {
                         "confidence: exact (磁盘源码字面匹配)\n{}",
                         render_search_mode_header(params.regex, &params.query)
                     );
+                    let ranked = rank_broad_hits(index, &matches);
+                    let preview_budget = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS) / 2;
+                    let mut preview = String::new();
+                    let mut shown_preview = 0;
+                    for hit in ranked.iter().take(BROAD_PREVIEW_HITS) {
+                        let line = format!("@{}:{} {}\n", hit.path, hit.line, hit.text);
+                        if estimate_tokens(&preview) + estimate_tokens(&line) > preview_budget {
+                            break;
+                        }
+                        preview.push_str(&line);
+                        shown_preview += 1;
+                    }
                     body.push_str(&format!(
-                        "shown=0 omitted={total} truncated=true total={total} offset=0 summary=true\n"
+                        "shown={shown_preview} omitted={} truncated=true total={total} offset=0 summary=true\n",
+                        total - shown_preview
                     ));
                     body.push_str(&render_search_summary(&matches, params.path_filter.as_deref()));
+                    if shown_preview > 0 {
+                        body.push_str(&format!(
+                            "最相关的 {shown_preview} 处（定义行优先，测试文件靠后；不是全集）：\n{preview}"
+                        ));
+                    }
                     body.push_str(&data_note);
                     return self.result_on(
                         &session.root,
@@ -2154,6 +2321,7 @@ impl AstrolabeServer {
                         json!({
                             "confidence": "exact",
                             "summary": true,
+                            "preview_shown": shown_preview,
                             "total": total,
                             "truncated": true,
                             "next_offset": 0,
@@ -2246,6 +2414,27 @@ impl AstrolabeServer {
                 let mut unindexed_hint = false;
                 if matches.is_empty() {
                     body.push_str("(未找到匹配的代码行)\n");
+                    let near = if params.regex {
+                        Vec::new()
+                    } else {
+                        closest_symbols(index, &params.query, params.path_filter.as_deref(), 8)
+                    };
+                    if !near.is_empty() {
+                        body.push_str("最接近的符号名（大小写/前缀/相近拼写）：\n");
+                        for line in &near {
+                            body.push_str(&format!("  {line}\n"));
+                        }
+                    }
+                    if let Some(filter) = params.path_filter.as_deref() {
+                        let wider = loosened_filter(filter)
+                            .map(|p| format!("放宽到 path_filter=\"{p}\" 或"))
+                            .unwrap_or_default();
+                        body.push_str(&format!(
+                            "提示：path_filter=\"{filter}\" 可能过窄，{wider}去掉后再试；也可缩短查询词。\n"
+                        ));
+                    } else if near.is_empty() {
+                        body.push_str("提示：换更短的字面量，或用 find_symbol 按名字查。\n");
+                    }
                     let counts = index.unindexed_code_exts(params.path_filter.as_deref());
                     if let Some(hint) =
                         format_search_code_unindexed_hint(&counts, params.path_filter.as_deref())
@@ -2397,7 +2586,8 @@ impl AstrolabeServer {
                 };
                 if let Some(c) = earlier {
                     body.push_str(&format!(
-                        "  （本会话第 {c} 次调用已返回此定义，文件未改动，不再重发；需要时传 dedup=false）\n"
+                        "  （本会话第 {c} 次调用已返回此定义，文件未改动，不再重发；需要时传 dedup=false）\n  签名：{}\n",
+                        def.signature.lines().next().unwrap_or("").trim()
                     ));
                     continue;
                 }
@@ -4524,7 +4714,7 @@ mod tests {
         assert!(text.contains("宽查询：75 处命中分布在 2 个文件"), "{text}");
         assert!(text.contains("     70  pkg/a/one.py"), "{text}");
         assert!(text.contains("建议：path_filter=\"pkg/a\""), "{text}");
-        assert!(!text.contains("@pkg/a/one.py:1 "), "{text}");
+        assert_eq!(text.matches("\n@pkg/").count(), 12, "{text}");
         let mut paged = search("NEEDLE_");
         paged.page = true;
         let page = text_of(&server.search_code(Parameters(paged)));
@@ -4741,6 +4931,65 @@ mod tests {
             !instructions.contains("initial_instructions"),
             "{instructions}"
         );
+    }
+
+    #[test]
+    fn dedup_pointer_carries_signature_and_match_line() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let _ = server.search_code(Parameters(search("marker_x")));
+        let again = text_of(&server.search_code(Parameters(search("total *= 2"))));
+        assert!(again.contains("@calc.py:3 total *= 2"), "{again}");
+        assert!(again.contains("签名：def compute(a, b):"), "{again}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broad_query_previews_ranked_hits_definitions_first_tests_last() {
+        // 70 plain hits in a test file come first alphabetically; the single
+        // definition and an ordinary use must outrank them.
+        let tests: String = (0..70).map(|i| format!("x{i} = widget_{i}\n")).collect();
+        let (server, dir) = smart_server(&[
+            ("a_tests/t.py", tests),
+            (
+                "src/z_def.py",
+                "def widget_main():\n    return 1\n\n\ndef other():\n    return widget_main()\n"
+                    .into(),
+            ),
+        ]);
+        let text = text_of(&server.search_code(Parameters(search("widget_"))));
+        assert!(text.contains("shown=12 omitted=60"), "{text}");
+        assert!(text.contains("宽查询：72 处命中"), "{text}");
+        let def = text.find("@src/z_def.py:1 def widget_main").expect(&text);
+        let call = text.find("@src/z_def.py:6").expect(&text);
+        let test = text.find("@a_tests/t.py:1 ").expect(&text);
+        assert!(def < call && call < test, "{text}");
+        assert!(text.matches("@a_tests/t.py:").count() == 10, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_hit_search_suggests_close_symbols_and_looser_filter() {
+        let (server, dir) = smart_server(&[("pkg/sub/calc.py", CALC_PY.into())]);
+        let mut p = search("computee");
+        p.path_filter = Some("pkg/sub".into());
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("(未找到匹配的代码行)"), "{text}");
+        assert!(text.contains("最接近的符号名"), "{text}");
+        assert!(text.contains("def compute(a, b):"), "{text}");
+        assert!(text.contains("放宽到 path_filter=\"pkg\""), "{text}");
+        // Nothing close: no suggestion block, still the generic hint.
+        let none = text_of(&server.search_code(Parameters(search("zzzqqq"))));
+        assert!(!none.contains("最接近的符号名"), "{none}");
+        assert!(none.contains("find_symbol"), "{none}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn name_helpers_split_and_measure() {
+        assert_eq!(name_tokens("fooBar_baz"), ["foo", "bar", "baz"]);
+        assert_eq!(edit_distance("compute", "computee"), 1);
+        assert_eq!(loosened_filter("a/b/c/"), Some("a/b".into()));
+        assert_eq!(loosened_filter("a"), None);
     }
 
     #[test]
