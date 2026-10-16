@@ -31,6 +31,11 @@ ROOT 优先级：位置参数 → ASTROLABE_ROOT → .（从 cwd 探测）
                                （grokbuild/grok-build 亦映射为 grok；
                                 kimi-code/kimi_code/kimi→kimicode，z-code/zai→zcode，
                                 cursor-agent/cursor_agent/cursor-cli→cursor）
+                               可选：--deny-text-search[=true|false]
+                                     硬禁用 Grep/Glob/shell 文本搜索（首次即 deny）
+                               可选：--context=NAME  加载上下文 YAML 的 deny_text_search
+                               优先级：CLI > ASTROLABE_DENY_TEXT_SEARCH >
+                                       context YAML > 默认 off
   hooks cleanup                SessionEnd hook：按 stdin session_id 清理状态目录
   hooks gc                     清理超过 24h（ASTROLABE_HOOK_GC_HOURS 可调）未活动的
                                会话状态目录；remind 也会每小时机会式执行一次
@@ -45,6 +50,10 @@ pub enum Launch {
     Version,
     HooksRemind {
         client: String,
+        /// CLI `--deny-text-search` / `--deny-text-search=true|false`；None = 未指定
+        deny_text_search: Option<bool>,
+        /// Optional `--context=NAME` for YAML `deny_text_search`
+        context: Option<String>,
     },
     HooksCleanup,
     /// `hooks gc`：清理过期会话状态目录
@@ -175,6 +184,8 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
     match sub.to_string_lossy().as_ref() {
         "remind" => {
             let mut client: Option<String> = None;
+            let mut deny_text_search: Option<bool> = None;
+            let mut context: Option<String> = None;
             for arg in &rest[1..] {
                 let arg = arg.to_string_lossy();
                 if let Some(value) = arg.strip_prefix("--client=") {
@@ -184,6 +195,24 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
                     client = Some(value.to_string());
                 } else if arg == "--client" {
                     anyhow::bail!("--client requires =NAME in hook commands\n{USAGE}");
+                } else if arg == "--deny-text-search" {
+                    deny_text_search = Some(true);
+                } else if let Some(value) = arg.strip_prefix("--deny-text-search=") {
+                    let v = value.trim().to_ascii_lowercase();
+                    match v.as_str() {
+                        "1" | "true" | "yes" | "on" => deny_text_search = Some(true),
+                        "0" | "false" | "no" | "off" => deny_text_search = Some(false),
+                        _ => anyhow::bail!(
+                            "--deny-text-search expects true/false (got {value})\n{USAGE}"
+                        ),
+                    }
+                } else if let Some(value) = arg.strip_prefix("--context=") {
+                    if value.trim().is_empty() {
+                        anyhow::bail!("--context requires a name\n{USAGE}");
+                    }
+                    context = Some(value.to_string());
+                } else if arg == "--context" {
+                    anyhow::bail!("--context requires =NAME in hook commands\n{USAGE}");
                 } else {
                     anyhow::bail!("unknown hooks remind argument: {arg}\n{USAGE}");
                 }
@@ -191,6 +220,8 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
             // 未指定 client 时按 claude-code 形态输出（最常见宿主，格式是其超集）。
             Ok(Launch::HooksRemind {
                 client: client.unwrap_or_else(|| "claude-code".to_string()),
+                deny_text_search,
+                context,
             })
         }
         "cleanup" => {
@@ -241,12 +272,45 @@ mod tests {
     #[test]
     fn hooks_subcommands() {
         match parse(&["astrolabe", "hooks", "remind", "--client=codex"]) {
-            Launch::HooksRemind { client } => assert_eq!(client, "codex"),
+            Launch::HooksRemind {
+                client,
+                deny_text_search,
+                context,
+            } => {
+                assert_eq!(client, "codex");
+                assert_eq!(deny_text_search, None);
+                assert_eq!(context, None);
+            }
             other => panic!("expected HooksRemind, got {other:?}"),
         }
         // 未指定 client 回落 claude-code（输出格式是其超集）
         match parse(&["astrolabe", "hooks", "remind"]) {
-            Launch::HooksRemind { client } => assert_eq!(client, "claude-code"),
+            Launch::HooksRemind { client, .. } => assert_eq!(client, "claude-code"),
+            other => panic!("expected HooksRemind, got {other:?}"),
+        }
+        match parse(&[
+            "astrolabe",
+            "hooks",
+            "remind",
+            "--client=cursor",
+            "--deny-text-search",
+            "--context=claude-code",
+        ]) {
+            Launch::HooksRemind {
+                client,
+                deny_text_search,
+                context,
+            } => {
+                assert_eq!(client, "cursor");
+                assert_eq!(deny_text_search, Some(true));
+                assert_eq!(context.as_deref(), Some("claude-code"));
+            }
+            other => panic!("expected HooksRemind, got {other:?}"),
+        }
+        match parse(&["astrolabe", "hooks", "remind", "--deny-text-search=false"]) {
+            Launch::HooksRemind {
+                deny_text_search, ..
+            } => assert_eq!(deny_text_search, Some(false)),
             other => panic!("expected HooksRemind, got {other:?}"),
         }
         assert!(matches!(
