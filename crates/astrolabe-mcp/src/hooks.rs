@@ -5,7 +5,11 @@
 //! - `ASTROLABE_SLICE_READ_MAX`: 切片精读最大行数（默认 200）
 //! - `ASTROLABE_SLICE_READ_THRESHOLD`: 连续切片读提醒阈值（默认 10，期间无任何 astrolabe 工具调用）
 //! - `ASTROLABE_READ_THRESHOLD`: 连续全文件 Read deny 阈值（默认 3）
+//! - `ASTROLABE_GREP_THRESHOLD`: 连续 Grep/shell 文本搜索 deny 阈值（默认 3）
 //! - `ASTROLABE_DENY_SILENCE_SECS`: deny 后静默窗口秒数（默认 15）
+//! - `ASTROLABE_DENY_TEXT_SEARCH`: 硬禁用 Grep/Glob/shell 文本搜索（true/1/yes/on；默认 off）。
+//!   开启后首次即 deny（不再等阈值）；覆盖 soft DEFAULT_GREP_THRESHOLD。亦可通过
+//!   `hooks remind --deny-text-search` / 上下文 YAML `deny_text_search` 配置。
 //!
 //! 子代理计数隔离：并发子 Agent 触发的 PreToolUse payload 携带 `agent_id` / `agentId`
 //! （主线程 payload 不含该字段）时，计数状态按 `~/.astrolabe/hook_data/<session_id>/<agent分量>/`
@@ -27,7 +31,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 /// 阈值常量（照抄 Serena 数值）
-pub(crate) const GREP_THRESHOLD: u32 = 3;
+pub(crate) const DEFAULT_GREP_THRESHOLD: u32 = 3;
 pub(crate) const DEFAULT_READ_THRESHOLD: u32 = 3;
 pub(crate) const NON_SYMBOLIC_THRESHOLD: u32 = 4;
 /// 连续切片读提醒阈值默认值：连续 N 次切片读且期间无任何 astrolabe 工具调用 → deny 提醒。
@@ -55,7 +59,9 @@ pub(crate) const DEFAULT_SLICE_READ_MAX_LIMIT: u64 = 200;
 pub(crate) const ENV_SLICE_READ_MAX: &str = "ASTROLABE_SLICE_READ_MAX";
 pub(crate) const ENV_SLICE_READ_THRESHOLD: &str = "ASTROLABE_SLICE_READ_THRESHOLD";
 pub(crate) const ENV_READ_THRESHOLD: &str = "ASTROLABE_READ_THRESHOLD";
+pub(crate) const ENV_GREP_THRESHOLD: &str = "ASTROLABE_GREP_THRESHOLD";
 pub(crate) const ENV_DENY_SILENCE_SECS: &str = "ASTROLABE_DENY_SILENCE_SECS";
+pub(crate) const ENV_DENY_TEXT_SEARCH: &str = "ASTROLABE_DENY_TEXT_SEARCH";
 
 /// 运行时配置（从环境变量解析，进程启动后只读）
 #[derive(Debug, Clone, Copy)]
@@ -63,6 +69,9 @@ pub(crate) struct HooksConfig {
     pub slice_read_max_limit: u64,
     pub slice_read_threshold: u32,
     pub read_threshold: u32,
+    pub grep_threshold: u32,
+    /// Hard-deny Grep/Glob/shell text-search on first use.
+    pub deny_text_search: bool,
     pub min_deny_interval_seconds: f64,
 }
 
@@ -72,6 +81,8 @@ impl Default for HooksConfig {
             slice_read_max_limit: DEFAULT_SLICE_READ_MAX_LIMIT,
             slice_read_threshold: DEFAULT_SLICE_READ_THRESHOLD,
             read_threshold: DEFAULT_READ_THRESHOLD,
+            grep_threshold: DEFAULT_GREP_THRESHOLD,
+            deny_text_search: false,
             min_deny_interval_seconds: DEFAULT_MIN_DENY_INTERVAL_SECONDS,
         }
     }
@@ -119,6 +130,22 @@ impl HooksConfig {
             })
             .unwrap_or(DEFAULT_READ_THRESHOLD);
 
+        let grep_threshold = std::env::var(ENV_GREP_THRESHOLD)
+            .ok()
+            .and_then(|s| {
+                s.trim().parse::<u32>().ok().or_else(|| {
+                    tracing::warn!(
+                        "invalid {ENV_GREP_THRESHOLD}={s:?}; using default {}",
+                        DEFAULT_GREP_THRESHOLD
+                    );
+                    None
+                })
+            })
+            .unwrap_or(DEFAULT_GREP_THRESHOLD);
+
+        let deny_text_search =
+            parse_env_bool(std::env::var(ENV_DENY_TEXT_SEARCH).ok().as_deref()).unwrap_or(false);
+
         let min_deny_interval_seconds = std::env::var(ENV_DENY_SILENCE_SECS)
             .ok()
             .and_then(|s| {
@@ -136,9 +163,40 @@ impl HooksConfig {
             slice_read_max_limit,
             slice_read_threshold,
             read_threshold,
+            grep_threshold,
+            deny_text_search,
             min_deny_interval_seconds,
         }
     }
+}
+
+/// Parse true/false env tokens: true/1/yes/on vs false/0/no/off.
+/// Unrecognised values → None (caller keeps default / warns).
+pub(crate) fn parse_env_bool(raw: Option<&str>) -> Option<bool> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        other => {
+            tracing::warn!(value = %other, "invalid bool env token; ignoring");
+            None
+        }
+    }
+}
+
+/// Resolve `deny_text_search` with precedence: CLI > env > context YAML > false.
+pub(crate) fn resolve_deny_text_search(
+    cli: Option<bool>,
+    env_raw: Option<&str>,
+    context_flag: Option<bool>,
+) -> bool {
+    if let Some(v) = cli {
+        return v;
+    }
+    if let Some(v) = parse_env_bool(env_raw) {
+        return v;
+    }
+    context_flag.unwrap_or(false)
 }
 
 /// 全局配置单例（进程生命周期内只初始化一次）
@@ -320,8 +378,10 @@ pub(crate) enum ToolKind {
     /// Astrolabe 非符号工具（search_code / diagnostics / instructions 等）：
     /// 只清零切片读额度，不清零 grep/read/non_symbolic 计数
     AstrolabeNonSymbolic,
-    /// grep 类工具
+    /// grep 类工具（含 shell 文本搜索）
     Grep,
+    /// Glob / file_search 类工具（仅 deny_text_search 开启时分类；关闭时保持 Neutral）
+    Glob,
     /// read 类工具，附带是否为代码文件判定
     Read { is_code_file: bool },
     /// Read 工具切片读（显式 limit <= slice_read_max_limit）：计入连续切片额度
@@ -335,6 +395,10 @@ pub(crate) enum ToolKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenyKind {
     Grep,
+    /// Hard-deny host Glob（deny_text_search）
+    Glob,
+    /// Hard-deny Grep / shell 文本搜索（deny_text_search）
+    TextSearch,
     Read,
     Mixed,
     /// 连续切片读超额度（期间无任何 astrolabe 工具调用）
@@ -798,10 +862,38 @@ pub(crate) fn is_read_code_file_call(
     true
 }
 
+/// Token-boundary detection matching the arm-D nogrep experiment hook:
+/// deny `grep|egrep|fgrep|zgrep|rg|ag|ack` as command tokens, and
+/// `git [opts…] grep`. Paths like `src/grep_utils.rs` do not match.
+pub(crate) fn command_contains_text_search(cmd: &str) -> bool {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?x)
+            (?:^|[;&|`($[:space:]])
+            (?:grep|egrep|fgrep|zgrep|rg|ag|ack)
+            (?:[[:space:]]|$)
+            |
+            git[[:space:]]+(?:-[^[:space:]]+[[:space:]]+)*grep(?:[[:space:]]|$)
+            ",
+        )
+        .expect("text-search regex")
+    });
+    re.is_match(cmd)
+}
+
+pub(crate) fn is_glob_tool_name(tool_name: &str) -> bool {
+    let n = tool_name.trim().to_ascii_lowercase();
+    n == "glob" || n == "file_search" || n == "filesearch"
+}
+
 /// 工具分类函数
 ///
 /// `limit` / `offset` 来自 tool_input 的切片参数（数字或数字字符串）。
 /// 当前切片精读判定只使用 `limit`（须存在且 <= slice_read_max_limit，默认 200）；`offset` 保留传入以兼容调用方。
+/// `deny_text_search`：开启时把 Glob 与 shell 文本搜索（含管道/`git grep`）纳入拦截。
+/// Soft-mode 包装（`deny_text_search=false`）；生产路径走 [`classify_tool_ex`]。
+#[cfg(test)]
 pub(crate) fn classify_tool(
     tool_name: &str,
     client: Client,
@@ -810,6 +902,31 @@ pub(crate) fn classify_tool(
     command_args_str: Option<&str>,
     limit: Option<u64>,
     offset: Option<u64>,
+) -> ToolKind {
+    classify_tool_ex(
+        tool_name,
+        client,
+        file_path,
+        command_name,
+        command_args_str,
+        None,
+        limit,
+        offset,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn classify_tool_ex(
+    tool_name: &str,
+    client: Client,
+    file_path: Option<&str>,
+    command_name: Option<&str>,
+    command_args_str: Option<&str>,
+    full_command: Option<&str>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    deny_text_search: bool,
 ) -> ToolKind {
     // 1. 先检查是否为 Astrolabe 符号工具
     if is_astrolabe_symbolic_tool(tool_name) {
@@ -820,6 +937,26 @@ pub(crate) fn classify_tool(
     // 只清零切片读额度（decide 中处理），不清零 grep/read/non_symbolic 计数
     if tool_name.contains("astrolabe") {
         return ToolKind::AstrolabeNonSymbolic;
+    }
+
+    // 1.7 Hard text-search mode: Glob + shell token scan (pipelines / git grep)
+    if deny_text_search {
+        if is_glob_tool_name(tool_name) {
+            return ToolKind::Glob;
+        }
+        if let Some(cmd) = full_command {
+            if command_contains_text_search(cmd) {
+                return ToolKind::Grep;
+            }
+        } else if let Some(cmd) = command_name {
+            let reconstructed = match command_args_str {
+                Some(args) => format!("{cmd} {args}"),
+                None => cmd.to_string(),
+            };
+            if command_contains_text_search(&reconstructed) {
+                return ToolKind::Grep;
+            }
+        }
     }
 
     // 2. 检查是否为 grep 类工具
@@ -922,8 +1059,20 @@ pub(crate) fn classify_tool(
     ToolKind::Neutral
 }
 
-/// 纯逻辑决策函数：按输入状态与工具类型推进计数并生成决策
+/// 纯逻辑决策函数：按输入状态与工具类型推进计数并生成决策（用全局 config）。
+/// 生产路径走 [`decide_with`]；本包装供单测与兼容调用。
+#[cfg(test)]
 pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) -> Decision {
+    decide_with(counter, tool_kind, now, config())
+}
+
+/// 可注入配置的决策函数（测试与 CLI/context 覆盖用）。
+pub(crate) fn decide_with(
+    counter: &mut CounterState,
+    tool_kind: ToolKind,
+    now: f64,
+    cfg: &HooksConfig,
+) -> Decision {
     // 1. 静默窗内 → no-op（allow，无输出更新）
     if !counter.is_hook_active(now) {
         return Decision::Silenced;
@@ -943,6 +1092,23 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
         return Decision::ResetSlice;
     }
 
+    // 2.6 Hard text-search: first Grep / Glob → deny immediately
+    if cfg.deny_text_search {
+        match tool_kind {
+            ToolKind::Grep => {
+                counter.reset_burst();
+                counter.last_deny_ts = Some(now);
+                return Decision::Deny(DenyKind::TextSearch);
+            }
+            ToolKind::Glob => {
+                counter.reset_burst();
+                counter.last_deny_ts = Some(now);
+                return Decision::Deny(DenyKind::Glob);
+            }
+            _ => {}
+        }
+    }
+
     // 2.7 切片读（Read 带 limit<=max）→ 连续额度制：
     // 不并入 n_non_symbolic（保持 mixed 语义不变）、不计 read/grep；
     // 间隔超 SLICE_RESET_PERIOD_SECONDS 则重置为 1 否则 +1；
@@ -959,7 +1125,7 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
         }
         counter.last_slice_ts = Some(now);
 
-        if counter.n_slice >= config().slice_read_threshold {
+        if counter.n_slice >= cfg.slice_read_threshold {
             counter.reset_burst();
             counter.last_deny_ts = Some(now);
             return Decision::Deny(DenyKind::Slice);
@@ -968,9 +1134,11 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
     }
 
     // 3. 非追踪工具（既非 grep 类也非 read 类）→ 中立：不增不重置，直接 allow
+    // Glob 在 soft 模式下不会出现（classify 仅 hard 时返回 Glob）；若漏网则放行。
     let (is_grep, is_code_file_read, is_read) = match tool_kind {
         ToolKind::Grep => (true, false, false),
         ToolKind::Read { is_code_file } => (false, is_code_file, true),
+        ToolKind::Glob => return Decision::NeutralAllow,
         _ => return Decision::NeutralAllow,
     };
 
@@ -1014,16 +1182,17 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
         counter.last_non_symbolic_ts = Some(now);
     }
 
-    // 阈值判定
-    let too_many_greps = counter.n_grep >= GREP_THRESHOLD;
-    let too_many_reads = counter.n_read >= config().read_threshold;
+    // 阈值判定（grep_threshold 可经 ASTROLABE_GREP_THRESHOLD 调整；0/1 ≈ hard deny for grep）
+    let grep_threshold = cfg.grep_threshold.max(1);
+    let too_many_greps = counter.n_grep >= grep_threshold;
+    let too_many_reads = counter.n_read >= cfg.read_threshold;
     let too_many_non_symbolic = counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD;
 
     // 依次判定：
-    // 当前调用是 grep 类且 n_grep≥3 → grep deny；
-    // 当前是 read-代码文件 且 n_read≥3 → read deny；
-    // 否则 n_grep≥3 → grep deny；
-    // n_read≥3 → read deny；
+    // 当前调用是 grep 类且 n_grep≥threshold → grep deny；
+    // 当前是 read-代码文件 且 n_read≥threshold → read deny；
+    // 否则 n_grep≥threshold → grep deny；
+    // n_read≥threshold → read deny；
     // n_non_symbolic≥4 → mixed deny。
     let deny_kind = if is_grep && too_many_greps {
         Some(DenyKind::Grep)
@@ -1069,6 +1238,16 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
             format!(
                 "You were using many grep calls recently. Use Astrolabe's symbolic mcp tools instead for more code-centric search (search_code / find_references are read-only and return path:line anchors). {switch_instruction}{unindexed_lang_note}"
             ),
+        ),
+        DenyKind::TextSearch => (
+            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, explain_symbol. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
+            format!(
+                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Call mcp__astrolabe__search_code (literal/regex, enclosing bodies), mcp__astrolabe__find_symbol, mcp__astrolabe__find_references, or mcp__astrolabe__explain_symbol now (read-only, safe).{unindexed_lang_note}"
+            ),
+        ),
+        DenyKind::Glob => (
+            "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, explain_symbol.",
+            "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__search_code or mcp__astrolabe__find_symbol to locate symbols and paths (read-only, safe).".to_string(),
         ),
         DenyKind::Read => (
             "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).",
@@ -1299,14 +1478,35 @@ pub fn run_gc() -> i32 {
     )
 }
 
-/// PreToolUse remind hook 纯实现（支持依赖注入方便测试）
+/// PreToolUse remind hook 纯实现（支持依赖注入方便测试；生产走 [`run_remind`]）。
+#[cfg(test)]
 pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
+    client_name: &str,
+    reader: R,
+    stdout: W,
+    stderr: E,
+    now: Option<f64>,
+    home_override: Option<&Path>,
+) -> i32 {
+    run_remind_impl_with(
+        client_name,
+        reader,
+        stdout,
+        stderr,
+        now,
+        home_override,
+        config(),
+    )
+}
+
+pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
     client_name: &str,
     mut reader: R,
     mut stdout: W,
     mut stderr: E,
     now: Option<f64>,
     home_override: Option<&Path>,
+    cfg: &HooksConfig,
 ) -> i32 {
     let mut raw = String::new();
     if let Err(err) = reader.read_to_string(&mut raw) {
@@ -1377,6 +1577,7 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
     let mut file_path: Option<String> = None;
     let mut command_name: Option<String> = None;
     let mut command_args_str: Option<String> = None;
+    let mut full_command: Option<String> = None;
     let mut tool_input_limit: Option<u64> = None;
     let mut tool_input_offset: Option<u64> = None;
 
@@ -1413,6 +1614,7 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if let Some(cmd_str) = cmd {
+            full_command = Some(cmd_str.to_string());
             if let Some(idx) = cmd_str.find(char::is_whitespace) {
                 let first = &cmd_str[..idx];
                 let rest = cmd_str[idx..].trim();
@@ -1436,14 +1638,16 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
         }
     }
 
-    let tool_kind = classify_tool(
+    let tool_kind = classify_tool_ex(
         &tool_name,
         client,
         file_path.as_deref(),
         command_name.as_deref(),
         command_args_str.as_deref(),
+        full_command.as_deref(),
         tool_input_limit,
         tool_input_offset,
+        cfg.deny_text_search,
     );
 
     tracing::debug!(
@@ -1485,7 +1689,7 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
     // load → decide → save 在同一把文件锁内串行化
     let decision = match persistence_path.as_ref() {
         Some(path) => with_counter_locked(path, |mut counter| {
-            let decision = decide(&mut counter, tool_kind, now_ts);
+            let decision = decide_with(&mut counter, tool_kind, now_ts, cfg);
             let should_save = matches!(
                 decision,
                 Decision::ResetSymbolic
@@ -1497,7 +1701,7 @@ pub(crate) fn run_remind_impl<R: Read, W: Write, E: Write>(
         }),
         None => {
             let mut counter = CounterState::default();
-            decide(&mut counter, tool_kind, now_ts)
+            decide_with(&mut counter, tool_kind, now_ts, cfg)
         }
     };
 
@@ -1597,17 +1801,53 @@ pub(crate) fn run_cleanup_impl<R: Read, E: Write>(
 
 /// PreToolUse remind hook：stdin 读 hook payload JSON，按 client 输出决策 JSON。
 /// 返回进程退出码（0 正常，包括 allow；2 输入不合法）。
-pub fn run_remind(client_name: &str) -> i32 {
+///
+/// `deny_text_search_cli`：CLI `--deny-text-search` 显式开关（优先于 env / context）。
+/// `context_name`：`--context=NAME` 或 path；用于读取 YAML `deny_text_search`。
+pub fn run_remind(
+    client_name: &str,
+    deny_text_search_cli: Option<bool>,
+    context_name: Option<&str>,
+) -> i32 {
+    let context_flag = context_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|name| crate::context::ClientContext::load(name).ok())
+        .map(|c| c.deny_text_search);
+    // Also honour ASTROLABE_CONTEXT when --context omitted (same as MCP server).
+    let context_flag = context_flag.or_else(|| {
+        if context_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+        {
+            return None;
+        }
+        std::env::var("ASTROLABE_CONTEXT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|name| crate::context::ClientContext::load(&name).ok())
+            .map(|c| c.deny_text_search)
+    });
+    let deny = resolve_deny_text_search(
+        deny_text_search_cli,
+        std::env::var(ENV_DENY_TEXT_SEARCH).ok().as_deref(),
+        context_flag,
+    );
+    let mut cfg = HooksConfig::from_env();
+    cfg.deny_text_search = deny;
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    run_remind_impl(
+    run_remind_impl_with(
         client_name,
         stdin.lock(),
         stdout.lock(),
         stderr.lock(),
         None,
         None,
+        &cfg,
     )
 }
 
@@ -3472,6 +3712,8 @@ mod tests {
         assert_eq!(default_cfg.slice_read_max_limit, 200);
         assert_eq!(default_cfg.slice_read_threshold, 10);
         assert_eq!(default_cfg.read_threshold, 3);
+        assert_eq!(default_cfg.grep_threshold, 3);
+        assert!(!default_cfg.deny_text_search);
         assert_eq!(default_cfg.min_deny_interval_seconds, 15.0);
     }
 
@@ -4695,5 +4937,353 @@ mod tests {
         );
         maybe_gc_opportunistic(home, SystemTime::now(), "cur", 24);
         assert!(root.join("b").exists(), "节流窗口内不应扫描");
+    }
+
+    #[test]
+    fn deny_text_search_env_bool_parsing() {
+        assert_eq!(parse_env_bool(Some("true")), Some(true));
+        assert_eq!(parse_env_bool(Some("1")), Some(true));
+        assert_eq!(parse_env_bool(Some("yes")), Some(true));
+        assert_eq!(parse_env_bool(Some("ON")), Some(true));
+        assert_eq!(parse_env_bool(Some("false")), Some(false));
+        assert_eq!(parse_env_bool(Some("0")), Some(false));
+        assert_eq!(parse_env_bool(Some("off")), Some(false));
+        assert_eq!(parse_env_bool(None), None);
+        assert_eq!(parse_env_bool(Some("")), None);
+        assert_eq!(parse_env_bool(Some("maybe")), None);
+    }
+
+    #[test]
+    fn deny_text_search_precedence_cli_over_env_over_context() {
+        assert!(resolve_deny_text_search(
+            Some(true),
+            Some("false"),
+            Some(false)
+        ));
+        assert!(!resolve_deny_text_search(
+            Some(false),
+            Some("true"),
+            Some(true)
+        ));
+        assert!(resolve_deny_text_search(None, Some("true"), Some(false)));
+        assert!(!resolve_deny_text_search(None, Some("false"), Some(true)));
+        assert!(resolve_deny_text_search(None, None, Some(true)));
+        assert!(!resolve_deny_text_search(None, None, None));
+        assert!(!resolve_deny_text_search(None, None, Some(false)));
+    }
+
+    #[test]
+    fn command_contains_text_search_token_boundaries() {
+        assert!(command_contains_text_search("rg foo"));
+        assert!(command_contains_text_search("grep -n bar src/a.rs"));
+        assert!(command_contains_text_search("egrep pattern file"));
+        assert!(command_contains_text_search("zgrep x y.gz"));
+        assert!(command_contains_text_search("cd src && rg foo"));
+        assert!(command_contains_text_search("git grep foo"));
+        assert!(command_contains_text_search("git --no-pager grep foo"));
+        assert!(command_contains_text_search("git -C repo grep foo"));
+        assert!(!command_contains_text_search("ls"));
+        assert!(!command_contains_text_search("cargo test"));
+        assert!(!command_contains_text_search("cat src/grep_utils.rs"));
+        assert!(!command_contains_text_search("echo grepping"));
+        assert!(!command_contains_text_search("git status"));
+        assert!(!command_contains_text_search("git commit -m 'grep later'"));
+    }
+
+    #[test]
+    fn classify_glob_only_when_deny_text_search() {
+        let soft = classify_tool_ex(
+            "glob",
+            Client::ClaudeCode,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(soft, ToolKind::Neutral);
+        let hard = classify_tool_ex(
+            "Glob",
+            Client::ClaudeCode,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(hard, ToolKind::Glob);
+        let fs = classify_tool_ex(
+            "file_search",
+            Client::Cursor,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(fs, ToolKind::Glob);
+    }
+
+    #[test]
+    fn classify_git_grep_and_pipeline_only_when_hard() {
+        let soft = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("git"),
+            Some("grep foo"),
+            Some("git grep foo"),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(soft, ToolKind::Neutral);
+        let hard = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("git"),
+            Some("grep foo"),
+            Some("git grep foo"),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(hard, ToolKind::Grep);
+        let pipe = classify_tool_ex(
+            "shell",
+            Client::Cursor,
+            None,
+            Some("cd"),
+            Some("src && rg foo"),
+            Some("cd src && rg foo"),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(pipe, ToolKind::Grep);
+    }
+
+    #[test]
+    fn decide_hard_deny_first_grep_and_glob() {
+        let cfg = HooksConfig {
+            deny_text_search: true,
+            ..Default::default()
+        };
+        let mut counter = CounterState::default();
+        let d = decide_with(&mut counter, ToolKind::Grep, 100.0, &cfg);
+        assert_eq!(d, Decision::Deny(DenyKind::TextSearch));
+        assert_eq!(counter.last_deny_ts, Some(100.0));
+
+        let mut counter2 = CounterState::default();
+        let d2 = decide_with(&mut counter2, ToolKind::Glob, 200.0, &cfg);
+        assert_eq!(d2, Decision::Deny(DenyKind::Glob));
+    }
+
+    #[test]
+    fn decide_soft_mode_unchanged_needs_three_greps() {
+        let cfg = HooksConfig::default();
+        assert!(!cfg.deny_text_search);
+        let mut counter = CounterState::default();
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, 1.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, 2.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, 3.0, &cfg),
+            Decision::Deny(DenyKind::Grep)
+        );
+    }
+
+    #[test]
+    fn decide_hard_allows_non_search_bash_kinds() {
+        let cfg = HooksConfig {
+            deny_text_search: true,
+            ..Default::default()
+        };
+        let mut counter = CounterState::default();
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Neutral, 1.0, &cfg),
+            Decision::NeutralAllow
+        );
+        assert_eq!(
+            decide_with(
+                &mut counter,
+                ToolKind::Read { is_code_file: true },
+                2.0,
+                &cfg
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn build_output_hard_text_search_and_glob() {
+        let out = build_output(Client::ClaudeCode, DenyKind::TextSearch);
+        assert!(out.contains("ASTROLABE_DENY_TEXT_SEARCH"), "{out}");
+        assert!(out.contains("search_code"), "{out}");
+        assert!(out.contains("\"permissionDecision\":\"deny\""));
+        let glob = build_output(Client::ClaudeCode, DenyKind::Glob);
+        assert!(glob.contains("Glob"), "{glob}");
+        assert!(glob.contains("search_code"), "{glob}");
+    }
+
+    #[test]
+    fn run_remind_hard_denies_first_grep_rg_git_grep_glob() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_deny_ts_{rand_id}"));
+        let cfg = HooksConfig {
+            deny_text_search: true,
+            ..Default::default()
+        };
+        let cases: &[(&str, serde_json::Value, &str)] = &[
+            (
+                "sess_grep",
+                serde_json::json!({
+                    "session_id": "sess_grep",
+                    "tool_name": "Grep",
+                    "tool_input": { "pattern": "foo" }
+                }),
+                "ASTROLABE_DENY_TEXT_SEARCH",
+            ),
+            (
+                "sess_rg",
+                serde_json::json!({
+                    "session_id": "sess_rg",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "rg foo src" }
+                }),
+                "ASTROLABE_DENY_TEXT_SEARCH",
+            ),
+            (
+                "sess_git_grep",
+                serde_json::json!({
+                    "session_id": "sess_git_grep",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "git grep foo" }
+                }),
+                "ASTROLABE_DENY_TEXT_SEARCH",
+            ),
+            (
+                "sess_glob",
+                serde_json::json!({
+                    "session_id": "sess_glob",
+                    "tool_name": "Glob",
+                    "tool_input": { "pattern": "**/*.rs" }
+                }),
+                "Glob",
+            ),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        for (i, (_sid, payload, needle)) in cases.iter().enumerate() {
+            out.clear();
+            let payload_str = payload.to_string();
+            let code = run_remind_impl_with(
+                "claude-code",
+                payload_str.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(1000.0 + i as f64),
+                Some(&temp_home),
+                &cfg,
+            );
+            assert_eq!(code, 0, "case {payload_str}");
+            let s = String::from_utf8_lossy(&out);
+            assert!(
+                s.contains("\"permissionDecision\":\"deny\""),
+                "expected deny for {payload_str}: {s}"
+            );
+            assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+        let allow_payload = serde_json::json!({
+            "session_id": "sess_ls",
+            "tool_name": "Bash",
+            "tool_input": { "command": "ls -la" }
+        })
+        .to_string();
+        out.clear();
+        let code = run_remind_impl_with(
+            "claude-code",
+            allow_payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(2000.0),
+            Some(&temp_home),
+            &cfg,
+        );
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "ls should be allowed: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let cargo = serde_json::json!({
+            "session_id": "sess_cargo",
+            "tool_name": "Bash",
+            "tool_input": { "command": "cargo test -p astrolabe-mcp" }
+        })
+        .to_string();
+        out.clear();
+        let code = run_remind_impl_with(
+            "claude-code",
+            cargo.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(2001.0),
+            Some(&temp_home),
+            &cfg,
+        );
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+
+        let soft = HooksConfig::default();
+        let soft_payload = serde_json::json!({
+            "session_id": "sess_soft_grep",
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "foo" }
+        })
+        .to_string();
+        out.clear();
+        let code = run_remind_impl_with(
+            "claude-code",
+            soft_payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(3000.0),
+            Some(&temp_home),
+            &soft,
+        );
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "soft first grep must allow");
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn grep_threshold_env_tunable_via_decide_with() {
+        let cfg = HooksConfig {
+            grep_threshold: 1,
+            ..Default::default()
+        };
+        let mut counter = CounterState::default();
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, 1.0, &cfg),
+            Decision::Deny(DenyKind::Grep)
+        );
     }
 }

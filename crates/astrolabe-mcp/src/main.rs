@@ -59,8 +59,16 @@ async fn main() -> anyhow::Result<()> {
             println!("astrolabe {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Launch::HooksRemind { client } => {
-            std::process::exit(astrolabe_mcp::hooks::run_remind(&client));
+        Launch::HooksRemind {
+            client,
+            deny_text_search,
+            context,
+        } => {
+            std::process::exit(astrolabe_mcp::hooks::run_remind(
+                &client,
+                deny_text_search,
+                context.as_deref(),
+            ));
         }
         Launch::HooksCleanup => {
             std::process::exit(astrolabe_mcp::hooks::run_cleanup());

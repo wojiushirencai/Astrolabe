@@ -159,6 +159,29 @@ Astrolabe 防漂移 Hook 层已内置对 **Codebuddy** 与 **Grok** 客户端的
 - **Context 行为**：Codebuddy 与 Grok 目前均使用 `default` 温和级上下文（无特殊 schema 限制或工具过滤，无需指定单独 `--context` 参数）。
 
 > **Hook 配方示例（适用于宿主支持 CC 兼容 hooks 的情况）**：
+>
+> 若要对该客户端**硬禁用** Grep/Glob/shell 文本搜索，在 mcp.json 的 Astrolabe `env` 与 hooks 命令两侧同时打开开关，例如：
+>
+> ```json
+> {
+>   "mcpServers": {
+>     "astrolabe": {
+>       "command": "astrolabe",
+>       "args": ["--context=claude-code"],
+>       "env": {
+>         "ASTROLABE_DENY_TEXT_SEARCH": "true"
+>       }
+>     }
+>   }
+> }
+> ```
+>
+> ```json
+> "command": "ASTROLABE_DENY_TEXT_SEARCH=true astrolabe hooks remind --client=claude-code --deny-text-search"
+> ```
+>
+> 或把 `deny_text_search: true` 写进自定义 context YAML，hooks 用 `--context=/path/to.yml`（优先级：CLI `--deny-text-search` > 环境变量 > context YAML > 默认 off）。
+>
 > 若所使用的 Codebuddy 或 Grok 宿主环境支持 Claude Code 兼容的 hooks 配置语法，可沿用与上方 CC 相同的 settings 配方，只需将 PreToolUse 命令中的 `--client` 替换为对应值即可：
 >
 > *Codebuddy 示例*：
@@ -455,6 +478,8 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 | `ASTROLABE_SLICE_READ_MAX` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为切片读 | `200` |
 | `ASTROLABE_SLICE_READ_THRESHOLD` | 连续切片读提醒阈值：连续 N 次切片读且期间无任何 Astrolabe 工具调用时触发 deny | `10` |
 | `ASTROLABE_READ_THRESHOLD` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） | `3` |
+| `ASTROLABE_GREP_THRESHOLD` | 连续 Grep/shell 文本搜索 deny 阈值（soft 模式；`1` ≈ 首次即拦） | `3` |
+| `ASTROLABE_DENY_TEXT_SEARCH` | 硬禁用宿主 Grep / Glob / shell 文本搜索（`true`/`1`/`yes`/`on`）；开启后首次即 deny，覆盖 soft 阈值。多进程/多客户端可在各自 mcp.json `env` 中分别配置 | 关闭 |
 | `ASTROLABE_DENY_SILENCE_SECS` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） | `15` |
 | `RUST_LOG` | 日志级别（`error` / `warn` / `info` / `debug`） | `info` |
 
@@ -504,7 +529,8 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 即使有 System Prompt 军规约束，大模型在上下文拉长后依然可能出现注意力衰退（Agent Drift），退化为盲目使用 `grep` / `read`。Astrolabe 提供了硬核的门禁拦截机制：
 
 ### 核心拦截与放行规则
-- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep、连续 3 次裸读源码文件（基于 41 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截）、连续 4 次混合调用，或连续 10 次切片读（可通过 `ASTROLABE_SLICE_READ_THRESHOLD` 调整，期间无任何 Astrolabe 工具调用），Hook 将坚决拦截，deny 文案直接给出切换指令（"Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe)."）。
+- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep（可用 `ASTROLABE_GREP_THRESHOLD` 调整）、连续 3 次裸读源码文件（基于 41 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截）、连续 4 次混合调用，或连续 10 次切片读（可通过 `ASTROLABE_SLICE_READ_THRESHOLD` 调整，期间无任何 Astrolabe 工具调用），Hook 将坚决拦截，deny 文案直接给出切换指令（"Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe)."）。
+- **硬禁用文本搜索（可选）**：设置 `ASTROLABE_DENY_TEXT_SEARCH=true`（或 hooks 命令加 `--deny-text-search`，或上下文 YAML `deny_text_search: true`）后，**首次**宿主 Grep / Glob / shell 文本搜索（`grep`/`egrep`/`fgrep`/`zgrep`/`rg`/`ag`/`ack`/`git grep`，含管道）即 deny，引导改用 `search_code` / `find_symbol` / `find_references` / `explain_symbol`。默认关闭，不影响原 soft 阈值行为。适合同一机器上多个 Astrolabe MCP 进程服务不同宿主时按进程开关。注意：mcp.json 的 `env` 只作用于 MCP 进程本身；hooks 命令需同样带上该环境变量、CLI 开关，或 `--context=` 指向含 `deny_text_search: true` 的 YAML。
 - **切片精读额度制**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 切片调用仍可正常使用，但不再无限豁免——连续 10 次切片读且期间无任何 Astrolabe 工具调用时触发提醒式拦截，任何 Astrolabe 工具调用（含 `search_code` 等非符号工具）都会清零该额度。`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片 shell 命令仍完全放行、不计数。
 - **计数重置**：AI 调用任意 Astrolabe 符号工具（如 `resolve_context`、`find_symbol` 等）时，全部连续计数立即清零；`search_code` 等非符号 Astrolabe 工具调用只清零切片读额度（不影响 grep/read 计数）；若连续调用间隔超过设定时间，亦自动重置。
 - **智能放行窗口**：触发 Deny 后进入 15 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。

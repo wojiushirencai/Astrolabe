@@ -5,6 +5,7 @@
 //! * `name`
 //! * `structured_tool_output` (`true` / `false` / `null`=auto → off)
 //! * optional `excluded_tools` (catalog filter; may be empty)
+//! * optional `deny_text_search` (hooks remind hard-deny Grep/Glob/shell text-search)
 //! * short `notes`
 //!
 //! Named contexts `codex` and any `oaicompat*` also opt into OpenAI tool-schema
@@ -47,6 +48,10 @@ pub struct ClientContext {
     /// shorter schemas, so every request carries less tool-definition text.
     /// `ASTROLABE_FULL_CATALOG=1` turns it off.
     pub slim_catalog: bool,
+    /// Hard-deny host Grep / Glob / shell text-search on first use (hooks remind).
+    /// Default false: keep soft GREP_THRESHOLD behaviour. Overridable by
+    /// `ASTROLABE_DENY_TEXT_SEARCH` and `hooks remind --deny-text-search`.
+    pub deny_text_search: bool,
 }
 
 impl ClientContext {
@@ -148,6 +153,7 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
     let mut list_key: Option<String> = None;
     let mut saw_structured = false;
     let mut slim_catalog = false;
+    let mut deny_text_search = false;
 
     for (idx, raw) in src.lines().enumerate() {
         let line_no = idx + 1;
@@ -192,6 +198,11 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
                     .map_err(|err| anyhow::anyhow!("line {line_no}: slim_catalog: {err}"))?
                     .unwrap_or(false);
             }
+            "deny_text_search" => {
+                deny_text_search = parse_bool_or_null(rest)
+                    .map_err(|err| anyhow::anyhow!("line {line_no}: deny_text_search: {err}"))?
+                    .unwrap_or(false);
+            }
             "excluded_tools" => {
                 // Re-key clears previous entries so the last block wins.
                 excluded_tools.clear();
@@ -228,6 +239,7 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
         excluded_tools,
         notes,
         slim_catalog,
+        deny_text_search,
     })
 }
 
@@ -273,8 +285,8 @@ fn unquote(s: &str) -> String {
 
 fn parse_bool_or_null(raw: &str) -> anyhow::Result<Option<bool>> {
     match unquote(raw).as_str() {
-        "true" | "True" | "TRUE" | "yes" | "1" => Ok(Some(true)),
-        "false" | "False" | "FALSE" | "no" | "0" => Ok(Some(false)),
+        "true" | "True" | "TRUE" | "yes" | "on" | "1" => Ok(Some(true)),
+        "false" | "False" | "FALSE" | "no" | "off" | "0" => Ok(Some(false)),
         "null" | "Null" | "NULL" | "~" | "" => Ok(None),
         other => anyhow::bail!("expected true/false/null, got `{other}`"),
     }
@@ -474,6 +486,18 @@ excluded_tools:
         .unwrap();
         assert!(ctx.excludes("trace_calls"));
         assert!(ctx.excludes("get_hotspots"));
+    }
+
+    #[test]
+    fn deny_text_search_parses_from_yaml() {
+        let on =
+            parse_context_yaml("name: demo\ndeny_text_search: true\nnotes: x\n", "demo").unwrap();
+        assert!(on.deny_text_search);
+        let off =
+            parse_context_yaml("name: demo\ndeny_text_search: false\nnotes: x\n", "demo").unwrap();
+        assert!(!off.deny_text_search);
+        let missing = parse_context_yaml("name: demo\nnotes: x\n", "demo").unwrap();
+        assert!(!missing.deny_text_search);
     }
 
     #[test]

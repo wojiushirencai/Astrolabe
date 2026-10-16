@@ -201,6 +201,8 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 | `ASTROLABE_SLICE_READ_MAX` | `200` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为切片读 |
 | `ASTROLABE_SLICE_READ_THRESHOLD` | `10` | 连续切片读提醒阈值：连续 N 次切片读且期间无任何 Astrolabe 工具调用时触发 deny（任何 Astrolabe 工具调用清零该额度） |
 | `ASTROLABE_READ_THRESHOLD` | `3` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） |
+| `ASTROLABE_GREP_THRESHOLD` | `3` | 连续 Grep/shell 文本搜索 deny 阈值（soft 模式） |
+| `ASTROLABE_DENY_TEXT_SEARCH` | 关闭 | 硬禁用宿主 Grep/Glob/shell 文本搜索（`true`/`1`/`yes`/`on`）；首次即 deny。多 Astrolabe 进程可在各自 mcp.json `env` 中分别配置；hooks 命令需同步设置或加 `--deny-text-search` / `--context=` |
 | `ASTROLABE_DENY_SILENCE_SECS` | `15` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） |
 
 ### 语言服务器（可选）
