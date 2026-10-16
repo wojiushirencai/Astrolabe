@@ -10,14 +10,10 @@
 //! that actually unpack it. Oversized results go out as a `resource_link`
 //! plus a short text summary.
 //!
-//! Keep the tool surface small. A measured finding from the field: one strong
-//! entry-point tool guides an agent better than a menu of narrow ones — fewer
-//! mis-selections and less context spent per session. Twenty-one tools
-//! ([`astrolabe_mcp::TOOL_COUNT`]): ten graph-level, six language-server-backed
-//! (`find_references`, `goto_definition`, `get_diagnostics`, `get_symbol_info`,
-//! `plan_rename`, `apply_rename`), `initial_instructions`, and four memory
-//! tools. `resolve_context` is the front door. `apply_rename` is gated
-//! (auto-applicable or `force=true`) and irreversible.
+//! Keep the tool surface small. Eight tools ([`astrolabe_mcp::TOOL_COUNT`]):
+//! `resolve_context`, `search_code`, `find_symbol`, `get_languages`,
+//! `list_memories`, `find_references`, `goto_definition`, `get_diagnostics`.
+//! `resolve_context` is the front door.
 //!
 //! Declare a generous `ttlMs` on `tools/list` so clients stop re-fetching the
 //! tool definitions every session.

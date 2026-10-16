@@ -1,4 +1,5 @@
-//! MCP tool `ensure_language_server`: session-gated language-server install UX.
+//! Session-gated language-server install helpers used by `get_languages`.
+#![allow(dead_code)]
 //!
 //! Without `confirm_install` (default): return a needs_install / Ready / AST-only
 //! plan and **do not** download.

@@ -44,10 +44,6 @@ pub struct ClientContext {
     pub structured_tool_output: Option<bool>,
     pub excluded_tools: Vec<String>,
     pub notes: String,
-    /// Expose a minimal, terse tool catalog (claude-code): fewer tools and
-    /// shorter schemas, so every request carries less tool-definition text.
-    /// `ASTROLABE_FULL_CATALOG=1` turns it off.
-    pub slim_catalog: bool,
     /// Hard-deny host Grep / Glob / shell text-search on first use (hooks remind).
     /// Default false: keep soft GREP_THRESHOLD behaviour. Overridable by
     /// `ASTROLABE_DENY_TEXT_SEARCH` and `hooks remind --deny-text-search`.
@@ -97,15 +93,6 @@ impl ClientContext {
         })
     }
 
-    /// `slim_catalog` unless `ASTROLABE_FULL_CATALOG=1`.
-    pub fn slim(&self) -> bool {
-        self.slim_catalog
-            && !matches!(
-                std::env::var("ASTROLABE_FULL_CATALOG").as_deref(),
-                Ok("1") | Ok("true")
-            )
-    }
-
     pub fn excludes(&self, tool: &str) -> bool {
         self.excluded_tools.iter().any(|name| name == tool)
     }
@@ -152,7 +139,6 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
     let mut excluded_tools = Vec::new();
     let mut list_key: Option<String> = None;
     let mut saw_structured = false;
-    let mut slim_catalog = false;
     let mut deny_text_search = false;
 
     for (idx, raw) in src.lines().enumerate() {
@@ -192,11 +178,6 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
                 structured_tool_output = parse_bool_or_null(rest).map_err(|err| {
                     anyhow::anyhow!("line {line_no}: structured_tool_output: {err}")
                 })?;
-            }
-            "slim_catalog" => {
-                slim_catalog = parse_bool_or_null(rest)
-                    .map_err(|err| anyhow::anyhow!("line {line_no}: slim_catalog: {err}"))?
-                    .unwrap_or(false);
             }
             "deny_text_search" => {
                 deny_text_search = parse_bool_or_null(rest)
@@ -238,7 +219,6 @@ fn parse_context_yaml(src: &str, fallback_name: &str) -> anyhow::Result<ClientCo
         structured_tool_output,
         excluded_tools,
         notes,
-        slim_catalog,
         deny_text_search,
     })
 }
@@ -305,13 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn readonly_excludes_only_apply_rename() {
+    fn readonly_excludes_nothing_catalog_is_already_read_only() {
         let ctx = ClientContext::builtin("readonly").unwrap();
-        // 只读模式：唯一写盘工具被排除；plan_rename 仅产计划，保留。
-        assert!(ctx.excludes("apply_rename"));
-        assert!(!ctx.excludes("plan_rename"));
+        assert!(ctx.excluded_tools.is_empty());
         assert!(!ctx.excludes("find_references"));
-        // 与 claude-code 同为 text-first（structured off）。
         assert_eq!(ctx.structured_tool_output, Some(false));
     }
 

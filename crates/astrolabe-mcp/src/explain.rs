@@ -1,5 +1,5 @@
-//! explain_symbol caller rendering: one entry per call-site line, non-test
-//! callers first, receiver/type-qualified names, method vs function split.
+//! Caller / test-file helpers shared with `search_code` grouping.
+#![allow(dead_code)]
 
 use astrolabe_core::types::{CodeSymbol, SymbolKind};
 

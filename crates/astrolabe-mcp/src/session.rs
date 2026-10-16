@@ -66,7 +66,6 @@ pub(crate) struct RootSession {
     pub cache_hits: Arc<AtomicU64>,
     pub cache_misses: Arc<AtomicU64>,
     pub cache_budget_bytes: u64,
-    pub churn_cache: Arc<Mutex<Option<(Instant, astrolabe_core::churn::ChurnTable)>>>,
     pub rebuild_inflight: Arc<AtomicBool>,
     pub knobs: McpKnobs,
 }
@@ -107,26 +106,9 @@ impl RootSession {
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             cache_budget_bytes,
-            churn_cache: Arc::new(Mutex::new(None)),
             rebuild_inflight: Arc::new(AtomicBool::new(false)),
             knobs,
         })
-    }
-
-    pub(crate) fn cached_churn(&self) -> astrolabe_core::churn::ChurnTable {
-        const CHURN_TTL: Duration = Duration::from_secs(600);
-        {
-            let guard = self.churn_cache.lock().expect("churn cache lock poisoned");
-            if let Some((at, table)) = guard.as_ref() {
-                if at.elapsed() < CHURN_TTL {
-                    return table.clone();
-                }
-            }
-        }
-        let table = astrolabe_core::churn::compute_churn(&self.root);
-        *self.churn_cache.lock().expect("churn cache lock poisoned") =
-            Some((Instant::now(), table.clone()));
-        table
     }
 
     /// Stop the watcher and drop the indexer lock. Store files stay on disk.

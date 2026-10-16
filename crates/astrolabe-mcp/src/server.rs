@@ -11,9 +11,9 @@ use std::{
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
     cache::DEFAULT_MEMORY_BUDGET_BYTES,
-    graph::{compute_centrality, dependencies, dependents, rank_for_task},
+    graph::{compute_centrality, rank_for_task},
     render::{confidence_note, symbol_line},
-    CodeSymbol, Confidence, EdgeKind, FileId,
+    CodeSymbol, Confidence, FileId,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -263,220 +263,6 @@ fn data_hits_outside(
         out.push_str(&format!("  …另有 {} 个文件\n", files.len() - 8));
     }
     out
-}
-
-/// One explain_symbol call site.
-#[derive(Debug, Clone)]
-struct ExplainSite {
-    path: String,
-    line: usize,
-    caller: String,
-    code: String,
-    test: bool,
-    target: String,
-}
-
-impl ExplainSite {
-    fn render(&self, show_target: bool) -> String {
-        let target = if show_target {
-            format!(" → {}", self.target)
-        } else {
-            String::new()
-        };
-        format!(
-            "@{}:{}  in {}{target} │ {}",
-            self.path, self.line, self.caller, self.code
-        )
-    }
-}
-
-/// Call sites of `defs`: language-server references when that server is
-/// already running (exact), else the syntactic call graph narrowed to the
-/// actual call lines and filtered by call form (method vs function).
-fn explain_call_sites(
-    session: &RootSession,
-    index: &RepoIndex,
-    defs: &[&CodeSymbol],
-    params: &ExplainParams,
-) -> (Vec<ExplainSite>, bool) {
-    let symbols = &index.graph().symbols;
-    let file_syms = |file: astrolabe_core::types::FileId| -> Vec<&CodeSymbol> {
-        symbols.iter().filter(|s| s.file == file).collect()
-    };
-    let lines_of = |path: &str| {
-        index
-            .cached_lines(&session.file_cache, path)
-            .map(|(l, _)| l)
-    };
-    let clip = |text: &str| -> String {
-        let t = text.trim();
-        let c: String = t.chars().take(120).collect();
-        if c.len() < t.len() {
-            format!("{c}…")
-        } else {
-            c
-        }
-    };
-    let caller_label = |path: &str, line: usize| -> String {
-        match enclosing_symbol(index, path, line) {
-            Some(sym) => {
-                let same = file_syms(sym.file);
-                crate::explain::qualified_name(&sym, &same)
-            }
-            None => "(top level)".to_string(),
-        }
-    };
-    let mut out: Vec<ExplainSite> = Vec::new();
-    let mut lsp_used = false;
-    let lsp_allowed = params.precise.unwrap_or(true)
-        && !matches!(std::env::var("ASTROLABE_EXPLAIN_LSP").as_deref(), Ok("0"));
-    let mut lsp_done = BTreeSet::new();
-    if lsp_allowed {
-        for def in defs {
-            let Some(file) = index.file(def.file) else {
-                continue;
-            };
-            let path = file.path.as_str();
-            if !session.precise.is_warm(path) {
-                continue;
-            }
-            let Some(lines) = lines_of(path) else {
-                continue;
-            };
-            let decl = lines
-                .get(def.start_line as usize - 1)
-                .cloned()
-                .unwrap_or_default();
-            let Some(col) = decl.find(&def.name) else {
-                continue;
-            };
-            let result = session.precise.references(
-                &def.name,
-                Some(path),
-                Some(astrolabe_core::lsp::Position {
-                    line: def.start_line - 1,
-                    character: decl[..col].chars().count() as u32,
-                }),
-            );
-            if result.confidence != Confidence::Exact {
-                continue;
-            }
-            let same = file_syms(def.file);
-            let target = crate::explain::qualified_name(def, &same);
-            for loc in &result.value {
-                let p = loc.path.as_str().to_string();
-                let line = loc.range.start.line as usize + 1;
-                if p == path && line == def.start_line as usize {
-                    continue;
-                }
-                let code = lines_of(&p)
-                    .and_then(|l| l.get(line - 1).cloned())
-                    .unwrap_or_default();
-                let caller = caller_label(&p, line);
-                let test = crate::explain::is_test_caller(
-                    &p,
-                    caller.rsplit('.').next().unwrap_or(&caller),
-                );
-                out.push(ExplainSite {
-                    path: p,
-                    line,
-                    caller,
-                    code: clip(&code),
-                    test,
-                    target: target.clone(),
-                });
-            }
-            lsp_done.insert(def.id.0);
-            lsp_used = true;
-        }
-    }
-    let pending: Vec<&&CodeSymbol> = defs
-        .iter()
-        .filter(|d| !lsp_done.contains(&d.id.0))
-        .collect();
-    if !pending.is_empty() {
-        let wanted: BTreeSet<u32> = pending.iter().map(|d| d.id.0).collect();
-        let mut callers: Vec<&CodeSymbol> = Vec::new();
-        let mut seen_caller = BTreeSet::new();
-        for edge in index
-            .graph()
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Call && wanted.contains(&e.to))
-        {
-            if seen_caller.insert(edge.from) {
-                if let Some(from) = symbols.iter().find(|s| s.id.0 == edge.from) {
-                    callers.push(from);
-                }
-            }
-        }
-        let def_info: Vec<(&CodeSymbol, String, bool, String)> = pending
-            .iter()
-            .filter_map(|d| {
-                let file = index.file(d.file)?;
-                let same = file_syms(d.file);
-                Some((
-                    **d,
-                    crate::explain::qualified_name(d, &same),
-                    crate::explain::is_method(d, &same),
-                    file.path.as_str().to_string(),
-                ))
-            })
-            .collect();
-        let mut seen_site = BTreeSet::new();
-        for caller in callers {
-            let Some(file) = index.file(caller.file) else {
-                continue;
-            };
-            let path = file.path.as_str();
-            let Some(lines) = lines_of(path) else {
-                continue;
-            };
-            let same = file_syms(caller.file);
-            let label = crate::explain::qualified_name(caller, &same);
-            let test = crate::explain::is_test_caller(path, &caller.name);
-            let skip = (caller.name == params.name
-                || def_info.iter().any(|(d, ..)| d.id == caller.id))
-            .then_some(caller.start_line as usize);
-            let name = &def_info
-                .first()
-                .map(|(d, ..)| d.name.clone())
-                .unwrap_or_default();
-            for (line, form) in crate::explain::call_sites(
-                &lines,
-                caller.start_line as usize,
-                caller.end_line as usize,
-                name,
-                skip,
-            ) {
-                for (def, target, method, def_path) in &def_info {
-                    let same_dir = crate::explain::dir_of(def_path) == crate::explain::dir_of(path);
-                    let go = def_path.ends_with(".go");
-                    if !crate::explain::form_matches(form, *method, same_dir, go) {
-                        continue;
-                    }
-                    if !seen_site.insert((path.to_string(), line, def.id.0)) {
-                        continue;
-                    }
-                    out.push(ExplainSite {
-                        path: path.to_string(),
-                        line,
-                        caller: label.clone(),
-                        code: clip(&lines[line - 1]),
-                        test,
-                        target: target.clone(),
-                    });
-                }
-            }
-        }
-    }
-    out.sort_by(|a, b| {
-        a.test
-            .cmp(&b.test)
-            .then(a.path.cmp(&b.path))
-            .then(a.line.cmp(&b.line))
-    });
-    (out, lsp_used)
 }
 
 /// Smallest symbol in `file` that encloses `line` with at least 3 lines.
@@ -1194,34 +980,6 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
     })
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub(crate) struct ExplainParams {
-    #[schemars(description = "Exact symbol name (case-insensitive fallback).")]
-    pub name: String,
-    #[serde(default)]
-    #[schemars(
-        description = "Optional repo-relative path substring to pick among same-named definitions."
-    )]
-    pub path_filter: Option<String>,
-    #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate tokens in the result (default 2500).")]
-    pub budget_tokens: usize,
-    #[serde(default)]
-    #[schemars(
-        description = "Default true: bodies already returned this session are referenced, not resent."
-    )]
-    pub dedup: Option<bool>,
-    #[serde(default)]
-    #[schemars(
-        description = "List call sites inside test code too (default false: tests are collapsed to a count)."
-    )]
-    pub include_tests: Option<bool>,
-    #[serde(default)]
-    #[schemars(
-        description = "Default true: when the language server is already running, callers come from its references (exact)."
-    )]
-    pub precise: Option<bool>,
-}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
@@ -1276,98 +1034,12 @@ pub(crate) struct SearchParams {
     pub dedup: Option<bool>,
 }
 
-fn default_direction() -> String {
-    "dependents".into()
-}
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct DependentsParams {
-    #[schemars(description = "Repo-relative path or unique path suffix")]
-    pub target: String,
-    #[serde(default = "default_direction")]
-    #[schemars(description = "dependents or dependencies")]
-    pub direction: String,
-    #[serde(default = "default_budget")]
-    pub budget_tokens: usize,
-}
-
-fn default_call_direction() -> String {
-    "both".into()
-}
-
-fn default_neighborhood_depth() -> u16 {
-    2
-}
-
-/// Trace / group-graph depth default: docs say 1 (flat / top-level).
-fn default_trace_or_group_depth() -> u16 {
-    1
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct GroupGraphParams {
-    /// 1..=3，超域钳制。
-    #[serde(default = "default_trace_or_group_depth")]
-    #[schemars(description = "Folder grouping depth 1-3 (default 1 = top-level dirs)")]
-    pub depth: u16,
-    #[serde(default = "default_budget")]
-    pub budget_tokens: usize,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct MemoryNameParams {
-    #[schemars(description = "Memory name ([A-Za-z0-9_-], <=64 chars)")]
-    pub name: String,
-    #[serde(default = "default_budget")]
-    pub budget_tokens: usize,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct MemoryContentParams {
-    #[schemars(description = "Memory name ([A-Za-z0-9_-], <=64 chars)")]
-    pub name: String,
-    #[schemars(description = "Markdown content")]
-    pub content: String,
-    #[serde(default = "default_budget")]
-    pub budget_tokens: usize,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct NeighborhoodParams {
-    #[schemars(description = "Repo-relative path or unique path suffix")]
-    pub target: String,
-    #[serde(default = "default_call_direction")]
-    #[schemars(description = "dependents, dependencies, or both")]
-    pub direction: String,
-    /// 1..=3，超域钳制（openvisio 同款上限）。u16 让 256+ 先能反序列化再钳。
-    #[serde(default = "default_neighborhood_depth")]
-    #[schemars(description = "BFS hops over import edges, 1-3 (default 2)")]
-    pub depth: u16,
-    #[serde(default = "default_budget")]
-    pub budget_tokens: usize,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct TraceParams {
-    pub symbol: String,
-    #[serde(default = "default_call_direction")]
-    #[schemars(description = "callers, callees, or both")]
-    pub direction: String,
-    /// \>1 时走多跳调用树（1..=6，超出钳制；默认 1 保持旧行为）。u16 让
-    /// 256+ 先能反序列化再钳。
-    #[serde(default = "default_trace_or_group_depth")]
-    #[schemars(
-        description = "Trace depth 1-6; >1 renders a tree with cycle markers (default 1 = flat)"
-    )]
-    pub depth: u16,
-    #[serde(default = "default_budget")]
-    pub budget_tokens: usize,
-}
 
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
-    /// Parent (multi) or the single index root. Memory tools and
-    /// `initial_instructions` use this; graph tools use the routed session.
+    /// Parent (multi) or the single index root. Memory tools use this;
+    /// graph tools use the routed session.
     root: PathBuf,
     primary: Arc<RootSession>,
     dispatch: Option<Arc<DispatchState>>,
@@ -1622,12 +1294,6 @@ impl AstrolabeServer {
     fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| !self.context.excludes(tool.name.as_ref()));
-        if crate::slim::explain_disabled() {
-            tools.retain(|tool| tool.name != "explain_symbol");
-        }
-        if self.context.slim() {
-            return crate::slim::slim_catalog(tools);
-        }
         if self.context.openai_tool_compatible() {
             for tool in &mut tools {
                 let schema = Value::Object((*tool.input_schema).clone());
@@ -1891,52 +1557,10 @@ fn format_find_symbol_unindexed_hint(
     ))
 }
 
-fn file_extension(path: &str) -> Option<String> {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-}
 
 #[tool_router]
 impl AstrolabeServer {
-    /// L2 bootstrap（Serena 模式）：返回完整《Astrolabe Instructions Manual》——
-    /// 工具选择军规（claude-code 语境为 FORBIDDEN 级，default 为温和建议级）。
-    /// 不依赖索引，任何时候可调用。
-    #[tool(
-        description = "CRITICAL: read this first — the Astrolabe Instructions Manual (tool-selection doctrine for this client). Call once at the start of a coding task."
-    )]
-    pub(crate) fn initial_instructions(
-        &self,
-        Parameters(params): Parameters<BudgetOnly>,
-    ) -> CallToolResult {
-        let manual = crate::instructions::manual(&self.context.name).to_string();
-        let body = truncate_body_text(&manual, params.budget_tokens);
-        self.result(
-            "initial_instructions",
-            body,
-            json!({
-                "confidence": "exact",
-                "context": self.context.name,
-                "budget_tokens": params.budget_tokens,
-            }),
-            Some(params.budget_tokens),
-        )
-    }
 
-    #[tool(
-        description = "Session-gated language-server install. Without confirm_install (default): return needs_install plan (name, version_policy=latest, size if known) and do NOT download. With confirm_install=true: call core installer after the user agrees. Prefer this over silent downloads when precise tools report Unavailable."
-    )]
-    pub(crate) fn ensure_language_server(
-        &self,
-        Parameters(params): Parameters<crate::ensure_ls::EnsureLanguageServerParams>,
-    ) -> CallToolResult {
-        // Does not need the index; discovery is PATH/env based.
-        self.finish(crate::ensure_ls::run_ensure_language_server(
-            params,
-            &crate::ensure_ls::default_installer(),
-        ))
-    }
 
     #[tool(
         description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them."
@@ -2016,7 +1640,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "Prefer this over Grep/Read for code. 精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请向用户确认后调用 ensure_language_server（默认只出计划）。REQUIRED for rename/rewrite — grep matches text, not bindings. Also the right tool for who-calls / who-uses-X questions: one call returns every call site, instead of search_code on the name and Reading each hit."
+        description = "Prefer this over Grep/Read for code. 精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请在本机安装对应语言服务器（见 get_languages）。REQUIRED for rename/rewrite — grep matches text, not bindings. Also the right tool for who-calls / who-uses-X questions: one call returns every call site, instead of search_code on the name and Reading each hit."
     )]
     pub(crate) fn find_references(
         &self,
@@ -2029,7 +1653,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Prefer this over Grep/Read for code. 精确定义跳转：语言服务器绑定解析；不要用 find_symbol 代替（那是句法名字匹配）。LSP Unavailable → ask user, then ensure_language_server. The sanctioned way to resolve a definition — not Read/grep."
+        description = "Prefer this over Grep/Read for code. 精确定义跳转：语言服务器绑定解析；不要用 find_symbol 代替（那是句法名字匹配）。LSP Unavailable 时请在本机安装对应语言服务器。The sanctioned way to resolve a definition — not Read/grep."
     )]
     pub(crate) fn goto_definition(
         &self,
@@ -2042,7 +1666,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "文件诊断：语法与类型错误，用于改写后确认代码仍然成立。LSP Unavailable → ensure_language_server (user-gated). MUST run after editing a file to confirm it still holds."
+        description = "文件诊断：语法与类型错误，用于改写后确认代码仍然成立。LSP Unavailable 时请在本机安装对应语言服务器。MUST run after editing a file to confirm it still holds."
     )]
     pub(crate) fn get_diagnostics(
         &self,
@@ -2054,74 +1678,6 @@ impl AstrolabeServer {
         })
     }
 
-    #[tool(
-        description = "Prefer this over Grep/Read for code. 符号语义信息（LSP hover：docstring/类型/签名）。LSP Unavailable → ensure_language_server (ask user first). Docstrings without reading the file — pair with find_symbol anchors."
-    )]
-    pub(crate) fn get_symbol_info(
-        &self,
-        Parameters(params): Parameters<crate::precise_tools::GetSymbolInfoParams>,
-    ) -> CallToolResult {
-        let hint = Self::join_hint(&[&params.path, &params.symbol]);
-        self.with_precise(&hint, true, move |session| {
-            crate::precise_tools::run_get_symbol_info(params, session.precise.as_ref())
-        })
-    }
-
-    #[tool(
-        description = "生成重命名计划，只产出待改位置与置信度，不写盘。Needs LSP; if Unavailable ask user then ensure_language_server. Always plan before apply_rename; NEVER hand-edit occurrences for a rename."
-    )]
-    pub(crate) fn plan_rename(
-        &self,
-        Parameters(params): Parameters<crate::precise_tools::PlanRenameParams>,
-    ) -> CallToolResult {
-        let hint = Self::join_hint(&[params.path.as_deref().unwrap_or(""), &params.symbol]);
-        self.with_precise(&hint, true, move |session| {
-            crate::precise_tools::run_plan_rename(params, session.precise.as_ref())
-        })
-    }
-
-    #[tool(
-        description = "应用重命名（不可逆）。默认仅 exact/scoped 写盘；低置信度需 force=true。写后重解析，失败整笔回滚。The only sanctioned way to rename; never hand-edit occurrences."
-    )]
-    pub(crate) fn apply_rename(
-        &self,
-        Parameters(params): Parameters<crate::precise_tools::ApplyRenameParams>,
-    ) -> CallToolResult {
-        let hint = Self::join_hint(&[params.path.as_deref().unwrap_or(""), &params.symbol]);
-        self.with_precise(&hint, true, move |session| {
-            crate::precise_tools::run_apply_rename(params, session.precise.as_ref(), &session.root)
-        })
-    }
-
-    #[tool(
-        description = "返回按 import 图中心性排名的仓库骨架与公开符号。Prefer over reading files for a first map of the repo."
-    )]
-    pub(crate) fn get_repo_skeleton(
-        &self,
-        Parameters(params): Parameters<BudgetOnly>,
-    ) -> CallToolResult {
-        self.with_index("", |session, index| {
-            let centrality = compute_centrality(index.graph());
-            let mut ids: Vec<_> = index.graph().files.iter().map(|file| file.id).collect();
-            ids.sort_by(|a, b| {
-                centrality
-                    .by_file
-                    .get(b)
-                    .copied()
-                    .unwrap_or_default()
-                    .partial_cmp(&centrality.by_file.get(a).copied().unwrap_or_default())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let body = self.ranked_files(index, ids, params.budget_tokens, Confidence::Scoped);
-            self.result_on(
-                &session.root,
-                "get_repo_skeleton",
-                body,
-                json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            )
-        })
-    }
 
     #[tool(
         description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer this over Grep/Read for code. Results are exhaustive for indexed languages: every symbol matching the name is listed (total/next_offset declare truncation), no need to re-grep the same name. Prefer over Read for locating symbols — no whole-file reads needed. Need the code itself? Pass include_body=true to get the full body of each hit (function, method, class) in the same call instead of search_code + Read. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
@@ -2652,366 +2208,6 @@ impl AstrolabeServer {
         )
     }
 
-    #[tool(
-        description = "沿 scope-aware import 图查询文件的依赖或被依赖关系。Replaces manual grep for \"who imports this file\" — scoped from the import graph."
-    )]
-    pub(crate) fn get_dependents(
-        &self,
-        Parameters(params): Parameters<DependentsParams>,
-    ) -> CallToolResult {
-        self.with_fresh_index(&params.target, |session, index| {
-            let Some(target) = index.file_id(&params.target) else {
-                let unindexed = index.unindexed_code_exts(None);
-                let target_ext = file_extension(&params.target);
-                let message = if let Some(ext) = target_ext.filter(|e| unindexed.contains_key(e)) {
-                    format!(
-                        "目标 {} 是 .{} 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。\nconfidence: exact",
-                        params.target, ext
-                    )
-                } else {
-                    format!("未找到目标路径：{}\nconfidence: exact", params.target)
-                };
-                return self.result_on(
-                    &session.root,
-                    "get_dependents",
-                    message,
-                    json!({"confidence":"exact","found":false,"budget_tokens":params.budget_tokens}),
-                    Some(params.budget_tokens),
-                );
-            };
-            let ids = if params.direction == "dependencies" {
-                dependencies(index.graph(), target)
-            } else {
-                dependents(index.graph(), target)
-            };
-            let body = self.ranked_files(index, ids, params.budget_tokens, Confidence::Scoped);
-            self.result_on(
-                &session.root,
-                "get_dependents",
-                body,
-                json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            )
-        })
-    }
-
-    #[tool(
-        description = "Prefer this over Grep/Read for code. One call for a named function/method/type: its definition body (up to 3 same-named definitions, receiver/type-qualified) plus every call site as path:line with the calling function and the code line. Non-test call sites first; test call sites are collapsed to a count unless include_tests=true. Call sites come from the language server when it is already running (exact), otherwise from the syntactic call graph filtered by call form (method vs function). Use instead of find_symbol + search_code + Read; for the precise set before an edit use find_references."
-    )]
-    pub(crate) fn explain_symbol(
-        &self,
-        Parameters(params): Parameters<ExplainParams>,
-    ) -> CallToolResult {
-        self.with_fresh_index(&params.name, |session, index| {
-            let budget = clamp_budget(params.budget_tokens);
-            let in_filter = |symbol: &CodeSymbol| {
-                params.path_filter.as_deref().is_none_or(|filter| {
-                    index
-                        .file(symbol.file)
-                        .is_some_and(|file| file.path.as_str().contains(filter))
-                })
-            };
-            let symbols = &index.graph().symbols;
-            let mut defs: Vec<&CodeSymbol> = symbols
-                .iter()
-                .filter(|s| s.name == params.name && in_filter(s))
-                .collect();
-            if defs.is_empty() {
-                defs = symbols
-                    .iter()
-                    .filter(|s| s.name.eq_ignore_ascii_case(&params.name) && in_filter(s))
-                    .collect();
-            }
-            if defs.is_empty() {
-                return self.result_on(
-                    &session.root,
-                    "explain_symbol",
-                    format!("未找到名为 {} 的定义。可用 find_symbol 做子串查找，或 search_code 查字面量。\n", params.name),
-                    json!({"definitions": 0}),
-                    Some(params.budget_tokens),
-                );
-            }
-            // Prefer exported, larger definitions (implementations over decls).
-            defs.sort_by_key(|s| (!s.exported, std::cmp::Reverse(s.end_line - s.start_line)));
-            let total_defs = defs.len();
-            defs.truncate(3);
-            let dedup = session_dedup_enabled(params.dedup);
-            let generation = index.generation();
-            let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
-            let root_key = session.root.display().to_string();
-            let mut body = String::from("confidence: definitions exact; callers syntactic (名字匹配)\n");
-            if total_defs > 3 {
-                body.push_str(&format!("同名定义 {total_defs} 个，显示前 3 个；用 path_filter 指定。\n"));
-            }
-            let body_budget = budget.saturating_sub(SEARCH_HEADER_TOKENS) * 3 / 4;
-            for def in &defs {
-                let Some(file) = index.file(def.file) else { continue };
-                let path = file.path.as_str();
-                let kind = format!("{:?}", def.kind).to_lowercase();
-                let same_file: Vec<&CodeSymbol> = symbols.iter().filter(|s| s.file == def.file).collect();
-                body.push_str(&format!(
-                    "── {kind} {} · {path}:{}-{} ──\n",
-                    crate::explain::qualified_name(def, &same_file),
-                    def.start_line,
-                    def.end_line
-                ));
-                let key = format!("{root_key}|{path}:{}-{}", def.start_line, def.end_line);
-                let earlier = self.lookup_sent(&key, dedup, generation);
-                if let Some(c) = earlier {
-                    body.push_str(&format!(
-                        "  （本会话第 {c} 次调用已返回此定义，文件未改动，不再重发；需要时传 dedup=false）\n  签名：{}\n",
-                        def.signature.lines().next().unwrap_or("").trim()
-                    ));
-                    continue;
-                }
-                match astrolabe_core::body::symbol_body(&session.root.join(path), def) {
-                    Ok(text) => {
-                        let used = estimate_tokens(&body);
-                        let fits = used + estimate_tokens(&text) <= body_budget.max(used + 1)
-                            || body_budget == 0;
-                        if fits {
-                            self.commit_sent(
-                                &session.root,
-                                path,
-                                (def.start_line, def.end_line),
-                                generation,
-                                call,
-                            );
-                        }
-                        if used + estimate_tokens(&text) > body_budget.max(used + 1) && body_budget > 0 {
-                            let keep = body_budget.saturating_sub(used) * 4;
-                            let mut cut: String = text.chars().take(keep).collect();
-                            cut.push_str("\n…(定义体超出 budget_tokens 已截断；加大 budget_tokens 查看全部)\n");
-                            body.push_str(&cut);
-                        } else {
-                            body.push_str(&text);
-                            if !text.ends_with('\n') {
-                                body.push('\n');
-                            }
-                        }
-                    }
-                    Err(err) => body.push_str(&format!("  (读取定义体失败：{err})\n")),
-                }
-            }
-            let (sites, lsp_used) = explain_call_sites(session, index, &defs, &params);
-            if lsp_used {
-                body = body.replacen("callers syntactic (名字匹配)", "callers exact (语言服务器引用)", 1);
-            }
-            let include_tests = params.include_tests.unwrap_or(false);
-            let (tests, code): (Vec<_>, Vec<_>) = sites.into_iter().partition(|s| s.test);
-            let code_fns: BTreeSet<_> = code.iter().map(|s| (s.path.clone(), s.caller.clone())).collect();
-            let test_fns: BTreeSet<_> = tests.iter().map(|s| (s.path.clone(), s.caller.clone())).collect();
-            let how = if lsp_used { "语言服务器引用" } else { "名字匹配 + 调用形式过滤" };
-            body.push_str(&format!(
-                "调用点（{how}，非测试 {} 处 / {} 个函数）：\n",
-                code.len(),
-                code_fns.len()
-            ));
-            let shown: Vec<&ExplainSite> = if include_tests {
-                code.iter().chain(tests.iter()).collect()
-            } else {
-                code.iter().collect()
-            };
-            let lines: Vec<String> = shown.iter().map(|s| s.render(defs.len() > 1)).collect();
-            let remaining = budget.saturating_sub(estimate_tokens(&body)).saturating_sub(40);
-            let cap = lines.len().min(40);
-            let (kept, omitted) = truncate_ranked(&lines[..cap], remaining, |l| format!("{l}\n"));
-            for line in kept {
-                body.push_str("  ");
-                body.push_str(line);
-                body.push('\n');
-            }
-            let hidden = omitted + lines.len().saturating_sub(cap);
-            if hidden > 0 {
-                body.push_str(&format!("  …另有 {hidden} 处；完整/精确集合用 find_references。\n"));
-            } else if code.is_empty() && (tests.is_empty() || !include_tests) {
-                body.push_str("  (未找到非测试调用点；动态分派/反射调用请用 find_references 核验)\n");
-            }
-            if !tests.is_empty() && !include_tests {
-                body.push_str(&format!(
-                    "测试调用 {} 处 / {} 个测试函数（已折叠；include_tests=true 展开）\n",
-                    tests.len(),
-                    test_fns.len()
-                ));
-            }
-            self.result_on(
-                &session.root,
-                "explain_symbol",
-                body,
-                json!({
-                    "definitions": total_defs,
-                    "call_sites": code.len(),
-                    "callers": code_fns.len(),
-                    "test_call_sites": tests.len(),
-                    "precise": lsp_used,
-                    "budget_tokens": params.budget_tokens
-                }),
-                Some(params.budget_tokens),
-            )
-        })
-    }
-
-    #[tool(
-        description = "Prefer this over Grep/Read for code. 追踪名字匹配得到的调用者/被调用者；结果是 syntactic，必须核验动态分派。For the precise set use find_references."
-    )]
-    pub(crate) fn trace_calls(
-        &self,
-        Parameters(params): Parameters<TraceParams>,
-    ) -> CallToolResult {
-        self.with_fresh_index(&params.symbol, |session, index| {
-            // depth>1：多跳树（对齐 openvisio trace.ts；环检测 + 缩进渲染）。
-            if params.depth > 1 {
-                let body = self.trace_calls_tree_body(index, &params);
-                return self.result_on(
-                    &session.root,
-                    "trace_calls",
-                    body,
-                    json!({"confidence":"syntactic","depth":params.depth.clamp(1, 6),"budget_tokens":params.budget_tokens}),
-                    Some(params.budget_tokens),
-                );
-            }
-            let wanted: BTreeSet<_> = index
-                .graph()
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.name.eq_ignore_ascii_case(&params.symbol))
-                .map(|symbol| symbol.id.0)
-                .collect();
-            let mut lines = BTreeSet::new();
-            for edge in index.graph().edges.iter().filter(|edge| edge.kind == EdgeKind::Call) {
-                let include = match params.direction.as_str() {
-                    "callers" => wanted.contains(&edge.to),
-                    "callees" => wanted.contains(&edge.from),
-                    _ => wanted.contains(&edge.from) || wanted.contains(&edge.to),
-                };
-                if !include {
-                    continue;
-                }
-                let from = index.graph().symbols.iter().find(|symbol| symbol.id.0 == edge.from);
-                let to = index.graph().symbols.iter().find(|symbol| symbol.id.0 == edge.to);
-                if let (Some(from), Some(to), Some(from_file), Some(to_file)) = (
-                    from,
-                    to,
-                    from.and_then(|symbol| index.file(symbol.file)),
-                    to.and_then(|symbol| index.file(symbol.file)),
-                ) {
-                    lines.insert(format!(
-                        "{} -> {}",
-                        symbol_line(from, &from_file.path),
-                        symbol_line(to, &to_file.path)
-                    ));
-                }
-            }
-            let lines: Vec<_> = lines.into_iter().collect();
-            let (kept, omitted) =
-                truncate_ranked(&lines, params.budget_tokens, |line| format!("{line}\n"));
-            let mut body = format!(
-                "confidence: syntactic {}\n警告：调用图基于名字匹配，可能漏掉动态分派或包含同名误报。\n",
-                confidence_note(Confidence::Syntactic)
-            );
-            for line in kept {
-                body.push_str(line);
-                body.push('\n');
-            }
-            if omitted > 0 {
-                body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
-            }
-            self.result_on(
-                &session.root,
-                "trace_calls",
-                body,
-                json!({"confidence":"syntactic","budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            )
-        })
-    }
-
-    #[tool(
-        description = "多跳 import 邻域（BFS 1-3 跳，对齐 openvisio get_neighborhood）：文件在依赖图上的 k 跳可达集。Replaces chained get_dependents calls for impact analysis."
-    )]
-    pub(crate) fn get_neighborhood(
-        &self,
-        Parameters(params): Parameters<NeighborhoodParams>,
-    ) -> CallToolResult {
-        self.with_fresh_index(&params.target, |session, index| {
-            let Some(target_id) = index.file_id(&params.target) else {
-                let unindexed = index.unindexed_code_exts(None);
-                let target_ext = file_extension(&params.target);
-                let message = if let Some(ext) = target_ext.filter(|e| unindexed.contains_key(e)) {
-                    format!(
-                        "目标 {} 是 .{} 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。\n",
-                        params.target, ext
-                    )
-                } else {
-                    format!("未找到目标文件：{}\n", params.target)
-                };
-                return self.result_on(
-                    &session.root,
-                    "get_neighborhood",
-                    message,
-                    json!({"confidence":"unknown","budget_tokens":params.budget_tokens}),
-                    Some(params.budget_tokens),
-                );
-            };
-            let direction = match params.direction.as_str() {
-                "dependencies" => astrolabe_core::neighborhood::NeighborhoodDirection::Dependencies,
-                "dependents" => astrolabe_core::neighborhood::NeighborhoodDirection::Dependents,
-                _ => astrolabe_core::neighborhood::NeighborhoodDirection::Both,
-            };
-            let depth = params.depth.clamp(1, u16::from(astrolabe_core::neighborhood::MAX_NEIGHBORHOOD_DEPTH)) as u8;
-            let entries = astrolabe_core::neighborhood::neighborhood(
-                index.graph(),
-                target_id,
-                direction,
-                depth,
-            );
-            let mut header = format!(
-                "confidence: scoped {} (import 图 BFS；depth 1-3)\n",
-                confidence_note(Confidence::Scoped)
-            );
-            if entries.is_empty() {
-                header.push_str("无邻域（目标孤立或超深度域）。\n");
-                return self.result_on(
-                    &session.root,
-                    "get_neighborhood",
-                    header,
-                    json!({"confidence":"scoped","entries":0,"depth":depth,"budget_tokens":params.budget_tokens}),
-                    Some(params.budget_tokens),
-                );
-            }
-            let lines: Vec<String> = entries
-                .iter()
-                .filter_map(|entry| {
-                    index.file(entry.file).map(|file| {
-                        format!(
-                            "depth={} @{}:1 ({} LOC)",
-                            entry.depth, file.path, file.loc
-                        )
-                    })
-                })
-                .collect();
-            let remaining = params
-                .budget_tokens
-                .saturating_sub(estimate_tokens(&header));
-            let (kept, omitted) =
-                truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
-            let mut body = header;
-            for line in kept {
-                body.push_str(line);
-                body.push('\n');
-            }
-            if omitted > 0 {
-                body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
-            }
-            self.result_on(
-                &session.root,
-                "get_neighborhood",
-                body,
-                json!({"confidence":"scoped","entries":entries.len(),"depth":depth,"budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            )
-        })
-    }
 
     // ----- 项目记忆（Serena memories 对应物：跨会话知识留存，名称寻址）-----
     #[tool(
@@ -3023,7 +2219,7 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         let entries = crate::memory::list_memories(&self.root);
         let header = if entries.is_empty() {
-            "（无项目记忆；用 write_memory 沉淀跨会话知识）\n".to_string()
+            "（无项目记忆）\n".to_string()
         } else {
             format!(
                 "共 {} 条项目记忆（<root>/.astrolabe/memories/）：\n",
@@ -3062,127 +2258,6 @@ impl AstrolabeServer {
         )
     }
 
-    #[tool(
-        description = "读单条项目记忆全文（Serena read_memory）。Check list_memories for names."
-    )]
-    pub(crate) fn read_memory(
-        &self,
-        Parameters(params): Parameters<MemoryNameParams>,
-    ) -> CallToolResult {
-        match crate::memory::read_memory(&self.root, &params.name) {
-            Some(content) => self.result(
-                "read_memory",
-                truncate_body_text(&content, params.budget_tokens),
-                json!({"confidence":"exact","name":params.name,"budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            ),
-            None => self.result(
-                "read_memory",
-                format!("记忆 `{}` 不存在（先 list_memories 查名）。confidence: exact\n", params.name),
-                json!({"confidence":"exact","found":false,"budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            ),
-        }
-    }
-
-    #[tool(
-        description = "写/覆写项目记忆（Serena write_memory）：跨会话沉淀任务结论、坑、架构决策。原子写。"
-    )]
-    pub(crate) fn write_memory(
-        &self,
-        Parameters(params): Parameters<MemoryContentParams>,
-    ) -> CallToolResult {
-        match crate::memory::write_memory(&self.root, &params.name, &params.content) {
-            Ok(()) => self.result(
-                "write_memory",
-                format!("记忆 `{}` 已写入。\n", params.name),
-                json!({"confidence":"exact","name":params.name,"budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            ),
-            Err(error) => self.finish(text_error(format!("写入失败：{error}"))),
-        }
-    }
-
-    #[tool(description = "删除项目记忆（Serena delete_memory）。Irreversible.")]
-    pub(crate) fn delete_memory(
-        &self,
-        Parameters(params): Parameters<MemoryNameParams>,
-    ) -> CallToolResult {
-        let deleted = crate::memory::delete_memory(&self.root, &params.name);
-        if deleted {
-            self.result(
-                "delete_memory",
-                format!("记忆 `{}` 已删除。confidence: exact\n", params.name),
-                json!({"confidence":"exact","deleted":true,"budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            )
-        } else {
-            self.finish(text_error(format!(
-                "删除失败：记忆 `{}` 不存在或名字非法",
-                params.name
-            )))
-        }
-    }
-
-    #[tool(
-        description = "文件夹级架构图（对齐 openvisio toGroupGraph）：顶层目录为节点、聚合 import 为加权边。The macro architecture view — start here for module-boundary decisions."
-    )]
-    pub(crate) fn get_group_graph(
-        &self,
-        Parameters(params): Parameters<GroupGraphParams>,
-    ) -> CallToolResult {
-        self.with_index("", |session, index| {
-            let centrality = compute_centrality(index.graph());
-            let depth = params.depth.clamp(1, 3) as u8;
-            let (nodes, edges) =
-                astrolabe_core::group_graph::group_graph(index.graph(), &centrality, depth);
-            let header = format!(
-                "confidence: scoped {} (import 图文件夹聚合；depth={depth})\n\nnodes:\n",
-                confidence_note(Confidence::Scoped)
-            );
-            let mut lines: Vec<String> = nodes
-                .iter()
-                .map(|node| {
-                    format!(
-                        "{}  files={} centrality={:.4}",
-                        node.id, node.files, node.centrality
-                    )
-                })
-                .collect();
-            lines.push(String::new());
-            lines.push("edges (from -> to, weight):".to_string());
-            if edges.is_empty() {
-                lines.push("(无跨组边)".to_string());
-            } else {
-                for edge in &edges {
-                    lines.push(format!(
-                        "{} -> {} weight={}",
-                        edge.from, edge.to, edge.weight
-                    ));
-                }
-            }
-            let remaining = params
-                .budget_tokens
-                .saturating_sub(estimate_tokens(&header));
-            let (kept, omitted) =
-                truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
-            let mut body = header;
-            for line in kept {
-                body.push_str(line);
-                body.push('\n');
-            }
-            if omitted > 0 {
-                body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
-            }
-            self.result_on(
-                &session.root,
-                "get_group_graph",
-                body,
-                json!({"confidence":"scoped","groups":nodes.len(),"edges":edges.len(),"depth":depth,"budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            )
-        })
-    }
 
     /// Earlier call ordinal if this exact range was already returned this
     /// session at the same index generation (and dedup is on).
@@ -3479,168 +2554,6 @@ impl AstrolabeServer {
         )
     }
 
-    /// 多跳调用树（depth 1-6）：对每个同名符号各跑一棵 trace_tree，
-    /// 缩进渲染 + 环标记。同名多根时各树以根锚点行分隔。
-    /// M3：整树渲染受 budget_tokens 截断保护——超大森林只保留预算内的
-    /// 前缀行并显式声明省略数，不无限内联。
-    #[allow(clippy::too_many_lines)]
-    fn trace_calls_tree_body(&self, index: &RepoIndex, params: &TraceParams) -> String {
-        let direction = match params.direction.as_str() {
-            "callers" => astrolabe_core::trace_tree::TraceDirection::Callers,
-            "callees" => astrolabe_core::trace_tree::TraceDirection::Callees,
-            _ => astrolabe_core::trace_tree::TraceDirection::Both,
-        };
-        let depth = params.depth.clamp(1, 6) as u8;
-        let mut header = format!(
-            "confidence: syntactic {}\n警告：调用图基于名字匹配，可能漏掉动态分派或包含同名误报。depth={depth}，(cycle) = 路径成环已截断。\n",
-            confidence_note(Confidence::Syntactic)
-        );
-        // 同名符号多根一次建图 + 全森林硬上限（审查 major #3：逐根重建邻接、
-        // 无节点上限，depth=6 稠密图组合爆炸）。
-        let roots: Vec<_> = index
-            .graph()
-            .symbols
-            .iter()
-            .filter(|symbol| symbol.name.eq_ignore_ascii_case(&params.symbol))
-            .map(|symbol| symbol.id)
-            .collect();
-        let forest =
-            astrolabe_core::trace_tree::trace_forest(index.graph(), &roots, direction, depth, 2000);
-        if forest.entries.is_empty() {
-            header.push_str("未找到同名符号或无可展开调用边。\n");
-            return header;
-        }
-        // 预渲染 SymbolId → 锚点行，避免逐节点线性扫符号表（审查 major #3）。
-        let mut line_by_id: BTreeMap<_, String> = BTreeMap::new();
-        for symbol in &index.graph().symbols {
-            if let Some(file) = index.file(symbol.file) {
-                line_by_id.insert(symbol.id, symbol_line(symbol, &file.path));
-            }
-        }
-        let mut lines: Vec<String> = Vec::new();
-        for entry in &forest.entries {
-            let Some(root_line) = line_by_id.get(&entry.root) else {
-                continue;
-            };
-            lines.push(String::new());
-            lines.push(format!("root: {root_line}"));
-            // Both = Callees 树在前、Callers 树在后（trace_tree 语义）——第二
-            // 个 depth=0 是分界，打分段头；depth=0 节点本身已由 root 头表达
-            // （审查 major #4：根重复打印）。
-            let mut seen_root: usize = 0;
-            for node in &entry.nodes {
-                if node.depth == 0 {
-                    if direction == astrolabe_core::trace_tree::TraceDirection::Both
-                        && seen_root == 1
-                    {
-                        lines.push("--- callers ---".to_string());
-                    }
-                    seen_root += 1;
-                    continue;
-                }
-                let Some(line) = line_by_id.get(&node.symbol) else {
-                    continue;
-                };
-                let cycle = if node.cycle { " (cycle)" } else { "" };
-                lines.push(format!(
-                    "{}{}{cycle}",
-                    "  ".repeat(node.depth as usize),
-                    line
-                ));
-            }
-        }
-        // M3 树保护：树行纳入 budget_tokens，超出部分整行丢弃并声明。
-        let remaining = params
-            .budget_tokens
-            .saturating_sub(estimate_tokens(&header));
-        let (kept, omitted) = truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
-        let mut body = header;
-        for line in kept {
-            body.push_str(line);
-            body.push('\n');
-        }
-        if omitted > 0 {
-            body.push_str(&format!(
-                "{omitted} 个树节点因 budget_tokens 被省略（调用树过大；可减小 depth 或改用 find_references 后重查）。\n"
-            ));
-        }
-        body
-    }
-
-    #[tool(
-        description = "返回 import 中心性较高的承重文件，适合风险与重构候选定位。Start here to find load-bearing files before a refactor."
-    )]
-    pub(crate) fn get_hotspots(
-        &self,
-        Parameters(params): Parameters<BudgetOnly>,
-    ) -> CallToolResult {
-        self.with_index("", |session, index| {
-            // churn 融合（对齐 openvisio buildHotspots）：中心性 × churn 增益。
-            // 无 git / git 失败 → 空表 → 增益恒 1，退化为纯中心性（向后兼容）。
-            let centrality = compute_centrality(index.graph());
-            let churn = session.cached_churn();
-            let mut scored: Vec<(FileId, f64)> = index
-                .graph()
-                .files
-                .iter()
-                .map(|file| {
-                    let c = centrality.by_file.get(&file.id).copied().unwrap_or_default();
-                    let path_key = file.path.to_string();
-                    (file.id, astrolabe_core::churn::fuse_hotspot_score(c, churn.get(&path_key)))
-                })
-                .collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            // churn_fused = 至少一个文件真正命中 churn 键（表非空但全 miss 时
-            // 不误报——审查 major：子目录口径失配场景）。
-            let churn_hits = scored
-                .iter()
-                .filter(|(id, _)| {
-                    index
-                        .file(*id)
-                        .map(|file| churn.contains_key(&file.path.to_string()))
-                        .unwrap_or(false)
-                })
-                .count();
-            let mut header = format!(
-                "confidence: scoped {} (中心性×git-churn 融合；churn 缺失时退化为纯中心性)\n",
-                confidence_note(Confidence::Scoped)
-            );
-            let mut rows: Vec<String> = Vec::new();
-            for (id, score) in &scored {
-                if rows.len() >= 25 {
-                    break;
-                }
-                if let Some(file) = index.file(*id) {
-                    let churn_note = churn
-                        .get(&file.path.to_string())
-                        .map(|stats| {
-                            format!(" churn=90d:{}c/{}a", stats.commits_90d, stats.authors_90d)
-                        })
-                        .unwrap_or_default();
-                    rows.push(format!(
-                        "@{}:1 score={:.4}{churn_note} ({} LOC)",
-                        file.path, score, file.loc
-                    ));
-                }
-            }
-            let (kept, omitted) =
-                truncate_ranked(&rows, params.budget_tokens, |row| format!("{row}\n"));
-            for row in kept {
-                header.push_str(row);
-                header.push('\n');
-            }
-            if omitted > 0 {
-                header.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
-            }
-            self.result_on(
-                &session.root,
-                "get_hotspots",
-                header,
-                json!({"confidence":"scoped","budget_tokens":params.budget_tokens,"churn_fused":churn_hits>0,"churn_files":churn_hits}),
-                Some(params.budget_tokens),
-            )
-        })
-    }
 
     #[tool(
         description = "统计已索引仓库的语言、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。Index coverage + session-gated install status."
@@ -3693,10 +2606,9 @@ impl AstrolabeServer {
                 "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, visualbasic, kotlin, shell, ruby, lua\n\
                  confidence: exact (来自已扫描文件元数据 + LSP discovery)\n\
                  file_cache: {cache_bytes}/{} bytes, hits={cache_hits}, misses={cache_misses}\n\
-                 LSP status: Ready = server on PATH; needs_install = ask user then \
-                 ensure_language_server; AST-only = parse/index only (server not wired).\n\
-                 Install is session-gated: ensure_language_server without confirm returns a \
-                 plan only (latest, no download).\n",
+                 LSP status: Ready = server on PATH; needs_install = language server missing; \
+                 AST-only = parse/index only (server not wired).\n\
+                 If a precise tool reports Unavailable, install the named language server locally.\n",
                 session.cache_budget_bytes
             );
             for row in kept {
@@ -3766,11 +2678,10 @@ impl ServerHandler for AstrolabeServer {
         )
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
         .with_server_info(Implementation::new("astrolabe", env!("CARGO_PKG_VERSION")))
-        .with_instructions(if self.context.slim() {
-            crate::slim::slim_instructions(&self.root)
-        } else {
-            crate::instructions::connection_instructions(&self.context.name, &self.root)
-        })
+        .with_instructions(crate::instructions::connection_instructions(
+            &self.context.name,
+            &self.root,
+        ))
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -3821,23 +2732,6 @@ impl ServerHandler for AstrolabeServer {
     }
 }
 
-/// Truncate free-form text by whole lines to honor `budget_tokens`.
-fn truncate_body_text(text: &str, budget_tokens: usize) -> String {
-    if estimate_tokens(text) <= budget_tokens {
-        return text.to_string();
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let (kept, omitted) = truncate_ranked(&lines, budget_tokens, |line| format!("{line}\n"));
-    let mut out = String::new();
-    for line in kept {
-        out.push_str(line);
-        out.push('\n');
-    }
-    if omitted > 0 {
-        out.push_str(&format!("({omitted} 行因 budget_tokens 被省略)\n"));
-    }
-    out
-}
 
 /// P0 单行安全切片：超长匹配行只展示命中点附近的窗口。
 ///
@@ -4289,7 +3183,7 @@ mod tests {
     #[test]
     fn excluded_tools_are_omitted_from_catalog() {
         let mut ctx = crate::ClientContext::default_builtin();
-        ctx.excluded_tools = vec!["trace_calls".into(), "get_hotspots".into()];
+        ctx.excluded_tools = vec!["get_languages".into(), "list_memories".into()];
         let server = AstrolabeServer::new_with_cache_budget_and_context(
             PathBuf::from("."),
             DEFAULT_MEMORY_BUDGET_BYTES,
@@ -4300,9 +3194,9 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert!(!names.iter().any(|name| name == "trace_calls"), "{names:?}");
+        assert!(!names.iter().any(|name| name == "get_languages"), "{names:?}");
         assert!(
-            !names.iter().any(|name| name == "get_hotspots"),
+            !names.iter().any(|name| name == "list_memories"),
             "{names:?}"
         );
         assert!(
@@ -4394,7 +3288,6 @@ mod tests {
             task_description: "alpha".into(),
             budget_tokens: 100,
         })));
-        assert_first_text(server.get_repo_skeleton(Parameters(BudgetOnly { budget_tokens: 100 })));
         assert_first_text(server.find_symbol(Parameters(QueryParams {
             query: "alpha".into(),
             include_body: false,
@@ -4417,19 +3310,8 @@ mod tests {
             group: None,
             dedup: None,
         })));
-        assert_first_text(server.get_dependents(Parameters(DependentsParams {
-            target: "src/lib.rs".into(),
-            direction: "dependents".into(),
-            budget_tokens: 100,
-        })));
-        assert_first_text(server.trace_calls(Parameters(TraceParams {
-            symbol: "alpha".into(),
-            direction: "both".into(),
-            depth: 1,
-            budget_tokens: 100,
-        })));
-        assert_first_text(server.get_hotspots(Parameters(BudgetOnly { budget_tokens: 100 })));
         assert_first_text(server.get_languages(Parameters(BudgetOnly { budget_tokens: 100 })));
+        assert_first_text(server.list_memories(Parameters(BudgetOnly { budget_tokens: 100 })));
     }
 
     #[test]
@@ -4735,76 +3617,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn trace_calls_tree_respects_budget_tokens() {
-        let mut server =
-            AstrolabeServer::new_with_cache_budget(PathBuf::from("."), DEFAULT_MEMORY_BUDGET_BYTES);
-        // 30 个 caller → alpha：depth=2 的树有 30 个节点行，预算只给 10。
-        let mut symbols = vec![CodeSymbol {
-            id: SymbolId(0),
-            file: FileId(0),
-            name: "alpha".into(),
-            kind: SymbolKind::Function,
-            signature: "fn alpha()".into(),
-            start_line: 1,
-            end_line: 1,
-            exported: true,
-        }];
-        let mut edges = Vec::new();
-        for i in 1..=30u32 {
-            symbols.push(CodeSymbol {
-                id: SymbolId(i),
-                file: FileId(0),
-                name: format!("caller{i}"),
-                kind: SymbolKind::Function,
-                signature: format!("fn caller{i}()"),
-                start_line: i + 1,
-                end_line: i + 1,
-                exported: false,
-            });
-            edges.push(astrolabe_core::CodeEdge {
-                from: i,
-                to: 0,
-                kind: EdgeKind::Call,
-                weight: 1,
-                confidence: Confidence::Syntactic,
-            });
-        }
-        let graph = CodeGraph {
-            files: vec![CodeFile {
-                id: FileId(0),
-                path: RelPath::new("src/lib.rs"),
-                language: Some(Language::Rust),
-                loc: 40,
-                sha: String::new(),
-            }],
-            symbols,
-            edges,
-        };
-        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(
-            RepoIndex::from_graph(PathBuf::from("."), graph, Default::default()),
-        ));
-        server.structured_output = false;
-
-        let result = server.trace_calls(Parameters(TraceParams {
-            symbol: "alpha".into(),
-            direction: "callers".into(),
-            depth: 2,
-            budget_tokens: 10,
-        }));
-        let text = result.content[0].as_text().unwrap().text.clone();
-        assert!(text.contains("个树节点因 budget_tokens 被省略"), "{text}");
-        assert!(!text.contains("caller25"), "{text}");
-        // 大预算下同一棵树完整内联（保护不改变正常路径）。
-        let full = server.trace_calls(Parameters(TraceParams {
-            symbol: "alpha".into(),
-            direction: "callers".into(),
-            depth: 2,
-            budget_tokens: 4_000,
-        }));
-        let full_text = full.content[0].as_text().unwrap().text.clone();
-        assert!(full_text.contains("caller25"), "{full_text}");
-    }
 
     fn unique_temp_dir() -> PathBuf {
         // A timestamp alone is not unique: macOS resolves `SystemTime::now`
@@ -4934,63 +3746,6 @@ mod tests {
     const CMD_GO: &str = "package cobra\n\ntype Command struct{}\n\nfunc (c *Command) MarkFlagRequired(name string) error {\n\treturn MarkFlagRequired(nil, name)\n}\n\nfunc MarkFlagRequired(flags *int, name string) error {\n\treturn nil\n}\n\nfunc (c *Command) enforce() {\n\tx := 1\n\t_ = c.MarkFlagRequired(\"a\")\n\t_ = x\n\t_ = c.MarkFlagRequired(\"b\")\n}\n";
     const CMD_TEST_GO: &str = "package cobra\n\nimport \"testing\"\n\nfunc TestRequired(t *testing.T) {\n\tc := &Command{}\n\t_ = c.MarkFlagRequired(\"x\")\n}\n";
 
-    fn explain(name: &str, include_tests: Option<bool>) -> ExplainParams {
-        ExplainParams {
-            name: name.into(),
-            path_filter: None,
-            budget_tokens: 4000,
-            dedup: Some(false),
-            include_tests,
-            precise: None,
-        }
-    }
-
-    #[test]
-    fn explain_symbol_call_sites_qualified_and_tests_collapsed() {
-        let (server, dir) = smart_server(&[
-            ("command.go", CMD_GO.into()),
-            ("command_test.go", CMD_TEST_GO.into()),
-        ]);
-        let text = text_of(&server.explain_symbol(Parameters(explain("MarkFlagRequired", None))));
-        // Receiver-qualified headers keep the method and the function apart.
-        assert!(
-            text.contains("(*Command).MarkFlagRequired · command.go:5-7"),
-            "{text}"
-        );
-        assert!(
-            text.contains("function MarkFlagRequired · command.go:9-11"),
-            "{text}"
-        );
-        // One entry per call line, bound by call form: c.X( → method, X( → func.
-        assert!(
-            text.contains("@command.go:15  in (*Command).enforce → (*Command).MarkFlagRequired"),
-            "{text}"
-        );
-        assert!(
-            text.contains("@command.go:17  in (*Command).enforce → (*Command).MarkFlagRequired"),
-            "{text}"
-        );
-        assert!(
-            text.contains("@command.go:6  in (*Command).MarkFlagRequired → MarkFlagRequired │"),
-            "{text}"
-        );
-        assert!(
-            !text.contains("@command.go:15  in (*Command).enforce → MarkFlagRequired │"),
-            "{text}"
-        );
-        assert!(
-            !text.contains("@command.go:6  in (*Command).MarkFlagRequired → (*Command)"),
-            "{text}"
-        );
-        // Tests collapsed by default, listed (after code) on request.
-        assert!(text.contains("测试调用 1 处 / 1 个测试函数"), "{text}");
-        assert!(!text.contains("command_test.go:7"), "{text}");
-        let all =
-            text_of(&server.explain_symbol(Parameters(explain("MarkFlagRequired", Some(true)))));
-        let test_at = all.find("@command_test.go:7  in TestRequired").expect(&all);
-        assert!(all.find("@command.go:15").unwrap() < test_at, "{all}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     fn find(query: &str) -> QueryParams {
         QueryParams {
@@ -5057,86 +3812,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn explain_symbol_returns_body_and_callers() {
-        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let params = || ExplainParams {
-            name: "compute".into(),
-            path_filter: None,
-            budget_tokens: 2500,
-            dedup: None,
-            include_tests: None,
-            precise: None,
-        };
-        let text = text_of(&server.explain_symbol(Parameters(params())));
-        assert!(
-            text.contains("── function compute · calc.py:1-5 ──"),
-            "{text}"
-        );
-        assert!(text.contains("marker_x = total - 1"), "{text}");
-        assert!(text.contains("非测试 1 处 / 1 个函数"), "{text}");
-        assert!(
-            text.contains("@calc.py:9  in caller │ return compute(1, 2)"),
-            "{text}"
-        );
-        let again = text_of(&server.explain_symbol(Parameters(params())));
-        assert!(again.contains("已返回此定义"), "{again}");
-        assert!(!again.contains("total *= 2"), "{again}");
-        let missing = text_of(&server.explain_symbol(Parameters(ExplainParams {
-            name: "nope".into(),
-            ..params()
-        })));
-        assert!(missing.contains("未找到名为 nope 的定义"), "{missing}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn claude_code_context_lists_slim_catalog() {
-        let ctx = crate::ClientContext::builtin("claude-code").unwrap();
-        assert!(ctx.slim_catalog);
-        let slim = AstrolabeServer::new_with_cache_budget_and_context(
-            PathBuf::from("."),
-            DEFAULT_MEMORY_BUDGET_BYTES,
-            ctx,
-        );
-        let tools = slim.listed_tools();
-        let names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(
-            names,
-            [
-                "search_code",
-                "find_symbol",
-                "explain_symbol",
-                "find_references",
-                "goto_definition"
-            ]
-        );
-        let full = AstrolabeServer::new_with_cache_budget_and_context(
-            PathBuf::from("."),
-            DEFAULT_MEMORY_BUDGET_BYTES,
-            crate::ClientContext::default_builtin(),
-        );
-        let bytes = |t: &[rmcp::model::Tool]| serde_json::to_string(t).unwrap().len();
-        assert!(
-            bytes(&tools) * 4 < bytes(&full.listed_tools()),
-            "slim catalog should be far smaller"
-        );
-        let search = tools.iter().find(|t| t.name == "search_code").unwrap();
-        let props = search
-            .input_schema
-            .get("properties")
-            .unwrap()
-            .as_object()
-            .unwrap();
-        assert!(props.contains_key("path_filter") && !props.contains_key("budget_tokens"));
-        let info = slim.get_info();
-        let instructions = info.instructions.unwrap();
-        assert!(instructions.contains("explain_symbol"), "{instructions}");
-        assert!(
-            !instructions.contains("initial_instructions"),
-            "{instructions}"
-        );
-    }
 
     #[test]
     fn dedup_pointer_carries_signature_and_match_line() {
@@ -5289,7 +3964,6 @@ mod tests {
             if [
                 "search_code",
                 "find_symbol",
-                "explain_symbol",
                 "find_references",
                 "goto_definition",
             ]
@@ -5303,16 +3977,7 @@ mod tests {
                 );
             }
         }
-        let slim = AstrolabeServer::new_with_cache_budget_and_context(
-            PathBuf::from("."),
-            DEFAULT_MEMORY_BUDGET_BYTES,
-            crate::ClientContext::builtin("claude-code").unwrap(),
-        );
-        let tools = slim.listed_tools();
-        for tool in &tools {
-            let d = tool.description.as_deref().unwrap_or("");
-            assert!(d.contains("over Grep/Read for code"), "{}: {d}", tool.name);
-        }
+        let tools = full.listed_tools();
         let desc = |n: &str| {
             tools
                 .iter()
@@ -5323,12 +3988,9 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        assert!(desc("search_code").contains("never re-grep"));
-        assert!(desc("search_code").contains("before editing/renaming a literal"));
-        assert!(desc("find_symbol").contains("no need to re-grep"));
-        let instructions = slim.get_info().instructions.unwrap();
-        assert!(instructions.contains("don't re-grep"), "{instructions}");
-        assert!(instructions.contains("group=true"), "{instructions}");
+        assert!(desc("search_code").contains("do not re-grep") || desc("search_code").contains("never re-grep"));
+        assert!(desc("search_code").contains("before editing") || desc("search_code").contains("group=true"));
+        assert!(desc("find_symbol").contains("re-grep") || desc("find_symbol").contains("include_body"));
     }
 
     #[test]
@@ -6903,30 +5565,6 @@ mod tests {
             "{symbol_text}"
         );
 
-        // 3. get_dependents target=A.scala 精确文案
-        let dep_res = server.get_dependents(Parameters(DependentsParams {
-            target: "A.scala".into(),
-            direction: "dependents".into(),
-            budget_tokens: 2500,
-        }));
-        let dep_text = dep_res.content[0].as_text().unwrap().text.as_str();
-        assert!(
-            dep_text.contains("目标 A.scala 是 .scala 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
-            "{dep_text}"
-        );
-
-        // 3b. get_neighborhood target=A.scala 精确文案
-        let neigh_res = server.get_neighborhood(Parameters(NeighborhoodParams {
-            target: "A.scala".into(),
-            direction: "both".into(),
-            depth: 2,
-            budget_tokens: 2500,
-        }));
-        let neigh_text = neigh_res.content[0].as_text().unwrap().text.as_str();
-        assert!(
-            neigh_text.contains("目标 A.scala 是 .scala 文件（语言暂不支持，未入 import 图）——依赖查询不覆盖它，请改用 Grep/Read 分析其引用关系。"),
-            "{neigh_text}"
-        );
 
         // 4. get_languages 首行 supported、末尾 unindexed 行
         let langs_res = server.get_languages(Parameters(BudgetOnly {

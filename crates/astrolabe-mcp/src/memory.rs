@@ -107,6 +107,7 @@ pub fn list_memories(root: &Path) -> Vec<(String, String)> {
 }
 
 /// 读单个记忆全文。不存在（或名字非法、IO 失败）→ None。
+#[allow(dead_code)]
 pub fn read_memory(root: &Path, name: &str) -> Option<String> {
     let name = validate_name(name).ok()?;
     std::fs::read_to_string(memory_path(&memories_dir(root), &name)).ok()
@@ -115,6 +116,7 @@ pub fn read_memory(root: &Path, name: &str) -> Option<String> {
 /// 写/覆写记忆（name 合法性：非空、只允许 [A-Za-z0-9_-]、长度 ≤ 64，
 /// 非法 → Err(原因字符串)；正文超过 [`MAX_CONTENT_BYTES`] → Err；
 /// 自动创建目录；原子写：先写 .tmp 再 rename；Windows 上目的已存在时先删再 rename）。
+#[allow(dead_code)]
 pub fn write_memory(root: &Path, name: &str, content: &str) -> Result<(), String> {
     let name = validate_name(name)?;
     let content_len = content.len();
@@ -152,6 +154,7 @@ pub fn write_memory(root: &Path, name: &str, content: &str) -> Result<(), String
 }
 
 /// 删除记忆。不存在（或名字非法、IO 失败）→ false。
+#[allow(dead_code)]
 pub fn delete_memory(root: &Path, name: &str) -> bool {
     let Ok(name) = validate_name(name) else {
         return false;
