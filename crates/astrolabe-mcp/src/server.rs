@@ -1035,8 +1035,8 @@ pub(crate) struct SearchParams {
 
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
-    /// Parent (multi) or the single index root. Memory tools use this;
-    /// graph tools use the routed session.
+    /// Parent (multi) or the single index root. Tools use the routed
+    /// session; this is the fallback root.
     root: PathBuf,
     primary: Arc<RootSession>,
     dispatch: Option<Arc<DispatchState>>,
@@ -1413,6 +1413,7 @@ impl AstrolabeServer {
         resource_threshold_base_from_env().max(caller_budget.map(clamp_budget).unwrap_or(0))
     }
 
+    #[cfg(test)]
     fn result(
         &self,
         title: &str,
@@ -2198,55 +2199,6 @@ impl AstrolabeServer {
                     Some(params.budget_tokens),
                 )
             },
-        )
-    }
-
-    // ----- 项目记忆（Serena memories 对应物：跨会话知识留存，名称寻址）-----
-    #[tool(
-        description = "列出项目记忆（名称 + 首行摘要）。Lists names and first-line summaries only; read or edit the memory files directly on the filesystem."
-    )]
-    pub(crate) fn list_memories(
-        &self,
-        Parameters(params): Parameters<BudgetOnly>,
-    ) -> CallToolResult {
-        let entries = crate::memory::list_memories(&self.root);
-        let header = if entries.is_empty() {
-            "（无项目记忆）\n".to_string()
-        } else {
-            format!(
-                "共 {} 条项目记忆（<root>/.astrolabe/memories/）：\n",
-                entries.len()
-            )
-        };
-        if entries.is_empty() {
-            return self.result(
-                "list_memories",
-                header,
-                json!({"confidence":"exact","count":0,"budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
-            );
-        }
-        let lines: Vec<String> = entries
-            .iter()
-            .map(|(name, summary)| format!("- {name}: {summary}"))
-            .collect();
-        let remaining = params
-            .budget_tokens
-            .saturating_sub(estimate_tokens(&header));
-        let (kept, omitted) = truncate_ranked(&lines, remaining, |line| format!("{line}\n"));
-        let mut body = header;
-        for line in kept {
-            body.push_str(line);
-            body.push('\n');
-        }
-        if omitted > 0 {
-            body.push_str(&format!("{omitted} 条记忆因 budget_tokens 被省略。\n"));
-        }
-        self.result(
-            "list_memories",
-            body,
-            json!({"confidence":"exact","count":entries.len(),"budget_tokens":params.budget_tokens}),
-            Some(params.budget_tokens),
         )
     }
 
@@ -3172,7 +3124,7 @@ mod tests {
     #[test]
     fn excluded_tools_are_omitted_from_catalog() {
         let mut ctx = crate::ClientContext::default_builtin();
-        ctx.excluded_tools = vec!["get_languages".into(), "list_memories".into()];
+        ctx.excluded_tools = vec!["get_languages".into(), "find_symbol".into()];
         let server = AstrolabeServer::new_with_cache_budget_and_context(
             PathBuf::from("."),
             DEFAULT_MEMORY_BUDGET_BYTES,
@@ -3187,10 +3139,7 @@ mod tests {
             !names.iter().any(|name| name == "get_languages"),
             "{names:?}"
         );
-        assert!(
-            !names.iter().any(|name| name == "list_memories"),
-            "{names:?}"
-        );
+        assert!(!names.iter().any(|name| name == "find_symbol"), "{names:?}");
         assert!(
             names.iter().any(|name| name == "resolve_context"),
             "{names:?}"
@@ -3303,7 +3252,6 @@ mod tests {
             dedup: None,
         })));
         assert_first_text(server.get_languages(Parameters(BudgetOnly { budget_tokens: 100 })));
-        assert_first_text(server.list_memories(Parameters(BudgetOnly { budget_tokens: 100 })));
     }
 
     #[test]

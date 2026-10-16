@@ -10,9 +10,9 @@
 //! that actually unpack it. Oversized results go out as a `resource_link`
 //! plus a short text summary.
 //!
-//! Keep the tool surface small. Eight tools ([`astrolabe_mcp::TOOL_COUNT`]):
+//! Keep the tool surface small. Seven tools ([`astrolabe_mcp::TOOL_COUNT`]):
 //! `resolve_context`, `search_code`, `find_symbol`, `get_languages`,
-//! `list_memories`, `find_references`, `goto_definition`, `get_diagnostics`.
+//! `find_references`, `goto_definition`, `get_diagnostics`.
 //! `resolve_context` is the front door.
 //!
 //! Declare a generous `ttlMs` on `tools/list` so clients stop re-fetching the

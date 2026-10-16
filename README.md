@@ -386,7 +386,7 @@ export default AstrolabeGuard;
 
 ## 五、AI 助手可以用它做什么？（核心工具速查）
 
-Astrolabe 向 AI 暴露 8 个工具：
+Astrolabe 向 AI 暴露 7 个工具：
 
 | 工具名称 | 核心参数 | 它能帮 AI 解决什么？（大白话解读） |
 |---|---|---|
@@ -396,7 +396,6 @@ Astrolabe 向 AI 暴露 8 个工具：
 | `find_references` | `symbol`, `path` | **编译器级引用查找**：找到全库中所有调用该符号的准确位置。 |
 | `goto_definition` | `path`, `symbol` | **精准定义跳转**：利用 LSP 语义绑定直达真实定义处。 |
 | `get_diagnostics` | `path` | **改后即时体检**：获取当前文件的语法报错与类型错误。 |
-| `list_memories` | — | **列出项目记忆**：仅列名称 + 首行摘要（读写请直接操作 `.astrolabe/memories/` 下的文件）。 |
 | `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态。 |
 
 ## 六、进阶配置与运行细节

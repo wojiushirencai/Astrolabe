@@ -6,7 +6,6 @@
 //! [`crate::TOOL_COUNT`] includes [`crate::PRECISE_TOOL_COUNT`] (3).
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use astrolabe_core::{

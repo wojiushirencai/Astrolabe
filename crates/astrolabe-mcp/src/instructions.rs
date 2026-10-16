@@ -14,7 +14,7 @@ use std::path::Path;
 pub fn connection_instructions(context_name: &str, root: &Path) -> String {
     let _ = context_name;
     format!(
-        "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, list_memories, get_languages.\n\n\
+        "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages.\n\n\
          当前索引根 index_root: {}。每条工具结果第一行会重复该绝对路径；\
          若与你正在编辑的仓库不符，不要用这些路径读文件。\
          先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
@@ -282,7 +282,6 @@ Jump to a definition                    goto_definition
 Literal substring / explicit regex      search_code + path_filter (matches come with context; no follow-up Read)
 Check a file after edits                get_diagnostics
 Language / LSP readiness                get_languages (Ready / needs_install / AST-only)
-Cross-session project knowledge         list_memories
 
 Built-in Read/Edit/Glob/Grep are permitted on code files ONLY when:
 - Astrolabe has been tried on the target and failed, OR
@@ -361,6 +360,7 @@ mod tests {
                 "write_memory",
                 "delete_memory",
                 "initial_instructions",
+                "list_memories",
             ] {
                 assert!(!m.contains(gone), "{name} still mentions {gone}");
             }
@@ -381,6 +381,7 @@ mod tests {
             "ensure_language_server",
             "explain_symbol",
             "delete_memory",
+            "list_memories",
             "initial_instructions",
         ] {
             assert!(!p.contains(gone), "cc override still mentions {gone}");

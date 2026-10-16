@@ -209,7 +209,7 @@ pub(crate) fn config() -> &'static HooksConfig {
 
 /// 非符号工具子串：Astrolabe 工具名包含这些子串时不重置 burst 计数
 pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] =
-    &["search_code", "diagnostics", "languages", "memory"];
+    &["search_code", "diagnostics", "languages"];
 
 /// 非 Claude-Code 客户端判定 read_file 的动作动词子串
 pub(crate) const READ_FILE_VERB_SUBSTRINGS: &[&str] = &["read", "view", "open", "show"];
@@ -602,7 +602,7 @@ where
 /// 判定工具名是否为 Astrolabe 符号工具
 ///
 /// tool_name 含 "astrolabe" 且不含子串
-/// {pattern, search_code, diagnostics, languages, instructions, memory}
+/// {pattern, search_code, diagnostics, languages, instructions}
 pub(crate) fn is_astrolabe_symbolic_tool(tool_name: &str) -> bool {
     tool_name.contains("astrolabe")
         && !NON_SYMBOLIC_ASTROLABE_SUBSTRINGS
@@ -1921,7 +1921,6 @@ mod tests {
             "mcp__astrolabe__get_diagnostics"
         ));
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_languages"));
-        assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__list_memories"));
 
         // 导航类工具正常重置
         assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__find_symbol"));

@@ -20,7 +20,6 @@ mod index;
 pub mod instructions;
 mod live_backend;
 mod loop_guard;
-mod memory;
 mod openai_schema;
 mod precise_tools;
 mod reindex;
@@ -38,8 +37,8 @@ pub use server::AstrolabeServer;
 
 pub const TOOL_CATALOG_TTL_MS: u64 = 86_400_000;
 /// Catalog tools: `resolve_context`, `search_code`, `find_symbol`,
-/// `get_languages`, `list_memories`, plus the language-server-backed
+/// `get_languages`, plus the language-server-backed
 /// `find_references` / `goto_definition` / `get_diagnostics`.
-pub const TOOL_COUNT: usize = 5 + PRECISE_TOOL_COUNT;
+pub const TOOL_COUNT: usize = 4 + PRECISE_TOOL_COUNT;
 /// Language-server-backed tools defined in `precise_tools`, mounted on the server.
 pub const PRECISE_TOOL_COUNT: usize = 3;
