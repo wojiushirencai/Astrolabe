@@ -52,7 +52,7 @@ astrolabe -h
 
 ## 三、各 AI 编程工具 MCP 配置配方
 
-MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支持 21 个图谱与语言智能工具。
+MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支持 7 个图谱与语言智能工具。
 
 ### 1. Claude Code 配置
 
@@ -129,6 +129,50 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 ```
 *(Windows 请把 command 改为绝对路径 `C:\\Tools\\astrolabe\\astrolabe.exe`)*
 
+#### 免 Cursor 原生 MCP 审批
+
+`mcp.json` 没有 `trusted` 字段。要把下面 7 个只读工具免去 Cursor 原生 MCP 审批，需要写入用户级 `~/.cursor/permissions.json` 的 `mcpAllowlist`（格式 `server:tool`，其中 server 名必须与 mcp.json 的 key 一致，即 `astrolabe`）：
+
+- `search_code`
+- `find_symbol`
+- `resolve_context`
+- `get_diagnostics`
+- `find_references`
+- `goto_definition`
+- `get_languages`
+
+不要写 `astrolabe:*` 或 `*:*`。
+
+定义 `mcpAllowlist` 会**整表覆盖** IDE 里的 MCP allowlist，因此必须合并、不能覆盖已有条目；其它 MCP server 的工具也请写进同一文件。该 allowlist 需要开启 Cursor **Run Mode**（Auto-review / Allowlist / Run Everything）才生效。
+
+推荐在仓库根目录运行安装脚本（会 merge 写入，已存在的条目不会被删除；支持 `--dry-run` 预览、`--home` 覆盖 HOME）：
+
+```bash
+node scripts/setup-cursor-permissions.mjs
+```
+
+示例（脚本会在文件不存在时创建，已存在时只 union 进 `mcpAllowlist`，不修改 `terminalAllowlist` / `autoRun`）：
+
+```json
+{
+  "mcpAllowlist": [
+    "astrolabe:search_code",
+    "astrolabe:find_symbol",
+    "astrolabe:resolve_context",
+    "astrolabe:get_diagnostics",
+    "astrolabe:find_references",
+    "astrolabe:goto_definition",
+    "astrolabe:get_languages"
+  ]
+}
+```
+
+可选：同时把 Cursor CLI 的 `~/.cursor/cli-config.json` 里 `permissions.allow` 补上缺失的 `Mcp(astrolabe:<tool>)`（不改 `approvalMode` 和其它字段）。若该文件不存在则跳过并提示，不会新建整个 cli-config：
+
+```bash
+node scripts/setup-cursor-permissions.mjs --cli
+```
+
 ---
 
 ### 3. Windsurf / VS Code (Cline / Roo-Code / Continue) 配置
@@ -186,7 +230,8 @@ MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 支
 >      }
 >    }
 >    ```
-> 4. 执行 `astrolabe -h` 验证配置生效。
+> 4. 若当前是 Cursor：在仓库根目录运行 `node scripts/setup-cursor-permissions.mjs`（merge 写入 `~/.cursor/permissions.json` 的 7 个 `astrolabe:<tool>`，不覆盖已有条目）。并确认 Settings 里已开启 Run Mode（Auto-review / Allowlist / Run Everything）。不要写 `astrolabe:*`。
+> 5. 执行 `astrolabe -h` 验证配置生效。
 
 ---
 

@@ -42,57 +42,49 @@ fn default_budget() -> usize {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct FindReferencesParams {
-    #[schemars(description = "Symbol name whose references should be resolved")]
+    #[schemars(description = "Symbol name to find references for.")]
     pub symbol: String,
     #[serde(default)]
-    #[schemars(description = "Optional repo-relative file that scopes the query")]
+    #[schemars(description = "Optional repo-relative file scoping the query.")]
     pub path: Option<String>,
     #[serde(default)]
-    #[schemars(
-        description = "Optional 0-based LSP line of the symbol's name token in path; use with character to skip name-based anchoring"
-    )]
+    #[schemars(description = "Optional 0-based line of symbol in path.")]
     pub line: Option<u32>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based UTF-16 column; use together with line")]
+    #[schemars(description = "Optional 0-based column; used with line.")]
     pub character: Option<u32>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate tokens in the rendered result")]
+    #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GotoDefinitionParams {
-    #[schemars(
-        description = "Repo-relative file that scopes the query and selects the language server"
-    )]
+    #[schemars(description = "Repo-relative file containing the target symbol reference.")]
     pub path: String,
     #[serde(default)]
-    #[schemars(
-        description = "Symbol name; uses the first identifier occurrence in path. Provide this or line+character"
-    )]
+    #[schemars(description = "Symbol name to locate definition for.")]
     pub symbol: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based LSP line; use together with character")]
+    #[schemars(description = "Optional 0-based line; used with character.")]
     pub line: Option<u32>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based UTF-16 column; use together with line")]
+    #[schemars(description = "Optional 0-based column; used with line.")]
     pub character: Option<u32>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate tokens in the rendered result")]
+    #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GetDiagnosticsParams {
-    #[schemars(description = "Repo-relative file to diagnose")]
+    #[schemars(description = "Repo-relative file to diagnose.")]
     pub path: String,
     #[serde(default)]
-    #[schemars(
-        description = "Optional minimum severity filter: error, warning, information, or hint"
-    )]
+    #[schemars(description = "Minimum severity: error, warning, information, or hint.")]
     pub severity: Option<String>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate tokens in the rendered result")]
+    #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
 }
 
@@ -188,7 +180,7 @@ impl PreciseTools {
 #[tool_router]
 impl PreciseTools {
     #[tool(
-        description = "精确引用查询（语言服务器）。LSP Unavailable 时说明服务器名与本机安装命令；可建议 search_code（有误报）",
+        description = "精确引用查询（语言服务器）。LSP-resolved call sites and usages across repository. Required for renames and caller analysis.",
         annotations(title = "精确引用", read_only_hint = true)
     )]
     pub(crate) fn find_references(
@@ -199,7 +191,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "精确定义跳转（语言服务器绑定解析）。不要用 find_symbol 代替；LSP Unavailable 时请在本机安装对应语言服务器",
+        description = "精确定义跳转（语言服务器绑定解析）。Resolves definition anchor via language server semantics.",
         annotations(title = "精确定义", read_only_hint = true)
     )]
     pub(crate) fn goto_definition(
@@ -210,7 +202,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "文件诊断（语言服务器）。按严重程度过滤；LSP Unavailable 时返回服务器名与本机安装命令，而不是空的干净结果",
+        description = "文件诊断（语言服务器）。LSP diagnostics (syntax and type errors) to verify file correctness after edits.",
         annotations(title = "文件诊断", read_only_hint = true)
     )]
     pub(crate) fn get_diagnostics(

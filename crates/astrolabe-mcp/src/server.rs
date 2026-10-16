@@ -893,65 +893,58 @@ fn structured_output_for(context: &ClientContext) -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct BudgetOnly {
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate tokens in the rendered result")]
+    #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ResolveContextParams {
-    #[schemars(description = "Natural-language coding task used to rank relevant context")]
+    #[schemars(description = "Natural-language coding task description.")]
     pub task_description: String,
     #[serde(default = "default_budget")]
+    #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct QueryParams {
     #[schemars(
-        description = "Symbol name, substring, or hierarchical path like 'Class/method', 'Type.method', 'A::b' or 'pkg.Func' ('/Abs/Path' anchors at file top level). Results rank exact name > prefix > substring."
+        description = "Symbol name, substring, or hierarchical path ('Class/method', 'pkg.Func')."
     )]
     pub query: String,
     /// 对展示列表前 5 个命中符号附带源码体（include_body，对齐 Serena）。
     #[serde(default)]
-    #[schemars(
-        description = "Include source bodies for up to 5 displayed matches (bodies count against budget_tokens). Use this instead of a follow-up Read when you need the implementation of a named function, method or class."
-    )]
+    #[schemars(description = "Include source implementation bodies for displayed matches.")]
     pub include_body: bool,
     /// 子串开关。名称查询：省略=子串匹配（精确名优先排序），false=只要精确名，
     /// true=子串；路径查询：最后段子串匹配（省略/false=精确）。
     #[serde(default)]
     #[schemars(
-        description = "Name queries: omit = substring match ranked exact>prefix>substring; false = exact name only; true = substring. Path queries: substring-match the last segment (default exact)"
+        description = "Match mode: omitted=ranked prefix/substring, false=exact, true=substring."
     )]
     pub substring: Option<bool>,
     /// kind 过滤（Function/Method/Class/Struct/Trait/...），名称与路径查询均生效。
     #[serde(default)]
     #[schemars(
-        description = "Filter results by SymbolKind name (function, method, class, interface, struct, enum, trait, type, const, module, field)"
+        description = "Filter by SymbolKind (function, method, class, interface, struct, etc.)."
     )]
     pub kind: Option<String>,
     /// 仓库相对路径子串过滤（与 search_code 相同语义）。
     #[serde(default)]
-    #[schemars(
-        description = "Optional case-sensitive substring of the repo-relative path (e.g. src/server). Not a glob. A filter matching no indexed path is an error that lists the closest indexed paths."
-    )]
+    #[schemars(description = "Optional repo-relative path substring filter.")]
     pub path_filter: Option<String>,
     /// 路径查询：展开匹配者的嵌套子符号层数（0=不展开）。
     #[serde(default)]
     #[schemars(
-        description = "Path queries: expand nested children of matches to this depth (0 = matches only)"
+        description = "Path queries: expansion depth for nested children (0 = matches only)."
     )]
     pub depth: u8,
     #[serde(default = "default_budget")]
-    #[schemars(
-        description = "Maximum approximate tokens in the rendered result (default 2500). Overflow drops later matches and sets truncated=true; call again with offset=next_offset to fetch the next page."
-    )]
+    #[schemars(description = "Maximum approximate token budget (default 2500).")]
     pub budget_tokens: usize,
     /// 0 起始的翻页偏移（与 search_code 一致）。
     #[serde(default)]
-    #[schemars(
-        description = "0-based index of the first match to return (default 0). When a result is truncated it reports total and next_offset; pass that value here to fetch the next page. Ordering is stable (exact > prefix > substring, then anchor)."
-    )]
+    #[schemars(description = "0-based match offset for pagination (see next_offset in result).")]
     pub offset: usize,
 }
 
@@ -983,60 +976,52 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
     #[schemars(
-        description = "Search string. Literal case-insensitive substring unless regex=true. Do not put A|B here without regex=true — that searches for a vertical bar."
+        description = "Search string (case-insensitive literal, or regex when regex=true)."
     )]
     pub query: String,
     #[serde(default)]
-    #[schemars(
-        description = "Default false: treat query as literal text. Set true to compile query as a regular expression. Required for A|B, .*, \\b, and other regex syntax."
-    )]
+    #[schemars(description = "Default false. Set true to treat query as a regular expression.")]
     pub regex: bool,
     #[serde(default)]
     #[schemars(
-        description = "Optional case-sensitive substring of the repo-relative path (e.g. relay/channel). Not a glob. Do not pass an absolute path or a ./ prefix."
+        description = "Optional repo-relative path substring filter (case-sensitive, not glob)."
     )]
     pub path_filter: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Optional. Omitted: literal search is case-insensitive, regex search is case-sensitive. true forces case-sensitive matching; false forces case-insensitive (also for regex)."
+        description = "Override default case matching (literal=insensitive, regex=sensitive)."
     )]
     pub case_sensitive: Option<bool>,
     #[serde(default = "default_budget")]
     #[schemars(
-        description = "Maximum approximate tokens in the rendered result (default 2500). Overflow drops later hits and sets truncated=true; call again with offset=next_offset to fetch the next page, or raise this / tighten path_filter."
+        description = "Maximum approximate token budget (default 2500). Overflow drops later hits; see next_offset for paging."
     )]
     pub budget_tokens: usize,
     #[serde(default)]
-    #[schemars(
-        description = "0-based index of the first match to return (default 0). When a result is truncated it reports total and next_offset; pass that value here to fetch the next page. Ordering is stable: code hits (index file order) then [text-only] hits."
-    )]
+    #[schemars(description = "0-based match offset for pagination (see next_offset in result).")]
     pub offset: usize,
     #[serde(default)]
     #[schemars(
-        description = "Lines of surrounding source shown above and below each match (0-10). Omitted: adaptive — 3 when the query has at most 15 matches, 1 up to 60, 0 (bare lines) beyond that. Overlapping windows in one file are merged. Use the context to answer directly instead of a follow-up Read; for a whole function or class use find_symbol include_body=true."
+        description = "Surrounding source lines (0-10, omitted: adaptive 0-3 based on matches)."
     )]
     pub context_lines: Option<usize>,
     #[serde(default)]
-    #[schemars(
-        description = "Force a match page even when the query is broad (more than 60 hits). Default false: a broad query returns per-file / per-directory hit counts so you can narrow with path_filter."
-    )]
+    #[schemars(description = "Force match list on broad queries instead of summary counts.")]
     pub page: bool,
     #[serde(default)]
     #[schemars(
-        description = "Group hits per file (production code first, then tests; each hit tagged [断言]/[引用] or [加载]/[定义]/[使用] with its enclosing function). Use it BEFORE editing or renaming a literal, or before asserting on it, to see who loads and who asserts it. Automatic (when omitted) if more than 5 hits span more than 3 files; false forces the plain list."
+        description = "Group hits per file with test/assertion tags (default: auto for wide hits)."
     )]
     pub group: Option<bool>,
     #[serde(default)]
-    #[schemars(
-        description = "Default true: a symbol body already returned earlier in this session (file unchanged) is referenced by location instead of resent. false resends it."
-    )]
+    #[schemars(description = "Default true: reference repeated symbol bodies by location.")]
     pub dedup: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
-    /// Parent (multi) or the single index root. Tools use the routed
-    /// session; this is the fallback root.
+    /// Parent (multi) or the single index root. Memory tools use this;
+    /// graph tools use the routed session.
     root: PathBuf,
     primary: Arc<RootSession>,
     dispatch: Option<Arc<DispatchState>>,
@@ -1558,7 +1543,7 @@ fn format_find_symbol_unindexed_hint(
 #[tool_router]
 impl AstrolabeServer {
     #[tool(
-        description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them."
+        description = "主入口：根据编码任务聚合最相关文件、骨架符号与依赖图谱。Ranks relevant files and symbols for a given task."
     )]
     pub(crate) fn resolve_context(
         &self,
@@ -1635,7 +1620,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "Prefer this over Grep/Read for code. 精确引用查询：由语言服务器解析，图谱的名字匹配不足以支撑改写决策。LSP Unavailable 时请在本机安装对应语言服务器（见 get_languages）。REQUIRED for rename/rewrite — grep matches text, not bindings. Also the right tool for who-calls / who-uses-X questions: one call returns every call site, instead of search_code on the name and Reading each hit."
+        description = "精确引用查询（语言服务器驱动）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis."
     )]
     pub(crate) fn find_references(
         &self,
@@ -1648,7 +1633,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Prefer this over Grep/Read for code. 精确定义跳转：语言服务器绑定解析；不要用 find_symbol 代替（那是句法名字匹配）。LSP Unavailable 时请在本机安装对应语言服务器。The sanctioned way to resolve a definition — not Read/grep."
+        description = "精确定义跳转（语言服务器绑定解析）。Resolves definition anchor via language server semantics."
     )]
     pub(crate) fn goto_definition(
         &self,
@@ -1661,7 +1646,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "文件诊断：语法与类型错误，用于改写后确认代码仍然成立。LSP Unavailable 时请在本机安装对应语言服务器。MUST run after editing a file to confirm it still holds."
+        description = "获取文件诊断信息（语法与类型错误）。LSP diagnostics to verify file correctness after edits."
     )]
     pub(crate) fn get_diagnostics(
         &self,
@@ -1674,7 +1659,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer this over Grep/Read for code. Results are exhaustive for indexed languages: every symbol matching the name is listed (total/next_offset declare truncation), no need to re-grep the same name. Prefer over Read for locating symbols — no whole-file reads needed. Need the code itself? Pass include_body=true to get the full body of each hit (function, method, class) in the same call instead of search_code + Read. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
+        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点。Pass include_body=true to retrieve full function/class implementations in indexed languages. Paging via offset=next_offset."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -1811,7 +1796,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Prefer this over Grep/Read for code. Results are exhaustive: every match of the literal in the scanned files is counted (total=; truncation is declared), so do not re-grep the same literal. Search repository text for a literal substring (default) or a regex when regex=true. Returns each match as a path:line anchor plus a few surrounding source lines (context_lines; adaptive default, overlapping windows merged), so the answer is usually visible without a follow-up Read. Best for literals (strings, error messages, config keys, routes): set path_filter to the directory you care about. Before editing or renaming a literal, or asserting on it, use group=true (also automatic when more than 5 hits span more than 3 files) to see who loads and who asserts it. For a named function/class body use find_symbol include_body=true; for callers/usages use find_references. Query is literal unless regex=true — A|B without that flag searches for a vertical bar, not an alternation. Case rules: literal is case-insensitive, regex is case-sensitive; pass case_sensitive to override. Covers indexed source (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) first, then every other scanned text file (md, sql, yaml, json, xml, gradle, templates …, honoring .gitignore, size and binary limits; lock files skipped); those hits are tagged [text-only] and listed after code hits. Truncation is declared in the result (total/shown range/next_offset); call again with offset=next_offset to page through the rest, or raise budget_tokens / tighten path_filter. Discovery only; edits and renames must be driven by find_references."
+        description = "Exhaustive code & text search. Literal case-insensitive by default; regex when regex=true. Matches include surrounding context lines. Use group=true to group hits by file before refactoring/asserting. Covers indexed code first, then other text files tagged [text-only]. Paging via offset=next_offset."
     )]
     pub(crate) fn search_code(
         &self,
@@ -2498,7 +2483,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "统计已索引仓库的语言、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。Index coverage + session-gated install status."
+        description = "统计仓库语言分布、代码规模及各语言 LSP 服务就绪状态 (Ready / needs_install / AST-only)。"
     )]
     pub(crate) fn get_languages(
         &self,
@@ -3045,6 +3030,7 @@ mod tests {
     use astrolabe_core::{
         graph::CodeGraph, CodeFile, CodeSymbol, Language, RelPath, SymbolId, SymbolKind,
     };
+    use std::collections::HashSet;
     use std::time::Duration;
 
     fn ready_server() -> AstrolabeServer {
@@ -3111,6 +3097,12 @@ mod tests {
         // Compare against the constant rather than a literal so adding a tool
         // fails in exactly one place.
         assert_eq!(tools.len(), crate::TOOL_COUNT);
+        let names: HashSet<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        let catalog: HashSet<String> = crate::CATALOG_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(names, catalog);
         for tool in tools {
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
             assert!(
@@ -3888,29 +3880,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_descriptions_carry_prefer_over_grep_and_exhaustive_guidance() {
+    fn tool_descriptions_carry_query_and_paging_guidance() {
         let full = AstrolabeServer::new_with_cache_budget_and_context(
             PathBuf::from("."),
             DEFAULT_MEMORY_BUDGET_BYTES,
             crate::ClientContext::default_builtin(),
         );
-        for tool in full.listed_tools() {
-            if [
-                "search_code",
-                "find_symbol",
-                "find_references",
-                "goto_definition",
-            ]
-            .contains(&tool.name.as_ref())
-            {
-                let d = tool.description.as_deref().unwrap_or("");
-                assert!(
-                    d.contains("Prefer this over Grep/Read for code"),
-                    "{}: {d}",
-                    tool.name
-                );
-            }
-        }
         let tools = full.listed_tools();
         let desc = |n: &str| {
             tools
@@ -3922,17 +3897,21 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
+        let search_code = desc("search_code");
+        assert!(search_code.contains("Exhaustive"), "{search_code}");
+        assert!(search_code.contains("group=true"), "{search_code}");
+        assert!(search_code.contains("offset=next_offset"), "{search_code}");
+        let find_symbol = desc("find_symbol");
+        assert!(find_symbol.contains("include_body"), "{find_symbol}");
+        assert!(find_symbol.contains("offset=next_offset"), "{find_symbol}");
+        let find_references = desc("find_references");
         assert!(
-            desc("search_code").contains("do not re-grep")
-                || desc("search_code").contains("never re-grep")
+            find_references.contains("LSP-resolved"),
+            "{find_references}"
         );
-        assert!(
-            desc("search_code").contains("before editing")
-                || desc("search_code").contains("group=true")
-        );
-        assert!(
-            desc("find_symbol").contains("re-grep") || desc("find_symbol").contains("include_body")
-        );
+        assert!(find_references.contains("renames"), "{find_references}");
+        let goto_definition = desc("goto_definition");
+        assert!(goto_definition.contains("definition"), "{goto_definition}");
     }
 
     #[test]
@@ -4605,10 +4584,7 @@ mod tests {
             path_filter.as_str().unwrap().contains("case-sensitive"),
             "{path_filter}"
         );
-        assert!(
-            budget.as_str().unwrap().contains("offset=next_offset"),
-            "{budget}"
-        );
+        assert!(budget.as_str().unwrap().contains("next_offset"), "{budget}");
         assert!(tool_desc.contains("regex=true"), "{tool_desc}");
         assert!(tool_desc.contains("offset=next_offset"), "{tool_desc}");
     }
@@ -5797,21 +5773,16 @@ mod tests {
     fn tool_descriptions_declare_indexed_languages_boundary() {
         let server = ready_server();
         let tools = server.listed_tools();
-        for name in &["find_symbol", "resolve_context"] {
-            let tool = tools.iter().find(|t| t.name == *name).expect(name);
-            let desc = tool.description.as_deref().unwrap_or("");
-            assert!(
-                desc.contains("Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart"),
-                "{name} description missing indexed languages notice: {desc}"
-            );
-        }
+        let find_symbol = tools.iter().find(|t| t.name == "find_symbol").unwrap();
+        let desc = find_symbol.description.as_deref().unwrap_or("");
+        assert!(
+            desc.contains("indexed languages"),
+            "find_symbol description missing indexed languages notice: {desc}"
+        );
         // search_code also covers non-indexed text files and says so.
         let tool = tools.iter().find(|t| t.name == "search_code").unwrap();
         let desc = tool.description.as_deref().unwrap_or("");
         assert!(desc.contains("[text-only]"), "{desc}");
-        assert!(
-            desc.contains("literal is case-insensitive, regex is case-sensitive"),
-            "{desc}"
-        );
+        assert!(desc.contains("case-insensitive"), "{desc}");
     }
 }
