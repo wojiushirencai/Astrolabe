@@ -6,6 +6,41 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-17
+
+破坏性变更：MCP 工具目录固定为 7 个，删除 15 个入口。完整发版说明与评测数据见 GitHub Release。
+
+### 1、具体是什么问题？如何解决的。
+
+1. **22 个工具的目录体积大、边缘工具几乎无人调用**
+   - 解决：目录固定为 7 个：`resolve_context`、`search_code`、`find_symbol`、`find_references`、`goto_definition`、`get_diagnostics`、`get_languages`。删除 `trace_calls`、`get_repo_skeleton`、`get_dependents`、`get_neighborhood`、`get_group_graph`、`get_hotspots`、`get_symbol_info`、`plan_rename`、`apply_rename`、`read_memory`、`write_memory`、`delete_memory`、`list_memories`、`initial_instructions`、`ensure_language_server`，不设兼容层；`excluded_tools` 中已删工具名被忽略。（#70）
+2. **`search_code` 命中后模型还要反复 Read**
+   - 解决：命中自带上下文（自适应展开函数体）；会话去重指针保留签名；宽查询预览最相关命中；零命中给相近名称。（#66、#67）
+3. **谁断言/加载某字面量难以一眼看出；去重计数不准**
+   - 解决：`group` 分组并标注角色标签，宽命中自动分组；去重只记真正发出的函数体；下线旧版 read-guard hook。（#68）
+4. **模型绕过索引用 grep/rg/Glob 扫盘**
+   - 解决：新增 `deny_text_search` 开关（`--deny-text-search`、`ASTROLABE_DENY_TEXT_SEARCH`、context YAML），默认关闭。（#69）
+
+### 2、新增支持
+
+- `search_code` 自带函数体、`group` 分组与角色标签、零命中近似名建议。
+- `deny_text_search` 硬拦截开关（按进程配置）。
+
+### 3、前后对比
+
+| 项目 | v0.11.0 | 精简测试版 (c5) | 本版 7 工具 |
+|---|---|---|---|
+| tools/list 工具数 | 22 | 5 | 7 |
+| 目录管理机制 | 动态过滤与全量保留 | `slim_catalog` 裁剪 | 固定 7 个 |
+
+评测（gemini-3.8-flash-high，12 任务 × 3 轮，A/B/C 同时运行，每组 36 次；C 为 #68 的 5 工具精简版）：
+
+| 组别 | 答对数 | 费用中位数 | 费用合计 | 耗时中位数 | Bash grep 调用 | Read 调用 |
+|---|---|---|---|---|---|---|
+| A 完全不开 | 34/36 | $1.22 | $56.58 | 178s | 272 | 376 |
+| B v0.11.0 | 36/36 | $1.20 | $58.26 | 196s | 118 | 347 |
+| C 精简版 | 36/36 | $0.99 | $46.82 | 192s | 96 | 305 |
+
 ## [0.11.0] - 2026-10-13
 
 ### 1、具体是什么问题？如何解决的。
