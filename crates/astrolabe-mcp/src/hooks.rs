@@ -208,15 +208,8 @@ pub(crate) fn config() -> &'static HooksConfig {
 }
 
 /// 非符号工具子串：Astrolabe 工具名包含这些子串时不重置 burst 计数
-pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] = &[
-    "pattern",
-    "search_code",
-    "diagnostics",
-    "languages",
-    "ensure_language",
-    "instructions",
-    "memory",
-];
+pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] =
+    &["search_code", "diagnostics", "languages", "memory"];
 
 /// 非 Claude-Code 客户端判定 read_file 的动作动词子串
 pub(crate) const READ_FILE_VERB_SUBSTRINGS: &[&str] = &["read", "view", "open", "show"];
@@ -1922,19 +1915,13 @@ mod tests {
 
     #[test]
     fn test_3_search_code_does_not_reset_counter() {
-        // search_code / pattern / diagnostics 等非导航类工具不应重置符号计数
+        // search_code / diagnostics 等非导航类工具不应重置符号计数
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__search_code"));
-        assert!(!is_astrolabe_symbolic_tool("astrolabe_pattern"));
         assert!(!is_astrolabe_symbolic_tool(
             "mcp__astrolabe__get_diagnostics"
         ));
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_languages"));
-        assert!(!is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__ensure_language_server"
-        ));
-        assert!(!is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__initial_instructions"
-        ));
+        assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__list_memories"));
 
         // 导航类工具正常重置
         assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__find_symbol"));

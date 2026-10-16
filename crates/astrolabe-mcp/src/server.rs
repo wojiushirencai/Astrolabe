@@ -980,7 +980,6 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
     })
 }
 
-
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
     #[schemars(
@@ -1033,8 +1032,6 @@ pub(crate) struct SearchParams {
     )]
     pub dedup: Option<bool>,
 }
-
-
 
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
@@ -1557,11 +1554,8 @@ fn format_find_symbol_unindexed_hint(
     ))
 }
 
-
 #[tool_router]
 impl AstrolabeServer {
-
-
     #[tool(
         description = "主入口：根据编码任务聚合最相关文件、符号、依赖与索引完整性信息。FIRST CALL for any coding task — before Read/Grep. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them."
     )]
@@ -1677,7 +1671,6 @@ impl AstrolabeServer {
             crate::precise_tools::run_get_diagnostics(params, session.precise.as_ref())
         })
     }
-
 
     #[tool(
         description = "按名称或子串定位符号，返回签名和 path:line 锚点。Prefer this over Grep/Read for code. Results are exhaustive for indexed languages: every symbol matching the name is listed (total/next_offset declare truncation), no need to re-grep the same name. Prefer over Read for locating symbols — no whole-file reads needed. Need the code itself? Pass include_body=true to get the full body of each hit (function, method, class) in the same call instead of search_code + Read. Indexed languages only: python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua — other source files are invisible to this tool; use Grep/Read for them. Truncation is declared (total/shown range/next_offset); call again with offset=next_offset to page through all matches."
@@ -2208,10 +2201,9 @@ impl AstrolabeServer {
         )
     }
 
-
     // ----- 项目记忆（Serena memories 对应物：跨会话知识留存，名称寻址）-----
     #[tool(
-        description = "列出项目记忆（名称 + 首行摘要）。Read relevant memories before starting a task in this repo — they persist across sessions."
+        description = "列出项目记忆（名称 + 首行摘要）。Lists names and first-line summaries only; read or edit the memory files directly on the filesystem."
     )]
     pub(crate) fn list_memories(
         &self,
@@ -2257,7 +2249,6 @@ impl AstrolabeServer {
             Some(params.budget_tokens),
         )
     }
-
 
     /// Earlier call ordinal if this exact range was already returned this
     /// session at the same index generation (and dedup is on).
@@ -2554,7 +2545,6 @@ impl AstrolabeServer {
         )
     }
 
-
     #[tool(
         description = "统计已索引仓库的语言、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。Index coverage + session-gated install status."
     )]
@@ -2731,7 +2721,6 @@ impl ServerHandler for AstrolabeServer {
         Ok(ReadResourceResult::new(vec![ResourceContents::text(text.clone(), request.uri)]).into())
     }
 }
-
 
 /// P0 单行安全切片：超长匹配行只展示命中点附近的窗口。
 ///
@@ -3194,7 +3183,10 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert!(!names.iter().any(|name| name == "get_languages"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name == "get_languages"),
+            "{names:?}"
+        );
         assert!(
             !names.iter().any(|name| name == "list_memories"),
             "{names:?}"
@@ -3617,7 +3609,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     fn unique_temp_dir() -> PathBuf {
         // A timestamp alone is not unique: macOS resolves `SystemTime::now`
         // to roughly a microsecond, so two tests starting in the same instant
@@ -3743,10 +3734,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    const CMD_GO: &str = "package cobra\n\ntype Command struct{}\n\nfunc (c *Command) MarkFlagRequired(name string) error {\n\treturn MarkFlagRequired(nil, name)\n}\n\nfunc MarkFlagRequired(flags *int, name string) error {\n\treturn nil\n}\n\nfunc (c *Command) enforce() {\n\tx := 1\n\t_ = c.MarkFlagRequired(\"a\")\n\t_ = x\n\t_ = c.MarkFlagRequired(\"b\")\n}\n";
-    const CMD_TEST_GO: &str = "package cobra\n\nimport \"testing\"\n\nfunc TestRequired(t *testing.T) {\n\tc := &Command{}\n\t_ = c.MarkFlagRequired(\"x\")\n}\n";
-
-
     fn find(query: &str) -> QueryParams {
         QueryParams {
             query: query.into(),
@@ -3811,7 +3798,6 @@ mod tests {
         assert!(!regex.contains("数据/夹具"), "{regex}");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     #[test]
     fn dedup_pointer_carries_signature_and_match_line() {
@@ -3988,9 +3974,17 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        assert!(desc("search_code").contains("do not re-grep") || desc("search_code").contains("never re-grep"));
-        assert!(desc("search_code").contains("before editing") || desc("search_code").contains("group=true"));
-        assert!(desc("find_symbol").contains("re-grep") || desc("find_symbol").contains("include_body"));
+        assert!(
+            desc("search_code").contains("do not re-grep")
+                || desc("search_code").contains("never re-grep")
+        );
+        assert!(
+            desc("search_code").contains("before editing")
+                || desc("search_code").contains("group=true")
+        );
+        assert!(
+            desc("find_symbol").contains("re-grep") || desc("find_symbol").contains("include_body")
+        );
     }
 
     #[test]
@@ -5564,7 +5558,6 @@ mod tests {
             symbol_text.contains("(仓库另有 3 个 .scala 等未支持语言的源码文件未入符号索引，符号搜索不覆盖它们——如需检索请用 Grep/Read)"),
             "{symbol_text}"
         );
-
 
         // 4. get_languages 首行 supported、末尾 unindexed 行
         let langs_res = server.get_languages(Parameters(BudgetOnly {

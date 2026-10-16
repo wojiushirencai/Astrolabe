@@ -182,7 +182,6 @@ impl LiveBackend {
         }
         true
     }
-
 }
 
 /// An empty, unknown answer: what a server gives while still importing.
@@ -268,10 +267,6 @@ fn server_language_from_opt_path(
 }
 
 impl PreciseCapability for LiveBackend {
-    fn is_warm(&self, path: &str) -> bool {
-        server_language(&self.root, path).is_some_and(|lang| self.pool.is_resident(lang))
-    }
-
     fn files_changed(&self, changes: &astrolabe_core::watch::ChangeSet) {
         use astrolabe_core::lsp::{FileChange, FileChangeKind};
         use astrolabe_core::watch::ChangeKind;
@@ -341,7 +336,6 @@ impl PreciseCapability for LiveBackend {
         apple_references_fallback(&self.root, &rel, target, result)
     }
 
-
     fn definition(
         &self,
         path: &str,
@@ -406,6 +400,4 @@ impl PreciseCapability for LiveBackend {
             Err(error) => Precise::unknown(Vec::new(), error.to_string()),
         }
     }
-
 }
-

@@ -92,7 +92,9 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.
-- Prefer these tools over Grep/Read for code.
+- Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
+- search_code auto-groups wide hits (see above). It does not give per-directory
+  aggregate counts or exclude filters; for those, use other means (shell/scripts).
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
@@ -196,7 +198,9 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.
-- Prefer these tools over Grep/Read for code.
+- Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
+- search_code auto-groups wide hits (see above). It does not give per-directory
+  aggregate counts or exclude filters; for those, use other means (shell/scripts).
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
@@ -328,6 +332,16 @@ mod tests {
     }
 
     #[test]
+    fn manuals_state_scope_and_limits() {
+        for name in ["claude-code", "default"] {
+            let m = manual(name);
+            assert!(m.contains("fewer tokens"), "{name}");
+            assert!(m.contains("auto-groups"), "{name}");
+            assert!(m.contains("per-directory"), "{name}");
+        }
+    }
+
+    #[test]
     fn manuals_do_not_advertise_removed_tools() {
         for name in ["claude-code", "default"] {
             let m = manual(name);
@@ -345,6 +359,7 @@ mod tests {
                 "explain_symbol",
                 "read_memory",
                 "write_memory",
+                "delete_memory",
                 "initial_instructions",
             ] {
                 assert!(!m.contains(gone), "{name} still mentions {gone}");
@@ -361,6 +376,12 @@ mod tests {
             "apply_rename",
             "read_memory",
             "write_memory",
+            "get_repo_skeleton",
+            "get_hotspots",
+            "ensure_language_server",
+            "explain_symbol",
+            "delete_memory",
+            "initial_instructions",
         ] {
             assert!(!p.contains(gone), "cc override still mentions {gone}");
         }

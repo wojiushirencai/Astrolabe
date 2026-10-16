@@ -365,14 +365,14 @@ name: demo
 notes: filter hook
 structured_tool_output: false
 excluded_tools:
-  - trace_calls
-  - get_hotspots
+  - find_references
+  - get_languages
 "#,
             "demo",
         )
         .unwrap();
-        assert!(ctx.excludes("trace_calls"));
-        assert!(ctx.excludes("get_hotspots"));
+        assert!(ctx.excludes("find_references"));
+        assert!(ctx.excludes("get_languages"));
         assert!(!ctx.excludes("find_symbol"));
     }
 
@@ -427,13 +427,13 @@ name: demo
 future_list:
   - ignored
 excluded_tools:
-  - apply_rename
+  - goto_definition
 "#,
             "demo",
         )
         .unwrap();
-        assert!(ctx.excludes("apply_rename"));
-        assert_eq!(ctx.excluded_tools, vec!["apply_rename".to_string()]);
+        assert!(ctx.excludes("goto_definition"));
+        assert_eq!(ctx.excluded_tools, vec!["goto_definition".to_string()]);
     }
 
     #[test]
@@ -457,12 +457,12 @@ excluded_tools:
     #[test]
     fn excluded_tools_flow_list() {
         let ctx = parse_context_yaml(
-            "name: demo\nexcluded_tools: [trace_calls, get_hotspots]\nnotes: flow\n",
+            "name: demo\nexcluded_tools: [find_references, get_languages]\nnotes: flow\n",
             "demo",
         )
         .unwrap();
-        assert!(ctx.excludes("trace_calls"));
-        assert!(ctx.excludes("get_hotspots"));
+        assert!(ctx.excludes("find_references"));
+        assert!(ctx.excludes("get_languages"));
     }
 
     #[test]

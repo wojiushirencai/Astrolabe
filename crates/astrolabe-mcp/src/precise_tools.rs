@@ -97,7 +97,6 @@ pub(crate) struct GetDiagnosticsParams {
     pub budget_tokens: usize,
 }
 
-
 /// Backend for the precise MCP query tools.
 ///
 /// Production uses `LiveBackend` (on-demand language-server pool). Tests
@@ -119,11 +118,6 @@ pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
     fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>>;
     /// Files changed on disk; keeps running language servers in sync.
     fn files_changed(&self, _changes: &astrolabe_core::watch::ChangeSet) {}
-    /// Whether a language server for `path` is already running (queries
-    /// will not wait for a cold start).
-    fn is_warm(&self, _path: &str) -> bool {
-        false
-    }
 }
 
 /// Backend with no language server behind it.
@@ -152,7 +146,6 @@ impl PreciseCapability for Unwired {
         )
     }
 
-
     fn definition(
         &self,
         path: &str,
@@ -171,28 +164,23 @@ impl PreciseCapability for Unwired {
     fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>> {
         Precise::unknown(Vec::new(), format!("{NOT_WIRED} 目标文件 `{path}`。"))
     }
-
 }
-
 
 #[derive(Clone)]
 pub(crate) struct PreciseTools {
     backend: Arc<dyn PreciseCapability>,
-    /// Repository root (query tools ignore it).
-    root: PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
 impl PreciseTools {
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_backend(Arc::new(Unwired), PathBuf::from("."))
+        Self::with_backend(Arc::new(Unwired))
     }
 
-    pub(crate) fn with_backend(backend: Arc<dyn PreciseCapability>, root: PathBuf) -> Self {
+    pub(crate) fn with_backend(backend: Arc<dyn PreciseCapability>) -> Self {
         Self {
             backend,
-            root,
             tool_router: Self::tool_router(),
         }
     }
@@ -232,7 +220,6 @@ impl PreciseTools {
     ) -> CallToolResult {
         run_get_diagnostics(params, self.backend.as_ref())
     }
-
 }
 
 pub(crate) fn run_find_references(
@@ -300,7 +287,6 @@ pub(crate) fn run_find_references(
         }),
     )
 }
-
 
 pub(crate) fn run_goto_definition(
     params: GotoDefinitionParams,
@@ -477,7 +463,6 @@ pub(crate) fn run_get_diagnostics(
         }),
     )
 }
-
 
 fn text_result(body: String, structured: Value) -> CallToolResult {
     let body = if body.trim().is_empty() {
@@ -668,7 +653,6 @@ fn render_diagnostic(diag: &Diagnostic) -> String {
     )
 }
 
-
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
         Severity::Error => "error",
@@ -677,7 +661,6 @@ fn severity_label(severity: Severity) -> &'static str {
         Severity::Hint => "hint",
     }
 }
-
 
 fn confidence_json(confidence: Confidence) -> &'static str {
     match confidence {
@@ -692,7 +675,7 @@ fn confidence_json(confidence: Confidence) -> &'static str {
 mod tests {
     use super::*;
     use astrolabe_core::lsp::{Position, Range};
-    
+
     fn loc(path: &str, line: u32, character: u32) -> Location {
         Location {
             path: RelPath::new(path),
@@ -718,7 +701,6 @@ mod tests {
             code: None,
         }
     }
-
 
     #[derive(Debug)]
     struct Fake {
@@ -751,7 +733,7 @@ mod tests {
     }
 
     fn tools_with(fake: Fake) -> PreciseTools {
-        PreciseTools::with_backend(Arc::new(fake), PathBuf::from("."))
+        PreciseTools::with_backend(Arc::new(fake))
     }
 
     fn first_text(result: &CallToolResult) -> &str {
@@ -805,11 +787,7 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec![
-                "find_references",
-                "get_diagnostics",
-                "goto_definition"
-            ]
+            vec!["find_references", "get_diagnostics", "goto_definition"]
         );
         assert!(
             !names.iter().any(|n| n == "rename_symbol"),
@@ -983,7 +961,6 @@ mod tests {
         })));
         let text = first_text(&diags);
         assert!(text.contains("因 budget_tokens 被省略"), "{text}");
-
     }
 
     #[test]
@@ -1165,5 +1142,4 @@ mod tests {
         assert!(hint.contains("Dart"));
         assert!(hint.contains("dart language-server"));
     }
-
 }
