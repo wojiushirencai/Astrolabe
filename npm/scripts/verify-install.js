@@ -119,8 +119,8 @@ async function main() {
   const names = catalog.tools.map((tool) => tool.name);
   console.log(`tools/list count=${catalog.tools.length} ttlMs=${catalog.ttlMs}`);
   console.log(`tools: ${names.join(', ')}`);
-  if (catalog.tools.length < 8) {
-    throw new Error(`expected at least 8 tools, got ${catalog.tools.length}`);
+  if (catalog.tools.length < 7) {
+    throw new Error(`expected at least 7 tools, got ${catalog.tools.length}`);
   }
 
   const bad = await badRootExit(bin);

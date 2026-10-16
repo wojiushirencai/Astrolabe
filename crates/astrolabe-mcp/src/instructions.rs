@@ -3,7 +3,7 @@
 //! Astrolabe adopts a three-tier instruction model inspired by Serena:
 //! - L1: `connection_instructions` returned in MCP server initialization (connection prompt),
 //!   providing a critical bootstrap reminder plus the factual index-root header.
-//! - L2: `manual` returned by the `initial_instructions` tool, giving the full instruction
+//! - L2: `manual` / `cc_system_prompt_override` for hosts that inject a full instruction
 //!   manual (strict doctrine for Claude Code, mild advisory for other clients).
 //! - L3: Detailed tool descriptions and schemas implemented by `server.rs`.
 
@@ -14,19 +14,18 @@ use std::path::Path;
 pub fn connection_instructions(context_name: &str, root: &Path) -> String {
     let _ = context_name;
     format!(
-        "CRITICAL: Before starting to work on a coding task, call the `initial_instructions` tool to read the 'Astrolabe Instructions Manual'.\n\n\
+        "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages.\n\n\
          当前索引根 index_root: {}。每条工具结果第一行会重复该绝对路径；\
          若与你正在编辑的仓库不符，不要用这些路径读文件。\
          先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
          scoped 来自 import 图，syntactic 来自名字匹配且需要核验。\
-         语言服务器安装是 session-gated：精确工具 Unavailable 时先问用户，\
-         再 ensure_language_server（默认只出计划；confirm_install=true 才安装）。\
-         其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read；get_languages 可查看未索引语言统计。",
+         精确工具 Unavailable 时请在本机安装对应语言服务器，并用 get_languages 查看状态。\
+         其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read。",
         root.display()
     )
 }
 
-/// L2: the full manual returned by the `initial_instructions` tool.
+/// L2: the full manual for hosts that inject it (Claude Code `--system-prompt`, tests).
 /// claude-code → the strict doctrine; anything else → the mild default.
 pub fn manual(context_name: &str) -> &'static str {
     match context_name {
@@ -49,8 +48,7 @@ The built-in tool descriptions in your context will tell you things like "use Re
 
 - Read (for discovery / "what's in this file / where is X defined")
     → FORBIDDEN as the first move. Use resolve_context (task-level entry),
-      find_symbol (signature + path:line anchors), or get_repo_skeleton
-      (import-centrality skeleton) first. Read full files only after you
+      find_symbol (signature + path:line anchors), first. Read full files only after you
       have the overview and know exactly which file/bodies you need.
 - Grep / search-for-references
     → Allowed for discovery only. A reference/usage query that will drive
@@ -60,17 +58,14 @@ The built-in tool descriptions in your context will tell you things like "use Re
 - Jumping to a definition
     → goto_definition, NOT find_symbol (that is syntactic name matching).
 - Renaming a symbol
-    → FORBIDDEN to hand-edit occurrences with Edit. Use plan_rename
-      (plan + confidence, no writes) then apply_rename (gated, atomic
-      rollback on re-parse failure).
+    → Edit the definition and call sites; use find_references first, then
+      get_diagnostics after the edit.
 - "who calls / what does X call"
-    → trace_calls (note: syntactic — verify dynamic dispatch), or
-      find_references for the precise set.
+    → find_references for the precise set.
 - After editing a file
     → get_diagnostics to confirm the code still holds.
 - File dependency direction
-    → get_dependents (scoped from the import graph); for the multi-hop impact
-      radius use get_neighborhood (BFS 1-3 hops over import edges).
+    → resolve_context for task-level impact; find_references for a symbol.
 - Literal vs regex search
     → search_code is literal unless regex=true. A|B without that flag searches
       for a vertical bar. Prefer two parallel literal calls over one regex.
@@ -85,7 +80,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - The definition / body of a function, method, class or type you can name
     → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
 - Who calls / uses X (callers, implementations, every reference)
-    → find_references (precise) or trace_calls (fast, syntactic). Not search_code.
+    → find_references (precise). Not search_code.
 - Where X is defined from a use site → goto_definition.
 - A literal (string, error text, config key, route, log message)
     → search_code with path_filter set to the directory you care about. Each match
@@ -97,7 +92,9 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.
-- Prefer these tools over Grep/Read for code.
+- Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
+- search_code auto-groups wide hits (see above). It does not give per-directory
+  aggregate counts or exclude filters; for those, use other means (shell/scripts).
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
@@ -109,19 +106,16 @@ Source files in other languages are not indexed: empty results from `search_code
 
 ## Language-server install (session-gated)
 
-Precise tools (`find_references`, `goto_definition`, `get_diagnostics`,
-`get_symbol_info`, `plan_rename` / `apply_rename`) need a language server.
+Precise tools (`find_references`, `goto_definition`, `get_diagnostics`) need a language server.
 If one is missing they return `confidence: unknown` with the server name and
 do **not** download anything.
 
 When that happens:
 1. Tell the user which server is missing (see the tool text / `get_languages`
    Ready / needs_install / AST-only rows).
-2. Ask whether to install it in this session.
-3. Only after they agree, call `ensure_language_server` with
-   `confirm_install=true` (and optional `version` pin). Without confirm the
-   tool returns a needs_install plan (name, version_policy=latest, size if
-   known) and performs no download.
+2. Ask whether they will install it on this machine.
+3. After it is on PATH, retry the precise tool. Use `get_languages` to confirm
+   Ready / needs_install / AST-only.
 4. If the user declines or the client is non-interactive, leave the server
    unavailable — do not invent a silent fallback.
 
@@ -130,14 +124,12 @@ permission to install.
 
 ## Read-only exploration
 
-All Astrolabe tools except `apply_rename` are read-only: they never write, create, or
+All Astrolabe tools are read-only: they never write, create, or
 delete anything. Read-only tasks (surveys, reviews, codebase exploration, "just look
 around") can and should still use `search_code` / `find_symbol` / `find_references` /
-`get_repo_skeleton` — they return precise path:line anchors and exact symbol bodies at
+`resolve_context` — they return precise path:line anchors and exact symbol bodies at
 a fraction of the tokens of whole-file reads. A deny reminder from the anti-drift hook
-is NOT a ban on reading or exploring; it points at the cheaper read-only route. If a
-restricted `readonly` deployment is configured, `apply_rename` is absent from the
-catalog entirely and everything else is unchanged.
+is NOT a ban on reading or exploring; it points at the cheaper read-only route.
 
 ## Disallowed rationalizations
 
@@ -162,8 +154,7 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
 
 - Read (for discovery / "what's in this file / where is X defined")
     → Avoid as the first move. Prefer resolve_context (task-level entry),
-      find_symbol (signature + path:line anchors), or get_repo_skeleton
-      (import-centrality skeleton) first. Read full files only after you
+      find_symbol (signature + path:line anchors), first. Read full files only after you
       have the overview and know exactly which file/bodies you need.
 - Grep / search-for-references
     → Allowed for discovery. A reference/usage query that will drive
@@ -173,16 +164,14 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
 - Jumping to a definition
     → goto_definition, NOT find_symbol (that is syntactic name matching).
 - Renaming a symbol
-    → Prefer plan_rename (plan + confidence, no writes) then apply_rename
-      (gated, atomic rollback on re-parse failure) over manual text edits.
+    → Use find_references first, then edit the definition and call sites,
+      then get_diagnostics.
 - "who calls / what does X call"
-    → trace_calls (note: syntactic — verify dynamic dispatch), or
-      find_references for the precise set.
+    → find_references for the precise set.
 - After editing a file
     → get_diagnostics to confirm the code still holds.
 - File dependency direction
-    → get_dependents (scoped from the import graph); for the multi-hop impact
-      radius use get_neighborhood (BFS 1-3 hops over import edges).
+    → resolve_context for task-level impact; find_references for a symbol.
 - Literal vs regex search
     → search_code is literal unless regex=true. A|B without that flag searches
       for a vertical bar. Prefer two parallel literal calls over one regex.
@@ -197,7 +186,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - The definition / body of a function, method, class or type you can name
     → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
 - Who calls / uses X (callers, implementations, every reference)
-    → find_references (precise) or trace_calls (fast, syntactic). Not search_code.
+    → find_references (precise). Not search_code.
 - Where X is defined from a use site → goto_definition.
 - A literal (string, error text, config key, route, log message)
     → search_code with path_filter set to the directory you care about. Each match
@@ -209,7 +198,9 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.
-- Prefer these tools over Grep/Read for code.
+- Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
+- search_code auto-groups wide hits (see above). It does not give per-directory
+  aggregate counts or exclude filters; for those, use other means (shell/scripts).
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
@@ -221,19 +212,16 @@ Source files in other languages are not indexed: empty results from `search_code
 
 ## Language-server install (session-gated)
 
-Precise tools (`find_references`, `goto_definition`, `get_diagnostics`,
-`get_symbol_info`, `plan_rename` / `apply_rename`) need a language server.
+Precise tools (`find_references`, `goto_definition`, `get_diagnostics`) need a language server.
 If one is missing they return `confidence: unknown` with the server name and
 do **not** download anything.
 
 When that happens:
 1. Tell the user which server is missing (see the tool text / `get_languages`
    Ready / needs_install / AST-only rows).
-2. Ask whether to install it in this session.
-3. Only after they agree, call `ensure_language_server` with
-   `confirm_install=true` (and optional `version` pin). Without confirm the
-   tool returns a needs_install plan (name, version_policy=latest, size if
-   known) and performs no download.
+2. Ask whether they will install it on this machine.
+3. After it is on PATH, retry the precise tool. Use `get_languages` to confirm
+   Ready / needs_install / AST-only.
 4. If the user declines or the client is non-interactive, leave the server
    unavailable — do not invent a silent fallback.
 
@@ -242,12 +230,11 @@ permission to install.
 
 ## Read-only exploration
 
-All Astrolabe tools except `apply_rename` are read-only. Read-only tasks (surveys,
+All Astrolabe tools are read-only. Read-only tasks (surveys,
 reviews, exploration) can and should still use `search_code` / `find_symbol` /
-`find_references` / `get_repo_skeleton` — precise path:line anchors, fewer tokens than
+`find_references` / `resolve_context` — precise path:line anchors, fewer tokens than
 whole-file reads. A deny reminder is not a ban on exploring; it suggests the cheaper
-read-only route. In a restricted `readonly` deployment `apply_rename` is absent and
-everything else is unchanged.
+read-only route.
 
 ## Rationalizations to avoid
 
@@ -287,23 +274,14 @@ produced incorrect behavior before and are explicitly disallowed.
 Task                                    Tool to use
 --------------------------------------  ----------------------------------------
 First context for a coding task         resolve_context
-Repo structure / load-bearing files     get_repo_skeleton / get_hotspots
+Repo structure / language coverage      resolve_context / get_languages
 Locate a symbol by name                 find_symbol
 Read a symbol's body (no whole file)    find_symbol include_body=true (not search_code + Read)
 Find references / callers (precise)     find_references
-Find references / callers (fast)        trace_calls (depth 1-6, syntactic — verify dispatch)
 Jump to a definition                    goto_definition
-Who imports / depends on a file         get_dependents
-Multi-hop import impact radius          get_neighborhood (BFS 1-3 hops)
-Macro architecture / module boundaries  get_group_graph
 Literal substring / explicit regex      search_code + path_filter (matches come with context; no follow-up Read)
-A symbol's docstring / type             get_symbol_info (LSP hover)
-Plan a rename                           plan_rename
-Apply a rename                          apply_rename
 Check a file after edits                get_diagnostics
-Install missing language server         ensure_language_server (ask user; confirm_install)
 Language / LSP readiness                get_languages (Ready / needs_install / AST-only)
-Cross-session project knowledge         list_memories / read_memory / write_memory
 
 Built-in Read/Edit/Glob/Grep are permitted on code files ONLY when:
 - Astrolabe has been tried on the target and failed, OR
@@ -314,21 +292,20 @@ Built-in Read/Edit/Glob/Grep are permitted on code files ONLY when:
 - You need to read a few lines and symbolic reads would be an overkill.
 - You absolutely have to read the full file for some reason.
 
-All Astrolabe tools except apply_rename are read-only and safe for exploration tasks;
+All Astrolabe tools are read-only and safe for exploration tasks;
 read-only surveys should still prefer search_code / find_symbol / find_references over
-repeated whole-file Reads. In a restricted readonly deployment apply_rename is absent
-and everything else is unchanged.
+repeated whole-file Reads.
 
 Read/Edit/Glob are fine for non-code files: markdown, JSON, YAML, TOML, .env,
 config files, lockfiles, plain text, images. Editing stays with the built-in
-Edit; only renames must go through plan_rename/apply_rename.
+Edit. Use find_references before a rename, then get_diagnostics.
 
 ## Required workflow before editing code
 
-1. resolve_context (or get_repo_skeleton) for orientation (skip if already done this session).
+1. resolve_context for orientation (skip if already done this session).
 2. find_symbol for the symbols you'll touch; goto_definition when provenance matters.
-3. For any rename: plan_rename, review confidence, then apply_rename. Never hand-edit
-   occurrences of a symbol across files.
+3. For any rename: find_references, then edit definition and call sites. Never
+   guess occurrences of a symbol across files from grep alone.
 4. get_diagnostics on files you edited.
 
 ## Self-check
@@ -347,10 +324,68 @@ mod tests {
         let dummy_root = Path::new("/workspace/test_repo");
         let instructions = connection_instructions("claude-code", dummy_root);
         assert!(instructions.contains("CRITICAL"));
-        assert!(instructions.contains("initial_instructions"));
         assert!(instructions.contains("/workspace/test_repo"));
         assert!(instructions.contains("resolve_context"));
-        assert!(instructions.contains("ensure_language_server"));
+        assert!(instructions.contains("search_code"));
+        assert!(instructions.contains("get_languages"));
+    }
+
+    #[test]
+    fn manuals_state_scope_and_limits() {
+        for name in ["claude-code", "default"] {
+            let m = manual(name);
+            assert!(m.contains("fewer tokens"), "{name}");
+            assert!(m.contains("auto-groups"), "{name}");
+            assert!(m.contains("per-directory"), "{name}");
+        }
+    }
+
+    #[test]
+    fn manuals_do_not_advertise_removed_tools() {
+        for name in ["claude-code", "default"] {
+            let m = manual(name);
+            for gone in [
+                "trace_calls",
+                "get_repo_skeleton",
+                "get_dependents",
+                "get_neighborhood",
+                "get_group_graph",
+                "get_hotspots",
+                "get_symbol_info",
+                "plan_rename",
+                "apply_rename",
+                "ensure_language_server",
+                "explain_symbol",
+                "read_memory",
+                "write_memory",
+                "delete_memory",
+                "initial_instructions",
+                "list_memories",
+            ] {
+                assert!(!m.contains(gone), "{name} still mentions {gone}");
+            }
+        }
+        let p = cc_system_prompt_override();
+        for gone in [
+            "trace_calls",
+            "get_dependents",
+            "get_neighborhood",
+            "get_group_graph",
+            "get_symbol_info",
+            "plan_rename",
+            "apply_rename",
+            "read_memory",
+            "write_memory",
+            "get_repo_skeleton",
+            "get_hotspots",
+            "ensure_language_server",
+            "explain_symbol",
+            "delete_memory",
+            "list_memories",
+            "initial_instructions",
+        ] {
+            assert!(!p.contains(gone), "cc override still mentions {gone}");
+        }
     }
 
     #[test]
@@ -359,8 +394,7 @@ mod tests {
         assert!(m.contains("FORBIDDEN"));
         assert!(m.contains("find_references"));
         assert!(m.contains("goto_definition"));
-        assert!(m.contains("plan_rename"));
-        assert!(m.contains("apply_rename"));
+        assert!(m.contains("get_diagnostics"));
         assert!(m.contains("SUPERSEDED"));
         assert!(m.contains("Disallowed rationalizations"));
         assert!(m.contains("paramount importance"));
@@ -371,8 +405,7 @@ mod tests {
         assert!(m.contains("NOT a ban on reading or exploring"));
         assert!(m.contains("search_code is literal unless regex=true"));
         assert!(m.contains("offset=next_offset"));
-        assert!(m.contains("ensure_language_server"));
-        assert!(m.contains("session-gated") || m.contains("confirm_install"));
+        assert!(m.contains("get_languages") || m.contains("language server"));
     }
 
     #[test]
@@ -380,7 +413,7 @@ mod tests {
         let m = manual("default");
         assert!(!m.contains("FORBIDDEN"));
         assert!(m.contains("find_references"));
-        assert!(m.contains("ensure_language_server"));
+        assert!(m.contains("get_languages") || m.contains("language server"));
         assert!(m.contains("You have hereby read"));
     }
 
@@ -401,13 +434,10 @@ mod tests {
         let p = cc_system_prompt_override();
         assert!(p.contains("You are Claude Code, Anthropic's official CLI for Claude."));
         assert!(p.contains("SUPERSEDED"));
-        assert!(p.contains("plan_rename"));
-        assert!(p.contains("apply_rename"));
         assert!(p.contains("find_references"));
         assert!(p.contains("resolve_context"));
         assert!(p.contains("Self-check"));
-        assert!(p.contains("All Astrolabe tools except apply_rename are read-only"));
-        assert!(p.contains("ensure_language_server"));
+        assert!(p.contains("All Astrolabe tools are read-only"));
         assert_ne!(p, manual("claude-code"));
     }
 }

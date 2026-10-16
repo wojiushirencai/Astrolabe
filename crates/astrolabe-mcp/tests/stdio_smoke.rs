@@ -110,6 +110,19 @@ fn assert_tool_catalog(response: &Value) {
         "tools/list must not silently return an empty catalog: {response}"
     );
     assert_eq!(tools.len(), TOOL_COUNT, "unexpected tool count: {response}");
+    let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    names.sort_unstable();
+    let mut expected = vec![
+        "find_references",
+        "find_symbol",
+        "get_diagnostics",
+        "get_languages",
+        "goto_definition",
+        "resolve_context",
+        "search_code",
+    ];
+    expected.sort_unstable();
+    assert_eq!(names, expected, "tools/list must be exactly the 7 tools");
     assert_eq!(response["result"]["ttlMs"], TOOL_CATALOG_TTL_MS);
 }
 

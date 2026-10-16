@@ -8,3 +8,4 @@
 # Index artefacts written by the server into whatever repo it indexes.
 .astrolabe/
 /dist/
+__pycache__/

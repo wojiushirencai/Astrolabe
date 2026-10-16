@@ -6,7 +6,7 @@
 
 ## 1. 它解决什么问题
 
-Astrolabe 是给编码智能体用的**确定性代码图谱**，以 MCP server 提供查询。文件级问题走 import 图，符号级精确操作走语言服务器（Phase 2 已实现：`lsp/` + MCP 的 `find_references` / `goto_definition` / `get_diagnostics` / `plan_rename`；Phase 3 gated `apply_rename`）。解析失败和不确定性必须出现在结果里，不能用空列表假装「仓库里没有」。
+Astrolabe 是给编码智能体用的**确定性代码图谱**，以 MCP server 提供查询。文件级问题走 import 图，符号级精确操作走语言服务器（Phase 2 已实现：`lsp/` + MCP 的 `find_references` / `goto_definition` / `get_diagnostics`；重命名的 MCP 入口已移除）。解析失败和不确定性必须出现在结果里，不能用空列表假装「仓库里没有」。
 
 同一仓库（serena，1028 个文件）上 README 记录的对照：
 
@@ -48,7 +48,7 @@ Astrolabe 是给编码智能体用的**确定性代码图谱**，以 MCP server 
 
 - 文件级问题（依赖、邻域、影响面、热文件、任务相关骨架）**只走图谱**。
 - 「这个符号实际被谁引用 / 能否安全改名」**只走语言服务器**。
-- `trace_calls` 暴露的是名字匹配调用边，置信度固定为 `syntactic`，调用方必须核验。
+- 名字匹配调用边（库内能力，当前无 MCP 工具暴露）置信度固定为 `syntactic`，调用方必须核验。
 
 **为什么不能「图谱不行再回退 LSP」。** 图谱几乎不会以 Err 失败。名字匹配总会连上一些边，只是 TypeScript 漏三分之一、Python 漏五分之四。动态回退看到的是「有结果」，察觉不到这种沉默的不完整。错的引用一旦变成编辑，代价在用户的编译器里，不在我们的测试里。
 
@@ -99,8 +99,8 @@ exact  >  scoped  >  syntactic  >  unknown
 | 值 | 含义 | 典型来源 | 智能体应如何对待 |
 |---|---|---|---|
 | `exact` | 编译器或语言服务器，或磁盘字面匹配 | LSP 引用；`search_code` 扫到的源码行 | 可以当事实 |
-| `scoped` | 构建配置 + 词法/模块结构 | import 边；`get_dependents` | 文件级可信；不是类型检查 |
-| `syntactic` | 名字匹配，可漏报也可过报 | 调用边、`find_symbol`、`trace_calls` | 必须用锚点核验 |
+| `scoped` | 构建配置 + 词法/模块结构 | import 边（`resolve_context` 的邻域） | 文件级可信；不是类型检查 |
+| `syntactic` | 名字匹配，可漏报也可过报 | 调用边（库内）、`find_symbol` | 必须用锚点核验 |
 | `unknown` | 没查或查不了 | 未安装 `gopls` | **禁止**当成「零引用」 |
 
 `Precise<T>` 存在的唯一理由：空 `Vec` 在 `exact` 和 `unknown` 下意义相反。改名计划低于 `scoped` 不得自动落盘（`RewritePlan::is_auto_applicable`）。把置信度从结果里拿掉，等于把 66% / 18% 的调用图伪装成精确答案。
@@ -164,7 +164,7 @@ exact  >  scoped  >  syntactic  >  unknown
 调用边开关：
 
 - `IndexOptions::default().call_edges = false`。基准和库默认关掉。
-- MCP 的 `index::build` 打开它，因为 `trace_calls` 需要这些边。打开后边数从约 1531 涨到 98154（README，约 64 倍），既漏也过报。这是产品上接受噪声、并用 `syntactic` 标出来，不是「默认就该开」。
+- MCP 的 `index::build` 打开它，因为库内调用边查询需要这些边（对应的 `trace_calls` MCP 工具已移除）。打开后边数从约 1531 涨到 98154（README，约 64 倍），既漏也过报。这是产品上接受噪声、并用 `syntactic` 标出来，不是「默认就该开」。
 
 ## 5. 模块地图
 
@@ -190,18 +190,18 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 | `lsp` | Phase 2 已实现：按需 LSP、精确查询 | `LanguageServer`, `Precise<T>`, `LspError` | 图谱问题不得进入此模块 |
 | `rewrite` | Phase 3 计划层：先计划后写入、低于 scoped 不自动应用 | `RewritePlan`, `ScopeResolver`, `Evidence` | JS/TS 走 oxc；**哪些位点**由本模块决定。写入经 gated `apply_rename` 接到 MCP |
 
-`lsp/` 子模块（`discovery` / `transport` / `pool` / `queries` / `diagnostics` / `router`）已落地。`rewrite/` 的 `engine` 与 `scope_js`/`scope_ts` 能产出 `plan_rename`；MCP `apply_rename` 已 gated 接入（低于 scoped 默认不写；`force` 可强制）。约束不变：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
+`lsp/` 子模块（`discovery` / `transport` / `pool` / `queries` / `diagnostics` / `router`）已落地。`rewrite/` 的 `engine` 与 `scope_js`/`scope_ts` 能产出重命名计划；重命名的 MCP 工具（`plan_rename` / `apply_rename`）已移除，库内能力保留。约束不变：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
 
 ### 5.2 `astrolabe-mcp`
 
 | 模块 | 职责 |
 |---|---|
 | `main` | 根目录优先级：位置参数 → `ASTROLABE_ROOT` → cwd；stdio；日志在 stderr |
-| `lib` | `TOOL_COUNT = 13`（8 图谱 + 5 精确），`tools/list` 的 24h `ttlMs` |
+| `lib` | `TOOL_COUNT = 7`（4 个核心 + 3 个精确），`tools/list` 的 24h `ttlMs` |
 | `index` | 对 `IncrementalIndex::build` 的薄封装；**打开 `call_edges`**；Ready 快照可 `apply_changeset` |
 | `reindex` | 语言过滤、节流合并、leader 门控 persist |
-| `server` | 十三个工具、索引状态机、watch 增量重建、`content[0]` 非空文本 |
-| `precise_tools` | 精确层渲染：`find_references` / `goto_definition` / `get_diagnostics` / `plan_rename` / `apply_rename`（gated） |
+| `server` | 七个工具、索引状态机、watch 增量重建、`content[0]` 非空文本 |
+| `precise_tools` | 精确层渲染：`find_references` / `goto_definition` / `get_diagnostics` |
 | `live_backend` | 按需 `LspPool` + rewrite planner；缺服务器标 `unknown` |
 
 工具与置信度：
@@ -209,17 +209,12 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 | 工具 | 走哪一层 | 标注 |
 |---|---|---|
 | `resolve_context` | 任务个性化 PageRank + 邻域符号 | `scoped` |
-| `get_repo_skeleton` / `get_hotspots` | 静态 import 中心性 | `scoped` |
-| `get_dependents` | import 可达性 | `scoped` |
 | `get_languages` | 图上的语言/LOC 计数 | `exact` |
 | `search_code` | 磁盘源码字面匹配 | `exact` |
 | `find_symbol` | 符号名子串 | `syntactic` |
-| `trace_calls` | 名字匹配调用边 | `syntactic` |
 | `find_references` | 语言服务器引用 | `exact`；缺服务器 `unknown` |
 | `goto_definition` | 语言服务器定义（绑定解析） | `exact`；缺服务器 / 冷索引 `unknown` |
 | `get_diagnostics` | 语言服务器诊断 | `exact`；缺服务器 `unknown` |
-| `plan_rename` | rewrite 计划，不落盘 | 随证据；低于 `scoped` 不可自动应用 |
-| `apply_rename` | 事务写盘 + 写后重解析；失败回滚 | 默认仅 `exact`/`scoped`；否则需 `force=true`（结果含警告）；不可逆 |
 
 Cursor 会静默丢弃只有 `structuredContent`、没有文本的工具响应。每条响应的 `content[0]` 必须是非空文本。这是测过四个客户端之后的硬规则，不是格式偏好。
 
@@ -232,7 +227,7 @@ Cursor 会静默丢弃只有 `structuredContent`、没有文本的工具响应�
 
 这些不是「待优化列表」。它们是测量过、目前故意停在这里的限制。
 
-**调用边默认在库里关闭。** README：开启后边数 1531 → 98154（64 倍）。名字匹配既漏动态分派，也把同名符号连在一起。MCP 为了 `trace_calls` 打开它，但每条边和工具输出都标 `syntactic`。不要为了让调用图「看起来密」就去掉这层标注，也不要把这 64 倍写进与 `call_edges=false` 对打的性能基线。
+**调用边默认在库里关闭。** README：开启后边数 1531 → 98154（64 倍）。名字匹配既漏动态分派，也把同名符号连在一起。MCP 索引仍打开它，但每条边和输出都标 `syntactic`。不要为了让调用图「看起来密」就去掉这层标注，也不要把这 64 倍写进与 `call_edges=false` 对打的性能基线。
 
 当前 serena 性能基线（调用边关）是 **1529** 条 import 边、10051 符号、0 解析失败。1531 / 1529 的差是测量窗口里的漂移，不是两种算法。
 
@@ -251,7 +246,7 @@ Cursor 会静默丢弃只有 `structuredContent`、没有文本的工具响应�
 
 **CI 的语料门禁。** `.github/workflows/ci.yml` 在 push/PR 上跑 fmt、clippy `-D warnings`、`cargo test --workspace`、`cargo deny`，以及必过检查 `five-language corpus gate`。后者先用 `scripts/fetch-corpora.sh` 按锁定 commit / tag 浅克隆语料到 gitignore 的 `corpus/`（按脚本哈希缓存），再跑 `scripts/verify.sh`，里面两道门：Python / Go / Java / Rust / TypeScript import 解析，以及 `scripts/recall-gate/recall_gate.py`（Swift / ObjC / Kotlin / Ruby / Shell / Lua / Vue 声明召回，门槛 ≥99.9% 且 200 名抽查全中）。召回门的 ground truth 冻结在 `scripts/recall-gate/gt/`；语料 pin 变了要同步重生成 GT。新语言门约 45 秒（debug 构建，不含编译）。C# / VB / Dart / C / C++ / PHP 还没进 CI 门禁，改它们的解析器仍要本地跑召回基准。
 
-**Phase 2 已接线；Phase 3 写入经 gated `apply_rename` 接到 MCP。** MCP 暴露 `find_references`、`goto_definition`、`get_diagnostics`、`plan_rename`、`apply_rename`（`TOOL_COUNT=13`）。默认低于 `scoped` 拒绝写盘；`force=true` 可强制。继续遵守：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
+**Phase 2 已接线；Phase 3 重命名的 MCP 入口已移除，库内 rewrite 能力保留。** MCP 精确层暴露 `find_references`、`goto_definition`、`get_diagnostics`（目录共 7 个工具，`TOOL_COUNT=7`）。继续遵守：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
 
 ## 7. 动这些决策会付出什么
 

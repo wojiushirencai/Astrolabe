@@ -1,8 +1,8 @@
 # 设计笔记：是否把 `goto_definition` 暴露为 MCP 工具
 
-**状态：已实现。** core `goto_definition` 已接 `SymbolAt` + `guard_cold_index`；MCP 精确层已挂工具（参数/渲染对齐 `find_references`）。下文保留原设计推理，供对照实现。
+**状态：已实现。** 当前 MCP 目录固定为 7 个工具（`TOOL_COUNT = 7`，其中精确层 3 个：`find_references` / `goto_definition` / `get_diagnostics`）；`plan_rename` / `apply_rename` 等已移除，下文涉及它们的是历史描述。 core `goto_definition` 已接 `SymbolAt` + `guard_cold_index`；MCP 精确层已挂工具（参数/渲染对齐 `find_references`）。下文保留原设计推理，供对照实现。
 
-历史现状（实现前）：`astrolabe-core::lsp::queries::goto_definition` 已有查询层；MCP 精确层原先只挂 `find_references` / `get_diagnostics` / `plan_rename`。
+历史现状（实现前）：`astrolabe-core::lsp::queries::goto_definition` 已有查询层；MCP 精确层原先只挂 `find_references` / `get_diagnostics` / `plan_rename`（后者现已移除）。
 
 ---
 
@@ -131,7 +131,7 @@ confidence: Exact
 
 ### MCP 单元（`precise_tools` + `LiveBackend` fake）
 
-1. catalog：`PRECISE_TOOL_COUNT == 4`，名字含 `goto_definition`，仍无 `apply_rename`。
+1. catalog：`PRECISE_TOOL_COUNT == 3`（现状；实现当时为 4），名字含 `goto_definition`。
 2. schema：`path` required；`budget_tokens` optional；`symbol` 与行列的约束在文档/校验里测到。
 3. unwired / 缺 LSP：`confidence: Unknown`、安装提示、`content[0]` 非空、`isError != true`。
 4. exact 命中：`@path:line` 锚点、structured `matches`。
@@ -158,7 +158,7 @@ confidence: Exact
 | `crates/astrolabe-mcp/src/precise_tools.rs` | `GotoDefinitionParams`、`run_goto_definition`、`#[tool]`、`PreciseCapability::definition`、测例与 catalog 断言 |
 | `crates/astrolabe-mcp/src/live_backend.rs` | 实现 `definition`：选语言、`acquire`、调 core |
 | `crates/astrolabe-mcp/src/server.rs` | 挂载 tool → `finish`（自动 `index_root`） |
-| `crates/astrolabe-mcp/src/lib.rs` | `PRECISE_TOOL_COUNT: 3 → 4`（`TOOL_COUNT` 随之 12） |
+| `crates/astrolabe-mcp/src/lib.rs` | `PRECISE_TOOL_COUNT: 3 → 4`（实现当时的改动；现状 `PRECISE_TOOL_COUNT = 3`、`TOOL_COUNT = 7`） |
 | `crates/astrolabe-mcp/tests/stdio_smoke.rs` | list/可选调用 |
 | `README.md` / `CHANGELOG.md` / `docs/ARCHITECTURE.md` | 工具表与「未暴露」表述 |
 

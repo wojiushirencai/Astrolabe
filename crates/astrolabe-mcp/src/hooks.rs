@@ -208,15 +208,8 @@ pub(crate) fn config() -> &'static HooksConfig {
 }
 
 /// 非符号工具子串：Astrolabe 工具名包含这些子串时不重置 burst 计数
-pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] = &[
-    "pattern",
-    "search_code",
-    "diagnostics",
-    "languages",
-    "ensure_language",
-    "instructions",
-    "memory",
-];
+pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] =
+    &["search_code", "diagnostics", "languages"];
 
 /// 非 Claude-Code 客户端判定 read_file 的动作动词子串
 pub(crate) const READ_FILE_VERB_SUBSTRINGS: &[&str] = &["read", "view", "open", "show"];
@@ -609,7 +602,7 @@ where
 /// 判定工具名是否为 Astrolabe 符号工具
 ///
 /// tool_name 含 "astrolabe" 且不含子串
-/// {pattern, search_code, diagnostics, languages, instructions, memory}
+/// {pattern, search_code, diagnostics, languages, instructions}
 pub(crate) fn is_astrolabe_symbolic_tool(tool_name: &str) -> bool {
     tool_name.contains("astrolabe")
         && !NON_SYMBOLIC_ASTROLABE_SUBSTRINGS
@@ -1228,7 +1221,7 @@ pub(crate) fn decide_with(
 pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let max_limit = config().slice_read_max_limit;
     let slice_threshold = config().slice_read_threshold;
-    let readonly_note = format!(" Note: all Astrolabe tools except apply_rename are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
+    let readonly_note = format!(" Note: all Astrolabe tools are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
     let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_languages tool), grep is the correct tool for them — ignore this reminder.";
     let switch_instruction =
         "Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).";
@@ -1240,13 +1233,13 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
             ),
         ),
         DenyKind::TextSearch => (
-            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, explain_symbol. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
+            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, goto_definition. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
             format!(
-                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Call mcp__astrolabe__search_code (literal/regex, enclosing bodies), mcp__astrolabe__find_symbol, mcp__astrolabe__find_references, or mcp__astrolabe__explain_symbol now (read-only, safe).{unindexed_lang_note}"
+                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Call mcp__astrolabe__search_code (literal/regex, enclosing bodies), mcp__astrolabe__find_symbol, mcp__astrolabe__find_references, or mcp__astrolabe__goto_definition now (read-only, safe).{unindexed_lang_note}"
             ),
         ),
         DenyKind::Glob => (
-            "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, explain_symbol.",
+            "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, goto_definition.",
             "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__search_code or mcp__astrolabe__find_symbol to locate symbols and paths (read-only, safe).".to_string(),
         ),
         DenyKind::Read => (
@@ -1922,19 +1915,12 @@ mod tests {
 
     #[test]
     fn test_3_search_code_does_not_reset_counter() {
-        // search_code / pattern / diagnostics 等非导航类工具不应重置符号计数
+        // search_code / diagnostics 等非导航类工具不应重置符号计数
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__search_code"));
-        assert!(!is_astrolabe_symbolic_tool("astrolabe_pattern"));
         assert!(!is_astrolabe_symbolic_tool(
             "mcp__astrolabe__get_diagnostics"
         ));
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_languages"));
-        assert!(!is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__ensure_language_server"
-        ));
-        assert!(!is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__initial_instructions"
-        ));
 
         // 导航类工具正常重置
         assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__find_symbol"));
@@ -1947,8 +1933,6 @@ mod tests {
         assert!(is_astrolabe_symbolic_tool(
             "mcp__astrolabe__resolve_context"
         ));
-        assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__plan_rename"));
-        assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__apply_rename"));
 
         let kind = classify_tool(
             "mcp__astrolabe__search_code",

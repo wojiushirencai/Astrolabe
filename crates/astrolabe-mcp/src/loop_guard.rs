@@ -168,7 +168,7 @@ impl<R: Clone> LoopGuard<R> {
                 rate_note = Some(format!(
                     "⚠ loop guard: 最近 {} 秒内已成功执行搜索 {} 次（上限 {}）。\
                      很可能陷入了循环：请停止批量轮换查询，基于已有结果作答，或换用 \
-                     find_references / get_repo_skeleton / Read 等方式推进。",
+                     find_references / find_symbol / Read 等方式推进。",
                     cfg.rate_window.as_secs(),
                     self.all.len() + 1,
                     cfg.rate_max

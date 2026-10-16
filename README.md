@@ -57,7 +57,7 @@ Astrolabe 为什么能做到又快、又准、还省钱？核心在于三项工�
 - **人话解读**：AI 像个容易健忘的学生，聊久了就经常偷懒，放弃专业工具重新开始盲目 grep 和全文裸读代码。
 - **原理**：Astrolabe 设计了三层递进约束体系：
   - **L1 握手注入**：会话建立第一秒就将当前仓库绝对根目录和工具使用军规刻进上下文；
-  - **L2 行为指导**：提供标准化系统指令与工具守则（`initial_instructions`），明确禁止盲目大面积读代码；
+  - **L2 行为指导**：握手 `instructions` 与 `print-cc-system-prompt-override` 注入工具守则，明确禁止盲目大面积读代码；
   - **PreToolUse 门禁 Hook**：在底层的工具调用拦截层设卡 —— 一旦抓到 AI 连续 3 次无脑 grep 或连续 3 次大段裸读源码，**直接敲黑板打断并报错拦截**，逼迫 AI 回归星盘图谱工具；同时对特定小范围的精准行阅读智能放行。
 
 ---
@@ -378,6 +378,8 @@ export default AstrolabeGuard;
 }
 ```
 
+配置 MCP 之后，请按 [安装指南「Cursor 配置」](docs/INSTALL_GUIDE.md#2-cursor-配置) 写入 `~/.cursor/permissions.json`，或运行 `node scripts/setup-cursor-permissions.mjs`，以免去 Cursor 原生 MCP 审批。
+
 #### 3. Codex / Windsurf 等通用客户端
 - **Codex**：在 `~/.codex/config.toml` 中配置 `args = [".", "--context=codex"]`。
 - **通用客户端**：使用标准输入输出（stdio），日志统一走 stderr（stdout 为 JSON-RPC 通道），完全符合标准 MCP 规范。
@@ -386,36 +388,18 @@ export default AstrolabeGuard;
 
 ## 五、AI 助手可以用它做什么？（核心工具速查）
 
-Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为两层：
-
-### 1. 图谱层工具（常驻秒级响应，0 外部依赖）
+Astrolabe 向 AI 暴露 8 个工具：
 
 | 工具名称 | 核心参数 | 它能帮 AI 解决什么？（大白话解读） |
 |---|---|---|
-| `resolve_context` | `task_description` | **【核心主入口】** 丢给它一句“我要接微信支付”，它自动把相关代码骨架、依赖邻域与核心文件聚合整理好，AI 接单立刻能干活！ |
-| `get_repo_skeleton` | — | **全库骨架鸟瞰**：按重要性高低列出核心文件与公开符号，一眼看穿项目全貌。 |
-| `get_group_graph` | `depth` | **模块架构大图**：按目录把细碎文件聚合成顶层组件图，搞清“系统分几大模块、模块间怎么调用”。 |
-| `get_neighborhood` | `target`, `depth`, `direction` | **改动影响面评估**：双向探索 1~3 跳依赖，改动这个文件到底会波及哪些上游和下游？ |
-| `get_dependents` | `target`, `direction` | **依赖精准反查**：查谁在导入/使用这个文件（准确率 100%）。 |
-| `get_hotspots` | — | **找代码承重墙**：定位全库中被引用最多、改动风险最高的核心枢纽文件。 |
-| `find_symbol` | `query` | **快速定位符号**：按名字或子串秒搜函数、类或类型定义，直接返回 `文件:行号` 锚点。 |
-| `search_code` | `query`, `path_filter`, `offset` | **确定性代码全文检索**：带正则与路径过滤的精准文本查找。结果被截断时会给出 `total` 和 `next_offset`，用 `offset=next_offset` 再调一次即可翻到下一页（顺序固定：代码命中在前，`[text-only]` 在后）。 |
-| `trace_calls` | `symbol` | **调用链分析**：快速追踪函数的上下游调用关系。 |
-| `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态 Ready / needs_install / AST-only。 |
-
-### 2. 精确层工具（按需拉起语言服务器，精确到编译器级别）
-
-| 工具名称 | 核心参数 | 它能帮 AI 解决什么？（大白话解读） |
-|---|---|---|
-| `find_references` | `symbol`, `path` | **编译器级引用查找**：找到全库中所有调用该符号的准确位置，绝不漏报。 |
-| `goto_definition` | `path`, `symbol` | **精准定义跳转**：利用 LSP 语义绑定直达真实定义处，而非靠名字瞎猜。 |
-| `get_diagnostics` | `path` | **改后即时体检**：获取当前文件的语法报错与类型错误，确认写完的代码是否成立。 |
-| `get_symbol_info` | `path`, `symbol` | **符号语义信息**：LSP hover（文档串 / 类型 / 签名），不必整文件阅读。 |
-| `ensure_language_server` | `language`, `confirm_install` | **会话确认安装语言服务器**：默认只返回 needs_install 计划（latest，不下载）；用户同意后再 `confirm_install=true` 调用安装器。精确工具 Unavailable 时先问用户再调此工具。 |
-| `plan_rename` | `symbol`, `new_name`, `path` | **重命名预演**：在安全修改前先列出改动清单供审查，绝不贸然写盘。 |
-| `apply_rename` | `symbol`, `new_name`, `path` | **安全批量重命名**：真正执行跨文件改名；写后自动重新编译解析，一旦报错立即安全回滚。 |
-
----
+| `resolve_context` | `task_description` | **【核心主入口】** 丢给它一句任务描述，它自动把相关代码骨架、依赖邻域与核心文件聚合整理好。 |
+| `search_code` | `query`, `path_filter`, `offset` | **确定性代码全文检索**：带正则与路径过滤。结果被截断时给出 `total` 和 `next_offset`。 |
+| `find_symbol` | `query` | **快速定位符号**：按名字或子串秒搜函数、类或类型，可直接带出定义体。 |
+| `find_references` | `symbol`, `path` | **编译器级引用查找**：找到全库中所有调用该符号的准确位置。 |
+| `goto_definition` | `path`, `symbol` | **精准定义跳转**：利用 LSP 语义绑定直达真实定义处。 |
+| `get_diagnostics` | `path` | **改后即时体检**：获取当前文件的语法报错与类型错误。 |
+| `list_memories` | — | **列出项目记忆**：仅列名称 + 首行摘要（读写请直接操作 `.astrolabe/memories/` 下的文件）。 |
+| `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态。 |
 
 ## 六、进阶配置与运行细节
 
@@ -445,7 +429,7 @@ Astrolabe 向 AI 暴露了精炼而强悍的工具集，按职责清晰划分为
 - `claude-code`：专为 Claude Code 优化，关闭破坏性的残缺 `structuredContent`，只返回安全完整的文本流。
 - `cursor`：专为 Cursor 优化，保证 `content[0]` 始终为有效文本，避免被 Cursor 静默丢弃。
 - `codex`：适配 Codex 的 cwd 与参数特性。
-- `readonly`：**只读安全模式**（排除唯一写盘工具 `apply_rename`，保留仅供审查预演的 `plan_rename`，适用于安全审计、演示账号或只读审查代理）。
+- `readonly`：**只读安全模式**（目录工具均为只读，适用于安全审计、演示账号或只读审查代理）。
 
 ### 4. 环境变量速查表
 
@@ -530,7 +514,7 @@ Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM
 
 ### 核心拦截与放行规则
 - **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep（可用 `ASTROLABE_GREP_THRESHOLD` 调整）、连续 3 次裸读源码文件（基于 41 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截）、连续 4 次混合调用，或连续 10 次切片读（可通过 `ASTROLABE_SLICE_READ_THRESHOLD` 调整，期间无任何 Astrolabe 工具调用），Hook 将坚决拦截，deny 文案直接给出切换指令（"Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe)."）。
-- **硬禁用文本搜索（可选）**：设置 `ASTROLABE_DENY_TEXT_SEARCH=true`（或 hooks 命令加 `--deny-text-search`，或上下文 YAML `deny_text_search: true`）后，**首次**宿主 Grep / Glob / shell 文本搜索（`grep`/`egrep`/`fgrep`/`zgrep`/`rg`/`ag`/`ack`/`git grep`，含管道）即 deny，引导改用 `search_code` / `find_symbol` / `find_references` / `explain_symbol`。默认关闭，不影响原 soft 阈值行为。适合同一机器上多个 Astrolabe MCP 进程服务不同宿主时按进程开关。注意：mcp.json 的 `env` 只作用于 MCP 进程本身；hooks 命令需同样带上该环境变量、CLI 开关，或 `--context=` 指向含 `deny_text_search: true` 的 YAML。
+- **硬禁用文本搜索（可选）**：设置 `ASTROLABE_DENY_TEXT_SEARCH=true`（或 hooks 命令加 `--deny-text-search`，或上下文 YAML `deny_text_search: true`）后，**首次**宿主 Grep / Glob / shell 文本搜索（`grep`/`egrep`/`fgrep`/`zgrep`/`rg`/`ag`/`ack`/`git grep`，含管道）即 deny，引导改用 `search_code` / `find_symbol` / `find_references` / `goto_definition`。默认关闭，不影响原 soft 阈值行为。适合同一机器上多个 Astrolabe MCP 进程服务不同宿主时按进程开关。注意：mcp.json 的 `env` 只作用于 MCP 进程本身；hooks 命令需同样带上该环境变量、CLI 开关，或 `--context=` 指向含 `deny_text_search: true` 的 YAML。
 - **切片精读额度制**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 切片调用仍可正常使用，但不再无限豁免——连续 10 次切片读且期间无任何 Astrolabe 工具调用时触发提醒式拦截，任何 Astrolabe 工具调用（含 `search_code` 等非符号工具）都会清零该额度。`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片 shell 命令仍完全放行、不计数。
 - **计数重置**：AI 调用任意 Astrolabe 符号工具（如 `resolve_context`、`find_symbol` 等）时，全部连续计数立即清零；`search_code` 等非符号 Astrolabe 工具调用只清零切片读额度（不影响 grep/read 计数）；若连续调用间隔超过设定时间，亦自动重置。
 - **智能放行窗口**：触发 Deny 后进入 15 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。
@@ -597,14 +581,14 @@ cargo run --release --example index_bench -- <repo>  # 测试任意指定仓库�
 Astrolabe 站在开源代码智能体探索的坚实肩膀之上。在架构设计与关键功能实现中，我们深度汲取并由衷致敬 **[Serena](https://github.com/oraios/serena)** 与 **[OpenVisio](https://github.com/openvisio/openvisio)** 两个优秀项目的工程实践与理论思想：
 
 ### 汲取自 Serena (Oraios AI) 的工程智慧
-- **三级提示词范式（Tiered Instructions L1–L3）**：学习 Serena 层次分明的 Agent 引导思路 —— 在握手阶段确立项目根与边界（L1），在会话中通过 `initial_instructions` 注入严密的行为纪律（L2），在工具元数据中给出精准描述（L3），有效约束大模型遵循工具使用准则。
+- **三级提示词范式（Tiered Instructions L1–L3）**：学习 Serena 层次分明的 Agent 引导思路 —— 在握手阶段确立项目根与边界（L1），用连接指令与可选的 `--system-prompt` 覆写注入行为纪律（L2），在工具元数据中给出精准描述（L3），有效约束大模型遵循工具使用准则。
 - **多客户端兼容性对齐（Client Alignment）**：吸纳 Serena 在异构环境下的适配策略，包括支持 `.git` 与 `.serena/project.yml` 双标记就近项目探测（彻底杜绝子仓库与 worktree 越界），以及对 Claude Code 和 Cursor 各自 output 缺陷的精细处理。
 - **PreToolUse 防漂移拦截体系**：继承 Serena 主动对抗 Agent 遗忘偏置的治理思路，通过在 PreToolUse 阶段对高频盲目 grep / read 进行硬性计数拦截，主动将偏离轨道的 AI 重新拉回高效的图谱工具轨道。
 
 ### 汲取自 OpenVisio (OpenVisio contributors) 的算法思想
-- **目录级架构聚合图（`get_group_graph`）**：借鉴 OpenVisio 将微观文件依赖折叠为顶层目录或宏观模块组件视图的思想，清晰解答“系统分几大模块、模块间如何交互”的宏观问题。
-- **双向多跳邻域探索（`get_neighborhood`）**：对齐 OpenVisio 的依赖子图切片能力，沿导入边进行 1~3 跳双向 BFS 扩展，帮助智能体以极少 Token 精准圈定改动的影响半径。
-- **中心性拓扑热点探测（`get_hotspots`）**：借鉴 OpenVisio 基于图拓扑度数与中心度发现系统“承重墙”的算法，迅速标定系统中改动风险最高的关键枢纽。
+- **目录级架构聚合图**：借鉴 OpenVisio 将微观文件依赖折叠为顶层目录或宏观模块组件视图的思想（实现保留在 core，不再单独暴露为 MCP 工具）。
+- **双向多跳邻域探索**：对齐 OpenVisio 的依赖子图切片能力，沿导入边进行 1~3 跳双向 BFS 扩展（实现保留在 core）。
+- **中心性拓扑热点探测**：借鉴 OpenVisio 基于图拓扑度数与中心度发现系统“承重墙”的算法（实现保留在 core）。
 
 ### Astrolabe 的系统级重写与实质飞跃
 在继承上述前沿思想的同时，Astrolabe 针对传统工具在长周期生产环境下的性能瓶颈与脆弱性，**采用 Rust 进行了全面的系统级工程重写**，实现了质的跨越：

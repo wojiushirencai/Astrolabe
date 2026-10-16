@@ -1,9 +1,10 @@
 //! Session-gated language-server installation.
 //!
 //! Installation is never a side effect of discovery, indexing, or a precise
-//! query. The MCP layer exposes `ensure_language_server`: without
-//! `confirm_install` it returns a [`InstallPlan`] and does not download; with
-//! `confirm_install=true` it calls [`LanguageServerInstaller::install`].
+//! query. The MCP catalog no longer exposes an install tool: `get_languages`
+//! reports Ready / needs_install / AST-only, and the operator installs the
+//! named server locally. [`LanguageServerInstaller::install`] remains the
+//! gated entrypoint for a future installer.
 //!
 //! # Status
 //!
@@ -84,7 +85,7 @@ impl LspStatus {
             LspStatus::NeedsInstall {
                 server_name,
                 install_hint: _,
-            } => format!(" — needs_install ({server_name}; ask user then ensure_language_server)"),
+            } => format!(" — needs_install ({server_name}; install this language server locally)"),
             LspStatus::AstOnly { reason } => format!(" — AST-only ({reason})"),
         }
     }
@@ -159,7 +160,7 @@ pub struct InstallRecord {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InstallError {
-    #[error("unknown language `{0}` for ensure_language_server")]
+    #[error("unknown language `{0}` for language-server install")]
     UnknownLanguage(String),
     #[error("language `{0}` is AST-only: {1}")]
     AstOnly(String, String),

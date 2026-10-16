@@ -31,9 +31,8 @@ from the following open-source projects:
    - License: MIT License
 
    Astrolabe acknowledges and builds upon concepts inspired by OpenVisio,
-   including folder architecture group graph aggregation (toGroupGraph /
-   get_group_graph), bidirectional BFS multi-hop neighborhood exploration
-   (get_neighborhood), and topological centrality hotspots analysis (get_hotspots).
+   including folder architecture group graph aggregation (toGroupGraph), bidirectional BFS multi-hop neighborhood exploration,
+   and topological centrality hotspots analysis.
 
 ===============================================================================
 Third-Party License Notices
