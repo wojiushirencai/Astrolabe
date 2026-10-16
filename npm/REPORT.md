@@ -135,20 +135,20 @@ npx missing-dir EXIT:1
 
 shim 把 Rust 的 stderr 和退出码 1 原样透出。
 
-### 5.3 MCP 握手：`tools/list` 返回 8 个工具
+### 5.3 MCP 握手：`tools/list` 返回 7 个工具
 
 对已安装的 `.bin/astrolabe` 走真实 stdio（shim `stdio: inherit` → Rust）：无 `initialize` 直接发 `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`。
 
 ```
-tools/list count=8 ttlMs=86400000
-tools: find_symbol, get_dependents, get_hotspots, get_languages, get_repo_skeleton, resolve_context, search_code, trace_calls
+tools/list count=7 ttlMs=86400000
+tools: find_references, find_symbol, get_diagnostics, get_languages, goto_definition, resolve_context, search_code
 missing-dir exit code=1 signal=null
 missing-dir stderr: Error: not a directory: .../no-such-dir
 SIGTERM to shim -> code=null signal=SIGTERM
 verify-install: ok
 ```
 
-8 个工具、`ttlMs=86400000`、缺目录退出码 1、对 shim 发 SIGTERM 后父进程看到 `signal=SIGTERM`。
+7 个工具、`ttlMs=86400000`、缺目录退出码 1、对 shim 发 SIGTERM 后父进程看到 `signal=SIGTERM`。
 
 ### 5.4 自愈回退（无平台包 + 假 Releases HTTP）
 
