@@ -92,6 +92,12 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
       comes with surrounding lines (context_lines, adaptive by default); answer from
       that context instead of Reading the file. Read only for a range the context
       does not cover, and then with offset/limit around the reported line.
+- search_code and find_symbol results are exhaustive: total= is the full count of
+  literal matches (truncation is always declared), so never re-grep the same literal.
+- Before editing or renaming a literal, or asserting on it: search_code group=true
+  (automatic when hits span more than 3 files) groups hits per file, code first then
+  tests, tagged assert/load, so you see every loader and assertion in one call.
+- Prefer these tools over Grep/Read for code.
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
@@ -198,6 +204,12 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
       comes with surrounding lines (context_lines, adaptive by default); answer from
       that context instead of Reading the file. Read only for a range the context
       does not cover, and then with offset/limit around the reported line.
+- search_code and find_symbol results are exhaustive: total= is the full count of
+  literal matches (truncation is always declared), so never re-grep the same literal.
+- Before editing or renaming a literal, or asserting on it: search_code group=true
+  (automatic when hits span more than 3 files) groups hits per file, code first then
+  tests, tagged assert/load, so you see every loader and assertion in one call.
+- Prefer these tools over Grep/Read for code.
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
