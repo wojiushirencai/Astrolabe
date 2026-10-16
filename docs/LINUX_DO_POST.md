@@ -38,7 +38,7 @@
 ### 1. 确定性代码图谱：零 LLM 调用、零 Token 消耗
 - Astrolabe 建图 **不调用任何外部 LLM、不做向量 Embedding 检索**。
 - 它完全依赖本地 Tree-sitter 语法树解析与构建配置拓扑运算。
-- 启动即在后台完成全局拓扑图构建，AI 发起 `resolve_context`、`get_dependents`、`get_repo_skeleton` 查询时，直接返回**精确的文件依赖链、架构热点与 `path:line` 符号锚点**。
+- 启动即在后台完成全局拓扑图构建，AI 发起 `resolve_context`、`find_symbol`、`search_code` 查询时，直接返回**精确的文件依赖链、架构热点与 `path:line` 符号锚点**。
 - **结果**：AI 不再需要盲目 Read 上百个文件来“脑补”项目架构，只读精准相关的骨架切片，单次探索节省 80% 以上的上下文 Token。
 
 ### 2. 动静分流架构：图谱常驻 + 按需 LSP，绝不让后台内存泄漏

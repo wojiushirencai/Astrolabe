@@ -388,17 +388,16 @@ export default AstrolabeGuard;
 
 ## 五、AI 助手可以用它做什么？（核心工具速查）
 
-Astrolabe 向 AI 暴露 8 个工具：
+Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、依赖图、热点、重命名、记忆等 15 个入口已移除，无兼容层）：
 
 | 工具名称 | 核心参数 | 它能帮 AI 解决什么？（大白话解读） |
 |---|---|---|
 | `resolve_context` | `task_description` | **【核心主入口】** 丢给它一句任务描述，它自动把相关代码骨架、依赖邻域与核心文件聚合整理好。 |
-| `search_code` | `query`, `path_filter`, `offset` | **确定性代码全文检索**：带正则与路径过滤。结果被截断时给出 `total` 和 `next_offset`。 |
+| `search_code` | `query`, `path_filter`, `offset`, `group` | **确定性代码全文检索**：带正则与路径过滤；少量命中（≤5 处）自带所在函数体；跨文件命中自动分组并标注 `[定义]/[引用]/[断言]/[加载]` 角色（业务代码在前、测试在后）；同会话已输出的函数体折叠为带签名的指针；宽查询（>60 处）按目录汇总计数并预览最相关命中；零命中给出相近名称建议；结果被截断时给出 `total` 和 `next_offset`。暂无 `exclude` 目录黑名单。 |
 | `find_symbol` | `query` | **快速定位符号**：按名字或子串秒搜函数、类或类型，可直接带出定义体。 |
 | `find_references` | `symbol`, `path` | **编译器级引用查找**：找到全库中所有调用该符号的准确位置。 |
 | `goto_definition` | `path`, `symbol` | **精准定义跳转**：利用 LSP 语义绑定直达真实定义处。 |
 | `get_diagnostics` | `path` | **改后即时体检**：获取当前文件的语法报错与类型错误。 |
-| `list_memories` | — | **列出项目记忆**：仅列名称 + 首行摘要（读写请直接操作 `.astrolabe/memories/` 下的文件）。 |
 | `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态。 |
 
 ## 六、进阶配置与运行细节

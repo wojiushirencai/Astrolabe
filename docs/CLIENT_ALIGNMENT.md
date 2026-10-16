@@ -1,3 +1,5 @@
+> **注（v0.12.0）**：本文为历史对齐记录；`plan_rename`、`apply_rename` 等入口已于 v0.12.0 移除，当前 MCP 目录固定 7 个工具。
+
 # 客户端适配对齐：Serena vs Astrolabe
 
 只读对照笔记。反映 **本机磁盘现状**（`crates/astrolabe-mcp/`）。不改 Rust 源码。
