@@ -125,6 +125,7 @@ version = "0.12.0"
 dependencies = [
  "anyhow",
  "astrolabe-core",
+ "globset",
  "regex",
  "rmcp",
  "schemars",

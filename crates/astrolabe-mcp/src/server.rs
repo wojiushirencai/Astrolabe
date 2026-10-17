@@ -429,6 +429,9 @@ fn loosened_filter(filter: &str) -> Option<String> {
 /// Role of a hit line. Tests: assertion vs plain reference; code: load/read,
 /// definition, or other use. Heuristic, text-based.
 fn hit_role(is_test: bool, text: &str) -> &'static str {
+    if is_comment_line(text) {
+        return "注释";
+    }
     let t = text.to_lowercase();
     let any = |keys: &[&str]| keys.iter().any(|k| t.contains(k));
     if is_test {
@@ -440,6 +443,8 @@ fn hit_role(is_test: bool, text: &str) -> &'static str {
         } else {
             "引用"
         }
+    } else if is_definition_line(text) {
+        "定义"
     } else if any(&[
         "load",
         "read",
@@ -466,6 +471,234 @@ fn hit_role(is_test: bool, text: &str) -> &'static str {
         "定义"
     } else {
         "使用"
+    }
+}
+
+/// A line that is only a comment (`//`, `///`, `#`, `--`, `/* */`, `*`, `<!--`).
+fn is_comment_line(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("//")
+        || t.starts_with("/*")
+        || t.starts_with("*/")
+        || t.starts_with("<!--")
+        || t.starts_with("--")
+        || t.starts_with("\"\"\"")
+        || t == "*"
+        || t.starts_with("* ")
+        || t == "#"
+        || t.starts_with("# ")
+        || t.starts_with("##")
+        || t.starts_with("#!")
+}
+
+/// A line that declares something: `fn`/`func`/`def`/`class`/`struct`/… .
+fn is_definition_line(text: &str) -> bool {
+    const MODIFIERS: [&str; 12] = [
+        "pub(crate) ",
+        "pub ",
+        "export ",
+        "default ",
+        "async ",
+        "public ",
+        "private ",
+        "protected ",
+        "static ",
+        "final ",
+        "abstract ",
+        "unsafe ",
+    ];
+    let mut t = text.trim_start();
+    loop {
+        let before = t;
+        for m in MODIFIERS {
+            if let Some(rest) = t.strip_prefix(m) {
+                t = rest.trim_start();
+            }
+        }
+        if t == before {
+            break;
+        }
+    }
+    [
+        "fn ",
+        "func ",
+        "def ",
+        "function ",
+        "class ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "interface ",
+        "type ",
+        "impl ",
+        "const ",
+        "let ",
+        "var ",
+        "mod ",
+        "module ",
+    ]
+    .iter()
+    .any(|k| t.starts_with(k))
+}
+
+/// Below this many hits `group=true` lists every row.
+const GROUP_FULL_HITS: usize = 40;
+
+/// Closing line of a hit listing: totals and whether the listing is complete.
+fn closure_line(hits: &[SearchHit], shown: usize, offset: usize, broad: bool) -> String {
+    let files = hits
+        .iter()
+        .map(|h| h.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let total = hits.len();
+    let listed = offset + shown;
+    if listed >= total {
+        format!("汇总：{total} 处命中 / {files} 个文件，已全部列出（结果完整，无需重查）。\n")
+    } else {
+        let cont = if broad {
+            format!("page=true 再 offset={listed} 逐页")
+        } else {
+            format!("offset={listed} 继续")
+        };
+        format!(
+            "汇总：{total} 处命中 / {files} 个文件，已列 {listed}，未列全（不完整；{cont}，或用 path_filter/exclude/aggregate 收窄）。\n"
+        )
+    }
+}
+
+/// `aggregate=dir|file` / `count_only`: counts and a total, no hit lines.
+fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
+    const MAX_ROWS: usize = 80;
+    let total = hits.len();
+    let mut files: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut dirs: BTreeMap<&str, usize> = BTreeMap::new();
+    for hit in hits {
+        *files.entry(hit.path.as_str()).or_default() += 1;
+        let dir = hit.path.rsplit_once('/').map_or(".", |(d, _)| d);
+        *dirs.entry(dir).or_default() += 1;
+    }
+    let mut out = format!(
+        "计数：总计 {total} 处命中 / {} 个文件 / {} 个目录（完整计数）。\n",
+        files.len(),
+        dirs.len()
+    );
+    let rows: Option<Vec<(&str, usize)>> = match aggregate {
+        Some("dir") => Some(dirs.into_iter().collect()),
+        Some("file") => Some(files.into_iter().collect()),
+        _ => None,
+    };
+    if let Some(mut rows) = rows {
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let suffix = if aggregate == Some("dir") { "/" } else { "" };
+        for (key, n) in rows.iter().take(MAX_ROWS) {
+            out.push_str(&format!("  {n:>5}  {key}{suffix}\n"));
+        }
+        if rows.len() > MAX_ROWS {
+            let rest: usize = rows[MAX_ROWS..].iter().map(|r| r.1).sum();
+            out.push_str(&format!(
+                "  …其余 {} 项共 {rest} 处（已计入总计）\n",
+                rows.len() - MAX_ROWS
+            ));
+        }
+        out.push_str(&format!("  {total:>5}  总计\n"));
+    }
+    out
+}
+
+/// Glob list -> matcher. A bare name (`vendor`) also excludes everything
+/// below a directory of that name; `*` crosses `/`.
+fn build_exclude_set(globs: Option<&[String]>) -> Result<Option<globset::GlobSet>, String> {
+    let Some(globs) = globs.filter(|g| !g.is_empty()) else {
+        return Ok(None);
+    };
+    let mut builder = globset::GlobSetBuilder::new();
+    for raw in globs {
+        let pat = raw.trim().trim_start_matches("./");
+        if pat.is_empty() {
+            continue;
+        }
+        let base = pat.trim_end_matches('/');
+        let mut variants = vec![base.to_string(), format!("{base}/**")];
+        if !base.starts_with("**/") {
+            variants.push(format!("**/{base}"));
+            variants.push(format!("**/{base}/**"));
+        }
+        for v in variants {
+            let glob = globset::Glob::new(&v)
+                .map_err(|e| format!("exclude 里的 glob `{raw}` 无效：{e}"))?;
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .map(Some)
+        .map_err(|e| format!("exclude 无法编译：{e}"))
+}
+
+/// Gist of a whole result kept for the repeat-query pointer: counts, busiest
+/// files, and the first hit with its enclosing symbol signature.
+fn search_digest(index: &RepoIndex, hits: &[SearchHit]) -> String {
+    let mut files: BTreeMap<&str, usize> = BTreeMap::new();
+    for h in hits {
+        *files.entry(h.path.as_str()).or_default() += 1;
+    }
+    let n_files = files.len();
+    let mut top: Vec<_> = files.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let top: Vec<String> = top
+        .iter()
+        .take(3)
+        .map(|(f, n)| format!("{f}×{n}"))
+        .collect();
+    let mut out = format!(
+        "{} 处命中 / {n_files} 个文件；最多：{}",
+        hits.len(),
+        top.join("、")
+    );
+    if let Some(first) = hits.first() {
+        out.push_str(&format!("；首处 {}:{}", first.path, first.line));
+        if !first.text_only {
+            if let Some(sym) = enclosing_symbol(index, &first.path, first.line) {
+                out.push_str(&format!(
+                    "，位于 {}（签名：{}）",
+                    sym.name,
+                    sym.signature.lines().next().unwrap_or("").trim()
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// One-line pointer to the follow-up tool that fits the task wording.
+fn next_step_hint(task: &str) -> &'static str {
+    let t = task.to_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| t.contains(k));
+    if has(&["rename", "重命名", "改名", "批量改", "替换"]) {
+        "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后 get_diagnostics 验证。\n"
+    } else if has(&[
+        "多少",
+        "统计",
+        "count",
+        "how many",
+        "每个目录",
+        "分布",
+        "调用次数",
+    ]) {
+        "下一步：search_code(query, aggregate=dir|file, exclude=[…]) 直接取计数；只要总数加 count_only=true。\n"
+    } else if has(&[
+        "谁调用",
+        "调用方",
+        "caller",
+        "callers",
+        "引用",
+        "usages",
+        "references",
+    ]) {
+        "下一步：find_references(symbol) 取精确调用点；定义用 goto_definition。\n"
+    } else {
+        "下一步：已知名字用 find_symbol（include_body=true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n"
     }
 }
 
@@ -509,7 +742,7 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     prod.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     tests.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     let mut out = format!(
-        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]（文本启发式，需核对）。\n",
+        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]。\n",
         hits.len(),
         prod.len() + tests.len(),
         prod.len(),
@@ -517,6 +750,12 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     );
     let mut shown = 0usize;
     let mut stopped = false;
+    // Few hits: show every row of every file (nothing hidden to re-query).
+    let row_cap = if hits.len() <= GROUP_FULL_HITS {
+        usize::MAX
+    } else {
+        6
+    };
     for (title, group) in [("生产代码", &prod), ("测试", &tests)] {
         if group.is_empty() {
             continue;
@@ -525,7 +764,7 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
         out.push_str(&format!("## {title}（{n} 处 / {} 个文件）\n", group.len()));
         for (path, rows) in group {
             let mut block = format!("{path} ({})\n", rows.len());
-            for r in rows.iter().take(6) {
+            for r in rows.iter().take(row_cap) {
                 let sym = if r.sym.is_empty() {
                     String::new()
                 } else {
@@ -534,14 +773,17 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
                 let text: String = r.text.trim().chars().take(140).collect();
                 block.push_str(&format!("  L{} [{}]{sym}: {text}\n", r.line, r.role));
             }
-            if rows.len() > 6 {
-                block.push_str(&format!("  …另有 {} 处\n", rows.len() - 6));
+            if rows.len() > row_cap {
+                block.push_str(&format!(
+                    "  （本文件还有 {} 处未列出；path_filter=\"{path}\" 可看全）\n",
+                    rows.len() - row_cap
+                ));
             }
             if estimate_tokens(&out) + estimate_tokens(&block) > limit {
                 stopped = true;
                 break;
             }
-            shown += rows.len().min(6);
+            shown += rows.len().min(row_cap);
             out.push_str(&block);
         }
         if stopped {
@@ -550,7 +792,7 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     }
     if stopped {
         out.push_str(
-            "…其余文件因 budget_tokens 被省略；用 path_filter 收窄或加大 budget_tokens。\n",
+            "（不完整）其余文件因 budget_tokens 未列出；用 path_filter/exclude 收窄或加大 budget_tokens。\n",
         );
     }
     (out, shown)
@@ -1016,6 +1258,15 @@ pub(crate) struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Default true: reference repeated symbol bodies by location.")]
     pub dedup: Option<bool>,
+    #[serde(default)]
+    #[schemars(description = "dir|file: hit counts per dir/file + total, no lines.")]
+    pub aggregate: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Globs to skip, e.g. [\"vendor\",\"*_test.go\"].")]
+    pub exclude: Option<Vec<String>>,
+    #[serde(default)]
+    #[schemars(description = "Only totals (hits, files).")]
+    pub count_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1037,6 +1288,9 @@ pub struct AstrolabeServer {
     /// keyed by root+path+range, with the index generation they were read at
     /// and the ordinal of the call that sent them.
     sent_ranges: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    /// One-line digest of each whole `search_code` result, keyed like the
+    /// query entries of `sent_ranges`, so a repeat query gets the gist back.
+    search_digests: Arc<Mutex<HashMap<String, String>>>,
     call_seq: Arc<AtomicU64>,
 }
 
@@ -1154,6 +1408,7 @@ impl AstrolabeServer {
             loop_guard: Arc::new(Mutex::new(LoopGuard::new(loop_guard_config))),
             tool_router: Self::tool_router(),
             sent_ranges: Arc::new(Mutex::new(HashMap::new())),
+            search_digests: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1602,6 +1857,7 @@ impl AstrolabeServer {
                     "{omitted_symbols} 个符号因 budget_tokens 被省略。\n"
                 ));
             }
+            body.push_str(next_step_hint(&params.task_description));
             self.result_on(
                 &session.root,
                 "resolve_context",
@@ -1620,7 +1876,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "精确引用查询（语言服务器驱动）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis."
+        description = "精确引用查询（语言服务器驱动）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis. dry_run_rename=NewName: read-only per-file rename checklist."
     )]
     pub(crate) fn find_references(
         &self,
@@ -1796,7 +2052,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Exhaustive code & text search. Literal case-insensitive by default; regex when regex=true. Matches include surrounding context lines. Use group=true to group hits by file before refactoring/asserting. Covers indexed code first, then other text files tagged [text-only]. Paging via offset=next_offset."
+        description = "Exhaustive code & text search. Literal case-insensitive by default; regex when regex=true. Matches include surrounding context lines. Use group=true to group hits by file before refactoring/asserting. Covers indexed code first, then other text files tagged [text-only]. Paging via offset=next_offset. Counts (calls per dir): aggregate=dir|file, count_only; exclude=[globs]."
     )]
     pub(crate) fn search_code(
         &self,
@@ -1831,6 +2087,17 @@ impl AstrolabeServer {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(format!("无效正则表达式：{error}")),
                 };
+                if let Some(mode) = params.aggregate.as_deref() {
+                    if mode != "dir" && mode != "file" {
+                        return text_error(format!("aggregate 只能是 dir 或 file，收到 `{mode}`。"));
+                    }
+                }
+                let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
+                    Ok(set) => set,
+                    Err(message) => return text_error(message),
+                };
+                let excluded = |path: &str| exclude_set.as_ref().is_some_and(|set| set.is_match(path));
+                let mut dedup_key: Option<String> = None;
                 if session_dedup_enabled(params.dedup) {
                     let mut probe = params.clone();
                     probe.dedup = None;
@@ -1838,19 +2105,28 @@ impl AstrolabeServer {
                     let generation = index.generation();
                     // Same ordinal the body bookkeeping below takes.
                     let call = self.call_seq.load(Ordering::Relaxed) + 1;
+                    dedup_key = Some(key.clone());
                     let earlier = {
                         let mut map = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
                         match map.get(&key) {
                             Some((g, c)) if *g == generation => Some(*c),
                             _ => {
-                                map.insert(key, (generation, call));
+                                map.insert(key.clone(), (generation, call));
                                 None
                             }
                         }
                     };
                     if let Some(c) = earlier {
+                        let digest = self
+                            .search_digests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&key)
+                            .cloned()
+                            .map(|d| format!("首次结果摘要：{d}\n"))
+                            .unwrap_or_default();
                         let body = format!(
-                            "confidence: exact (磁盘源码字面匹配)\n{}同一查询已在本会话第 {c} 次调用返回，文件未改动，不再重发；需要时传 dedup=false。\n",
+                            "confidence: exact (磁盘源码字面匹配)\n{}同一查询已在本会话第 {c} 次调用返回（文件未改动），不再重发全文；无需换词重查。\n{digest}要重新取全文传 dedup=false。\n",
                             render_search_mode_header(params.regex, &params.query)
                         );
                         return self.result_on(
@@ -1896,13 +2172,20 @@ impl AstrolabeServer {
                     {
                         continue;
                     }
+                    if excluded(file.path.as_str()) {
+                        continue;
+                    }
                     scan_file(file.path.as_str(), &mut matches);
                 }
                 // 非索引文本文件（md/sql/yaml/json/xml/gradle/kt/模板…）也搜，
                 // 排在代码命中之后并标注 [text-only]：它们没有符号/引用信息。
                 // ripgrep 引擎（grep-searcher）并行搜索，按输入顺序回收结果。
                 let code_matches = matches.len();
-                let text_paths = index.text_only_paths(params.path_filter.as_deref());
+                let text_paths: Vec<_> = index
+                    .text_only_paths(params.path_filter.as_deref())
+                    .into_iter()
+                    .filter(|p| !excluded(p.as_str()))
+                    .collect();
                 let sensitive = params.case_sensitive.unwrap_or(params.regex);
                 if let Ok(text_matcher) = astrolabe_core::text_search::build_matcher(
                     &params.query,
@@ -1952,6 +2235,36 @@ impl AstrolabeServer {
                 let remaining = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS);
                 let total = matches.len();
                 let offset = params.offset.min(total);
+                if let Some(key) = &dedup_key {
+                    if total > 0 {
+                        let digest = search_digest(index, &matches);
+                        self.search_digests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key.clone(), digest);
+                    }
+                }
+                if params.count_only || params.aggregate.is_some() {
+                    let body = format!(
+                        "confidence: exact (磁盘源码字面匹配)\n{}{}",
+                        render_search_mode_header(params.regex, &params.query),
+                        render_search_counts(&matches, params.aggregate.as_deref())
+                    );
+                    return self.result_on(
+                        &session.root,
+                        "search_code",
+                        body,
+                        json!({
+                            "confidence": "exact",
+                            "counts_only": true,
+                            "total": total,
+                            "files": matches.iter().map(|m| m.path.as_str()).collect::<BTreeSet<_>>().len(),
+                            "complete": true,
+                            "budget_tokens": params.budget_tokens,
+                        }),
+                        Some(params.budget_tokens),
+                    );
+                }
                 let auto_group = params.group.is_none()
                     && params.context_lines.is_none()
                     && !params.page
@@ -1978,6 +2291,7 @@ impl AstrolabeServer {
                         "grouped=true total={total} shown={shown}\n"
                     ));
                     body.push_str(&grouped);
+                    body.push_str(&closure_line(&matches, shown, 0, false));
                     body.push_str(&data_note);
                     return self.result_on(
                         &session.root,
@@ -2024,6 +2338,7 @@ impl AstrolabeServer {
                             "最相关的 {shown_preview} 处（定义行优先，测试文件靠后；不是全集）：\n{preview}"
                         ));
                     }
+                    body.push_str(&closure_line(&matches, shown_preview, 0, true));
                     body.push_str(&data_note);
                     return self.result_on(
                         &session.root,
@@ -2125,6 +2440,9 @@ impl AstrolabeServer {
                     ));
                 }
                 body.push_str(&rendered);
+                if !matches.is_empty() {
+                    body.push_str(&closure_line(&matches, shown, offset, false));
+                }
                 body.push_str(&data_note);
                 // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
                 // （对齐 find_references 的 `未找到对 … 的引用。` 空结果约定）。
@@ -3242,6 +3560,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         })));
         assert_first_text(server.get_languages(Parameters(BudgetOnly { budget_tokens: 100 })));
     }
@@ -3493,6 +3814,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         let rendered = text
@@ -3534,6 +3858,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("shown=0"), "{text}");
@@ -3609,6 +3936,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }
     }
 
@@ -3834,6 +4164,220 @@ mod tests {
     }
 
     #[test]
+    fn hit_roles_tag_comments_and_definitions() {
+        assert_eq!(hit_role(false, "// see MAGIC_KEY here"), "注释");
+        assert_eq!(hit_role(false, "    # MAGIC_KEY note"), "注释");
+        assert_eq!(hit_role(false, " * MAGIC_KEY javadoc"), "注释");
+        assert_eq!(hit_role(true, "// want MAGIC_KEY"), "注释");
+        assert_eq!(hit_role(false, "pub fn magic_key() -> u8 {"), "定义");
+        assert_eq!(hit_role(false, "func MagicKey() string {"), "定义");
+        assert_eq!(hit_role(false, "def magic_key(self):"), "定义");
+        assert_eq!(hit_role(false, "log(\"MAGIC_KEY\")"), "使用");
+        // `#define` / `#[attr]` are not comments.
+        assert_eq!(hit_role(false, "#define MAGIC_KEY 1"), "定义");
+        assert_ne!(hit_role(false, "#[cfg(MAGIC_KEY)]"), "注释");
+    }
+
+    #[test]
+    fn grouped_output_has_no_recheck_wording_and_closes_with_summary() {
+        let rows: String = (0..9)
+            .map(|i| format!("func f{i}() {{ use(\"CLOSE_KEY\") }}\n"))
+            .collect();
+        let (server, dir) = smart_server(&[
+            ("a/one.go", format!("package a\n{rows}")),
+            (
+                "b/two.go",
+                "package b\n// CLOSE_KEY doc\nconst k = \"CLOSE_KEY\"\n".into(),
+            ),
+        ]);
+        let mut p = search("CLOSE_KEY");
+        p.group = Some(true);
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(!text.contains("需核对"), "{text}");
+        assert!(!text.contains("文本启发式"), "{text}");
+        assert!(text.contains("[注释]"), "{text}");
+        assert!(text.contains("[定义]"), "{text}");
+        // 11 hits <= GROUP_FULL_HITS: all 9 rows of one.go are listed.
+        assert_eq!(text.matches("  L").count(), 11, "{text}");
+        assert!(!text.contains("未列出"), "{text}");
+        assert!(
+            text.contains("汇总：11 处命中 / 2 个文件，已全部列出（结果完整"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grouped_output_over_cap_says_incomplete_per_file() {
+        let rows: String = (0..50)
+            .map(|i| format!("func f{i}() {{ use(\"WIDE_KEY\") }}\n"))
+            .collect();
+        let (server, dir) = smart_server(&[("a/one.go", format!("package a\n{rows}"))]);
+        let mut p = search("WIDE_KEY");
+        p.group = Some(true);
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("本文件还有 44 处未列出"), "{text}");
+        assert!(text.contains("不完整"), "{text}");
+        assert!(!text.contains("已全部列出"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broad_summary_points_to_page_true_when_incomplete() {
+        let rows: String = (0..70)
+            .map(|i| format!("func f{i}() {{ use(\"BROAD_KEY\") }}\n"))
+            .collect();
+        let (server, dir) = smart_server(&[("a/one.go", format!("package a\n{rows}"))]);
+        let text = text_of(&server.search_code(Parameters(search("BROAD_KEY"))));
+        assert!(text.contains("不完整；page=true 再 offset="), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flat_results_end_with_completeness_line() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let text = text_of(&server.search_code(Parameters(search("marker_x"))));
+        assert!(
+            text.contains("汇总：2 处命中 / 1 个文件，已全部列出（结果完整"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn counting_fixture() -> (AstrolabeServer, PathBuf) {
+        smart_server(&[
+            (
+                "svc/a.go",
+                "package svc\nfunc A() { SysLog(1)\n SysLog(2) }\n".into(),
+            ),
+            ("svc/b.go", "package svc\nfunc B() { SysLog(3) }\n".into()),
+            ("web/c.go", "package web\nfunc C() { SysLog(4) }\n".into()),
+            (
+                "vendor/x/d.go",
+                "package x\nfunc D() { SysLog(5) }\n".into(),
+            ),
+            (
+                "svc/a_test.go",
+                "package svc\nfunc TestA() { SysLog(6) }\n".into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn aggregate_dir_counts_hits_per_directory_with_total() {
+        let (server, dir) = counting_fixture();
+        let mut p = search("SysLog(");
+        p.aggregate = Some("dir".into());
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(
+            text.contains("总计 6 处命中 / 5 个文件 / 3 个目录"),
+            "{text}"
+        );
+        assert!(text.contains("    4  svc/"), "{text}");
+        assert!(text.contains("    1  web/"), "{text}");
+        assert!(text.contains("    1  vendor/x/"), "{text}");
+        assert!(text.contains("    6  总计"), "{text}");
+        assert!(!text.contains("@svc/a.go"), "no hit lines: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aggregate_file_and_count_only_and_validation() {
+        let (server, dir) = counting_fixture();
+        let mut p = search("SysLog(");
+        p.aggregate = Some("file".into());
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("    2  svc/a.go"), "{text}");
+        assert!(text.contains("    1  web/c.go"), "{text}");
+        let mut c = search("SysLog(");
+        c.count_only = true;
+        let text = text_of(&server.search_code(Parameters(c)));
+        assert!(text.contains("总计 6 处命中 / 5 个文件"), "{text}");
+        assert!(!text.contains("总计\n"), "count_only has no rows: {text}");
+        let mut bad = search("SysLog(");
+        bad.aggregate = Some("package".into());
+        let text = text_of(&server.search_code(Parameters(bad)));
+        assert!(text.contains("aggregate 只能是 dir 或 file"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclude_globs_skip_paths_in_lists_and_counts() {
+        let (server, dir) = counting_fixture();
+        let mut p = search("SysLog(");
+        p.aggregate = Some("dir".into());
+        p.exclude = Some(vec!["vendor".into(), "*_test.go".into()]);
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(
+            text.contains("总计 4 处命中 / 3 个文件 / 2 个目录"),
+            "{text}"
+        );
+        assert!(!text.contains("vendor"), "{text}");
+        let mut q = search("SysLog(");
+        q.exclude = Some(vec!["**/web/**".into(), "svc/b.go".into()]);
+        let text = text_of(&server.search_code(Parameters(q)));
+        assert!(!text.contains("web/c.go"), "{text}");
+        assert!(!text.contains("svc/b.go"), "{text}");
+        assert!(text.contains("svc/a.go"), "{text}");
+        let mut bad = search("SysLog(");
+        bad.exclude = Some(vec!["[".into()]);
+        let text = text_of(&server.search_code(Parameters(bad)));
+        assert!(text.contains("glob"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeat_query_pointer_returns_first_result_digest() {
+        let (server, dir) = counting_fixture();
+        let mut p = search("SysLog(");
+        p.group = Some(false);
+        let _first = server.search_code(Parameters(p.clone()));
+        let again = text_of(&server.search_code(Parameters(p)));
+        assert!(again.contains("不再重发全文"), "{again}");
+        assert!(
+            again.contains("首次结果摘要：6 处命中 / 5 个文件"),
+            "{again}"
+        );
+        assert!(again.contains("svc/a.go×2"), "{again}");
+        assert!(again.contains("首处 svc/a.go:2"), "{again}");
+        assert!(again.contains("dedup=false"), "{again}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_context_next_step_hint_matches_task() {
+        assert!(next_step_hint("rename Foo to Bar everywhere").contains("dry_run_rename"));
+        assert!(next_step_hint("统计各目录调用次数").contains("aggregate=dir"));
+        assert!(next_step_hint("谁调用了 parse").contains("find_references"));
+        assert!(next_step_hint("add a flag").contains("find_symbol"));
+        for t in ["rename x", "多少处", "callers of x", "other"] {
+            let h = next_step_hint(t);
+            assert!(h.starts_with("下一步：") && h.ends_with('\n') && h.lines().count() == 1);
+        }
+    }
+
+    #[test]
+    fn resolve_context_output_ends_with_next_step_line() {
+        let server = ready_server();
+        let result = server.resolve_context(Parameters(ResolveContextParams {
+            task_description: "rename alpha".into(),
+            budget_tokens: 2000,
+        }));
+        let text = text_of(&result);
+        let last = text.trim_end().lines().last().unwrap_or_default();
+        assert!(last.starts_with("下一步："), "{text}");
+    }
+
+    #[test]
+    fn tools_list_stays_compact() {
+        let server = ready_server();
+        let tools = server.listed_tools();
+        assert_eq!(tools.len(), 7);
+        let bytes = serde_json::to_vec(&tools).unwrap().len();
+        assert!(bytes < 7_600, "tools/list grew to {bytes} bytes");
+    }
+
+    #[test]
     fn dedup_marks_only_bodies_that_actually_shipped() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
         // Budget too small for the body: falls back to line context.
@@ -3957,6 +4501,9 @@ mod tests {
             page: false,
             group: None,
             dedup: Some(false),
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         };
 
         let first = server.search_code(Parameters(params.clone()));
@@ -4008,6 +4555,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
 
         let weighted = server.primary.file_cache.weighted_size();
@@ -4037,6 +4587,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4057,6 +4610,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("fresh-content"), "{text}");
@@ -4086,6 +4642,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         result.content[0].as_text().unwrap().text.clone()
     }
@@ -4190,6 +4749,9 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
+                aggregate: None,
+                exclude: None,
+                count_only: false,
                 query: "needle".into(),
                 regex: false,
                 path_filter: None,
@@ -4247,6 +4809,9 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
+                aggregate: None,
+                exclude: None,
+                count_only: false,
                 query: "needle-a".into(),
                 regex: false,
                 path_filter: None,
@@ -4324,6 +4889,9 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
+                aggregate: None,
+                exclude: None,
+                count_only: false,
             }))
         };
         for _ in 0..3 {
@@ -4448,6 +5016,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         };
         let result = server.search_code(Parameters(params(None)));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -4477,6 +5048,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         // 零命中必须显式声明，避免"只剩元信息、疑似服务故障"的歧义输出。
@@ -4506,6 +5080,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -4544,6 +5121,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -4741,6 +5321,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         assert_eq!(result.is_error, Some(true));
         assert!(
@@ -5388,6 +5971,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
@@ -5420,6 +6006,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
             .as_text()
@@ -5448,6 +6037,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let filter_miss_text = search_filter_miss.content[0]
             .as_text()
@@ -5520,6 +6112,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
         assert!(dart_text.contains("@service.dart:2"), "{dart_text}");
@@ -5547,6 +6142,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         (text, result.structured_content.expect("structured"))
@@ -5711,6 +6309,9 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
