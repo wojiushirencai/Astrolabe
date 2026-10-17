@@ -6,6 +6,16 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+基于 v0.12.0 实测分析（模型不信任 `search_code` 结果、反复重查，聚合/批量任务不用 Astrolabe）的收口改进；工具目录仍为 7 个，`tools/list` 约 7.4 KB。
+
+### 变更
+
+- **`search_code` 收口信号**：注释行标 `[注释]`，声明行标 `[定义]`，其余代码仍 `[使用]`；去掉“文本启发式，需核对”；命中不超过 40 处时 `group` 全部展开；每次结果末尾一行“汇总：N 处命中 / M 个文件，已全部列出（结果完整）”或“未列全（不完整）”并给出续查方式；“另有 N 处”改为明确的“本文件还有 N 处未列出”。
+- **`search_code` 计数与排除**：新增 `aggregate=dir|file`、`count_only`、`exclude`（glob 列表，裸名如 `vendor` 也匹配其下所有路径）。
+- **`resolve_context`** 结果末尾一行提示下一步该用的工具（按任务措辞选 `find_symbol` / `search_code` / `find_references`）。
+- **`find_references` 改名预览**：新增 `dry_run_rename=新名`，输出按文件的逐处替换清单（只读，不写盘；置信度非 exact 时提示核对）。未新增工具。
+- **去重指针带摘要**：同一 `search_code` 查询重复时返回首次结果摘要（命中数、文件数、最多命中的文件、首处位置与所在签名），减少换词重查。
+
 ## [0.12.0] - 2026-10-17
 
 破坏性变更：MCP 工具目录固定为 7 个，删除 15 个入口。完整发版说明与评测数据见 GitHub Release。

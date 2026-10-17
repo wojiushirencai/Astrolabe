@@ -30,4 +30,5 @@ tracing-subscriber.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-io", "schemars"] }
 schemars.workspace = true
 regex.workspace = true
+globset.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "signal"] }

@@ -56,6 +56,9 @@ pub(crate) struct FindReferencesParams {
     #[serde(default = "default_budget")]
     #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
+    #[serde(default)]
+    #[schemars(description = "New name: preview per-file edits (no write).")]
+    pub dry_run_rename: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -180,7 +183,7 @@ impl PreciseTools {
 #[tool_router]
 impl PreciseTools {
     #[tool(
-        description = "精确引用查询（语言服务器）。LSP-resolved call sites and usages across repository. Required for renames and caller analysis.",
+        description = "精确引用查询（语言服务器）。LSP-resolved call sites and usages across repository. Required for renames and caller analysis. dry_run_rename=NewName: read-only per-file rename checklist.",
         annotations(title = "精确引用", read_only_hint = true)
     )]
     pub(crate) fn find_references(
@@ -265,6 +268,18 @@ pub(crate) fn run_find_references(
     if omitted > 0 {
         body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
     }
+    let mut preview_files = 0usize;
+    if let Some(new_name) = params.dry_run_rename.as_deref() {
+        let (text, files) = render_rename_preview(
+            &params.symbol,
+            new_name,
+            &locations,
+            result.confidence,
+            params.budget_tokens,
+        );
+        body.push_str(&text);
+        preview_files = files;
+    }
 
     text_result(
         body,
@@ -275,8 +290,81 @@ pub(crate) fn run_find_references(
             "returned": locations.len() - omitted,
             "omitted": omitted,
             "truncated": omitted > 0,
+            "dry_run_rename": params.dry_run_rename.is_some(),
+            "rename_files": preview_files,
         }),
     )
+}
+
+/// Read-only rename preview: per-file checklist of the sites that hold the
+/// old name (1-based line, 0-based column as in the reference list). Nothing
+/// is written; the caller edits file by file and verifies with
+/// get_diagnostics.
+fn render_rename_preview(
+    symbol: &str,
+    new_name: &str,
+    locations: &[Location],
+    confidence: Confidence,
+    budget_tokens: usize,
+) -> (String, usize) {
+    let new_name = new_name.trim();
+    let valid = !new_name.is_empty()
+        && !new_name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && new_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    if !valid {
+        return (
+            format!("改名预览未生成：dry_run_rename=`{new_name}` 不是合法标识符。\n"),
+            0,
+        );
+    }
+    if new_name == symbol {
+        return ("改名预览未生成：新名与旧名相同。\n".to_string(), 0);
+    }
+    if locations.is_empty() {
+        return (
+            format!("改名预览：没有找到 `{symbol}` 的引用，无需改动。\n"),
+            0,
+        );
+    }
+    let mut by_file: Vec<(&str, Vec<String>)> = Vec::new();
+    for loc in locations {
+        let site = format!(
+            "L{}:{}",
+            loc.range.start.line.saturating_add(1),
+            loc.range.start.character
+        );
+        match by_file.last_mut() {
+            Some((path, sites)) if *path == loc.path.as_str() => sites.push(site),
+            _ => by_file.push((loc.path.as_str(), vec![site])),
+        }
+    }
+    let mut out = format!(
+        "改名预览（只读，未写盘）：`{symbol}` → `{new_name}`，共 {} 处 / {} 个文件。逐文件把下列位置的 `{symbol}` 替换为 `{new_name}`：\n",
+        locations.len(),
+        by_file.len()
+    );
+    let lines: Vec<String> = by_file
+        .iter()
+        .map(|(path, sites)| format!("  {path} ×{}: {}", sites.len(), sites.join(" ")))
+        .collect();
+    let (kept, omitted) = truncate_ranked(&lines, budget_tokens, |l| format!("{l}\n"));
+    for line in kept {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "（不完整）另有 {omitted} 个文件因 budget_tokens 未列出；加大 budget_tokens 取全清单。\n"
+        ));
+    }
+    if confidence == Confidence::Exact {
+        out.push_str("清单来自语言服务器（精确）；替换完成后用 get_diagnostics 逐文件验证。\n");
+    } else {
+        out.push_str("注意：引用置信度低于 exact，清单可能漏报或误报，替换前请核对。\n");
+    }
+    (out, by_file.len())
 }
 
 pub(crate) fn run_goto_definition(
@@ -841,6 +929,7 @@ mod tests {
             line: None,
             character: None,
             budget_tokens: 800,
+            dry_run_rename: None,
         })));
         assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
             path: "src/main.go".into(),
@@ -870,6 +959,7 @@ mod tests {
             line: None,
             character: None,
             budget_tokens: 800,
+            dry_run_rename: None,
         })));
         let text = first_text(&refs);
         assert!(text.contains("confidence: Unknown"), "{text}");
@@ -933,6 +1023,7 @@ mod tests {
             line: None,
             character: None,
             budget_tokens: 0,
+            dry_run_rename: None,
         })));
         let text = first_text(&refs);
         assert!(text.contains("因 budget_tokens 被省略"), "{text}");
@@ -967,6 +1058,7 @@ mod tests {
             line: None,
             character: None,
             budget_tokens: 800,
+            dry_run_rename: None,
         })));
         let text = first_text(&result);
         assert!(text.contains("confidence: Exact"), "{text}");
@@ -1008,6 +1100,61 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_rename_lists_edits_per_file_without_writing() {
+        let tools = tools_with(Fake {
+            references: Precise::exact(vec![
+                loc("src/a.rs", 3, 4),
+                loc("src/a.rs", 9, 8),
+                loc("src/b.rs", 0, 12),
+            ]),
+            definition: Precise::exact(Vec::new()),
+            diagnostics: Precise::exact(Vec::new()),
+        });
+        let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            symbol: "old_name".into(),
+            path: None,
+            line: None,
+            character: None,
+            budget_tokens: 800,
+            dry_run_rename: Some("new_name".into()),
+        })));
+        let text = first_text(&result);
+        assert!(text.contains("改名预览（只读，未写盘）"), "{text}");
+        assert!(
+            text.contains("`old_name` → `new_name`，共 3 处 / 2 个文件"),
+            "{text}"
+        );
+        assert!(text.contains("  src/a.rs ×2: L4:4 L10:8"), "{text}");
+        assert!(text.contains("  src/b.rs ×1: L1:12"), "{text}");
+        assert!(text.contains("get_diagnostics"), "{text}");
+        // No preview without the parameter.
+        let plain = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            symbol: "old_name".into(),
+            path: None,
+            line: None,
+            character: None,
+            budget_tokens: 800,
+            dry_run_rename: None,
+        })));
+        assert!(!first_text(&plain).contains("改名预览"));
+    }
+
+    #[test]
+    fn dry_run_rename_rejects_bad_names_and_flags_low_confidence() {
+        let (bad, _) =
+            render_rename_preview("a", "1x", &[loc("a.rs", 0, 0)], Confidence::Exact, 800);
+        assert!(bad.contains("不是合法标识符"), "{bad}");
+        let (same, _) =
+            render_rename_preview("a", "a", &[loc("a.rs", 0, 0)], Confidence::Exact, 800);
+        assert!(same.contains("相同"), "{same}");
+        let (none, n) = render_rename_preview("a", "b", &[], Confidence::Exact, 800);
+        assert!(none.contains("无需改动") && n == 0, "{none}");
+        let (low, _) =
+            render_rename_preview("a", "b", &[loc("a.rs", 0, 0)], Confidence::Syntactic, 800);
+        assert!(low.contains("低于 exact"), "{low}");
+    }
+
+    #[test]
     fn empty_exact_references_are_not_unknown() {
         let tools = tools_with(Fake {
             references: Precise::exact(Vec::new()),
@@ -1020,6 +1167,7 @@ mod tests {
             line: None,
             character: None,
             budget_tokens: 100,
+            dry_run_rename: None,
         })));
         let text = first_text(&result);
         assert!(text.contains("confidence: Exact"), "{text}");

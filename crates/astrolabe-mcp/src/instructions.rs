@@ -93,8 +93,12 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.
 - Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
-- search_code auto-groups wide hits (see above). It does not give per-directory
-  aggregate counts or exclude filters; for those, use other means (shell/scripts).
+- search_code auto-groups wide hits (see above); few hits list every row and every
+  result ends with a "汇总" line saying whether the listing is complete — if it says
+  complete, answer from it, do not re-query with other words. Counting (calls per
+  directory/file): aggregate=dir|file or count_only=true; skip paths with
+  exclude=[globs]. Batch rename: find_references symbol=<old> dry_run_rename=<new>
+  returns a per-file edit checklist (read-only), then edit file by file.
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
@@ -199,8 +203,12 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.
 - Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
-- search_code auto-groups wide hits (see above). It does not give per-directory
-  aggregate counts or exclude filters; for those, use other means (shell/scripts).
+- search_code auto-groups wide hits (see above); few hits list every row and every
+  result ends with a "汇总" line saying whether the listing is complete — if it says
+  complete, answer from it, do not re-query with other words. Counting (calls per
+  directory/file): aggregate=dir|file or count_only=true; skip paths with
+  exclude=[globs]. Batch rename: find_references symbol=<old> dry_run_rename=<new>
+  returns a per-file edit checklist (read-only), then edit file by file.
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
   rather than paging through hundreds of hits.
@@ -336,7 +344,8 @@ mod tests {
             let m = manual(name);
             assert!(m.contains("fewer tokens"), "{name}");
             assert!(m.contains("auto-groups"), "{name}");
-            assert!(m.contains("per-directory"), "{name}");
+            assert!(m.contains("aggregate=dir|file"), "{name}");
+            assert!(m.contains("dry_run_rename"), "{name}");
         }
     }
 
