@@ -6,7 +6,7 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
-基于 v0.12.0 实测分析（模型不信任 `search_code` 结果、反复重查，聚合/批量任务不用 Astrolabe）的收口改进；工具目录仍为 7 个，`tools/list` 约 7.4 KB。
+基于 v0.12.0 实测分析（模型不信任 `search_code` 结果、反复重查，聚合/批量任务不用 Astrolabe）的收口改进；工具目录仍为 7 个，`tools/list` 约 8 KB 以内。
 
 ### 变更
 
@@ -15,6 +15,16 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 - **`resolve_context`** 结果末尾一行提示下一步该用的工具（按任务措辞选 `find_symbol` / `search_code` / `find_references`）。
 - **`find_references` 改名预览**：新增 `dry_run_rename=新名`，输出按文件的逐处替换清单（只读，不写盘；置信度非 exact 时提示核对）。未新增工具。
 - **去重指针带摘要**：同一 `search_code` 查询重复时返回首次结果摘要（命中数、文件数、最多命中的文件、首处位置与所在签名），减少换词重查。
+
+### 新增（聚合类任务采用率改进）
+
+- **`aggregate=top`**：按顶层目录汇总；`top`/`dir`/`file` 每行同时给出“N 处 / M 个文件”和总计（含顶层目录数、目录数）。
+- **`skip_comments`**：跳过注释（行注释、块注释，Rust 嵌套块注释）与字符串字面量里的命中，识别 Go/Rust/Python/JS/TS/Dart/Java/C 系/Kotlin/C#/Ruby/Shell 等；查询词本身含引号时字符串不跳过；文档类 text-only 命中（md/rst/txt）一并跳过并报告跳过数量。可与 `aggregate`、`exclude`、`count_only` 组合。
+- **`exclude`** 支持 `_test.go`、`.min.js` 这类按文件名后缀的写法，以及 `*_test.go`、`vendor`。
+- **工具描述首句与服务器 instructions** 改为“统计/计数每个目录有多少处调用”措辞，直指 `aggregate=top|dir|file`。
+- **命中多（>40 处）时**结果末尾也给“下一步”提示（统计用 `aggregate`，改名用 `find_references dry_run_rename`）。
+- **“已全部列出”可核验**：改为“汇总：23/23 处命中 / M 个文件，无截断”；未列全写“已列 K/N 处，有截断”。
+- **分组结果把文档（`docs/`、md/rst/txt）从“生产代码”拆出**，单列“文档”组，命中行标 `[文档]`。
 
 ## [0.12.0] - 2026-10-17
 

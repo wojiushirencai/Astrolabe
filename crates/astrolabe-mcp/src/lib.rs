@@ -8,6 +8,7 @@
 //! `ASTROLABE_CONTEXT`) and `ASTROLABE_STRUCTURED` can turn it on.
 
 mod cli;
+mod code_mask;
 mod context;
 mod ensure_ls;
 mod explain;
