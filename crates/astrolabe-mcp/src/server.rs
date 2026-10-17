@@ -554,7 +554,9 @@ fn closure_line(hits: &[SearchHit], shown: usize, offset: usize, broad: bool) ->
     let total = hits.len();
     let listed = offset + shown;
     if listed >= total {
-        format!("汇总：{total} 处命中 / {files} 个文件，已全部列出（结果完整，无需重查）。\n")
+        format!(
+            "汇总：{total}/{total} 处命中 / {files} 个文件，无截断，已全部列出（结果完整，无需重查）。\n"
+        )
     } else {
         let cont = if broad {
             format!("page=true 再 offset={listed} 逐页")
@@ -562,37 +564,78 @@ fn closure_line(hits: &[SearchHit], shown: usize, offset: usize, broad: bool) ->
             format!("offset={listed} 继续")
         };
         format!(
-            "汇总：{total} 处命中 / {files} 个文件，已列 {listed}，未列全（不完整；{cont}，或用 path_filter/exclude/aggregate 收窄）。\n"
+            "汇总：已列 {listed}/{total} 处命中 / {files} 个文件，有截断，未列全（不完整；{cont}，或用 path_filter/exclude/aggregate 收窄）。\n"
         )
     }
 }
 
-/// `aggregate=dir|file` / `count_only`: counts and a total, no hit lines.
+/// Next-step line for results with many hits (> `GROUP_FULL_HITS`).
+fn many_hits_hint(total: usize) -> String {
+    if total > GROUP_FULL_HITS {
+        "下一步：要统计各目录/各文件有多少处（计数、调用次数）用 aggregate=top|dir|file（可加 skip_comments=true、exclude=[\"_test.go\",\"vendor\"]）；要批量改名用 find_references dry_run_rename。\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Documentation files: listed apart from production code and tests.
+fn is_doc_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    let ext = p.rsplit_once('.').map_or("", |(_, e)| e);
+    matches!(ext, "md" | "mdx" | "rst" | "txt" | "adoc")
+        || p.starts_with("docs/")
+        || p.starts_with("doc/")
+        || p.contains("/docs/")
+        || p.contains("/doc/")
+}
+
+/// `aggregate=top|dir|file` / `count_only`: counts and a total, no hit lines.
 fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
     const MAX_ROWS: usize = 80;
     let total = hits.len();
-    let mut files: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut dirs: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut all_files: BTreeSet<&str> = BTreeSet::new();
+    let mut dirs: BTreeSet<&str> = BTreeSet::new();
+    let mut tops: BTreeSet<&str> = BTreeSet::new();
+    // key -> (hits, files)
+    let mut rows: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
     for hit in hits {
-        *files.entry(hit.path.as_str()).or_default() += 1;
-        let dir = hit.path.rsplit_once('/').map_or(".", |(d, _)| d);
-        *dirs.entry(dir).or_default() += 1;
+        let path = hit.path.as_str();
+        all_files.insert(path);
+        let dir = path.rsplit_once('/').map_or(".", |(d, _)| d);
+        dirs.insert(dir);
+        let top = path.split_once('/').map_or(".", |(t, _)| t);
+        tops.insert(top);
+        let key = match aggregate {
+            Some("top") => top,
+            Some("dir") => dir,
+            Some("file") => path,
+            _ => continue,
+        };
+        let row = rows.entry(key).or_default();
+        row.0 += 1;
+        row.1.insert(path);
     }
     let mut out = format!(
-        "计数：总计 {total} 处命中 / {} 个文件 / {} 个目录（完整计数）。\n",
-        files.len(),
-        dirs.len()
+        "计数：总计 {total} 处命中 / {} 个文件 / {} 个目录 / {} 个顶层目录（完整计数）。\n",
+        all_files.len(),
+        dirs.len(),
+        tops.len()
     );
-    let rows: Option<Vec<(&str, usize)>> = match aggregate {
-        Some("dir") => Some(dirs.into_iter().collect()),
-        Some("file") => Some(files.into_iter().collect()),
-        _ => None,
-    };
-    if let Some(mut rows) = rows {
+    if aggregate.is_some() {
+        let mut rows: Vec<(&str, usize, usize)> = rows
+            .into_iter()
+            .map(|(k, (n, f))| (k, n, f.len()))
+            .collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        let suffix = if aggregate == Some("dir") { "/" } else { "" };
-        for (key, n) in rows.iter().take(MAX_ROWS) {
-            out.push_str(&format!("  {n:>5}  {key}{suffix}\n"));
+        let label = match aggregate {
+            Some("top") => "每个顶层目录",
+            Some("dir") => "每个目录",
+            _ => "每个文件",
+        };
+        out.push_str(&format!("{label}: N 处 / M 个文件\n"));
+        let suffix = if aggregate == Some("file") { "" } else { "/" };
+        for (key, n, f) in rows.iter().take(MAX_ROWS) {
+            out.push_str(&format!("  {n:>5} 处 / {f:>4} 个文件  {key}{suffix}\n"));
         }
         if rows.len() > MAX_ROWS {
             let rest: usize = rows[MAX_ROWS..].iter().map(|r| r.1).sum();
@@ -601,7 +644,10 @@ fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
                 rows.len() - MAX_ROWS
             ));
         }
-        out.push_str(&format!("  {total:>5}  总计\n"));
+        out.push_str(&format!(
+            "  {total:>5} 处 / {:>4} 个文件  总计\n",
+            all_files.len()
+        ));
     }
     out
 }
@@ -620,6 +666,10 @@ fn build_exclude_set(globs: Option<&[String]>) -> Result<Option<globset::GlobSet
         }
         let base = pat.trim_end_matches('/');
         let mut variants = vec![base.to_string(), format!("{base}/**")];
+        // `_test.go` / `.min.js`: a bare name tail matches by file-name suffix.
+        if !base.contains(['/', '*', '?', '[']) && base.starts_with(['_', '.', '-']) {
+            variants.push(format!("**/*{base}"));
+        }
         if !base.starts_with("**/") {
             variants.push(format!("**/{base}"));
             variants.push(format!("**/{base}/**"));
@@ -686,7 +736,7 @@ fn next_step_hint(task: &str) -> &'static str {
         "分布",
         "调用次数",
     ]) {
-        "下一步：search_code(query, aggregate=dir|file, exclude=[…]) 直接取计数；只要总数加 count_only=true。\n"
+        "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 处 / M 个文件计数；只要总数加 count_only=true。\n"
     } else if has(&[
         "谁调用",
         "调用方",
@@ -727,7 +777,15 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     }
     let mut prod: Vec<(&str, Vec<Row>)> = Vec::new();
     let mut tests: Vec<(&str, Vec<Row>)> = Vec::new();
+    let mut docs: Vec<(&str, Vec<Row>)> = Vec::new();
     for (path, mut rows) in files {
+        if is_doc_path(path) {
+            for r in &mut rows {
+                r.role = "文档";
+            }
+            docs.push((path, rows));
+            continue;
+        }
         let file_is_test = crate::explain::is_test_caller(path, "");
         for r in &mut rows {
             let test = file_is_test || crate::explain::is_test_caller(path, &r.sym);
@@ -741,12 +799,14 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     }
     prod.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     tests.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+    docs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     let mut out = format!(
-        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]。\n",
+        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个，文档 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]，文档 [文档]。\n",
         hits.len(),
-        prod.len() + tests.len(),
+        prod.len() + tests.len() + docs.len(),
         prod.len(),
-        tests.len()
+        tests.len(),
+        docs.len()
     );
     let mut shown = 0usize;
     let mut stopped = false;
@@ -756,7 +816,7 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     } else {
         6
     };
-    for (title, group) in [("生产代码", &prod), ("测试", &tests)] {
+    for (title, group) in [("生产代码", &prod), ("测试", &tests), ("文档", &docs)] {
         if group.is_empty() {
             continue;
         }
@@ -1259,14 +1319,21 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Default true: reference repeated symbol bodies by location.")]
     pub dedup: Option<bool>,
     #[serde(default)]
-    #[schemars(description = "dir|file: hit counts per dir/file + total, no lines.")]
+    #[schemars(
+        description = "top|dir|file: hits and files per top-level dir / dir / file, plus total; no hit lines."
+    )]
     pub aggregate: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Globs to skip, e.g. [\"vendor\",\"*_test.go\"].")]
+    #[schemars(description = "Skip paths: [\"vendor\",\"_test.go\",\"*_test.go\"].")]
     pub exclude: Option<Vec<String>>,
     #[serde(default)]
     #[schemars(description = "Only totals (hits, files).")]
     pub count_only: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "Ignore hits inside comments and string literals (go/rs/py/js/ts/dart/java/c-family)."
+    )]
+    pub skip_comments: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2052,7 +2119,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Exhaustive code & text search. Literal case-insensitive by default; regex when regex=true. Matches include surrounding context lines. Use group=true to group hits by file before refactoring/asserting. Covers indexed code first, then other text files tagged [text-only]. Paging via offset=next_offset. Counts (calls per dir): aggregate=dir|file, count_only; exclude=[globs]."
+        description = "Count hits (统计/计数每个目录有多少处调用): aggregate=top|dir|file gives N hits / M files per dir + total; combine with skip_comments, exclude=[\"_test.go\",\"vendor\"], count_only. Also exhaustive code & text search: literal case-insensitive (regex=true for regex), hits come with context; group=true groups per file; other text files tagged [text-only]; page with offset=next_offset."
     )]
     pub(crate) fn search_code(
         &self,
@@ -2088,8 +2155,10 @@ impl AstrolabeServer {
                     Err(error) => return text_error(format!("无效正则表达式：{error}")),
                 };
                 if let Some(mode) = params.aggregate.as_deref() {
-                    if mode != "dir" && mode != "file" {
-                        return text_error(format!("aggregate 只能是 dir 或 file，收到 `{mode}`。"));
+                    if mode != "top" && mode != "dir" && mode != "file" {
+                        return text_error(format!(
+                            "aggregate 只能是 top、dir 或 file，收到 `{mode}`。"
+                        ));
                     }
                 }
                 let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
@@ -2141,9 +2210,16 @@ impl AstrolabeServer {
                 let mut matches: Vec<SearchHit> = Vec::new();
                 let mut hits = 0u64;
                 let mut misses = 0u64;
+                let mut skipped = 0usize;
+                let strings_are_code = params.query.contains(['"', '\'', '`']);
                 let mut scan_file = |path: &str, matches: &mut Vec<SearchHit>| {
                     let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
                         return;
+                    };
+                    let mask = if params.skip_comments {
+                        crate::code_mask::code_mask(path, &lines, strings_are_code)
+                    } else {
+                        None
                     };
                     if hit {
                         hits += 1;
@@ -2152,6 +2228,15 @@ impl AstrolabeServer {
                     }
                     for (line_no, line) in lines.iter().enumerate() {
                         if matcher.is_match(line) {
+                            if let Some(mask) = &mask {
+                                let real = matcher.find_iter(line).any(|m| {
+                                    mask[line_no].get(m.start()).copied().unwrap_or(true)
+                                });
+                                if !real {
+                                    skipped += 1;
+                                    continue;
+                                }
+                            }
                             // P0：超长行先做单行安全切片（Unicode 边界安全），
                             // 单条 match 不会把 budget 一口气吃光，也不会在
                             // 大小写折叠差异上 panic。
@@ -2200,6 +2285,10 @@ impl AstrolabeServer {
                         TEXT_SEARCH_MAX_FILE_BYTES,
                     );
                     for (idx, file_hits) in found {
+                        if params.skip_comments && is_doc_path(rels[idx]) {
+                            skipped += file_hits.len();
+                            continue;
+                        }
                         for hit in file_hits {
                             matches.push(SearchHit {
                                 path: rels[idx].to_string(),
@@ -2211,6 +2300,11 @@ impl AstrolabeServer {
                     }
                 }
                 let text_matches = matches.len() - code_matches;
+                let skip_note = if params.skip_comments {
+                    format!("skip_comments：已跳过注释/字符串/文档中的 {skipped} 处命中，以下不含它们。\n")
+                } else {
+                    String::new()
+                };
                 let data_note = if params.regex {
                     String::new()
                 } else {
@@ -2248,8 +2342,8 @@ impl AstrolabeServer {
                     let body = format!(
                         "confidence: exact (磁盘源码字面匹配)\n{}{}",
                         render_search_mode_header(params.regex, &params.query),
-                        render_search_counts(&matches, params.aggregate.as_deref())
-                    );
+                        render_search_counts(&matches, params.aggregate.as_deref()),
+                    ) + &skip_note;
                     return self.result_on(
                         &session.root,
                         "search_code",
@@ -2292,6 +2386,8 @@ impl AstrolabeServer {
                     ));
                     body.push_str(&grouped);
                     body.push_str(&closure_line(&matches, shown, 0, false));
+                    body.push_str(&many_hits_hint(total));
+                    body.push_str(&skip_note);
                     body.push_str(&data_note);
                     return self.result_on(
                         &session.root,
@@ -2339,6 +2435,8 @@ impl AstrolabeServer {
                         ));
                     }
                     body.push_str(&closure_line(&matches, shown_preview, 0, true));
+                    body.push_str(&many_hits_hint(total));
+                    body.push_str(&skip_note);
                     body.push_str(&data_note);
                     return self.result_on(
                         &session.root,
@@ -2442,8 +2540,10 @@ impl AstrolabeServer {
                 body.push_str(&rendered);
                 if !matches.is_empty() {
                     body.push_str(&closure_line(&matches, shown, offset, false));
+                    body.push_str(&many_hits_hint(total));
                 }
-                body.push_str(&data_note);
+                body.push_str(&skip_note);
+                    body.push_str(&data_note);
                 // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
                 // （对齐 find_references 的 `未找到对 … 的引用。` 空结果约定）。
                 let mut unindexed_hint = false;
@@ -3563,6 +3663,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         })));
         assert_first_text(server.get_languages(Parameters(BudgetOnly { budget_tokens: 100 })));
     }
@@ -3817,6 +3918,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         let rendered = text
@@ -3861,6 +3963,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("shown=0"), "{text}");
@@ -3939,6 +4042,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }
     }
 
@@ -4201,7 +4305,7 @@ mod tests {
         assert_eq!(text.matches("  L").count(), 11, "{text}");
         assert!(!text.contains("未列出"), "{text}");
         assert!(
-            text.contains("汇总：11 处命中 / 2 个文件，已全部列出（结果完整"),
+            text.contains("汇总：11/11 处命中 / 2 个文件，无截断，已全部列出（结果完整"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4238,7 +4342,7 @@ mod tests {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
         let text = text_of(&server.search_code(Parameters(search("marker_x"))));
         assert!(
-            text.contains("汇总：2 处命中 / 1 个文件，已全部列出（结果完整"),
+            text.contains("汇总：2/2 处命中 / 1 个文件，无截断，已全部列出（结果完整"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4270,13 +4374,14 @@ mod tests {
         p.aggregate = Some("dir".into());
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(
-            text.contains("总计 6 处命中 / 5 个文件 / 3 个目录"),
+            text.contains("总计 6 处命中 / 5 个文件 / 3 个目录 / 3 个顶层目录"),
             "{text}"
         );
-        assert!(text.contains("    4  svc/"), "{text}");
-        assert!(text.contains("    1  web/"), "{text}");
-        assert!(text.contains("    1  vendor/x/"), "{text}");
-        assert!(text.contains("    6  总计"), "{text}");
+        assert!(text.contains("每个目录: N 处 / M 个文件"), "{text}");
+        assert!(text.contains("    4 处 /    3 个文件  svc/"), "{text}");
+        assert!(text.contains("    1 处 /    1 个文件  web/"), "{text}");
+        assert!(text.contains("    1 处 /    1 个文件  vendor/x/"), "{text}");
+        assert!(text.contains("    6 处 /    5 个文件  总计"), "{text}");
         assert!(!text.contains("@svc/a.go"), "no hit lines: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4287,8 +4392,8 @@ mod tests {
         let mut p = search("SysLog(");
         p.aggregate = Some("file".into());
         let text = text_of(&server.search_code(Parameters(p)));
-        assert!(text.contains("    2  svc/a.go"), "{text}");
-        assert!(text.contains("    1  web/c.go"), "{text}");
+        assert!(text.contains("    2 处 /    1 个文件  svc/a.go"), "{text}");
+        assert!(text.contains("    1 处 /    1 个文件  web/c.go"), "{text}");
         let mut c = search("SysLog(");
         c.count_only = true;
         let text = text_of(&server.search_code(Parameters(c)));
@@ -4297,7 +4402,100 @@ mod tests {
         let mut bad = search("SysLog(");
         bad.aggregate = Some("package".into());
         let text = text_of(&server.search_code(Parameters(bad)));
-        assert!(text.contains("aggregate 只能是 dir 或 file"), "{text}");
+        assert!(text.contains("aggregate 只能是 top、dir 或 file"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn nested_fixture() -> (AstrolabeServer, PathBuf) {
+        smart_server(&[
+            (
+                "svc/a.go",
+                "package svc\n// SysLog(0) note\nfunc A() { SysLog(1)\n s := \"SysLog(2)\"\n /* SysLog(3)\n SysLog(4) */ SysLog(5) }\n".into(),
+            ),
+            ("svc/sub/b.go", "package sub\nfunc B() { SysLog(6) }\n".into()),
+            ("svc/b_test.go", "package svc\nfunc TestB() { SysLog(7) }\n".into()),
+            ("web/c.go", "package web\nfunc C() { SysLog(8) }\n".into()),
+            ("main.go", "package main\nfunc main() { SysLog(9) }\n".into()),
+            ("docs/guide.md", "call SysLog( like this\n".into()),
+        ])
+    }
+
+    #[test]
+    fn aggregate_top_reports_hits_and_files_per_top_dir() {
+        let (server, dir) = nested_fixture();
+        let mut p = search("SysLog(");
+        p.aggregate = Some("top".into());
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("每个顶层目录: N 处 / M 个文件"), "{text}");
+        assert!(text.contains("    7 处 /    3 个文件  svc/"), "{text}");
+        assert!(text.contains("    1 处 /    1 个文件  web/"), "{text}");
+        assert!(text.contains("    1 处 /    1 个文件  ./"), "{text}");
+        assert!(text.contains("   10 处 /    6 个文件  总计"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skip_comments_drops_comment_string_and_doc_hits_and_combines() {
+        let (server, dir) = nested_fixture();
+        let mut p = search("SysLog(");
+        p.aggregate = Some("top".into());
+        p.skip_comments = true;
+        p.exclude = Some(vec!["_test.go".into()]);
+        let text = text_of(&server.search_code(Parameters(p)));
+        // a.go keeps the SysLog(1) line and the `*/ SysLog(5)` line.
+        assert!(text.contains("    3 处 /    2 个文件  svc/"), "{text}");
+        assert!(text.contains("    5 处 /    4 个文件  总计"), "{text}");
+        assert!(!text.contains("docs/"), "{text}");
+        assert!(
+            text.contains("skip_comments：已跳过注释/字符串/文档中的 4 处命中"),
+            "{text}"
+        );
+        // Without the flag the same query counts them.
+        let mut q = search("SysLog(");
+        q.aggregate = Some("file".into());
+        let text = text_of(&server.search_code(Parameters(q)));
+        assert!(text.contains("    5 处 /    1 个文件  svc/a.go"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclude_accepts_bare_suffix_glob_and_directory_names() {
+        let set = build_exclude_set(Some(&[
+            "_test.go".into(),
+            "vendor".into(),
+            "*.min.js".into(),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert!(set.is_match("svc/a_test.go"));
+        assert!(set.is_match("a_test.go"));
+        assert!(set.is_match("x/vendor/y.go"));
+        assert!(set.is_match("web/app.min.js"));
+        assert!(!set.is_match("svc/a.go"));
+    }
+
+    #[test]
+    fn many_hits_get_next_step_hint_and_docs_are_listed_apart() {
+        let rows: String = (0..45)
+            .map(|i| format!("func f{i}() {{ HINTKEY({i}) }}\n"))
+            .collect();
+        let (server, dir) = smart_server(&[
+            ("a/one.go", format!("package a\n{rows}")),
+            ("b/two.go", "package b\nfunc g() { HINTKEY(1) }\n".into()),
+            ("c/three.go", "package c\nfunc h() { HINTKEY(2) }\n".into()),
+            ("d/four.go", "package d\nfunc i() { HINTKEY(3) }\n".into()),
+            ("docs/x.md", "HINTKEY docs\n".into()),
+        ]);
+        let mut p = search("HINTKEY");
+        p.group = Some(true);
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("下一步：要统计各目录"), "{text}");
+        assert!(text.contains("aggregate=top|dir|file"), "{text}");
+        assert!(text.contains("## 文档（1 处 / 1 个文件）"), "{text}");
+        assert!(text.contains("文档 1 个"), "{text}");
+        assert!(text.contains("[文档]"), "{text}");
+        let prod = text.find("## 生产代码").expect(&text);
+        assert!(prod < text.find("## 文档").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4309,7 +4507,7 @@ mod tests {
         p.exclude = Some(vec!["vendor".into(), "*_test.go".into()]);
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(
-            text.contains("总计 4 处命中 / 3 个文件 / 2 个目录"),
+            text.contains("总计 4 处命中 / 3 个文件 / 2 个目录 / 2 个顶层目录"),
             "{text}"
         );
         assert!(!text.contains("vendor"), "{text}");
@@ -4347,7 +4545,7 @@ mod tests {
     #[test]
     fn resolve_context_next_step_hint_matches_task() {
         assert!(next_step_hint("rename Foo to Bar everywhere").contains("dry_run_rename"));
-        assert!(next_step_hint("统计各目录调用次数").contains("aggregate=dir"));
+        assert!(next_step_hint("统计各目录调用次数").contains("aggregate=top|dir|file"));
         assert!(next_step_hint("谁调用了 parse").contains("find_references"));
         assert!(next_step_hint("add a flag").contains("find_symbol"));
         for t in ["rename x", "多少处", "callers of x", "other"] {
@@ -4374,7 +4572,7 @@ mod tests {
         let tools = server.listed_tools();
         assert_eq!(tools.len(), 7);
         let bytes = serde_json::to_vec(&tools).unwrap().len();
-        assert!(bytes < 7_600, "tools/list grew to {bytes} bytes");
+        assert!(bytes < 8_000, "tools/list grew to {bytes} bytes");
     }
 
     #[test]
@@ -4442,7 +4640,10 @@ mod tests {
                 .to_string()
         };
         let search_code = desc("search_code");
-        assert!(search_code.contains("Exhaustive"), "{search_code}");
+        assert!(
+            search_code.contains("exhaustive code & text search"),
+            "{search_code}"
+        );
         assert!(search_code.contains("group=true"), "{search_code}");
         assert!(search_code.contains("offset=next_offset"), "{search_code}");
         let find_symbol = desc("find_symbol");
@@ -4504,6 +4705,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         };
 
         let first = server.search_code(Parameters(params.clone()));
@@ -4558,6 +4760,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
 
         let weighted = server.primary.file_cache.weighted_size();
@@ -4590,6 +4793,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4613,6 +4817,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let text = after.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("fresh-content"), "{text}");
@@ -4645,6 +4850,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         result.content[0].as_text().unwrap().text.clone()
     }
@@ -4752,6 +4958,7 @@ mod tests {
                 aggregate: None,
                 exclude: None,
                 count_only: false,
+                skip_comments: false,
                 query: "needle".into(),
                 regex: false,
                 path_filter: None,
@@ -4812,6 +5019,7 @@ mod tests {
                 aggregate: None,
                 exclude: None,
                 count_only: false,
+                skip_comments: false,
                 query: "needle-a".into(),
                 regex: false,
                 path_filter: None,
@@ -4892,6 +5100,7 @@ mod tests {
                 aggregate: None,
                 exclude: None,
                 count_only: false,
+                skip_comments: false,
             }))
         };
         for _ in 0..3 {
@@ -5019,6 +5228,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         };
         let result = server.search_code(Parameters(params(None)));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -5051,6 +5261,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         // 零命中必须显式声明，避免"只剩元信息、疑似服务故障"的歧义输出。
@@ -5083,6 +5294,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -5124,6 +5336,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("mode: literal"), "{text}");
@@ -5324,6 +5537,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         assert_eq!(result.is_error, Some(true));
         assert!(
@@ -5974,6 +6188,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(
@@ -6009,6 +6224,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let filter_hint_text = search_filter_hit_hint.content[0]
             .as_text()
@@ -6040,6 +6256,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let filter_miss_text = search_filter_miss.content[0]
             .as_text()
@@ -6115,6 +6332,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let dart_text = search_dart.content[0].as_text().unwrap().text.as_str();
         assert!(dart_text.contains("@service.dart:2"), "{dart_text}");
@@ -6145,6 +6363,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
         (text, result.structured_content.expect("structured"))
@@ -6312,6 +6531,7 @@ mod tests {
             aggregate: None,
             exclude: None,
             count_only: false,
+            skip_comments: false,
         }));
         let search_text = search_miss.content[0].as_text().unwrap().text.as_str();
         assert!(

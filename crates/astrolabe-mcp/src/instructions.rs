@@ -17,7 +17,7 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
         "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages.\n\n\
          当前索引根 index_root: {}。每条工具结果第一行会重复该绝对路径；\
          若与你正在编辑的仓库不符，不要用这些路径读文件。\
-         先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
+         统计/计数（每个目录有多少处调用）用 search_code aggregate=top|dir|file，可加 skip_comments、exclude，不必写脚本。先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
          scoped 来自 import 图，syntactic 来自名字匹配且需要核验。\
          精确工具 Unavailable 时请在本机安装对应语言服务器，并用 get_languages 查看状态。\
          其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read。",
@@ -95,9 +95,11 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
 - search_code auto-groups wide hits (see above); few hits list every row and every
   result ends with a "汇总" line saying whether the listing is complete — if it says
-  complete, answer from it, do not re-query with other words. Counting (calls per
-  directory/file): aggregate=dir|file or count_only=true; skip paths with
-  exclude=[globs]. Batch rename: find_references symbol=<old> dry_run_rename=<new>
+  complete, answer from it, do not re-query with other words. Counting / 统计 / 计数 (how many
+  calls per directory or file, 每个目录有多少处调用): search_code aggregate=top|dir|file gives
+  "N 处 / M 个文件" per row plus a total — add skip_comments=true to ignore comment/string
+  hits and exclude=["_test.go","vendor"] to skip paths; count_only=true for totals only.
+  Do not write a script for this. Batch rename: find_references symbol=<old> dry_run_rename=<new>
   returns a per-file edit checklist (read-only), then edit file by file.
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
@@ -205,9 +207,11 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
 - search_code auto-groups wide hits (see above); few hits list every row and every
   result ends with a "汇总" line saying whether the listing is complete — if it says
-  complete, answer from it, do not re-query with other words. Counting (calls per
-  directory/file): aggregate=dir|file or count_only=true; skip paths with
-  exclude=[globs]. Batch rename: find_references symbol=<old> dry_run_rename=<new>
+  complete, answer from it, do not re-query with other words. Counting / 统计 / 计数 (how many
+  calls per directory or file, 每个目录有多少处调用): search_code aggregate=top|dir|file gives
+  "N 处 / M 个文件" per row plus a total — add skip_comments=true to ignore comment/string
+  hits and exclude=["_test.go","vendor"] to skip paths; count_only=true for totals only.
+  Do not write a script for this. Batch rename: find_references symbol=<old> dry_run_rename=<new>
   returns a per-file edit checklist (read-only), then edit file by file.
 - Broad queries (common words, short names, no path_filter) produce big truncated
   pages: narrow with path_filter, a more specific literal, or find_symbol first
@@ -288,6 +292,7 @@ Read a symbol's body (no whole file)    find_symbol include_body=true (not searc
 Find references / callers (precise)     find_references
 Jump to a definition                    goto_definition
 Literal substring / explicit regex      search_code + path_filter (matches come with context; no follow-up Read)
+Count hits per dir/file (统计/计数)      search_code aggregate=top|dir|file (+ skip_comments, exclude, count_only)
 Check a file after edits                get_diagnostics
 Language / LSP readiness                get_languages (Ready / needs_install / AST-only)
 
@@ -344,7 +349,7 @@ mod tests {
             let m = manual(name);
             assert!(m.contains("fewer tokens"), "{name}");
             assert!(m.contains("auto-groups"), "{name}");
-            assert!(m.contains("aggregate=dir|file"), "{name}");
+            assert!(m.contains("aggregate=top|dir|file"), "{name}");
             assert!(m.contains("dry_run_rename"), "{name}");
         }
     }
