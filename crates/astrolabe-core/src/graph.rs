@@ -211,11 +211,8 @@ fn import_adjacency(
             1
         };
         let weight = u64::from(edge.weight.max(1)).saturating_mul(context_multiplier);
-        *aggregated.entry((from_i, to_i)).or_default() = aggregated
-            .get(&(from_i, to_i))
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(weight);
+        let slot = aggregated.entry((from_i, to_i)).or_default();
+        *slot = slot.saturating_add(weight);
     }
 
     let mut outgoing = vec![Vec::new(); positions.len()];
@@ -227,6 +224,12 @@ fn import_adjacency(
 
 fn run_pagerank(outgoing: &[Vec<(usize, f64)>], restart: &[f64], scores: &mut Vec<f64>) {
     let n = scores.len();
+    // Edge weights do not change between iterations; same summation order as
+    // before, so the scores are bit-identical.
+    let total_weights: Vec<f64> = outgoing
+        .iter()
+        .map(|edges| edges.iter().map(|(_, weight)| *weight).sum())
+        .collect();
     for _ in 0..PAGERANK_ITERATIONS {
         let dangling: f64 = (0..n)
             .filter(|&i| outgoing[i].is_empty())
@@ -241,7 +244,7 @@ fn run_pagerank(outgoing: &[Vec<(usize, f64)>], restart: &[f64], scores: &mut Ve
             if outgoing[from].is_empty() {
                 continue;
             }
-            let total_weight: f64 = outgoing[from].iter().map(|(_, weight)| *weight).sum();
+            let total_weight = total_weights[from];
             for &(to, weight) in &outgoing[from] {
                 next[to] += PAGERANK_DAMPING * scores[from] * weight / total_weight;
             }

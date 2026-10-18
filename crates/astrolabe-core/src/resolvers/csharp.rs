@@ -507,9 +507,20 @@ fn unique_type(meta: &ProjectMeta, qualified: &str) -> Option<String> {
 }
 
 fn files_declaring(meta: &ProjectMeta, qualified: &str) -> Vec<String> {
-    let mut files: Vec<String> = meta
-        .type_decls
+    // `type_decls` is sorted by (namespace, name, file) (BTreeSet order in
+    // `detect`) and a declared name is a single identifier, so the only split
+    // of `qualified` that can match is at its last dot: binary-search that
+    // (namespace, name) range instead of scanning every declaration.
+    let (ns, name) = match qualified.rsplit_once('.') {
+        Some((ns, name)) => (ns, name),
+        None => ("", qualified),
+    };
+    let decls = &meta.type_decls;
+    let key = |t: &TypeDecl| (t.namespace.as_str().cmp(ns)).then_with(|| t.name.as_str().cmp(name));
+    let start = decls.partition_point(|t| key(t).is_lt());
+    let mut files: Vec<String> = decls[start..]
         .iter()
+        .take_while(|t| key(t).is_eq())
         .filter(|t| decl_is(t, qualified))
         .map(|t| t.file.clone())
         .collect();

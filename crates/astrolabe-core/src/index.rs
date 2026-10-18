@@ -37,7 +37,7 @@ use rayon::prelude::*;
 
 use crate::graph::CodeGraph;
 use crate::parse::{ParsedFile, ParserPool};
-use crate::resolvers::ResolverSet;
+use crate::resolvers::{resolver_owner, ResolverSet};
 use crate::scan::{self, ScanOptions, ScanResult};
 use crate::store::{self, Store};
 use crate::types::{
@@ -855,12 +855,49 @@ fn row_from_product(
 /// Parallel collection order is not stable; sort before assigning ids so
 /// FileId is a deterministic function of the repo contents.
 fn assemble_graph(
+    parsed: Vec<ParsedRow>,
+    files: &FileIndex,
+    resolvers: &ResolverSet,
+    opts: &IndexOptions,
+    report: IndexReport,
+) -> (CodeGraph, IndexReport) {
+    let (graph, report, _) =
+        assemble_graph_with(parsed, files, resolvers, opts, report, None, false);
+    (graph, report)
+}
+
+/// Import resolutions of one file, in `imports` order.
+struct FileResolutions {
+    /// Language the specs were resolved as.
+    lang: Language,
+    items: Vec<(String, ImportResolution)>,
+}
+
+/// Per-file import resolutions kept by an [`IncrementalIndex`] so an edit
+/// re-resolves only the files whose imports (or resolver metadata) changed.
+#[derive(Default)]
+struct ResolutionCache {
+    by_path: HashMap<RelPath, Arc<FileResolutions>>,
+}
+
+/// Cached resolutions from the previous snapshot, usable only when the file
+/// set is identical (resolution reads paths, never contents) and for
+/// languages whose resolver metadata did not change.
+struct ResolveReuse<'a> {
+    cache: &'a ResolutionCache,
+    changed: &'a [Language],
+}
+
+fn assemble_graph_with(
     mut parsed: Vec<ParsedRow>,
     files: &FileIndex,
     resolvers: &ResolverSet,
     opts: &IndexOptions,
     mut report: IndexReport,
-) -> (CodeGraph, IndexReport) {
+    reuse: Option<ResolveReuse<'_>>,
+    record: bool,
+) -> (CodeGraph, IndexReport, Option<ResolutionCache>) {
+    let mut new_cache = record.then(ResolutionCache::default);
     parsed.sort_by(|a, b| a.path.cmp(&b.path));
     report.files_parsed = parsed.len();
 
@@ -901,11 +938,39 @@ fn assemble_graph(
         // Path language first (keeps `.h` on the C resolver); content-sniffed
         // language only for extension-less shebang scripts.
         let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
-        for spec in &row.parsed.imports {
-            match resolvers.resolve_import_as(import_lang, &row.path, spec, files) {
+        let cached = reuse.as_ref().and_then(|r| {
+            let entry = r.cache.by_path.get(&row.path)?;
+            let same = entry.lang == import_lang
+                && !r.changed.contains(&resolver_owner(import_lang))
+                && entry.items.len() == row.parsed.imports.len()
+                && entry
+                    .items
+                    .iter()
+                    .zip(&row.parsed.imports)
+                    .all(|((spec, _), now)| spec == now);
+            same.then(|| Arc::clone(entry))
+        });
+        let entry = cached.unwrap_or_else(|| {
+            Arc::new(FileResolutions {
+                lang: import_lang,
+                items: row
+                    .parsed
+                    .imports
+                    .iter()
+                    .map(|spec| {
+                        (
+                            spec.clone(),
+                            resolvers.resolve_import_as(import_lang, &row.path, spec, files),
+                        )
+                    })
+                    .collect(),
+            })
+        });
+        for (spec, resolution) in &entry.items {
+            match resolution {
                 ImportResolution::Files(targets) => {
                     for target in targets {
-                        if let Some(&to) = index_of.get(&target) {
+                        if let Some(&to) = index_of.get(target) {
                             if to == from {
                                 continue;
                             }
@@ -920,7 +985,7 @@ fn assemble_graph(
                     }
                 }
                 ImportResolution::File(target) => {
-                    if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
+                    if let Some(&to) = index_of.get(target).filter(|&&to| to != from) {
                         edges.push(CodeEdge {
                             from: from.0,
                             to: to.0,
@@ -935,7 +1000,7 @@ fn assemble_graph(
                     // Every declaring file, partials included. Not an Import:
                     // PageRank stays on real file edges.
                     for target in targets {
-                        if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
+                        if let Some(&to) = index_of.get(target).filter(|&&to| to != from) {
                             edges.push(CodeEdge {
                                 from: from.0,
                                 to: to.0,
@@ -954,6 +1019,9 @@ fn assemble_graph(
                     }
                 }
             }
+        }
+        if let Some(cache) = new_cache.as_mut() {
+            cache.by_path.insert(row.path.clone(), entry);
         }
     }
 
@@ -1051,7 +1119,7 @@ fn assemble_graph(
     graph.edges = merged;
     report.unresolved_imports.sort();
 
-    (graph, report)
+    (graph, report, new_cache)
 }
 
 /// Build the graph for a repository.
@@ -1106,6 +1174,11 @@ pub struct IncrementalIndex {
     /// How many times a transient failure (read error, parse budget) has
     /// been retried on an apply, to bound the retries.
     failure_retries: HashMap<RelPath, u8>,
+    /// Resolver metadata of this snapshot. An apply that leaves the file set
+    /// unchanged re-runs `detect` only for resolvers that read a modified file.
+    resolvers: Arc<ResolverSet>,
+    /// Per-file import resolutions, reused while the file set is unchanged.
+    resolutions: Arc<ResolutionCache>,
 }
 
 impl std::fmt::Debug for IncrementalIndex {
@@ -1131,7 +1204,8 @@ impl IncrementalIndex {
         let failures = outcome.failures.clone();
         report.parse_failures = outcome.failures;
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
-        let (graph, report) = assemble_graph(outcome.parsed, &files, &resolvers, opts, report);
+        let (graph, report, resolutions) =
+            assemble_graph_with(outcome.parsed, &files, &resolvers, opts, report, None, true);
         Self {
             graph,
             report,
@@ -1140,6 +1214,8 @@ impl IncrementalIndex {
             products,
             failures,
             failure_retries: HashMap::new(),
+            resolvers: Arc::new(resolvers),
+            resolutions: Arc::new(resolutions.unwrap_or_default()),
         }
     }
 
@@ -1220,7 +1296,19 @@ pub fn index_repo_incremental(
         skipped: Vec::new(),
     };
     let file_index = scan::to_index(root, &scanned);
-    let resolvers = ResolverSet::detect(&file_index);
+    // Resolver metadata and import resolution read paths and (during
+    // `detect`) the content of build/declaration files. With an unchanged
+    // path set only `modified` contents can differ, so unaffected resolvers
+    // and per-file resolutions carry over; any added/removed path (or a file
+    // crossing the size cap) redoes everything, as a cold start would.
+    let same_paths = scanned.files == previous.files;
+    let (resolvers, changed_langs) = if same_paths {
+        let modified: BTreeSet<RelPath> = changes.modified.iter().cloned().collect();
+        let (set, changed) = previous.resolvers.redetect(&file_index, &modified);
+        (set, Some(changed))
+    } else {
+        (ResolverSet::detect(&file_index), None)
+    };
     let (scanned, file_index, newly_dropped) = apply_declared_excludes(root, scanned, &resolvers);
     let mut excluded_sources: BTreeSet<RelPath> = previous
         .excluded_sources
@@ -1346,7 +1434,12 @@ pub fn index_repo_incremental(
     products.run_pending();
 
     reused.extend(outcome.parsed);
-    let (graph, report) = assemble_graph(reused, &file_index, &resolvers, opts, report);
+    let reuse = changed_langs.as_deref().map(|changed| ResolveReuse {
+        cache: &previous.resolutions,
+        changed,
+    });
+    let (graph, report, resolutions) =
+        assemble_graph_with(reused, &file_index, &resolvers, opts, report, reuse, true);
     IncrementalIndex {
         graph,
         report,
@@ -1355,6 +1448,8 @@ pub fn index_repo_incremental(
         products,
         failures,
         failure_retries,
+        resolvers: Arc::new(resolvers),
+        resolutions: Arc::new(resolutions.unwrap_or_default()),
     }
 }
 
@@ -2904,5 +2999,250 @@ mod persist_audit_tests {
         let prev = with_failure(&root, &opts, "read: busy", MAX_FAILURE_RETRIES);
         let next = prev.apply_changeset(&root, &noop(), &opts);
         assert_eq!(next.failures.len(), 1, "retries are capped");
+    }
+}
+
+#[cfg(test)]
+mod incremental_resolve_tests {
+    //! Incremental apply must equal a cold build while reusing resolver
+    //! metadata and per-file import resolutions (audit scan-index-store #1).
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "astrolabe-incres-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    fn opts() -> IndexOptions {
+        IndexOptions {
+            persist: false,
+            ..IndexOptions::default()
+        }
+    }
+
+    type Fingerprint = (
+        Vec<String>,
+        Vec<String>,
+        Vec<(u32, u32, u8, u32)>,
+        Vec<(String, String)>,
+    );
+
+    fn fingerprint(inc: &IncrementalIndex) -> Fingerprint {
+        (
+            inc.graph
+                .files
+                .iter()
+                .map(|f| f.path.as_str().to_string())
+                .collect(),
+            inc.graph
+                .symbols
+                .iter()
+                .map(|s| format!("{}@{}", s.name, s.file.0))
+                .collect(),
+            inc.graph
+                .edges
+                .iter()
+                .map(|e| (e.from, e.to, e.kind as u8, e.weight))
+                .collect(),
+            inc.report
+                .unresolved_imports
+                .iter()
+                .map(|(p, s)| (p.as_str().to_string(), s.clone()))
+                .collect(),
+        )
+    }
+
+    fn changes(added: &[&str], modified: &[&str], removed: &[&str]) -> ChangeSet {
+        let to = |v: &[&str]| v.iter().map(|p| RelPath::new(p)).collect();
+        ChangeSet {
+            added: to(added),
+            modified: to(modified),
+            removed: to(removed),
+        }
+    }
+
+    fn step(root: &Path, prev: &IncrementalIndex, c: ChangeSet) -> IncrementalIndex {
+        let next = prev.apply_changeset(root, &c, &opts());
+        let cold = IncrementalIndex::build(root, &opts());
+        assert_eq!(fingerprint(&next), fingerprint(&cold), "changes: {c:?}");
+        next
+    }
+
+    fn fixture(root: &Path) {
+        write(root, "pkg/__init__.py", "");
+        write(
+            root,
+            "pkg/a.py",
+            "from pkg import b\n\ndef fa():\n    pass\n",
+        );
+        write(root, "pkg/b.py", "def fb():\n    pass\n");
+        write(root, "pkg/c.py", "def fc():\n    pass\n");
+        write(root, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        write(
+            root,
+            "main.go",
+            "package main\n\nimport \"example.com/app/util\"\n\nfunc main() { util.U() }\n",
+        );
+        write(root, "util/util.go", "package util\n\nfunc U() {}\n");
+        write(root, "util2/util.go", "package util2\n\nfunc V() {}\n");
+        write(
+            root,
+            "App/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>",
+        );
+        write(
+            root,
+            "App/Program.cs",
+            "using Lib.Core;\nnamespace App { class Program { static void Main() { } } }\n",
+        );
+        write(
+            root,
+            "App/Lib1.cs",
+            "namespace Lib.Core { public class One { } }\n",
+        );
+        write(
+            root,
+            "App/Lib2.cs",
+            "namespace Lib.Core { public class Two { } }\n",
+        );
+        write(
+            root,
+            "App/Other.cs",
+            "namespace Other.Ns { public class Three { } }\n",
+        );
+    }
+
+    #[test]
+    fn incremental_chain_matches_cold_build() {
+        let root = scratch("chain");
+        fixture(&root);
+        let mut inc = IncrementalIndex::build(&root, &opts());
+
+        // Python edit adds an import; nothing else may change.
+        write(
+            &root,
+            "pkg/a.py",
+            "from pkg import b, c\n\ndef fa():\n    pass\n",
+        );
+        inc = step(&root, &inc, changes(&[], &["pkg/a.py"], &[]));
+
+        // A C# declaration file moves namespaces: namespace edges follow.
+        write(
+            &root,
+            "App/Lib2.cs",
+            "namespace Other.Ns { public class Two { } }\n",
+        );
+        inc = step(&root, &inc, changes(&[], &["App/Lib2.cs"], &[]));
+
+        // The importer edits its `using`.
+        write(
+            &root,
+            "App/Program.cs",
+            "using Other.Ns;\nnamespace App { class Program { static void Main() { } } }\n",
+        );
+        inc = step(&root, &inc, changes(&[], &["App/Program.cs"], &[]));
+
+        // go.mod module rename changes how main.go's import resolves.
+        write(&root, "go.mod", "module example.com/renamed\n\ngo 1.21\n");
+        inc = step(&root, &inc, changes(&[], &["go.mod"], &[]));
+        write(&root, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        inc = step(&root, &inc, changes(&[], &["go.mod"], &[]));
+
+        // csproj edit.
+        write(
+            &root,
+            "App/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>",
+        );
+        inc = step(&root, &inc, changes(&[], &["App/App.csproj"], &[]));
+
+        // Add and remove files (path set changes: full redo).
+        write(&root, "pkg/d.py", "from pkg import a\n");
+        inc = step(&root, &inc, changes(&["pkg/d.py"], &[], &[]));
+        std::fs::remove_file(root.join("pkg/b.py")).unwrap();
+        inc = step(&root, &inc, changes(&[], &[], &["pkg/b.py"]));
+
+        // A no-op apply stays equal too.
+        step(&root, &inc, changes(&[], &[], &[]));
+    }
+
+    #[test]
+    fn unrelated_edit_reuses_resolver_metadata_and_resolutions() {
+        let root = scratch("reuse");
+        fixture(&root);
+        let inc = IncrementalIndex::build(&root, &opts());
+
+        write(
+            &root,
+            "pkg/c.py",
+            "from pkg import b\n\ndef fc2():\n    pass\n",
+        );
+        let next = inc.apply_changeset(&root, &changes(&[], &["pkg/c.py"], &[]), &opts());
+
+        // Untouched files keep the very same resolution entry.
+        for path in ["pkg/a.py", "main.go", "App/Program.cs"] {
+            let p = RelPath::new(path);
+            assert!(
+                Arc::ptr_eq(&inc.resolutions.by_path[&p], &next.resolutions.by_path[&p]),
+                "{path} should reuse its resolutions"
+            );
+        }
+        // The edited file was re-resolved.
+        let c = RelPath::new("pkg/c.py");
+        assert!(!Arc::ptr_eq(
+            &inc.resolutions.by_path[&c],
+            &next.resolutions.by_path[&c]
+        ));
+
+        // Only resolvers that read a modified file re-run `detect`.
+        let mods: BTreeSet<RelPath> = [RelPath::new("pkg/c.py")].into();
+        let files = scan::to_index(
+            &root,
+            &ScanResult {
+                files: inc.files.clone(),
+                skipped: Vec::new(),
+            },
+        );
+        let (_, changed) = inc.resolvers.redetect(&files, &mods);
+        assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    #[test]
+    fn declaration_edit_redetects_only_its_language() {
+        let root = scratch("lang");
+        fixture(&root);
+        let inc = IncrementalIndex::build(&root, &opts());
+        write(
+            &root,
+            "App/Lib2.cs",
+            "namespace Other.Ns { public class Two { } }\n",
+        );
+        let files = scan::to_index(
+            &root,
+            &ScanResult {
+                files: inc.files.clone(),
+                skipped: Vec::new(),
+            },
+        );
+        let mods: BTreeSet<RelPath> = [RelPath::new("App/Lib2.cs")].into();
+        let (_, changed) = inc.resolvers.redetect(&files, &mods);
+        assert_eq!(changed, vec![Language::CSharp]);
     }
 }
