@@ -81,6 +81,9 @@ impl ModuleResolver for PythonResolver {
         if det.roots.is_empty() {
             probe_layout(files, &mut det);
         }
+        // Monorepo members: every nested project file is detected on its own,
+        // with its directory as the base (uv/poetry/pip -e workspaces).
+        detect_subprojects(files, &mut det);
         // The repo root is always the last resort: pytest rootdir, `python -m`
         // from the checkout, `scripts/`, `test/`.
         det.add_root(String::new());
@@ -102,6 +105,7 @@ impl ModuleResolver for PythonResolver {
                 }
             }
         }
+        add_unique_toplevel_packages(files, &mut det);
 
         ProjectMeta {
             source_roots: det.roots,
@@ -117,6 +121,19 @@ impl ModuleResolver for PythonResolver {
         files: &FileIndex,
         meta: &ProjectMeta,
     ) -> Option<RelPath> {
+        // `from . import m` inside `pkg/__init__.py` names the package itself;
+        // a file importing itself is not a dependency.
+        resolve_inner(from, spec, files, meta).filter(|p| p != from)
+    }
+}
+
+fn resolve_inner(
+    from: &RelPath,
+    spec: &str,
+    files: &FileIndex,
+    meta: &ProjectMeta,
+) -> Option<RelPath> {
+    {
         // Parsers may hand us `from . foo import x` verbatim; whitespace is
         // never significant inside a module path.
         let cleaned: String;
@@ -144,6 +161,25 @@ impl ModuleResolver for PythonResolver {
         }
 
         let rel = spec.replace('.', "/");
+
+        // ---- 0. a source root of the project the importer lives in wins over
+        //         a same-named package in another monorepo member.
+        let mut own: Option<&String> = None;
+        let fd = from.dir();
+        for r in &meta.source_roots {
+            if !r.is_empty()
+                && fd.starts_with(r.as_str())
+                && fd.as_bytes().get(r.len()) == Some(&b'/')
+                && own.is_none_or(|o| r.len() > o.len())
+            {
+                own = Some(r);
+            }
+        }
+        if let Some(root) = own {
+            if let Some(p) = resolve_in(files, root, &rel) {
+                return Some(p);
+            }
+        }
 
         // ---- 1. declared units, longest prefix first
         if let Some(unit) = meta.module_for(&rel) {
@@ -185,6 +221,17 @@ impl ModuleResolver for PythonResolver {
             match parent_dir(dir) {
                 Some(p) => dir = p,
                 None => break,
+            }
+        }
+
+        // ---- 4. a sibling module next to the importing file: pytest's
+        //         rootdir-less `tests/`, `python script.py` (sys.path[0]).
+        //         Never for stdlib names, so `import logging` beside a
+        //         `logging.py` stays the standard library, and never inside a regular
+        //         package (Python 3 has no implicit relative imports there).
+        if !is_stdlib_module(first) && regular_package(files, from.dir()).is_none() {
+            if let Some(p) = resolve_in(files, from.dir(), &rel) {
+                return Some(p);
             }
         }
         None
@@ -272,6 +319,286 @@ fn parent_dir(dir: &str) -> Option<&str> {
 }
 
 // ------------------------------------------------------------------- detect
+
+/// Detect every non-root `pyproject.toml` / `setup.cfg` / `setup.py` as its
+/// own project: its roots and packages are prefixed with its directory.
+fn detect_subprojects(files: &FileIndex, det: &mut Detected) {
+    let mut dirs: Vec<String> = Vec::new();
+    for p in files.iter() {
+        if !matches!(p.file_name(), "pyproject.toml" | "setup.cfg" | "setup.py") {
+            continue;
+        }
+        let dir = p.dir();
+        if dir.is_empty() || dir.split('/').any(is_vendored_dir) {
+            continue;
+        }
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_string());
+        }
+    }
+    dirs.sort();
+    for base in dirs {
+        let mut sub = Detected::default();
+        for (name, f) in [
+            (
+                "pyproject.toml",
+                roots_from_pyproject as fn(&str, &mut Detected),
+            ),
+            ("setup.cfg", roots_from_setup_cfg),
+            ("setup.py", roots_from_setup_py),
+        ] {
+            let path = format!("{base}/{name}");
+            if files.contains(&path) {
+                if let Some(text) = files.read(&path) {
+                    f(&text, &mut sub);
+                }
+            }
+        }
+        if sub.roots.is_empty() && files.has_dir(&format!("{base}/src")) {
+            let src_layout = files.iter().any(|p| {
+                p.file_name() == "__init__.py"
+                    && parent_dir(p.dir()) == Some(&format!("{base}/src"))
+            });
+            if src_layout {
+                sub.add_root("src");
+            }
+        }
+        // A project's own directory is a root too (flat layout).
+        sub.add_root("");
+        for r in &sub.roots {
+            det.add_root(join_dir(&base, r));
+        }
+        for m in &sub.modules {
+            det.add_module(m.name.clone(), join_dir(&base, &m.dir));
+        }
+    }
+}
+
+fn join_dir(base: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+fn is_vendored_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules" | "site-packages" | ".venv" | "venv" | ".tox" | "build" | "dist"
+    )
+}
+
+/// Global fallback for monorepo packages no config declared: a top-level
+/// package (a dir with `__init__.py` whose parent has none) whose name is
+/// unique in the repo. Ambiguous names and stdlib names are skipped.
+fn add_unique_toplevel_packages(files: &FileIndex, det: &mut Detected) {
+    use std::collections::BTreeMap;
+    let mut tops: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for p in files.iter() {
+        if p.file_name() != "__init__.py" {
+            continue;
+        }
+        let dir = p.dir();
+        if dir.is_empty() || dir.split('/').any(is_vendored_dir) {
+            continue;
+        }
+        let parent = parent_dir(dir).unwrap_or("");
+        if !parent.is_empty() && regular_package(files, parent).is_some() {
+            continue;
+        }
+        let name = dir.rsplit('/').next().unwrap_or(dir);
+        if is_ident(name) && !is_stdlib_module(name) {
+            tops.entry(name.to_string())
+                .or_default()
+                .push(dir.to_string());
+        }
+    }
+    for (name, dirs) in tops {
+        if dirs.len() == 1 {
+            det.add_module(name, dirs[0].clone());
+        }
+    }
+}
+
+/// Top-level standard-library module names (CPython 3.x, plus `typing_extensions`
+/// -free). Used to keep `import logging` from binding to a sibling file.
+fn is_stdlib_module(name: &str) -> bool {
+    const STD: &[&str] = &[
+        "__future__",
+        "_thread",
+        "abc",
+        "argparse",
+        "array",
+        "ast",
+        "asyncio",
+        "atexit",
+        "base64",
+        "bdb",
+        "binascii",
+        "bisect",
+        "builtins",
+        "bz2",
+        "calendar",
+        "cmath",
+        "cmd",
+        "code",
+        "codecs",
+        "collections",
+        "colorsys",
+        "compileall",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "contextvars",
+        "copy",
+        "copyreg",
+        "cProfile",
+        "csv",
+        "ctypes",
+        "curses",
+        "dataclasses",
+        "datetime",
+        "dbm",
+        "decimal",
+        "difflib",
+        "dis",
+        "doctest",
+        "email",
+        "encodings",
+        "enum",
+        "errno",
+        "faulthandler",
+        "fcntl",
+        "filecmp",
+        "fileinput",
+        "fnmatch",
+        "fractions",
+        "ftplib",
+        "functools",
+        "gc",
+        "getopt",
+        "getpass",
+        "gettext",
+        "glob",
+        "graphlib",
+        "grp",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "http",
+        "imaplib",
+        "importlib",
+        "inspect",
+        "io",
+        "ipaddress",
+        "itertools",
+        "json",
+        "keyword",
+        "linecache",
+        "locale",
+        "logging",
+        "lzma",
+        "mailbox",
+        "marshal",
+        "math",
+        "mimetypes",
+        "mmap",
+        "multiprocessing",
+        "netrc",
+        "numbers",
+        "operator",
+        "optparse",
+        "os",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "pkgutil",
+        "platform",
+        "plistlib",
+        "poplib",
+        "posix",
+        "posixpath",
+        "pprint",
+        "profile",
+        "pstats",
+        "pty",
+        "pwd",
+        "py_compile",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtplib",
+        "socket",
+        "socketserver",
+        "sqlite3",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tarfile",
+        "telnetlib",
+        "tempfile",
+        "termios",
+        "textwrap",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "wsgiref",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
+    ];
+    STD.contains(&name)
+}
 
 #[derive(Default)]
 struct Detected {
@@ -1117,6 +1444,75 @@ where = ["src", "lib"]
             resolve(&files, &m, "src/serena/mcp.py", "tools.tools_base"),
             None
         );
+    }
+
+    #[test]
+    fn monorepo_members_resolve_across_packages() {
+        let files = index(&[
+            "packages/a/pyproject.toml",
+            "packages/a/src/a/__init__.py",
+            "packages/a/src/a/core.py",
+            "packages/b/pyproject.toml",
+            "packages/b/src/b/__init__.py",
+            "packages/b/src/b/x.py",
+        ]);
+        let m = PythonResolver.detect(&files);
+        assert_eq!(
+            resolve(&files, &m, "packages/b/src/b/x.py", "a.core"),
+            Some("packages/a/src/a/core.py".into())
+        );
+        assert_eq!(
+            resolve(&files, &m, "packages/a/src/a/core.py", "b.x"),
+            Some("packages/b/src/b/x.py".into())
+        );
+    }
+
+    #[test]
+    fn unique_toplevel_package_is_a_global_fallback() {
+        let files = index(&[
+            "libs/util/__init__.py",
+            "libs/util/h.py",
+            "svc1/app/__init__.py",
+            "svc1/app/m.py",
+            "svc2/app/__init__.py",
+            "svc2/app/m.py",
+            "svc3/main.py",
+        ]);
+        let m = PythonResolver.detect(&files);
+        assert_eq!(
+            resolve(&files, &m, "svc3/main.py", "util.h"),
+            Some("libs/util/h.py".into())
+        );
+        // Ambiguous top-level name: not guessed.
+        assert_eq!(resolve(&files, &m, "svc3/main.py", "app.m"), None);
+    }
+
+    #[test]
+    fn sibling_modules_outside_packages_resolve_but_not_stdlib() {
+        let files = index(&[
+            "tests/conftest.py",
+            "tests/helpers.py",
+            "tests/logging.py",
+            "tools/run.py",
+            "tools/util.py",
+        ]);
+        let m = PythonResolver.detect(&files);
+        assert_eq!(
+            resolve(&files, &m, "tests/conftest.py", "helpers"),
+            Some("tests/helpers.py".into())
+        );
+        assert_eq!(
+            resolve(&files, &m, "tools/run.py", "util"),
+            Some("tools/util.py".into())
+        );
+        assert_eq!(resolve(&files, &m, "tests/conftest.py", "logging"), None);
+    }
+
+    #[test]
+    fn package_init_importing_itself_is_not_an_edge() {
+        let files = index(&["sub/__init__.py", "sub/m.py"]);
+        let m = PythonResolver.detect(&files);
+        assert_eq!(resolve(&files, &m, "sub/__init__.py", "."), None);
     }
 
     // ------------------------------------------------- real corpus gate

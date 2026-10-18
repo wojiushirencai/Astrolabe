@@ -140,6 +140,7 @@ impl ResolverSet {
     pub fn resolve(&self, from: &RelPath, spec: &str, files: &FileIndex) -> Option<RelPath> {
         match self.resolve_import(from, spec, files) {
             crate::types::ImportResolution::File(path) => Some(path),
+            crate::types::ImportResolution::Files(v) => v.into_iter().next(),
             _ => None,
         }
     }

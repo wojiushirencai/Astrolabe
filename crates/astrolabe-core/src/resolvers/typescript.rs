@@ -46,7 +46,7 @@
 //! comment there does not cost a workspace package.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -106,13 +106,15 @@ pub struct Alias<'a> {
 
 /// Iterate the alias rules stored in `meta.modules`.
 pub fn alias_units(meta: &ProjectMeta) -> impl Iterator<Item = Alias<'_>> {
-    meta.modules.iter().filter_map(|u| {
-        let (scope, pattern) = u.name.split_once(ALIAS_SCOPE_SEP)?;
-        Some(Alias {
-            scope,
-            pattern,
-            target: &u.dir,
-        })
+    meta.modules.iter().filter_map(alias_at)
+}
+
+fn alias_at(u: &ModuleUnit) -> Option<Alias<'_>> {
+    let (scope, pattern) = u.name.split_once(ALIAS_SCOPE_SEP)?;
+    Some(Alias {
+        scope,
+        pattern,
+        target: &u.dir,
     })
 }
 
@@ -133,6 +135,7 @@ impl ModuleResolver for TypeScriptResolver {
     fn detect(&self, files: &FileIndex) -> ProjectMeta {
         let packages = collect_packages(files);
         let configs = collect_configs(files, &packages);
+        let authored = authored_ts_dirs(files);
 
         let mut meta = ProjectMeta::default();
         let mut roots = BTreeSet::new();
@@ -160,12 +163,12 @@ impl ModuleResolver for TypeScriptResolver {
                     .push(alias_unit(&cfg.dir, "*", &join_dir(base, "*")));
             }
             if let Some(out) = &cfg.out_dir {
-                if out_dir_is_excludable(cfg, out, files) {
+                if out_dir_is_excludable(cfg, out, &authored) {
                     excludes.insert(out.clone());
                 }
             }
             for e in &cfg.exclude {
-                if is_output_dir_path(e) && !dir_has_authored_ts(files, e) {
+                if is_output_dir_path(e) && !dir_has_authored_ts(&authored, e) {
                     excludes.insert(e.clone());
                 }
             }
@@ -191,6 +194,15 @@ impl ModuleResolver for TypeScriptResolver {
 
         meta.source_roots = roots.into_iter().collect();
         meta.excludes = excludes.into_iter().collect();
+        for (i, u) in meta.modules.iter().enumerate() {
+            if let Some((scope, _)) = u.name.split_once(ALIAS_SCOPE_SEP) {
+                meta.scope_index
+                    .0
+                    .entry(scope.to_string())
+                    .or_default()
+                    .push(i);
+            }
+        }
         meta
     }
 
@@ -352,12 +364,12 @@ fn resolve_aliases_in_scope(
     meta: &ProjectMeta,
 ) -> Option<RelPath> {
     let mut hits: Vec<AliasHit> = Vec::new();
-    for (order, alias) in alias_units(meta).enumerate() {
+    let mut visit = |order: usize, alias: Alias<'_>| {
         if alias.scope != scope {
-            continue;
+            return;
         }
         let Some(m) = match_pattern(alias.pattern, spec) else {
-            continue;
+            return;
         };
         let target = match m.captured {
             Some(c) => alias.target.replacen('*', c, 1),
@@ -369,6 +381,17 @@ fn resolve_aliases_in_scope(
             order,
             target,
         });
+    };
+    if meta.scope_index.0.is_empty() {
+        for (order, alias) in alias_units(meta).enumerate() {
+            visit(order, alias);
+        }
+    } else if let Some(idx) = meta.scope_index.0.get(scope) {
+        for &i in idx {
+            if let Some(alias) = alias_at(&meta.modules[i]) {
+                visit(i, alias);
+            }
+        }
     }
     if hits.is_empty() {
         return None;
@@ -582,16 +605,38 @@ pub fn is_authored_ts(path: &str) -> bool {
 /// Does `dir` (or anything below it) contain authored TS sources? A real
 /// build directory only holds emitted `.js`/`.d.ts`, so sources there mean
 /// the directory is not (only) build output.
-fn dir_has_authored_ts(files: &FileIndex, dir: &str) -> bool {
-    files
-        .iter()
-        .any(|p| dir_within(p.dir(), dir) && is_authored_ts(p.as_str()))
+fn dir_has_authored_ts(authored: &HashSet<String>, dir: &str) -> bool {
+    let d = dir.trim_end_matches('/');
+    if d.is_empty() || d == "." {
+        return !authored.is_empty();
+    }
+    authored.contains(d)
+}
+
+/// Every directory that is, or contains at any depth, an authored TS file.
+/// Computed once per `detect` instead of scanning all files per query.
+fn authored_ts_dirs(files: &FileIndex) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for p in files.iter() {
+        if !is_authored_ts(p.as_str()) {
+            continue;
+        }
+        let mut dir = p.dir();
+        while !dir.is_empty() {
+            if !out.insert(dir.to_string()) {
+                break;
+            }
+            dir = parent_dir(dir).unwrap_or("");
+        }
+        out.insert(String::new());
+    }
+    out
 }
 
 /// `outDir` is only excluded when it is a distinct directory holding no
 /// sources. `"outDir": "."` (zod) or an `outDir` that is an ancestor of the
 /// config / `rootDir` would otherwise drop the whole package from the index.
-fn out_dir_is_excludable(cfg: &TsConfig, out: &str, files: &FileIndex) -> bool {
+fn out_dir_is_excludable(cfg: &TsConfig, out: &str, authored: &HashSet<String>) -> bool {
     if dir_within(&cfg.dir, out) {
         return false;
     }
@@ -600,7 +645,7 @@ fn out_dir_is_excludable(cfg: &TsConfig, out: &str, files: &FileIndex) -> bool {
             return false;
         }
     }
-    !dir_has_authored_ts(files, out)
+    !dir_has_authored_ts(authored, out)
 }
 
 fn is_output_dir_path(path: &str) -> bool {
@@ -633,6 +678,7 @@ struct Package {
 fn collect_packages(files: &FileIndex) -> Vec<Package> {
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut pkgs: Vec<Package> = Vec::new();
+    let mut parsed: Vec<(String, Value)> = Vec::new();
     for p in files.iter() {
         if p.file_name() != "package.json" || in_node_modules(p.as_str()) {
             continue;
@@ -644,6 +690,11 @@ fn collect_packages(files: &FileIndex) -> Vec<Package> {
             tracing::debug!(path = %p, "package.json is not valid JSON(C); ignored");
             continue;
         };
+        parsed.push((p.dir().to_string(), json));
+    }
+    let workspace_globs = workspace_globs(files, &parsed);
+    let mut ranks: Vec<(bool, bool, bool, usize)> = Vec::new();
+    for (dir, json) in &parsed {
         let Some(name) = json
             .get("name")
             .and_then(Value::as_str)
@@ -652,20 +703,138 @@ fn collect_packages(files: &FileIndex) -> Vec<Package> {
         else {
             continue;
         };
-        let pkg = build_package(name, p.dir(), &json, files);
+        let pkg = build_package(name, dir, json, files);
+        let rank = package_rank(dir, &workspace_globs);
         match by_name.get(name).copied() {
-            // Duplicate names: the monorepo root often shares a name with the
-            // published member (`openvisio` at `/` and `/mcp`). Prefer the
-            // member — that is what an import means.
-            Some(i) if pkgs[i].dir.is_empty() && !pkg.dir.is_empty() => pkgs[i] = pkg,
-            Some(_) => {}
+            // Duplicate names: a workspace-declared member beats an
+            // undeclared one; examples/fixtures lose; the monorepo root
+            // (often sharing the published member's name) loses to a member;
+            // then the shallowest path wins. Order of discovery is irrelevant.
+            Some(i) => {
+                if rank < ranks[i] {
+                    pkgs[i] = pkg;
+                    ranks[i] = rank;
+                }
+            }
             None => {
                 by_name.insert(name.to_string(), pkgs.len());
                 pkgs.push(pkg);
+                ranks.push(rank);
             }
         }
     }
     pkgs
+}
+
+/// Lower is better: `(not a declared workspace member, is the repo root,
+/// lives under examples/fixtures/…, path length)`.
+fn package_rank(dir: &str, globs: &[Vec<String>]) -> (bool, bool, bool, usize) {
+    let declared = globs.iter().any(|g| glob_dir_match(g, dir));
+    let sample = dir.split('/').any(|seg| {
+        matches!(
+            seg,
+            "examples"
+                | "example"
+                | "fixtures"
+                | "fixture"
+                | "test"
+                | "tests"
+                | "__tests__"
+                | "templates"
+                | "template"
+                | "docs"
+                | "playground"
+                | "e2e"
+                | "demo"
+                | "demos"
+        )
+    });
+    (!declared, dir.is_empty(), sample, dir.len())
+}
+
+/// Workspace member patterns from `package.json` `workspaces` and
+/// `pnpm-workspace.yaml`, already joined onto their declaring directory and
+/// split into segments.
+fn workspace_globs(files: &FileIndex, parsed: &[(String, Value)]) -> Vec<Vec<String>> {
+    let mut raw: Vec<(String, String)> = Vec::new();
+    for (dir, json) in parsed {
+        let ws = json.get("workspaces");
+        let list = match ws {
+            Some(Value::Array(a)) => Some(a),
+            Some(Value::Object(o)) => o.get("packages").and_then(Value::as_array),
+            _ => None,
+        };
+        for pat in list.into_iter().flatten().filter_map(Value::as_str) {
+            raw.push((dir.clone(), pat.to_string()));
+        }
+    }
+    for p in files.iter() {
+        if p.file_name() != "pnpm-workspace.yaml" || in_node_modules(p.as_str()) {
+            continue;
+        }
+        let Some(text) = files.read(p.as_str()) else {
+            continue;
+        };
+        let mut in_packages = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(rest) = line.strip_prefix("packages:") {
+                in_packages = rest.trim().is_empty();
+                continue;
+            }
+            if !line.starts_with(' ') && !line.starts_with('-') && !t.is_empty() {
+                in_packages = false;
+            }
+            if in_packages {
+                if let Some(item) = t.strip_prefix('-') {
+                    let item = item.trim().trim_matches(|c| c == '"' || c == '\'');
+                    raw.push((p.dir().to_string(), item.to_string()));
+                }
+            }
+        }
+    }
+    raw.into_iter()
+        .filter(|(_, pat)| !pat.starts_with('!'))
+        .map(|(base, pat)| {
+            let pat = pat.trim_start_matches("./").trim_end_matches('/');
+            let mut segs: Vec<String> = base
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            segs.extend(
+                pat.split('/')
+                    .filter(|s| !s.is_empty() && *s != ".")
+                    .map(str::to_string),
+            );
+            segs
+        })
+        .collect()
+}
+
+fn glob_dir_match(pat: &[String], dir: &str) -> bool {
+    let segs: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    glob_segs(pat, &segs)
+}
+
+fn glob_segs(pat: &[String], segs: &[&str]) -> bool {
+    match pat.split_first() {
+        None => segs.is_empty(),
+        Some((p, rest)) if p == "**" => (0..=segs.len()).any(|i| glob_segs(rest, &segs[i..])),
+        Some((p, rest)) => match segs.split_first() {
+            Some((s, tail)) => seg_match(p, s) && glob_segs(rest, tail),
+            None => false,
+        },
+    }
+}
+
+fn seg_match(pat: &str, seg: &str) -> bool {
+    match pat.split_once('*') {
+        None => pat == seg,
+        Some((pre, post)) => {
+            seg.len() >= pre.len() + post.len() && seg.starts_with(pre) && seg.ends_with(post)
+        }
+    }
 }
 
 fn build_package(name: &str, dir: &str, json: &Value, files: &FileIndex) -> Package {
@@ -1611,6 +1780,78 @@ mod tests {
         assert_eq!(r("flat").as_deref(), Some("packages/flat/main.ts"));
         assert_eq!(r("@acme/nope"), None);
         assert_eq!(r("@acme/core/nope"), None);
+    }
+
+    #[test]
+    fn same_named_package_prefers_declared_workspace_over_examples() {
+        let (_d, files, meta) = fixture(
+            &[
+                (
+                    "package.json",
+                    r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+                ),
+                ("examples/core/package.json", r#"{"name": "@acme/core"}"#),
+                ("packages/core/package.json", r#"{"name": "@acme/core"}"#),
+            ],
+            &[
+                "examples/core/index.ts",
+                "packages/core/index.ts",
+                "packages/app/x.ts",
+            ],
+        );
+        assert_eq!(
+            res(&files, &meta, "packages/app/x.ts", "@acme/core").as_deref(),
+            Some("packages/core/index.ts")
+        );
+    }
+
+    #[test]
+    fn same_named_package_without_workspaces_avoids_samples() {
+        let (_d, files, meta) = fixture(
+            &[
+                ("examples/core/package.json", r#"{"name": "@acme/core"}"#),
+                ("packages/core/package.json", r#"{"name": "@acme/core"}"#),
+            ],
+            &["examples/core/index.ts", "packages/core/index.ts", "a/x.ts"],
+        );
+        assert_eq!(
+            res(&files, &meta, "a/x.ts", "@acme/core").as_deref(),
+            Some("packages/core/index.ts")
+        );
+    }
+
+    #[test]
+    fn scope_index_matches_linear_scan() {
+        let (_d, files, meta) = fixture(
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}"#,
+                ),
+                (
+                    "ui/tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"@/*": ["ui/src/*"]}}}"#,
+                ),
+            ],
+            &["src/a.ts", "ui/src/a.ts", "ui/b.ts", "c.ts"],
+        );
+        assert!(!meta.scope_index.0.is_empty());
+        let mut linear = meta.clone();
+        linear.scope_index = Default::default();
+        for from in ["ui/b.ts", "c.ts"] {
+            assert_eq!(
+                res(&files, &meta, from, "@/a"),
+                res(&files, &linear, from, "@/a")
+            );
+        }
+        assert_eq!(
+            res(&files, &meta, "ui/b.ts", "@/a").as_deref(),
+            Some("ui/src/a.ts")
+        );
+        assert_eq!(
+            res(&files, &meta, "c.ts", "@/a").as_deref(),
+            Some("src/a.ts")
+        );
     }
 
     #[test]

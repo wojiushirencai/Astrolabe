@@ -59,7 +59,8 @@
 use std::collections::BTreeSet;
 
 use crate::types::{
-    join_rel, FileIndex, Language, ModuleResolver, ModuleUnit, PathOverride, ProjectMeta, RelPath,
+    join_rel, FileIndex, ImportResolution, Language, ModuleResolver, ModuleUnit, PathOverride,
+    ProjectMeta, RelPath,
 };
 
 pub struct RustResolver;
@@ -108,13 +109,24 @@ impl ModuleResolver for RustResolver {
             if let Some(name) = &manifest.package_name {
                 let name = normalize_crate_name(name);
                 push_unit(&mut meta.modules, &name, join_path(&pkg_dir, "src"));
+                let lib_name = manifest
+                    .lib_name
+                    .as_deref()
+                    .map(normalize_crate_name)
+                    .filter(|l| *l != name);
+                if let Some(l) = &lib_name {
+                    push_unit(&mut meta.modules, l, join_path(&pkg_dir, "src"));
+                }
                 for target in &manifest.target_paths {
                     let Some(file) = join_rel(&pkg_dir, target) else {
                         continue;
                     };
                     if files.contains(&file) {
                         let dir = RelPath::new(&file).dir().to_string();
-                        push_unit(&mut meta.modules, &name, dir);
+                        push_unit(&mut meta.modules, &name, dir.clone());
+                        if let Some(l) = &lib_name {
+                            push_unit(&mut meta.modules, l, dir);
+                        }
                     }
                 }
             }
@@ -153,26 +165,63 @@ impl ModuleResolver for RustResolver {
         files: &FileIndex,
         meta: &ProjectMeta,
     ) -> Option<RelPath> {
+        self.resolve_all(from, spec, files, meta).into_iter().next()
+    }
+
+    fn resolve_import(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> ImportResolution {
+        let mut all = self.resolve_all(from, spec, files, meta);
+        match all.len() {
+            0 => ImportResolution::Unresolved,
+            1 => ImportResolution::File(all.remove(0)),
+            _ => ImportResolution::Files(all),
+        }
+    }
+}
+
+impl RustResolver {
+    /// Every distinct repo file a `use` statement points at, in source order.
+    fn resolve_all(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> Vec<RelPath> {
         let cleaned = clean_spec(spec);
         if cleaned.body.is_empty() {
-            return None;
+            return Vec::new();
         }
         let ctx = CrateCtx::for_file(from, files, meta);
 
         if cleaned.is_mod_decl {
             // `mod x;` — a child of the current module, honouring `#[path]`.
-            let name = cleaned.body.split_whitespace().next()?;
+            let Some(name) = cleaned.body.split_whitespace().next() else {
+                return Vec::new();
+            };
             let name = name.trim_start_matches("r#");
-            let child = child_module(&ctx.self_module(), name, files, meta, true)?;
-            return child.file.filter(|f| files.contains(f)).map(RelPath::new);
+            return child_module(&ctx.self_module(), name, files, meta, true)
+                .and_then(|c| c.file)
+                .filter(|f| files.contains(f))
+                .map(|f| vec![RelPath::new(f)])
+                .unwrap_or_default();
         }
 
+        let mut out: Vec<RelPath> = Vec::new();
         for segs in expand_use_tree(&cleaned.body) {
             if let Some(hit) = resolve_path(&ctx, &segs, files, meta) {
-                return Some(RelPath::new(hit));
+                let hit = RelPath::new(hit);
+                if !out.contains(&hit) {
+                    out.push(hit);
+                }
             }
         }
-        None
+        out
     }
 }
 
@@ -182,6 +231,8 @@ impl ModuleResolver for RustResolver {
 #[derive(Debug, Default)]
 struct Manifest {
     package_name: Option<String>,
+    /// `[lib] name`: the identifier `use` statements actually write.
+    lib_name: Option<String>,
     /// `[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]` `path`s.
     target_paths: Vec<String>,
     /// `(dependency key, relative path)` for every `{ path = "..." }` dep.
@@ -209,6 +260,11 @@ impl Manifest {
             .and_then(|n| n.as_str())
             .map(str::to_string);
 
+        m.lib_name = table
+            .get("lib")
+            .and_then(|l| l.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string);
         if let Some(p) = table
             .get("lib")
             .and_then(|l| l.get("path"))
@@ -1626,6 +1682,52 @@ serde = "1"
         assert_eq!(
             res(&files, &m, from, "crate::foo}"),
             Some("src/foo.rs".into())
+        );
+    }
+
+    #[test]
+    fn use_group_resolves_every_target_file() {
+        let files = FileIndex::new(
+            "/nonexistent-astrolabe-rust-group",
+            ["src/lib.rs", "src/a.rs", "src/b.rs", "src/main.rs"].map(RelPath::new),
+        );
+        let m = meta(&[unit("x", "src")]);
+        let from = RelPath::new("src/main.rs");
+        match RustResolver.resolve_import(&from, "use crate::{a::X, b::Y};", &files, &m) {
+            ImportResolution::Files(v) => {
+                assert_eq!(v, vec![RelPath::new("src/a.rs"), RelPath::new("src/b.rs")])
+            }
+            other => panic!("expected two files, got {other:?}"),
+        }
+        assert_eq!(
+            RustResolver.resolve_import(&from, "use crate::{a::X, a::Z};", &files, &m),
+            ImportResolution::File(RelPath::new("src/a.rs"))
+        );
+        assert_eq!(
+            res(&files, &m, "src/main.rs", "use crate::{a::X, b::Y};"),
+            Some("src/a.rs".into())
+        );
+    }
+
+    #[test]
+    fn lib_name_differs_from_package_name() {
+        let repo = TempRepo::new(
+            "libname",
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"foo-bar\"\n[lib]\nname = \"foo\"\n",
+                ),
+                ("src/lib.rs", "pub mod m;"),
+                ("src/m.rs", ""),
+                ("src/main.rs", ""),
+            ],
+        );
+        let files = repo.index();
+        let m = RustResolver.detect(&files);
+        assert_eq!(
+            res(&files, &m, "src/main.rs", "use foo::m::T;"),
+            Some("src/m.rs".into())
         );
     }
 

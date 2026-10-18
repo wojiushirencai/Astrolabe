@@ -263,7 +263,9 @@ impl ModuleResolver for CSharpResolver {
     ) -> Option<RelPath> {
         match self.resolve_import(from, spec, files, meta) {
             ImportResolution::File(path) => Some(path),
-            ImportResolution::Namespace { .. } | ImportResolution::Unresolved => None,
+            ImportResolution::Files(_)
+            | ImportResolution::Namespace { .. }
+            | ImportResolution::Unresolved => None,
         }
     }
 
@@ -304,6 +306,7 @@ struct Prepared {
     compile_include: Vec<String>,
     compile_remove: Vec<String>,
     output: String,
+            scope_index: Default::default(),
     intermediate: String,
 }
 

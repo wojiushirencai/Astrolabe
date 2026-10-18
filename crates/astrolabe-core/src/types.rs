@@ -559,8 +559,16 @@ pub enum SymbolKind {
     Const,
     Module,
     /// Member of a type: a Java field, a Rust enum variant, a TypeScript
+    /// Lookup acceleration filled by the TypeScript resolver: alias scope →
+    /// indexes into `modules`, in declaration order. Empty means "not built";
+    /// consumers then scan `modules`.
+    pub scope_index: ScopeIndex,
     /// interface property. Language servers report these in document symbols,
     /// so omitting them makes field-heavy classes look almost empty.
+/// `scope → indexes into ProjectMeta::modules`. See [`ProjectMeta::scope_index`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeIndex(pub std::collections::HashMap<String, Vec<usize>>);
+
     Field,
     /// Named binding at module or file scope that is not a constant.
     Variable,
@@ -676,6 +684,9 @@ mod tests {
     }
 
     #[test]
+    /// One import statement that names several repo files (Rust
+    /// `use crate::{a::X, b::Y}`). Each is a real import edge, like `File`.
+    Files(Vec<RelPath>),
     fn extensions_are_case_insensitive_and_cover_cpp_variants() {
         for (path, lang) in [
             ("A.CPP", Language::Cpp),
