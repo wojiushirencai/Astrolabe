@@ -33,9 +33,37 @@ pub fn decode_source(bytes: Vec<u8>) -> String {
     }
     let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     detector.feed(&bytes, true);
-    let encoding = detector.guess(None, chardetng::Utf8Detection::Deny);
+    let mut encoding = detector.guess(None, chardetng::Utf8Detection::Deny);
+    // chardetng is unreliable on short samples: a few GBK ideographs in an
+    // ASCII file are typically guessed as EUC-KR (or Big5/SJIS). When the
+    // guess is one of those and the bytes decode cleanly as GB18030 into
+    // *only* CJK ideographs / CJK punctuation (no Hangul, no kana), prefer GB18030.
+    if matches!(encoding.name(), "EUC-KR" | "Big5" | "Shift_JIS" | "EUC-JP")
+        && gb18030_ideographs_only(&bytes)
+    {
+        encoding = encoding_rs::GB18030;
+    }
     let (text, _, _) = encoding.decode(&bytes);
     text.into_owned()
+}
+
+fn gb18030_ideographs_only(bytes: &[u8]) -> bool {
+    let Some(text) =
+        encoding_rs::GB18030.decode_without_bom_handling_and_without_replacement(bytes)
+    else {
+        return false;
+    };
+    let mut any = false;
+    for c in text.chars().filter(|c| !c.is_ascii()) {
+        let ok = matches!(c as u32,
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3000..=0x303F | 0xFF00..=0xFFEF
+            | 0x2018..=0x201D | 0x2026 | 0x00B7 | 0x2014);
+        if !ok {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// Read a source file, decoding non-UTF-8 content instead of failing.
@@ -70,6 +98,20 @@ mod tests {
             le.extend_from_slice(&u.to_le_bytes());
         }
         assert_eq!(decode_source(le), "a\nb\n");
+    }
+
+    #[test]
+    fn short_gbk_not_misdetected_as_euc_kr() {
+        for src in ["// 你好 SysLog(gbkgo)\n", "x = 1 // 中文\n", "// 你好\n"] {
+            let (bytes, _, _) = encoding_rs::GBK.encode(src);
+            assert_eq!(decode_source(bytes.into_owned()), src);
+        }
+    }
+
+    #[test]
+    fn valid_utf8_never_transcoded() {
+        let s = "// 你好 SysLog\n";
+        assert_eq!(decode_source(s.as_bytes().to_vec()), s);
     }
 
     #[test]
