@@ -925,12 +925,10 @@ impl LspSession {
         // that had read older text send it after a fresher didChange.
         let mut opened = lock(&self.opened);
         let text = match std::fs::read(&abs) {
-            // Non-UTF-8 sources (GBK, Latin-1) are still synced, lossily: the
-            // server only ever sees UTF-8 text anyway.
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
-            },
+            // Non-UTF-8 sources (GBK, Latin-1) are still synced, transcoded to UTF-8.
+            // `decode_source` (BOM / chardetng) matches the text the index and
+            // the fallbacks see, so positions agree for GBK / UTF-16 files.
+            Ok(bytes) => crate::text::decode_source(bytes),
             Err(err) => {
                 if opened.remove(&key).is_some() {
                     let _ = self.transport.notify(
@@ -2532,6 +2530,7 @@ BATCH = []
 INITIALIZE_PARAMS = None
 DOCS = {}
 WATCHED = []
+SAVES = []
 BUFFERS = "--buffers" in sys.argv
 HANG_REFS = "--hang-refs" in sys.argv
 
@@ -2565,6 +2564,9 @@ while True:
     if method == "textDocument/didChange":
         td = msg["params"]["textDocument"]
         DOCS[td["uri"]] = {"version": td["version"], "text": msg["params"]["contentChanges"][-1]["text"]}
+        continue
+    if method == "textDocument/didSave":
+        SAVES.append(msg["params"]["textDocument"]["uri"])
         continue
     if method == "textDocument/didClose":
         DOCS.pop(msg["params"]["textDocument"]["uri"], None)
@@ -2639,7 +2641,7 @@ while True:
         n = int((msg.get("params") or {}).get("n") or 0)
         reply(msg, {"blob": "x" * n})
     elif method == "fake-state":
-        reply(msg, {"docs": DOCS, "watched": WATCHED})
+        reply(msg, {"docs": DOCS, "watched": WATCHED, "saves": SAVES})
     elif method == "textDocument/references" and HANG_REFS:
         time.sleep(30)
         reply(msg, [])
@@ -3594,6 +3596,38 @@ while True:
         // Unchanged content: no new version.
         let _ = find_references(Some(&session), &tmp.0, &path, at);
         assert_eq!(session.open_version(&path), Some(2));
+    }
+
+    #[test]
+    fn did_save_follows_did_change_but_not_did_open() {
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        let path = RelPath::new("s.py");
+        fs::write(tmp.0.join("s.py"), "x = 1\n").unwrap();
+        session.ensure_open(&path).unwrap();
+        let saves = |s: &LspSession| {
+            let st = s.transport.request("fake-state", json!({})).unwrap();
+            st["saves"].as_array().unwrap().len()
+        };
+        assert_eq!(saves(&session), 0, "first open sends no didSave");
+        session.ensure_open(&path).unwrap();
+        assert_eq!(saves(&session), 0, "unchanged content sends nothing");
+        fs::write(tmp.0.join("s.py"), "x = 2\n").unwrap();
+        session.ensure_open(&path).unwrap();
+        assert_eq!(saves(&session), 1, "didChange is followed by didSave");
+    }
+
+    #[test]
+    fn non_utf8_file_is_transcoded_for_the_server() {
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        let path = RelPath::new("g.py");
+        let (bytes, _, _) = encoding_rs::GBK.encode("# 你好，这是一个注释\nx = 1\n");
+        fs::write(tmp.0.join("g.py"), &bytes).unwrap();
+        session.ensure_open(&path).unwrap();
+        let st = session.transport.request("fake-state", json!({})).unwrap();
+        let text = st["docs"].as_object().unwrap().values().next().unwrap()["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("你好"), "got {text:?}");
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub(crate) fn identifier_at(
     path: &RelPath,
     position: Position,
 ) -> Option<String> {
-    let source = std::fs::read_to_string(repo_root.join(path.as_str())).ok()?;
+    let source = crate::text::read_source(&repo_root.join(path.as_str())).ok()?;
     let line = source.split('\n').nth(position.line as usize)?;
     let line = line.strip_suffix('\r').unwrap_or(line);
     // Map the UTF-16 column to a char index.
@@ -39,7 +39,6 @@ pub(crate) fn identifier_at(
         }
         utf16 += ch.len_utf16() as u32;
     }
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     if idx >= chars.len() || !is_ident(chars[idx]) {
         return None;
     }
@@ -161,7 +160,7 @@ fn collect(
             truncated = true;
             break;
         }
-        let Ok(source) = std::fs::read_to_string(repo_root.join(file.as_str())) else {
+        let Ok(source) = crate::text::read_source(&repo_root.join(file.as_str())) else {
             continue;
         };
         let mut file_hits = Vec::new();
@@ -190,12 +189,22 @@ fn collect(
             }
         }
         hits.extend(file_hits);
+        if hits.len() > MAX_HITS {
+            // A single huge file can overshoot the cap inside one iteration.
+            hits.truncate(MAX_HITS);
+            truncated = true;
+            break;
+        }
     }
     (hits, truncated)
 }
 
+/// Identifier characters; `$` covers JS/PHP names (`$name`, `$el`).
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
 fn word_columns(line: &str, name: &str) -> Vec<u32> {
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = Vec::new();
     if name.is_empty() {
         return out;
@@ -294,6 +303,38 @@ mod tests {
             .map(|l| l.path.as_str().to_string())
             .collect();
         assert_eq!(got, vec!["C.swift", "D.swift"]);
+    }
+
+    #[test]
+    fn dollar_names_match_as_whole_words() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "$name = 1;\necho $name; echo name;\necho $names;\n",
+        )
+        .unwrap();
+        let r = text_references(dir.path(), &RelPath::new("a.php"), "$name", "x");
+        assert_eq!(r.value.len(), 2);
+        // `name` alone must not match inside `$name`.
+        let r = text_references(dir.path(), &RelPath::new("a.php"), "name", "x");
+        assert_eq!(r.value.len(), 1);
+        let pos = Position {
+            line: 1,
+            character: 7,
+        };
+        assert_eq!(
+            identifier_at(dir.path(), &RelPath::new("a.php"), pos).as_deref(),
+            Some("$name")
+        );
+    }
+
+    #[test]
+    fn single_huge_file_cannot_exceed_hit_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.rs"), "foo\n".repeat(MAX_HITS * 3)).unwrap();
+        let r = text_references(dir.path(), &RelPath::new("big.rs"), "foo", "x");
+        assert_eq!(r.value.len(), MAX_HITS);
+        assert!(r.note.unwrap().contains("budget"));
     }
 
     #[test]
