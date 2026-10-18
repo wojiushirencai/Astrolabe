@@ -76,6 +76,7 @@ dependencies = [
  "grep-searcher",
  "hex",
  "ignore",
+ "libc",
  "lsp-types",
  "memchr",
  "moka",

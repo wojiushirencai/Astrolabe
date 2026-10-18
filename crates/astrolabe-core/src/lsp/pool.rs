@@ -309,7 +309,22 @@ struct Park {
 
 struct Slot {
     state: Mutex<SlotState>,
+    /// Serialises server starts for this language. The start itself runs
+    /// with `state` released, so file notifications, reclaim and checkouts of
+    /// other slots are never held up by a slow `initialize`.
+    start_gate: Mutex<()>,
 }
+
+/// Consecutive request timeouts after which a server is judged wedged and
+/// replaced.
+const WEDGED_AFTER_TIMEOUTS: u32 = 3;
+
+/// A server that stayed up this long is not counted as part of a crash loop.
+const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(60);
+
+/// First restart delay once a server has crashed twice in a row; doubles
+/// per further crash, capped at the pool's `start_cooldown`.
+const CRASH_BACKOFF_BASE: Duration = Duration::from_secs(2);
 
 struct SlotState {
     server: Option<Arc<dyn LanguageServer>>,
@@ -317,11 +332,19 @@ struct SlotState {
     generation: u64,
     last_used: Instant,
     start_failure: Option<StartFailure>,
+    /// Requests in a row that timed out on the current server.
+    timeouts: u32,
+    /// Crashes in a row without a stable run in between.
+    crashes: u32,
+    /// When the current server was installed.
+    started_at: Instant,
 }
 
 struct StartFailure {
     at: Instant,
     kind: StartFailureKind,
+    /// Overrides the pool's `start_cooldown` (crash-loop backoff).
+    retry_after: Option<Duration>,
 }
 
 enum StartFailureKind {
@@ -366,6 +389,7 @@ impl StartFailure {
         StartFailure {
             at: Instant::now(),
             kind,
+            retry_after: None,
         }
     }
 
@@ -575,7 +599,11 @@ impl Inner {
                         generation: 0,
                         last_used: Instant::now(),
                         start_failure: None,
+                        timeouts: 0,
+                        crashes: 0,
+                        started_at: Instant::now(),
                     }),
+                    start_gate: Mutex::new(()),
                 })
             })
             .clone()
@@ -600,28 +628,54 @@ impl Inner {
             });
         }
 
+        // Only one starter per language; everyone else waits here, not on the
+        // slot state, so the state lock stays free during `initialize`.
+        drop(state);
+        let gate_slot = Arc::clone(&slot);
+        let _gate = lock(&gate_slot.start_gate);
+        let mut state = lock(&slot.state);
+
+        if let Some(server) = state.server.clone() {
+            // Someone else finished the start while we queued on the gate.
+            state.in_flight += 1;
+            state.last_used = Instant::now();
+            let generation = state.generation;
+            drop(state);
+            return Ok(ServerGuard {
+                pool: Arc::downgrade(self),
+                slot,
+                server,
+                language,
+                generation,
+                first_checkout: false,
+            });
+        }
+
         if let Some(failure) = &state.start_failure {
-            let cooled = !self.config.start_cooldown.is_zero()
-                && failure.at.elapsed() < self.config.start_cooldown;
+            let cooldown = failure.retry_after.unwrap_or(self.config.start_cooldown);
+            let cooled = !self.config.start_cooldown.is_zero() && failure.at.elapsed() < cooldown;
             if cooled {
                 tracing::debug!(
                     language = language.name(),
                     elapsed_ms = failure.at.elapsed().as_millis() as u64,
-                    cooldown_ms = self.config.start_cooldown.as_millis() as u64,
+                    cooldown_ms = cooldown.as_millis() as u64,
                     "skipping language-server start; cooldown active"
                 );
                 return Err(failure.to_error(language));
             }
         }
+        drop(state);
 
-        // Start while holding the slot lock so two first-time callers cannot
-        // launch two processes. Other languages use other slots and proceed.
-        match self.factory.start(language) {
+        let started = self.factory.start(language);
+        let mut state = lock(&slot.state);
+        match started {
             Ok(boxed) => {
                 let server: Arc<dyn LanguageServer> = Arc::from(boxed);
                 state.generation += 1;
                 state.in_flight = 1;
                 state.last_used = Instant::now();
+                state.started_at = Instant::now();
+                state.timeouts = 0;
                 state.start_failure = None;
                 state.server = Some(Arc::clone(&server));
                 let generation = state.generation;
@@ -946,6 +1000,17 @@ fn park_or_stop(inner: &Inner, interval: Duration) -> bool {
 
 impl ServerGuard {
     fn retire_crashed(&self) {
+        self.retire(true);
+    }
+
+    /// Take the server out of the slot. `crashed` feeds the crash-loop
+    /// backoff; an orderly retire does not.
+    fn retire(&self, crashed: bool) {
+        let cooldown = self
+            .pool
+            .upgrade()
+            .map(|pool| pool.config.start_cooldown)
+            .unwrap_or_default();
         let server = {
             let mut state = lock(&self.slot.state);
             if state.generation != self.generation {
@@ -956,12 +1021,30 @@ impl ServerGuard {
             };
             state.generation += 1;
             state.in_flight = 0;
+            state.timeouts = 0;
+            if crashed {
+                if state.started_at.elapsed() > CRASH_LOOP_WINDOW {
+                    state.crashes = 0;
+                }
+                state.crashes += 1;
+                if state.crashes >= 2 && !cooldown.is_zero() {
+                    let exp = (state.crashes - 2).min(16);
+                    let backoff = CRASH_BACKOFF_BASE.saturating_mul(1u32 << exp).min(cooldown);
+                    state.start_failure = Some(StartFailure {
+                        at: Instant::now(),
+                        kind: StartFailureKind::Crashed,
+                        retry_after: Some(backoff),
+                    });
+                }
+            }
             server
         };
-        tracing::warn!(
-            language = self.language.name(),
-            "language server crashed; will restart on next request"
-        );
+        if crashed {
+            tracing::warn!(
+                language = self.language.name(),
+                "language server crashed or wedged; will restart on next request"
+            );
+        }
         if let Err(err) = server.shutdown() {
             tracing::debug!(
                 language = self.language.name(),
@@ -980,7 +1063,40 @@ impl ServerGuard {
                 self.retire_crashed();
                 Err(LspError::Crashed)
             }
-            other => other,
+            Err(LspError::Timeout(after)) => {
+                // A server that never answers is as dead as one that exited:
+                // after a few in a row, replace it instead of making every
+                // query wait out the full timeout again.
+                let wedged = {
+                    let mut state = lock(&self.slot.state);
+                    if state.generation == self.generation {
+                        state.timeouts += 1;
+                        state.timeouts >= WEDGED_AFTER_TIMEOUTS
+                    } else {
+                        false
+                    }
+                };
+                if wedged {
+                    tracing::warn!(
+                        language = self.language.name(),
+                        "language server timed out {WEDGED_AFTER_TIMEOUTS} times in a row; restarting it"
+                    );
+                    self.retire_crashed();
+                }
+                Err(LspError::Timeout(after))
+            }
+            other => {
+                if other.is_ok() {
+                    let mut state = lock(&self.slot.state);
+                    if state.generation == self.generation {
+                        state.timeouts = 0;
+                        if state.started_at.elapsed() > CRASH_LOOP_WINDOW {
+                            state.crashes = 0;
+                        }
+                    }
+                }
+                other
+            }
         }
     }
 }
@@ -1071,7 +1187,7 @@ impl LanguageServer for ServerGuard {
     }
 
     fn shutdown(&self) -> Result<(), LspError> {
-        self.retire_crashed();
+        self.retire(false);
         Ok(())
     }
 }
@@ -1111,6 +1227,8 @@ mod tests {
         memory: Arc<AtomicU64>,
         fail_starts: Arc<AtomicBool>,
         crash_on_use: Arc<AtomicBool>,
+        timeout_on_use: Arc<AtomicBool>,
+        start_delay_ms: Arc<AtomicU64>,
         shutdown_delay_ms: Arc<AtomicU64>,
     }
 
@@ -1119,6 +1237,7 @@ mod tests {
         memory: Arc<AtomicU64>,
         shutdowns: Arc<AtomicUsize>,
         crash_on_use: bool,
+        timeout_on_use: bool,
         shutdown_delay_ms: u64,
     }
 
@@ -1130,6 +1249,8 @@ mod tests {
                 memory: Arc::new(AtomicU64::new(1_048_576)),
                 fail_starts: Arc::new(AtomicBool::new(false)),
                 crash_on_use: Arc::new(AtomicBool::new(false)),
+                timeout_on_use: Arc::new(AtomicBool::new(false)),
+                start_delay_ms: Arc::new(AtomicU64::new(0)),
                 shutdown_delay_ms: Arc::new(AtomicU64::new(0)),
             }
         }
@@ -1146,6 +1267,10 @@ mod tests {
     impl ServerFactory for FakeFactory {
         fn start(&self, language: Language) -> Result<Box<dyn LanguageServer>, LspError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            let delay = self.start_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                thread::sleep(Duration::from_millis(delay));
+            }
             if self.fail_starts.load(Ordering::SeqCst) {
                 return Err(LspError::Unavailable(
                     language,
@@ -1157,6 +1282,7 @@ mod tests {
                 memory: Arc::clone(&self.memory),
                 shutdowns: Arc::clone(&self.shutdowns),
                 crash_on_use: self.crash_on_use.load(Ordering::SeqCst),
+                timeout_on_use: self.timeout_on_use.load(Ordering::SeqCst),
                 shutdown_delay_ms: self.shutdown_delay_ms.load(Ordering::SeqCst),
             }))
         }
@@ -1166,6 +1292,8 @@ mod tests {
         fn fail_if_crashed(&self) -> Result<(), LspError> {
             if self.crash_on_use {
                 Err(LspError::Crashed)
+            } else if self.timeout_on_use {
+                Err(LspError::Timeout(Duration::from_millis(1)))
             } else {
                 Ok(())
             }
@@ -1465,6 +1593,128 @@ mod tests {
             .expect("second generation is healthy");
         assert!(recovered.is_empty());
         assert_eq!(factory.starts(), 2);
+        pool.shutdown();
+    }
+
+    /// H3: a slow server start must not hold the slot lock, or the watcher
+    /// thread (notify_files_changed) and reclaim stall behind `initialize`.
+    #[test]
+    fn slow_start_does_not_block_file_notifications() {
+        let factory = FakeFactory::new();
+        factory.start_delay_ms.store(1500, Ordering::SeqCst);
+        let pool = Arc::new(LspPool::with_factory_and_config(
+            factory.clone(),
+            quiet_config(),
+        ));
+        let starter = {
+            let pool = Arc::clone(&pool);
+            thread::spawn(move || drop(pool.acquire(Language::Python)))
+        };
+        thread::sleep(Duration::from_millis(200));
+        let changes = [crate::lsp::FileChange {
+            path: dummy_path(),
+            kind: crate::lsp::FileChangeKind::Changed,
+        }];
+        let t = Instant::now();
+        pool.notify_files_changed(&changes);
+        pool.reclaim();
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "notify blocked behind a starting server: {:?}",
+            t.elapsed()
+        );
+        starter.join().unwrap();
+        assert_eq!(factory.starts(), 1);
+        pool.shutdown();
+    }
+
+    /// H3: two callers racing the first start still launch one process.
+    #[test]
+    fn concurrent_first_acquires_start_one_server() {
+        let factory = FakeFactory::new();
+        factory.start_delay_ms.store(300, Ordering::SeqCst);
+        let pool = Arc::new(LspPool::with_factory_and_config(
+            factory.clone(),
+            quiet_config(),
+        ));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                thread::spawn(move || drop(pool.acquire(Language::Python).expect("acquire")))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(factory.starts(), 1);
+        pool.shutdown();
+    }
+
+    /// M1: a server that keeps timing out is replaced.
+    #[test]
+    fn wedged_server_is_restarted_after_consecutive_timeouts() {
+        let factory = FakeFactory::new();
+        factory.timeout_on_use.store(true, Ordering::SeqCst);
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+        for _ in 0..WEDGED_AFTER_TIMEOUTS {
+            let err = pool
+                .with_server(Language::Python, |s| {
+                    s.references(&dummy_path(), dummy_pos())
+                })
+                .expect_err("times out");
+            assert!(matches!(err, LspError::Timeout(_)));
+        }
+        assert!(
+            !pool.is_resident(Language::Python),
+            "wedged server must be retired"
+        );
+        factory.timeout_on_use.store(false, Ordering::SeqCst);
+        pool.with_server(Language::Python, |s| {
+            s.references(&dummy_path(), dummy_pos())
+        })
+        .expect("fresh server");
+        assert_eq!(factory.starts(), 2);
+        pool.shutdown();
+    }
+
+    /// M1: a success in between resets the count.
+    #[test]
+    fn successful_call_resets_timeout_count() {
+        let factory = FakeFactory::new();
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+        let guard = pool.acquire(Language::Python).unwrap();
+        for _ in 0..(WEDGED_AFTER_TIMEOUTS - 1) {
+            let mut state = lock(&guard.slot.state);
+            state.timeouts += 1;
+        }
+        guard.references(&dummy_path(), dummy_pos()).unwrap();
+        assert_eq!(lock(&guard.slot.state).timeouts, 0);
+        drop(guard);
+        pool.shutdown();
+    }
+
+    /// M2: a server that crashes on every use is not restarted at once
+    /// forever; from the second consecutive crash the start is backed off.
+    #[test]
+    fn crash_loop_is_backed_off() {
+        let factory = FakeFactory::new();
+        factory.crash_on_use.store(true, Ordering::SeqCst);
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+        let call = |pool: &LspPool| {
+            pool.with_server(Language::Python, |s| {
+                s.references(&dummy_path(), dummy_pos())
+            })
+        };
+        assert!(matches!(call(&pool), Err(LspError::Crashed))); // crash 1: restart allowed
+        assert!(matches!(call(&pool), Err(LspError::Crashed))); // crash 2: backoff set
+        assert_eq!(factory.starts(), 2);
+        let third = call(&pool);
+        assert!(third.is_err());
+        assert_eq!(
+            factory.starts(),
+            2,
+            "crash loop must not respawn immediately"
+        );
         pool.shutdown();
     }
 

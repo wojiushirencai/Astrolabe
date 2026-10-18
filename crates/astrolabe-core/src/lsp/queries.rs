@@ -869,7 +869,7 @@ fn external_note(in_repo: &[Location], external: &[String]) -> Option<String> {
     let shown = format_external_list(external);
     if in_repo.is_empty() {
         Some(format!(
-            "{} 条结果全部在仓库外（标准库或依赖）已省略；all {} result(s) sit outside the repository (stdlib or dependencies) and were omitted: {shown}",
+            "{} 条结果在仓库外（标准库或依赖），全部已省略；all {} result(s) sit outside the repository (stdlib or dependencies) and were omitted: {shown}",
             external.len(),
             external.len()
         ))
@@ -2208,6 +2208,23 @@ mod tests {
         assert!(note.contains("definitions"));
         assert!(!note.contains("precise references"));
         assert!(note.contains("search_code"));
+    }
+
+    /// M3: a definition that lives in the stdlib/dependencies must come back
+    /// with an explicit "outside the repository" note, not a bare empty Exact.
+    #[test]
+    fn goto_definition_into_stdlib_says_results_are_outside_repo() {
+        let mut server = FakeServer::refs(Vec::new());
+        server.definition = Script::Ok(vec![loc("file:///usr/lib/go/src/fmt/print.go", 10, 5)]);
+        let result = goto_definition(
+            Some(&server),
+            Path::new("/repo"),
+            &RelPath::new("src/main.go"),
+            SymbolAt::Position(pos(1, 0)),
+        );
+        assert!(result.value.is_empty());
+        let note = result.note.as_deref().expect("note required");
+        assert!(note.contains("1 条结果在仓库外"), "{note}");
     }
 
     #[test]

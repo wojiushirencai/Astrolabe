@@ -410,7 +410,30 @@ impl<'a> Router<'a> {
             LspOp::Definition => server.definition(path, position),
         }) {
             Ok(mut locs) => {
+                // The transport keeps outside-the-workspace results as raw
+                // `file:` URIs; they are not repo paths, so report them
+                // instead of returning them (or silently nothing).
+                let before = locs.len();
+                locs.retain(|loc| {
+                    !loc.path.as_str()[..loc.path.as_str().len().min(5)]
+                        .eq_ignore_ascii_case("file:")
+                });
+                let external = before - locs.len();
                 sort_locations(&mut locs);
+                if external > 0 {
+                    let note = format!(
+                        "{external} 条结果在仓库外（标准库或依赖），已省略；{} result(s) sit outside the repository",
+                        external
+                    );
+                    return finish(
+                        kind,
+                        DataSource::LanguageServer,
+                        Confidence::Scoped,
+                        Confidence::Scoped,
+                        Answer::Locations(locs),
+                        Some(note),
+                    );
+                }
                 finish(
                     kind,
                     DataSource::LanguageServer,
