@@ -2038,17 +2038,30 @@ impl AstrolabeServer {
         } else {
             BarrierEffect::None
         };
-        let result = match &*session.state.read().expect("index state lock poisoned") {
-            IndexState::Building => self.finish_at(
+        // Clone the `Arc` and release the read guard before running the tool:
+        // a long scan must not keep a queued watcher write lock (and every
+        // reader behind it) waiting. The query runs on its own snapshot.
+        enum Snap {
+            Building,
+            Failed(String),
+            Ready(Arc<RepoIndex>),
+        }
+        let snap = match &*session.state.read().unwrap_or_else(|e| e.into_inner()) {
+            IndexState::Building => Snap::Building,
+            IndexState::Failed(error) => Snap::Failed(error.clone()),
+            IndexState::Ready(index) => Snap::Ready(Arc::clone(index)),
+        };
+        let result = match snap {
+            Snap::Building => self.finish_at(
                 &session.root,
                 text_error("索引正在后台构建；MCP 握手已完成，请稍后重试。confidence: unknown"),
             ),
-            IndexState::Failed(error) => self.finish_at(
+            Snap::Failed(error) => self.finish_at(
                 &session.root,
                 text_error(format!("索引构建失败：{error}\nconfidence: unknown")),
             ),
-            IndexState::Ready(index) => {
-                let result = f(&session, index);
+            Snap::Ready(index) => {
+                let result = f(&session, &index);
                 match index.coverage_note() {
                     Some(note) if result.is_error != Some(true) => append_stale_note(result, &note),
                     _ => result,
@@ -2113,7 +2126,7 @@ impl AstrolabeServer {
     fn index_stamp(&self, hint: &str) -> Option<u64> {
         let session = self.session_for(hint).ok()?;
         let _ = run_barrier(&session);
-        let state = session.state.read().expect("index state lock poisoned");
+        let state = session.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             IndexState::Ready(index) => Some(index.generation()),
             _ => None,
@@ -4553,6 +4566,34 @@ mod tests {
     };
     use std::collections::HashSet;
     use std::time::Duration;
+
+    #[test]
+    fn index_read_lock_is_released_while_a_tool_runs() {
+        let server = ready_server();
+        let session = Arc::clone(&server.primary);
+        let replacement = match &*session.state.read().unwrap() {
+            IndexState::Ready(i) => Arc::clone(i),
+            _ => panic!("ready"),
+        };
+        let result = server.with_index("", |_, _| {
+            // A watcher publishing a new index must not wait for this tool.
+            let s2 = Arc::clone(&session);
+            let handle = std::thread::spawn(move || {
+                *s2.state.write().unwrap() = IndexState::Ready(replacement);
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !handle.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writer blocked by running tool"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            handle.join().unwrap();
+            text_error("done")
+        });
+        assert!(fs_text(&result).contains("done"));
+    }
 
     fn ready_server() -> AstrolabeServer {
         let mut server =

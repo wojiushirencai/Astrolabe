@@ -182,6 +182,9 @@ pub(crate) fn start_root_indexing(session: Arc<RootSession>) {
 }
 
 fn bootstrap_root(session: Arc<RootSession>) {
+    if session.closed.load(Ordering::SeqCst) {
+        return;
+    }
     let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
 
     // Spawn the watcher (and take its baseline) BEFORE the cold build.
@@ -198,6 +201,11 @@ fn bootstrap_root(session: Arc<RootSession>) {
         wait_for_watcher_baseline(&session);
     }
 
+    if session.closed.load(Ordering::SeqCst) {
+        // Evicted before the cold build started: skip the whole build.
+        session.teardown();
+        return;
+    }
     let outcome = build_index(&session.root, persist, session.knobs.parse_cache_bytes);
     publish_ready(&session, outcome);
 }
@@ -294,11 +302,7 @@ fn start_watching(session: &Arc<RootSession>, mode: WatchMode) {
 fn apply_or_buffer(session: &RootSession, changes: &ChangeSet) {
     let mut pending = session.pending.lock().expect("pending lock poisoned");
     pending.merge(changes.clone());
-    let mut state = session.state.write().expect("index state lock poisoned");
-    if matches!(*state, IndexState::Ready(_)) {
-        let batch = std::mem::take(&mut *pending);
-        apply_under_write(session, &mut state, &batch);
-    }
+    apply_pending(session, &mut pending);
 }
 
 fn publish_ready(session: &RootSession, mut outcome: IndexState) {
@@ -306,7 +310,6 @@ fn publish_ready(session: &RootSession, mut outcome: IndexState) {
     let opts = crate::reindex::mcp_index_options(persist, session.knobs.parse_cache_bytes);
 
     let mut pending = session.pending.lock().expect("pending lock poisoned");
-    let mut state = session.state.write().expect("index state lock poisoned");
 
     if let IndexState::Ready(index) = &outcome {
         let drained = std::mem::take(&mut *pending);
@@ -321,32 +324,43 @@ fn publish_ready(session: &RootSession, mut outcome: IndexState) {
             }
         }
     }
-    *state = outcome;
+    if session.closed.load(Ordering::SeqCst) {
+        // Evicted during the cold build: do not publish into a dead session.
+        session.teardown();
+        return;
+    }
+    *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
 }
 
-fn apply_under_write(session: &RootSession, state: &mut IndexState, changes: &ChangeSet) {
+/// Apply buffered changes when the index is Ready. The caller holds the
+/// `pending` lock, which serialises every writer of `state` (apply, publish),
+/// so the heavy `apply_reindex` runs on a snapshot *outside* the state lock and
+/// the write lock is held only for the `Arc` swap. Queries keep reading the old
+/// index meanwhile instead of queueing behind the rebuild.
+fn apply_pending(session: &RootSession, pending: &mut ChangeSet) {
+    let previous = match &*session.state.read().unwrap_or_else(|e| e.into_inner()) {
+        IndexState::Ready(index) => Arc::clone(index),
+        _ => return,
+    };
+    let changes = std::mem::take(pending);
     if changes.is_empty() {
         return;
     }
     let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
     let opts = crate::reindex::mcp_index_options(persist, session.knobs.parse_cache_bytes);
-    let previous = match state {
-        IndexState::Ready(index) => Some(Arc::clone(index)),
-        _ => None,
-    };
-    let snapshot = previous.as_ref().and_then(|index| index.incremental());
-    match crate::reindex::apply_reindex(&session.root, snapshot, changes, &opts) {
+    match crate::reindex::apply_reindex(&session.root, previous.incremental(), &changes, &opts) {
         Ok(inc) => {
-            *state = IndexState::Ready(Arc::new(index::RepoIndex::from_incremental(
+            let next = Arc::new(index::RepoIndex::from_incremental(
                 session.root.clone(),
                 inc,
-            )));
+            ));
+            *session.state.write().unwrap_or_else(|e| e.into_inner()) = IndexState::Ready(next);
             if session.rebuild_inflight.load(Ordering::SeqCst) {
                 session
                     .rebuild_journal
                     .lock()
                     .expect("rebuild journal lock poisoned")
-                    .merge(changes.clone());
+                    .merge(changes);
             }
         }
         Err(error) => {
@@ -483,11 +497,7 @@ fn inline_repair(session: &RootSession, paths: Vec<RelPath>) {
     }
     let mut pending = session.pending.lock().expect("pending lock poisoned");
     pending.merge(repair);
-    let mut state = session.state.write().expect("index state lock poisoned");
-    if matches!(*state, IndexState::Ready(_)) {
-        let batch = std::mem::take(&mut *pending);
-        apply_under_write(session, &mut state, &batch);
-    }
+    apply_pending(session, &mut pending);
 }
 
 /// Kick a full `IncrementalIndex::build` without dropping to `Building`.
@@ -534,7 +544,6 @@ fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
     let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
     let opts = crate::reindex::mcp_index_options(persist, session.knobs.parse_cache_bytes);
     let mut pending = session.pending.lock().expect("pending lock poisoned");
-    let mut state = session.state.write().expect("index state lock poisoned");
     let mut replay = std::mem::take(
         &mut *session
             .rebuild_journal
@@ -554,7 +563,7 @@ fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
             }
         }
     }
-    *state = outcome;
+    *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
 }
 
 /// Append a staleness note to the first text block of an already-finished result.
@@ -923,6 +932,66 @@ mod tests {
             session.watch.lock().unwrap().is_none(),
             "a watcher spawned for a torn-down session must be stopped"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evicted_session_skips_cold_build_and_never_publishes() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        let knobs = McpKnobs {
+            watch_mode: None,
+            ..McpKnobs::default()
+        };
+        let session = RootSession::new(dir.clone(), knobs, 8 * 1024 * 1024);
+        session.teardown();
+        bootstrap_root(Arc::clone(&session));
+        assert!(matches!(
+            *session.state.read().unwrap(),
+            IndexState::Building
+        ));
+        // A build that finishes after eviction is dropped too.
+        let persist = false;
+        let built = build_index(&session.root, persist, session.knobs.parse_cache_bytes);
+        publish_ready(&session, built);
+        assert!(matches!(
+            *session.state.read().unwrap(),
+            IndexState::Building
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_pending_swaps_index_without_holding_state_lock_during_reindex() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let knobs = McpKnobs {
+            watch_mode: None,
+            ..McpKnobs::default()
+        };
+        let session = RootSession::new(dir.clone(), knobs, 8 * 1024 * 1024);
+        let cold = build_index(&session.root, false, session.knobs.parse_cache_bytes);
+        *session.state.write().unwrap() = cold;
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        let mut pending = ChangeSet {
+            added: vec![RelPath::new("b.py")],
+            ..ChangeSet::default()
+        };
+        // A reader holding the read guard must not deadlock the apply (it
+        // only takes the write lock for the swap, after dropping its read).
+        let old = match &*session.state.read().unwrap() {
+            IndexState::Ready(i) => Arc::clone(i),
+            _ => panic!("ready"),
+        };
+        apply_pending(&session, &mut pending);
+        assert!(pending.is_empty());
+        match &*session.state.read().unwrap() {
+            IndexState::Ready(i) => {
+                assert!(i.graph().symbols.iter().any(|s| s.name == "beta"));
+                assert!(!old.graph().symbols.iter().any(|s| s.name == "beta"));
+            }
+            _ => panic!("ready"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -47,6 +47,10 @@ pub(crate) struct LiveBackend {
     /// import) is being started on a background thread. Queries meanwhile
     /// get the syntactic fallback instead of blocking on the start.
     starting: Arc<AtomicBool>,
+    /// Set when the background start failed (server missing / crashed). Calls
+    /// then take the synchronous `acquire` path so the real error (install
+    /// hint) reaches the user instead of an endless "still importing".
+    start_failed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for LiveBackend {
@@ -71,6 +75,7 @@ impl LiveBackend {
             pool: Arc::new(pool),
             syntax: None,
             starting: Arc::new(AtomicBool::new(false)),
+            start_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -145,6 +150,7 @@ impl LiveBackend {
             return Ok(op(None));
         }
         let guard = self.pool.acquire(language)?;
+        self.start_failed.store(false, Ordering::Release);
         Ok(op(Some(&guard as &dyn LanguageServer)))
     }
 
@@ -155,6 +161,9 @@ impl LiveBackend {
     fn start_in_background(&self, language: Language) -> bool {
         if self.starting.load(Ordering::Acquire) {
             return true;
+        }
+        if self.start_failed.load(Ordering::Acquire) {
+            return false;
         }
         if self.pool.is_resident(language) {
             return false;
@@ -168,11 +177,13 @@ impl LiveBackend {
         }
         let pool = Arc::clone(&self.pool);
         let starting = Arc::clone(&self.starting);
+        let start_failed = Arc::clone(&self.start_failed);
         let spawned = std::thread::Builder::new()
             .name(format!("lsp-start-{}", language.name()))
             .spawn(move || {
                 if let Err(error) = pool.acquire(language) {
                     tracing::warn!(language = language.name(), %error, "background start failed");
+                    start_failed.store(true, Ordering::Release);
                 }
                 starting.store(false, Ordering::Release);
             });
@@ -398,6 +409,50 @@ impl PreciseCapability for LiveBackend {
         }) {
             Ok(result) => result,
             Err(error) => Precise::unknown(Vec::new(), error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod start_failure_tests {
+    use super::*;
+
+    /// A missing kotlin server must surface its install hint, not loop on
+    /// "still importing" forever.
+    #[test]
+    fn missing_kotlin_server_reports_real_error_after_background_failure() {
+        let root = std::env::temp_dir();
+        let empty_path = std::env::temp_dir().join("astrolabe-no-such-bin-dir");
+        let pool = LspPool::from_discovery_and_transport(
+            Discovery::new(&empty_path),
+            StdioSpawn::new(&root),
+            root.clone(),
+            LspPoolConfig::default(),
+        );
+        let syntax: SyntaxIndex = Arc::new(|| None);
+        let backend = LiveBackend {
+            root,
+            pool: Arc::new(pool),
+            syntax: Some(syntax),
+            starting: Arc::new(AtomicBool::new(false)),
+            start_failed: Arc::new(AtomicBool::new(false)),
+        };
+        // First call: warming while the background start runs.
+        let first = backend.with_server(Language::Kotlin, |s| s.is_none());
+        assert!(matches!(first, Ok(true)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !backend.start_failed.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "start never failed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        while backend.starting.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Next call: the real acquire error, every time.
+        for _ in 0..2 {
+            assert!(backend
+                .with_server(Language::Kotlin, |s| s.is_none())
+                .is_err());
         }
     }
 }
