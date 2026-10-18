@@ -52,7 +52,7 @@ use crate::types::{
 pub struct KotlinResolver;
 
 /// Upper bound on files read during `detect`.
-const MAX_FILES: usize = 50_000;
+const MAX_FILES: usize = 250_000;
 
 impl ModuleResolver for KotlinResolver {
     fn language(&self) -> Language {
@@ -71,6 +71,10 @@ impl ModuleResolver for KotlinResolver {
             }
             read += 1;
             if read > MAX_FILES {
+                tracing::warn!(
+                    limit = MAX_FILES,
+                    "kotlin declaration scan stopped: too many source files; later declarations stay unresolved"
+                );
                 break;
             }
             let Some(src) = files.read(p.as_str()) else {

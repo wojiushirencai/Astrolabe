@@ -398,3 +398,35 @@ fn csharp_many_projects_detect_is_linear() {
         t.elapsed()
     );
 }
+
+/// VB mirrors the C# per-project bucket fix: 300 projects x 40 files used to
+/// be quadratic. Generous wall bound so it only trips on a regression.
+#[test]
+fn vb_many_projects_detect_is_linear() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    let (p, f) = (300usize, 40usize);
+    for i in 0..p {
+        write(
+            r,
+            &format!("P{i}/P{i}.vbproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>",
+        );
+        for j in 0..f {
+            write(
+                r,
+                &format!("P{i}/sub/F{j}.vb"),
+                &format!("Namespace P{i}.Sub\nPublic Class C{j}\nEnd Class\nEnd Namespace\n"),
+            );
+        }
+    }
+    let t = Instant::now();
+    let opts = IndexOptions {
+        persist: false,
+        ..IndexOptions::default()
+    };
+    let (g, _) = index_repo(r, &opts);
+    let el = t.elapsed();
+    println!("vb {p}x{f} = {} files: {el:?}", g.files.len());
+    assert!(el.as_secs() < 15, "VB detect not linear: {el:?}");
+}

@@ -102,13 +102,13 @@ pub struct JavaResolver;
 /// Upper bound on `.java` files read from disk during the package-declaration
 /// fallback. One file per directory is enough — every file in a directory
 /// shares a package — so this caps I/O on huge, oddly laid-out repos.
-const FALLBACK_DIR_LIMIT: usize = 512;
+const FALLBACK_DIR_LIMIT: usize = 16_384;
 
 /// Most files one `import pkg.*` may link to.
 const WILDCARD_FILE_CAP: usize = 300;
 
 /// Upper bound on `.kt` files read for Java→Kotlin resolution.
-const KOTLIN_FILE_LIMIT: usize = 50_000;
+const KOTLIN_FILE_LIMIT: usize = 250_000;
 
 impl ModuleResolver for JavaResolver {
     fn language(&self) -> Language {
@@ -159,6 +159,10 @@ impl ModuleResolver for JavaResolver {
                 continue;
             }
             if seen_dirs.len() > FALLBACK_DIR_LIMIT {
+                tracing::warn!(
+                    limit = FALLBACK_DIR_LIMIT,
+                    "java source-root fallback stopped: too many directories without a known source root; remaining packages stay unresolved"
+                );
                 break;
             }
             let Some(src) = files.read(p.as_str()) else {
@@ -174,11 +178,16 @@ impl ModuleResolver for JavaResolver {
 
         // 5. Kotlin declarations, so Java can import Kotlin classes.
         let mut decls: BTreeSet<TypeDecl> = BTreeSet::new();
-        for p in files
-            .iter()
-            .filter(|p| p.extension() == Some("kt"))
-            .take(KOTLIN_FILE_LIMIT)
-        {
+        let mut kt_seen = 0usize;
+        for p in files.iter().filter(|p| p.extension() == Some("kt")) {
+            kt_seen += 1;
+            if kt_seen > KOTLIN_FILE_LIMIT {
+                tracing::warn!(
+                    limit = KOTLIN_FILE_LIMIT,
+                    "java->kotlin declaration scan stopped: too many .kt files; later Kotlin classes cannot be imported from Java"
+                );
+                break;
+            }
             let Some(src) = files.read(p.as_str()) else {
                 continue;
             };

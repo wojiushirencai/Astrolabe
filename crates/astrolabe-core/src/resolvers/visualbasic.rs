@@ -181,6 +181,33 @@ impl ModuleResolver for VisualBasicResolver {
             .map(|p| (p.manifest.clone(), p.directory.clone()))
             .collect();
 
+        // One pass: which project owns each VB source (deepest project
+        // directory above it; the last manifest wins a tie).
+        let mut dir_owner: std::collections::HashMap<&str, &str> = Default::default();
+        for (manifest, dir) in &directories {
+            dir_owner.insert(dir.as_str(), manifest.as_str());
+        }
+        let mut buckets: std::collections::HashMap<&str, Vec<&str>> = Default::default();
+        for p in files.iter() {
+            let path = p.as_str();
+            if p.extension() != Some("vb") || skipped_tree(path) {
+                continue;
+            }
+            let mut dir = p.dir();
+            let owner = loop {
+                if let Some(m) = dir_owner.get(dir) {
+                    break Some(*m);
+                }
+                if dir.is_empty() {
+                    break None;
+                }
+                dir = dir.rfind('/').map_or("", |i| &dir[..i]);
+            };
+            if let Some(m) = owner {
+                buckets.entry(m).or_default().push(path);
+            }
+        }
+
         let mut ns_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut type_decls: BTreeSet<TypeDecl> = BTreeSet::new();
         let mut source_roots: BTreeSet<String> = BTreeSet::new();
@@ -189,7 +216,11 @@ impl ModuleResolver for VisualBasicResolver {
             if prep.facts.default_compile_items || !prep.compile_include.is_empty() {
                 source_roots.insert(prep.facts.directory.clone());
             }
-            for path in compile_files(files, prep, &directories) {
+            let bucket = buckets
+                .get(prep.facts.manifest.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for path in compile_files(files, prep, bucket) {
                 let Some(text) = files.read(&path) else {
                     continue;
                 };
@@ -472,20 +503,12 @@ fn implicit_usings_for(sdk: &str) -> Vec<&'static str> {
     out
 }
 
-fn compile_files(files: &FileIndex, prep: &Prepared, projects: &[(String, String)]) -> Vec<String> {
+fn compile_files(files: &FileIndex, prep: &Prepared, bucket: &[&str]) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     let dir = &prep.facts.directory;
     if prep.facts.default_compile_items {
-        for path in files.iter() {
-            if path.extension() != Some("vb") {
-                continue;
-            }
-            let path = path.as_str();
-            if owning_manifest(path, projects) != Some(prep.facts.manifest.as_str()) {
-                continue;
-            }
-            if skipped_tree(path) || is_project_output(path, dir, &prep.output, &prep.intermediate)
-            {
+        for &path in bucket {
+            if is_project_output(path, dir, &prep.output, &prep.intermediate) {
                 continue;
             }
             let rel = rel_to(path, dir);
@@ -500,14 +523,7 @@ fn compile_files(files: &FileIndex, prep: &Prepared, projects: &[(String, String
         }
     }
     for include in &prep.compile_include {
-        add_include(
-            files,
-            dir,
-            include,
-            &prep.facts.manifest,
-            projects,
-            &mut out,
-        );
+        add_include(files, dir, include, bucket, &mut out);
     }
     for remove in &prep.compile_remove {
         out.retain(|path| !glob_match(remove, rel_to(path, dir)));
@@ -519,8 +535,7 @@ fn add_include(
     files: &FileIndex,
     dir: &str,
     pattern: &str,
-    manifest: &str,
-    projects: &[(String, String)],
+    bucket: &[&str],
     out: &mut BTreeSet<String>,
 ) {
     let pattern = pattern.replace('\\', "/");
@@ -532,26 +547,11 @@ fn add_include(
         }
         return;
     }
-    for path in files.iter() {
-        if path.extension() != Some("vb") {
-            continue;
-        }
-        let path = path.as_str();
-        if owning_manifest(path, projects) != Some(manifest) || skipped_tree(path) {
-            continue;
-        }
+    for &path in bucket {
         if glob_match(&pattern, rel_to(path, dir)) {
             out.insert(path.to_string());
         }
     }
-}
-
-fn owning_manifest<'a>(path: &str, projects: &'a [(String, String)]) -> Option<&'a str> {
-    projects
-        .iter()
-        .filter(|(_, dir)| is_under(path, dir))
-        .max_by_key(|(_, dir)| dir.len())
-        .map(|(manifest, _)| manifest.as_str())
 }
 
 fn is_project_output(path: &str, dir: &str, output: &str, intermediate: &str) -> bool {
