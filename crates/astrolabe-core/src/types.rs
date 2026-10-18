@@ -12,8 +12,20 @@ pub struct RelPath(String);
 impl RelPath {
     pub fn new(s: impl AsRef<str>) -> Self {
         let s = s.as_ref().replace('\\', "/");
-        let s = s.strip_prefix("./").unwrap_or(&s);
-        RelPath(s.trim_start_matches('/').to_string())
+        // Strip every leading `./` (and `/`), so `././a.rs` and `./a.rs`
+        // both normalise to `a.rs` as the type's contract promises.
+        let mut s = s.as_str();
+        loop {
+            let t = s.trim_start_matches('/');
+            match t.strip_prefix("./") {
+                Some(rest) => s = rest,
+                None => {
+                    s = t;
+                    break;
+                }
+            }
+        }
+        RelPath(s.to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -346,6 +358,14 @@ impl Language {
                 None
             };
         };
+        // `.m` is also MATLAB/Octave: without any Objective-C marker and with
+        // MATLAB-style `%` comments or `function … end`, it is not ObjC.
+        if lang == Language::ObjC
+            && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("m"))
+            && looks_matlab(source)
+        {
+            return None;
+        }
         if lang == Language::C && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h")) {
             // `@interface` / `#import` headers carry the public ObjC API.
             if let Some(objc) = crate::parse::objc_header_language(source) {
@@ -443,6 +463,9 @@ pub struct FileIndex {
     by_dir: BTreeMap<String, Vec<RelPath>>,
     dirs: BTreeSet<String>,
     root: PathBuf,
+    /// Paths passed to [`FileIndex::read`] while recording is on, so a
+    /// caller can learn which files a `detect` depended on.
+    reads: std::sync::Mutex<Option<BTreeSet<String>>>,
 }
 
 impl FileIndex {
@@ -502,7 +525,33 @@ impl FileIndex {
     /// Read a repo file from disk. Intended for build config during `detect`,
     /// not for bulk source reading on the resolve hot path.
     pub fn read(&self, p: &str) -> Option<String> {
+        if let Ok(mut guard) = self.reads.lock() {
+            if let Some(set) = guard.as_mut() {
+                set.insert(RelPath::new(p).as_str().to_string());
+            }
+        }
+        if escapes_root(p) {
+            return None;
+        }
         std::fs::read_to_string(self.root.join(p)).ok()
+    }
+
+    /// Start recording every path given to [`Self::read`] (clears any
+    /// previous recording).
+    pub fn start_recording_reads(&self) {
+        if let Ok(mut guard) = self.reads.lock() {
+            *guard = Some(BTreeSet::new());
+        }
+    }
+
+    /// Stop recording and return the paths read since
+    /// [`Self::start_recording_reads`].
+    pub fn take_recorded_reads(&self) -> BTreeSet<String> {
+        self.reads
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .unwrap_or_default()
     }
 }
 
@@ -765,6 +814,50 @@ pub struct CodeEdge {
     pub kind: EdgeKind,
     pub weight: u32,
     pub confidence: Confidence,
+}
+
+/// True when `p` is absolute or climbs above the repo root via `..`.
+fn escapes_root(p: &str) -> bool {
+    if p.starts_with('/') || p.starts_with('\\') || p.as_bytes().get(1) == Some(&b':') {
+        return true;
+    }
+    let mut depth: i32 = 0;
+    for seg in p.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
+/// A `.m` file that is MATLAB/Octave rather than Objective-C.
+fn looks_matlab(source: &str) -> bool {
+    const OBJC: [&str; 8] = [
+        "@interface",
+        "@implementation",
+        "@protocol",
+        "@end",
+        "#import",
+        "#include",
+        "#define",
+        "@property",
+    ];
+    if OBJC.iter().any(|m| source.contains(m)) {
+        return false;
+    }
+    source.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('%')
+            || (t.starts_with("function ") && !t.contains('{'))
+            || t.starts_with("classdef ")
+    })
 }
 
 #[cfg(test)]
@@ -1061,5 +1154,42 @@ mod tests {
         assert_eq!(meta.module_for("a/b/c").unwrap().name, "a/b");
         assert_eq!(meta.module_for("a/z").unwrap().name, "a");
         assert!(meta.module_for("zzz").is_none());
+    }
+
+    #[test]
+    fn relpath_strips_every_leading_dot_slash() {
+        assert_eq!(RelPath::new("././a.rs").as_str(), "a.rs");
+        assert_eq!(RelPath::new("././/b/c.rs").as_str(), "b/c.rs");
+        assert_eq!(RelPath::new("a/./b.rs").as_str(), "a/./b.rs");
+    }
+
+    #[test]
+    fn file_index_read_refuses_paths_outside_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repo");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/in.txt"), "in").unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "secret").unwrap();
+        let idx = FileIndex::new(&root, [RelPath::new("sub/in.txt")]);
+        assert_eq!(idx.read("sub/in.txt").as_deref(), Some("in"));
+        assert_eq!(idx.read("sub/../sub/in.txt").as_deref(), Some("in"));
+        assert!(idx.read("../secret.txt").is_none());
+        assert!(idx.read("sub/../../secret.txt").is_none());
+        let abs = outer.path().join("secret.txt");
+        assert!(idx.read(abs.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn dot_m_matlab_is_not_objective_c() {
+        let p = RelPath::new("a.m");
+        let matlab = "% solve\nfunction y = f(x)\n  y = x + 1;\nend\n";
+        assert_eq!(Language::from_path_and_source(&p, matlab), None);
+        let objc = "#import <Foundation/Foundation.h>\n@implementation A\n@end\n";
+        assert_eq!(
+            Language::from_path_and_source(&p, objc),
+            Some(Language::ObjC)
+        );
+        // Unknown/empty content keeps the historical ObjC default.
+        assert_eq!(Language::from_path_and_source(&p, ""), Some(Language::ObjC));
     }
 }
