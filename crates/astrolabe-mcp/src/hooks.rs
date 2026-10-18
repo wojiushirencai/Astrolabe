@@ -142,6 +142,11 @@ impl HooksConfig {
                 })
             })
             .unwrap_or(DEFAULT_GREP_THRESHOLD);
+        if grep_threshold == 0 {
+            tracing::warn!(
+                "{ENV_GREP_THRESHOLD}=0 is treated as 1 (first grep denied); use ASTROLABE_DENY_TEXT_SEARCH for hard deny"
+            );
+        }
 
         let deny_text_search =
             parse_env_bool(std::env::var(ENV_DENY_TEXT_SEARCH).ok().as_deref()).unwrap_or(false);
@@ -615,12 +620,55 @@ where
     result
 }
 
+/// `command` 字段：字符串原样；字符串数组按 argv 拼接（含空白的元素加单引号）
+fn command_value_to_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(a) if !a.is_empty() => {
+            let parts: Option<Vec<String>> = a
+                .iter()
+                .map(|x| {
+                    x.as_str().map(|t| {
+                        if t.is_empty() || t.contains(char::is_whitespace) {
+                            format!("'{}'", t.replace('\'', "'\\''"))
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                })
+                .collect();
+            parts.map(|p| p.join(" "))
+        }
+        _ => None,
+    }
+}
+
+/// 本服务固定目录里的 7 个工具名
+const ASTROLABE_CATALOG_TOOLS: &[&str] = &[
+    "resolve_context",
+    "search_code",
+    "find_symbol",
+    "find_references",
+    "goto_definition",
+    "get_diagnostics",
+    "get_languages",
+];
+
+/// 工具名是否属于 Astrolabe：含 "astrolabe" 且含固定目录里的某个工具名。
+/// 第三方 `mcp__astrolabe_docs__fetch` 之类仅名字撞上的工具不算。
+pub(crate) fn is_astrolabe_tool(tool_name: &str) -> bool {
+    tool_name.contains("astrolabe")
+        && ASTROLABE_CATALOG_TOOLS
+            .iter()
+            .any(|t| tool_name.contains(t))
+}
+
 /// 判定工具名是否为 Astrolabe 符号工具
 ///
 /// tool_name 含 "astrolabe" 且不含子串
 /// {pattern, search_code, diagnostics, languages, instructions}
 pub(crate) fn is_astrolabe_symbolic_tool(tool_name: &str) -> bool {
-    tool_name.contains("astrolabe")
+    is_astrolabe_tool(tool_name)
         && !NON_SYMBOLIC_ASTROLABE_SUBSTRINGS
             .iter()
             .any(|sub| tool_name.contains(sub))
@@ -1279,7 +1327,7 @@ pub(crate) fn classify_tool_ex(
 
     // 1.5 非符号 astrolabe 工具（search_code / diagnostics / instructions 等）：
     // 只清零切片读额度（decide 中处理），不清零 grep/read/non_symbolic 计数
-    if tool_name.contains("astrolabe") {
+    if is_astrolabe_tool(tool_name) {
         return ToolKind::AstrolabeNonSymbolic;
     }
 
@@ -1966,12 +2014,14 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
         tool_input_offset = map.get("offset").and_then(json_value_as_u64);
 
         // 取 cmd / command
-        let cmd = map
+        // Codex 可能把 command 传成 argv 数组（["bash","-lc","grep …"]）：拼成一条命令串
+        let cmd_owned: Option<String> = map
             .get("cmd")
             .or_else(|| map.get("command"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
+            .and_then(command_value_to_string)
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let cmd = cmd_owned.as_deref();
         if let Some(cmd_str) = cmd {
             full_command = Some(cmd_str.to_string());
             if let Some((name, args)) = effective_shell_command(cmd_str) {
@@ -2032,14 +2082,14 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
     // load → decide → save 在同一把文件锁内串行化
     let decision = match persistence_path.as_ref() {
         Some(path) => with_counter_locked(path, |mut counter| {
+            let before = counter.clone();
             let decision = decide_with(&mut counter, tool_kind, now_ts, cfg);
-            let should_save = matches!(
-                decision,
-                Decision::ResetSymbolic
-                    | Decision::ResetSlice
-                    | Decision::Allow
-                    | Decision::Deny(_)
-            );
+            // 重置类决定在状态本来就是零时不落盘（省一次 rename + 锁）
+            let should_save = match decision {
+                Decision::ResetSymbolic | Decision::ResetSlice => counter != before,
+                Decision::Allow | Decision::Deny(_) => true,
+                _ => false,
+            };
             (counter, should_save, decision)
         }),
         None => {
@@ -5866,5 +5916,59 @@ mod tests {
         assert!(is_sed_slice_print("-ne '10,20p' src/a.rs"));
         assert!(!is_sed_slice_print("-ni '10,20p' src/a.rs"));
         assert!(!is_sed_slice_print("'10,20p' src/a.rs"));
+    }
+
+    #[test]
+    fn third_party_astrolabe_named_tools_are_not_astrolabe() {
+        assert!(!is_astrolabe_tool("mcp__astrolabe_docs__fetch_page"));
+        assert!(!is_astrolabe_symbolic_tool(
+            "mcp__astrolabe_docs__fetch_page"
+        ));
+        assert!(is_astrolabe_tool("mcp__astrolabe__find_symbol"));
+        assert!(is_astrolabe_symbolic_tool(
+            "mcp__astrolabe-ai__find_references"
+        ));
+        assert!(is_astrolabe_tool("mcp__astrolabe__search_code"));
+        assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__search_code"));
+    }
+
+    #[test]
+    fn command_array_is_joined_and_classified() {
+        let v = serde_json::json!(["bash", "-lc", "grep -rn foo src"]);
+        let s = command_value_to_string(&v).unwrap();
+        assert_eq!(s, "bash -lc 'grep -rn foo src'");
+        assert_eq!(
+            command_value_to_string(&serde_json::json!("ls")).as_deref(),
+            Some("ls")
+        );
+        assert!(command_value_to_string(&serde_json::json!([])).is_none());
+        let (name, _) = effective_shell_command(&s).unwrap();
+        assert_eq!(name, "grep");
+    }
+
+    #[test]
+    fn redundant_reset_does_not_write_counter() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("astrolabe_noop_reset_{rand_id}"));
+        let payload = br#"{"session_id":"noop1","tool_name":"mcp__astrolabe__find_symbol"}"#;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_remind_impl(
+            "claude-code",
+            &payload[..],
+            &mut out,
+            &mut err,
+            Some(10.0),
+            Some(&home),
+        );
+        assert_eq!(code, 0);
+        let path = get_hook_data_dir(&home, "noop1", None)
+            .unwrap()
+            .join("counter.json");
+        // 状态本就是零：不应创建 counter.json
+        assert!(!path.exists(), "no-op reset must not write counter.json");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

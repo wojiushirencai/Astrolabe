@@ -8,7 +8,7 @@
 
 ## 2. Claude Code 配方
 
-可选：将以下配置写入项目 `.claude/settings.json`（或全局 `~/.claude/settings.json`）：
+可选：将以下配置**合并进**（不要覆盖已有的 `hooks` 条目）项目 `.claude/settings.json`（或全局 `~/.claude/settings.json`）：
 ```json
 {
   "hooks": {
@@ -65,8 +65,10 @@ Astrolabe 防漂移 Hook 层已内置对 **Codebuddy** 与 **Grok** 客户端的
 > ```
 >
 > ```json
-> "command": "ASTROLABE_DENY_TEXT_SEARCH=true astrolabe hooks remind --client=claude-code --deny-text-search"
+> "command": "astrolabe hooks remind --client=claude-code --deny-text-search"
 > ```
+>
+> `--deny-text-search` 是跨平台写法（Windows cmd/PowerShell 不支持 `VAR=1 cmd` 前缀语法，请勿在 hooks 命令里使用）。
 >
 > 或把 `deny_text_search: true` 写进自定义 context YAML，hooks 用 `--context=/path/to.yml`（优先级：CLI `--deny-text-search` > 环境变量 > context YAML > 默认 off）。
 >
