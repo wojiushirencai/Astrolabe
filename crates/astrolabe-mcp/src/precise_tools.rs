@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use astrolabe_core::{
-    budget::truncate_ranked,
-    lsp::{Diagnostic, Location, Position, Precise, Severity},
+    budget::{estimate_tokens, truncate_ranked},
+    lsp::{queries::AMBIGUOUS_DEFINITIONS_MARK, Diagnostic, Location, Position, Precise, Severity},
     render::{anchor, confidence_note},
     Confidence, Language, RelPath,
 };
@@ -40,22 +40,65 @@ fn default_budget() -> usize {
     DEFAULT_BUDGET
 }
 
+/// Same ceiling `ASTROLABE_MAX_BUDGET_TOKENS` puts on the other tools
+/// (default 32000); `budget_tokens` above it is lowered, never honoured.
+const MAX_BUDGET_TOKENS: usize = 32_000;
+
+fn effective_budget(raw: usize) -> usize {
+    let max = std::env::var("ASTROLABE_MAX_BUDGET_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_BUDGET_TOKENS);
+    raw.min(max)
+}
+
+/// Stated once per result that lists positions.
+const COORD_NOTE: &str =
+    "坐标：行、列均从 1 起，列按 UTF-16 单位；作为 line/character 入参时用 0 起的值（各减 1）。\n";
+
+/// One page of `items` starting at `offset`, cut by `budget`. Always keeps at
+/// least one item when any remain, so `next_offset` advances. Returns the kept
+/// items and how many remain after them.
+fn page<'a>(items: &'a [String], offset: usize, budget: usize) -> (Vec<&'a String>, usize) {
+    let rest = items.get(offset..).unwrap_or(&[]);
+    let (mut kept, mut omitted) = truncate_ranked(rest, budget, |line| format!("{line}\n"));
+    if kept.is_empty() && !rest.is_empty() {
+        kept.push(&rest[0]);
+        omitted -= 1;
+    }
+    (kept, omitted)
+}
+
+fn omitted_line(omitted: usize, next_offset: usize) -> String {
+    format!("{omitted} 个结果因 budget_tokens 被省略；用 offset={next_offset} 取后续。\n")
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct FindReferencesParams {
+    #[serde(default)]
+    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    pub root: Option<String>,
     #[schemars(description = "Symbol name to find references for.")]
     pub symbol: String,
     #[serde(default)]
-    #[schemars(description = "Optional repo-relative file scoping the query.")]
+    #[schemars(
+        required,
+        description = "Repo-relative file (selects the language server)."
+    )]
     pub path: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based line of symbol in path.")]
+    #[schemars(description = "Optional 0-based line.")]
     pub line: Option<u32>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based column; used with line.")]
+    #[schemars(description = "Optional 0-based UTF-16 column; used with line.")]
     pub character: Option<u32>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate token budget.")]
+    #[schemars(description = "Max tokens (capped at 32000).")]
     pub budget_tokens: usize,
+    #[serde(default)]
+    #[schemars(description = "Skip first N results (paging).")]
+    pub offset: Option<usize>,
     #[serde(default)]
     #[schemars(description = "New name: preview per-file edits (no write).")]
     pub dry_run_rename: Option<String>,
@@ -63,6 +106,9 @@ pub(crate) struct FindReferencesParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GotoDefinitionParams {
+    #[serde(default)]
+    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    pub root: Option<String>,
     #[schemars(description = "Repo-relative file containing the target symbol reference.")]
     pub path: String,
     #[serde(default)]
@@ -72,15 +118,21 @@ pub(crate) struct GotoDefinitionParams {
     #[schemars(description = "Optional 0-based line; used with character.")]
     pub line: Option<u32>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based column; used with line.")]
+    #[schemars(description = "Optional 0-based UTF-16 column.")]
     pub character: Option<u32>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate token budget.")]
+    #[schemars(description = "Max tokens (capped at 32000).")]
     pub budget_tokens: usize,
+    #[serde(default)]
+    #[schemars(description = "Skip first N results (paging).")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GetDiagnosticsParams {
+    #[serde(default)]
+    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    pub root: Option<String>,
     #[schemars(description = "Repo-relative file to diagnose.")]
     pub path: String,
     #[serde(default)]
@@ -217,9 +269,10 @@ impl PreciseTools {
 }
 
 pub(crate) fn run_find_references(
-    params: FindReferencesParams,
+    mut params: FindReferencesParams,
     backend: &dyn PreciseCapability,
 ) -> CallToolResult {
+    params.budget_tokens = effective_budget(params.budget_tokens);
     if params.symbol.trim().is_empty() {
         return text_result(
             unknown_preamble(Some("symbol 不能为空。"), params.path.as_deref(), true),
@@ -236,8 +289,9 @@ pub(crate) fn run_find_references(
         _ => None,
     };
     let result = backend.references(&params.symbol, params.path.as_deref(), position);
-    let mut locations = result.value;
-    locations.sort_by(|a, b| a.path.cmp(&b.path).then(a.range.cmp(&b.range)));
+    // Order is the backend's: queried file first, then path and position, so
+    // budget truncation drops the least local hits last.
+    let locations = result.value;
 
     // Keep the preamble out of ranked truncation so a zero budget still
     // yields non-empty text (the Cursor `content[0]` contract).
@@ -257,25 +311,40 @@ pub(crate) fn run_find_references(
         header
     };
 
+    let offset = params.offset.unwrap_or(0);
     let items: Vec<String> = locations.iter().map(render_location).collect();
-    let (kept, omitted) = truncate_ranked(&items, params.budget_tokens, |line| format!("{line}\n"));
+    let (kept, omitted) = page(&items, offset, params.budget_tokens);
 
     let mut body = preamble;
-    for line in kept {
+    if !kept.is_empty() {
+        body.push_str(COORD_NOTE);
+    }
+    if offset > 0 && offset >= items.len() && !items.is_empty() {
+        body.push_str(&format!("offset={offset} 超出结果总数 {}。\n", items.len()));
+    }
+    for line in &kept {
         body.push_str(line);
         body.push('\n');
     }
+    let next_offset = offset + kept.len();
     if omitted > 0 {
-        body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
+        body.push_str(&omitted_line(omitted, next_offset));
     }
     let mut preview_files = 0usize;
     if let Some(new_name) = params.dry_run_rename.as_deref() {
+        // One shared budget: the preview only gets what the list left over.
+        let remaining = params.budget_tokens.saturating_sub(estimate_tokens(&body));
+        let ambiguous = result
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains(AMBIGUOUS_DEFINITIONS_MARK));
         let (text, files) = render_rename_preview(
             &params.symbol,
             new_name,
             &locations,
             result.confidence,
-            params.budget_tokens,
+            ambiguous,
+            remaining,
         );
         body.push_str(&text);
         preview_files = files;
@@ -287,9 +356,11 @@ pub(crate) fn run_find_references(
             "confidence": confidence_json(result.confidence),
             "budget_tokens": params.budget_tokens,
             "matches": locations.len(),
-            "returned": locations.len() - omitted,
+            "offset": offset,
+            "returned": kept.len(),
             "omitted": omitted,
             "truncated": omitted > 0,
+            "next_offset": (omitted > 0).then_some(next_offset),
             "dry_run_rename": params.dry_run_rename.is_some(),
             "rename_files": preview_files,
         }),
@@ -297,7 +368,7 @@ pub(crate) fn run_find_references(
 }
 
 /// Read-only rename preview: per-file checklist of the sites that hold the
-/// old name (1-based line, 0-based column as in the reference list). Nothing
+/// old name (1-based line and column, UTF-16 units, as in the reference list). Nothing
 /// is written; the caller edits file by file and verifies with
 /// get_diagnostics.
 fn render_rename_preview(
@@ -305,6 +376,7 @@ fn render_rename_preview(
     new_name: &str,
     locations: &[Location],
     confidence: Confidence,
+    ambiguous: bool,
     budget_tokens: usize,
 ) -> (String, usize) {
     let new_name = new_name.trim();
@@ -322,9 +394,25 @@ fn render_rename_preview(
     if new_name == symbol {
         return ("改名预览未生成：新名与旧名相同。\n".to_string(), 0);
     }
+    if confidence == Confidence::Unknown {
+        return (
+            format!(
+                "改名预览未生成：`{symbol}` 的引用查询没有得出可信结果（confidence: Unknown），不能据此判断是否需要改动。\n"
+            ),
+            0,
+        );
+    }
+    if ambiguous {
+        return (
+            format!(
+                "改名预览未生成：`{symbol}` 在该文件有多个同名定义，引用已被合并，不是单个符号的改名清单。请用 line/character 指定其中一个再预览。\n"
+            ),
+            0,
+        );
+    }
     if locations.is_empty() {
         return (
-            format!("改名预览：没有找到 `{symbol}` 的引用，无需改动。\n"),
+            format!("改名预览：语言服务器未返回 `{symbol}` 的任何引用，无需改动。\n"),
             0,
         );
     }
@@ -333,7 +421,7 @@ fn render_rename_preview(
         let site = format!(
             "L{}:{}",
             loc.range.start.line.saturating_add(1),
-            loc.range.start.character
+            loc.range.start.character.saturating_add(1)
         );
         match by_file.last_mut() {
             Some((path, sites)) if *path == loc.path.as_str() => sites.push(site),
@@ -368,9 +456,10 @@ fn render_rename_preview(
 }
 
 pub(crate) fn run_goto_definition(
-    params: GotoDefinitionParams,
+    mut params: GotoDefinitionParams,
     backend: &dyn PreciseCapability,
 ) -> CallToolResult {
+    params.budget_tokens = effective_budget(params.budget_tokens);
     if params.path.trim().is_empty() {
         return text_result(
             unknown_preamble_definition(Some("path 不能为空。"), None),
@@ -410,8 +499,7 @@ pub(crate) fn run_goto_definition(
         if has_position { params.line } else { None },
         if has_position { params.character } else { None },
     );
-    let mut locations = result.value;
-    locations.sort_by(|a, b| a.path.cmp(&b.path).then(a.range.cmp(&b.range)));
+    let locations = result.value;
 
     let preamble = if result.confidence == Confidence::Unknown {
         unknown_preamble_definition(result.note.as_deref(), Some(params.path.as_str()))
@@ -430,16 +518,24 @@ pub(crate) fn run_goto_definition(
         header
     };
 
+    let offset = params.offset.unwrap_or(0);
     let items: Vec<String> = locations.iter().map(render_location).collect();
-    let (kept, omitted) = truncate_ranked(&items, params.budget_tokens, |line| format!("{line}\n"));
+    let (kept, omitted) = page(&items, offset, params.budget_tokens);
 
     let mut body = preamble;
-    for line in kept {
+    if !kept.is_empty() {
+        body.push_str(COORD_NOTE);
+    }
+    if offset > 0 && offset >= items.len() && !items.is_empty() {
+        body.push_str(&format!("offset={offset} 超出结果总数 {}。\n", items.len()));
+    }
+    for line in &kept {
         body.push_str(line);
         body.push('\n');
     }
+    let next_offset = offset + kept.len();
     if omitted > 0 {
-        body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
+        body.push_str(&omitted_line(omitted, next_offset));
     }
 
     text_result(
@@ -448,9 +544,11 @@ pub(crate) fn run_goto_definition(
             "confidence": confidence_json(result.confidence),
             "budget_tokens": params.budget_tokens,
             "matches": locations.len(),
-            "returned": locations.len() - omitted,
+            "offset": offset,
+            "returned": kept.len(),
             "omitted": omitted,
             "truncated": omitted > 0,
+            "next_offset": (omitted > 0).then_some(next_offset),
         }),
     )
 }
@@ -572,9 +670,11 @@ fn unknown_preamble(note: Option<&str>, path: Option<&str>, suggest_search: bool
             body.push('\n');
         }
     }
-    body.push_str(&unavailable_ensure_gate(language_of(path)));
-    body.push_str("安装提示：\n");
-    body.push_str(&install_hint(language_of(path)));
+    if server_missing(note) {
+        body.push_str(&unavailable_ensure_gate(language_of(path)));
+        body.push_str("安装提示：\n");
+        body.push_str(&install_hint(language_of(path)));
+    }
     if suggest_search {
         body.push_str(SEARCH_CODE_FALLBACK);
         body.push('\n');
@@ -591,12 +691,33 @@ fn unknown_preamble_definition(note: Option<&str>, path: Option<&str>) -> String
             body.push('\n');
         }
     }
-    body.push_str(&unavailable_ensure_gate(language_of(path)));
-    body.push_str("安装提示：\n");
-    body.push_str(&install_hint(language_of(path)));
+    if server_missing(note) {
+        body.push_str(&unavailable_ensure_gate(language_of(path)));
+        body.push_str("安装提示：\n");
+        body.push_str(&install_hint(language_of(path)));
+    }
     body.push_str(DEFINITION_FALLBACK);
     body.push('\n');
     body
+}
+
+/// True when the note says the language server itself is missing or cannot
+/// start (or when there is no note at all). Only then is an install hint
+/// useful; a bad symbol, position, or timeout with a working server is not
+/// fixed by installing anything.
+fn server_missing(note: Option<&str>) -> bool {
+    let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) else {
+        return true;
+    };
+    [
+        "not installed",
+        "no language server available",
+        "failed to start",
+        "尚未接通",
+        "语言服务器不可用",
+    ]
+    .iter()
+    .any(|m| note.contains(m))
 }
 
 /// Prompt contract when a precise tool hits Unavailable: tell the model to
@@ -710,11 +831,12 @@ fn parse_severity(raw: &str) -> Option<Severity> {
 }
 
 fn render_location(loc: &Location) -> String {
-    // LSP positions are 0-based; graph tools emit 1-based @path:line.
+    // LSP positions are 0-based; every position we print is 1-based
+    // (line in the anchor, UTF-16 column after `col`).
     format!(
         "{}  col {}",
         anchor(&loc.path, loc.range.start.line.saturating_add(1)),
-        loc.range.start.character
+        loc.range.start.character.saturating_add(1)
     )
 }
 
@@ -883,8 +1005,8 @@ mod tests {
         let required = required_fields(&refs);
         assert!(required.iter().any(|f| f == "symbol"), "{required:?}");
         assert!(
-            !required.iter().any(|f| f == "path"),
-            "path must be optional: {required:?}"
+            required.iter().any(|f| f == "path"),
+            "path is effectively required and must be listed: {required:?}"
         );
 
         let diags = schema_for_tool("get_diagnostics");
@@ -924,21 +1046,26 @@ mod tests {
     fn every_tool_returns_nonempty_first_text_when_unwired() {
         let tools = PreciseTools::new();
         assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            root: None,
             symbol: "Handler".into(),
             path: None,
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
             dry_run_rename: None,
         })));
         assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
+            root: None,
             path: "src/main.go".into(),
             symbol: Some("Handler".into()),
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
         })));
         assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
+            root: None,
             path: "src/main.go".into(),
             severity: None,
             budget_tokens: 800,
@@ -954,11 +1081,13 @@ mod tests {
         });
 
         let refs = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            root: None,
             symbol: "Handler".into(),
             path: Some("pkg/server.go".into()),
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
             dry_run_rename: None,
         })));
         let text = first_text(&refs);
@@ -978,6 +1107,7 @@ mod tests {
         );
 
         let diags = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
+            root: None,
             path: "pkg/server.go".into(),
             severity: None,
             budget_tokens: 800,
@@ -989,11 +1119,13 @@ mod tests {
         assert!(!text.contains("search_code"), "{text}");
 
         let defs = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
+            root: None,
             path: "pkg/server.go".into(),
             symbol: Some("Handler".into()),
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
         })));
         let text = first_text(&defs);
         assert!(text.contains("confidence: Unknown"), "{text}");
@@ -1018,11 +1150,13 @@ mod tests {
         });
 
         let refs = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            root: None,
             symbol: "x".into(),
             path: None,
             line: None,
             character: None,
             budget_tokens: 0,
+            offset: None,
             dry_run_rename: None,
         })));
         let text = first_text(&refs);
@@ -1037,6 +1171,7 @@ mod tests {
         );
 
         let diags = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
+            root: None,
             path: "src/lib.rs".into(),
             severity: None,
             budget_tokens: 0,
@@ -1053,11 +1188,13 @@ mod tests {
             diagnostics: Precise::exact(Vec::new()),
         });
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            root: None,
             symbol: "x".into(),
             path: None,
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
             dry_run_rename: None,
         })));
         let text = first_text(&result);
@@ -1080,6 +1217,7 @@ mod tests {
             ]),
         });
         let filtered = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
+            root: None,
             path: "src/a.rs".into(),
             severity: Some("error".into()),
             budget_tokens: 800,
@@ -1090,6 +1228,7 @@ mod tests {
         assert!(text.contains("@src/a.rs:2"), "{text}");
 
         let invalid = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
+            root: None,
             path: "src/a.rs".into(),
             severity: Some("fatal".into()),
             budget_tokens: 800,
@@ -1111,11 +1250,13 @@ mod tests {
             diagnostics: Precise::exact(Vec::new()),
         });
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            root: None,
             symbol: "old_name".into(),
             path: None,
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
             dry_run_rename: Some("new_name".into()),
         })));
         let text = first_text(&result);
@@ -1124,16 +1265,18 @@ mod tests {
             text.contains("`old_name` → `new_name`，共 3 处 / 2 个文件"),
             "{text}"
         );
-        assert!(text.contains("  src/a.rs ×2: L4:4 L10:8"), "{text}");
-        assert!(text.contains("  src/b.rs ×1: L1:12"), "{text}");
+        assert!(text.contains("  src/a.rs ×2: L4:5 L10:9"), "{text}");
+        assert!(text.contains("  src/b.rs ×1: L1:13"), "{text}");
         assert!(text.contains("get_diagnostics"), "{text}");
         // No preview without the parameter.
         let plain = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            root: None,
             symbol: "old_name".into(),
             path: None,
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
             dry_run_rename: None,
         })));
         assert!(!first_text(&plain).contains("改名预览"));
@@ -1141,16 +1284,34 @@ mod tests {
 
     #[test]
     fn dry_run_rename_rejects_bad_names_and_flags_low_confidence() {
-        let (bad, _) =
-            render_rename_preview("a", "1x", &[loc("a.rs", 0, 0)], Confidence::Exact, 800);
+        let (bad, _) = render_rename_preview(
+            "a",
+            "1x",
+            &[loc("a.rs", 0, 0)],
+            Confidence::Exact,
+            false,
+            800,
+        );
         assert!(bad.contains("不是合法标识符"), "{bad}");
-        let (same, _) =
-            render_rename_preview("a", "a", &[loc("a.rs", 0, 0)], Confidence::Exact, 800);
+        let (same, _) = render_rename_preview(
+            "a",
+            "a",
+            &[loc("a.rs", 0, 0)],
+            Confidence::Exact,
+            false,
+            800,
+        );
         assert!(same.contains("相同"), "{same}");
-        let (none, n) = render_rename_preview("a", "b", &[], Confidence::Exact, 800);
+        let (none, n) = render_rename_preview("a", "b", &[], Confidence::Exact, false, 800);
         assert!(none.contains("无需改动") && n == 0, "{none}");
-        let (low, _) =
-            render_rename_preview("a", "b", &[loc("a.rs", 0, 0)], Confidence::Syntactic, 800);
+        let (low, _) = render_rename_preview(
+            "a",
+            "b",
+            &[loc("a.rs", 0, 0)],
+            Confidence::Syntactic,
+            false,
+            800,
+        );
         assert!(low.contains("低于 exact"), "{low}");
     }
 
@@ -1162,11 +1323,13 @@ mod tests {
             diagnostics: Precise::exact(Vec::new()),
         });
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
+            root: None,
             symbol: "neverDefined".into(),
             path: None,
             line: None,
             character: None,
             budget_tokens: 100,
+            offset: None,
             dry_run_rename: None,
         })));
         let text = first_text(&result);
@@ -1184,16 +1347,18 @@ mod tests {
             diagnostics: Precise::exact(Vec::new()),
         });
         let result = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
+            root: None,
             path: "src/main.rs".into(),
             symbol: Some("Widget".into()),
             line: None,
             character: None,
             budget_tokens: 800,
+            offset: None,
         })));
         let text = first_text(&result);
         assert!(text.contains("confidence: Exact"), "{text}");
         assert!(text.contains("@src/lib.rs:12"), "{text}");
-        assert!(text.contains("col 4"), "{text}");
+        assert!(text.contains("col 5"), "{text}");
         assert_eq!(
             result.structured_content.as_ref().unwrap()["matches"],
             json!(1)
@@ -1208,11 +1373,13 @@ mod tests {
             diagnostics: Precise::exact(Vec::new()),
         });
         let result = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
+            root: None,
             path: "src/main.rs".into(),
             symbol: Some("neverDefined".into()),
             line: None,
             character: None,
             budget_tokens: 100,
+            offset: None,
         })));
         let text = first_text(&result);
         assert!(text.contains("confidence: Exact"), "{text}");
@@ -1226,11 +1393,13 @@ mod tests {
         let tools = PreciseTools::new();
         let missing_path =
             assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
+                root: None,
                 path: "".into(),
                 symbol: Some("x".into()),
                 line: None,
                 character: None,
                 budget_tokens: 100,
+                offset: None,
             })));
         let text = first_text(&missing_path);
         assert!(text.contains("confidence: Unknown"), "{text}");
@@ -1238,11 +1407,13 @@ mod tests {
 
         let missing_locator =
             assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
+                root: None,
                 path: "src/main.rs".into(),
                 symbol: None,
                 line: None,
                 character: None,
                 budget_tokens: 100,
+                offset: None,
             })));
         let text = first_text(&missing_locator);
         assert!(text.contains("confidence: Unknown"), "{text}");
@@ -1262,11 +1433,13 @@ mod tests {
             diagnostics: Precise::exact(Vec::new()),
         });
         let result = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
+            root: None,
             path: "src/lib.rs".into(),
             symbol: Some("x".into()),
             line: None,
             character: None,
             budget_tokens: 0,
+            offset: None,
         })));
         let text = first_text(&result);
         assert!(
@@ -1280,5 +1453,164 @@ mod tests {
         let hint = install_hint(None);
         assert!(hint.contains("Dart"));
         assert!(hint.contains("dart language-server"));
+    }
+
+    fn refs_params(
+        budget: usize,
+        offset: Option<usize>,
+        rename: Option<&str>,
+    ) -> FindReferencesParams {
+        FindReferencesParams {
+            symbol: "Run".into(),
+            path: Some("a.go".into()),
+            line: None,
+            character: None,
+            budget_tokens: budget,
+            offset,
+            dry_run_rename: rename.map(str::to_string),
+        }
+    }
+
+    fn fake_refs(references: Precise<Vec<Location>>) -> PreciseTools {
+        tools_with(Fake {
+            references,
+            definition: Precise::exact(Vec::new()),
+            diagnostics: Precise::exact(Vec::new()),
+        })
+    }
+
+    #[test]
+    fn rename_preview_refused_when_references_unknown() {
+        let tools = fake_refs(Precise::unknown(Vec::new(), "gopls is not installed"));
+        let r = tools.find_references(Parameters(refs_params(800, None, Some("Go"))));
+        let text = first_text(&r);
+        assert!(text.contains("改名预览未生成"), "{text}");
+        assert!(!text.contains("无需改动"), "{text}");
+    }
+
+    #[test]
+    fn rename_preview_refused_for_merged_definitions_and_not_called_exact() {
+        let note = format!("{AMBIGUOUS_DEFINITIONS_MARK} `Run` has 3 definitions");
+        let tools = fake_refs(Precise {
+            value: vec![loc("a.go", 5, 11), loc("a.go", 9, 11)],
+            confidence: Confidence::Scoped,
+            note: Some(note),
+        });
+        let r = tools.find_references(Parameters(refs_params(800, None, Some("Go"))));
+        let text = first_text(&r);
+        assert!(text.contains("多个同名定义"), "{text}");
+        assert!(!text.contains("清单来自语言服务器（精确）"), "{text}");
+        assert!(!text.contains("改名预览（只读"), "{text}");
+        assert!(text.contains("confidence: Scoped"), "{text}");
+    }
+
+    #[test]
+    fn truncation_keeps_backend_order_queried_file_first() {
+        // Backend order: queried file (zzz.go) first, then aaa.go.
+        let mut v = vec![loc("zzz.go", 0, 0)];
+        v.extend((0..16).map(|i| loc("aaa.go", i, 0)));
+        let tools = fake_refs(Precise::exact(v));
+        let r = tools.find_references(Parameters(refs_params(8, None, None)));
+        let text = first_text(&r);
+        assert!(text.contains("@zzz.go:1"), "{text}");
+    }
+
+    #[test]
+    fn budget_is_capped_and_preview_shares_it() {
+        let many: Vec<Location> = (0..3000).map(|i| loc("src/lib.rs", i, 0)).collect();
+        let tools = fake_refs(Precise::exact(many));
+        let r = tools.find_references(Parameters(refs_params(100_000_000, None, None)));
+        let s = r.structured_content.unwrap();
+        assert_eq!(s["budget_tokens"], json!(MAX_BUDGET_TOKENS));
+        assert!(s["truncated"].as_bool().unwrap());
+        let text = first_text(&r);
+        assert!(
+            estimate_tokens(text) <= MAX_BUDGET_TOKENS + 300,
+            "{}",
+            estimate_tokens(text)
+        );
+
+        // Preview: list + preview together stay within one budget.
+        let r = tools.find_references(Parameters(refs_params(400, None, Some("Go"))));
+        let text = first_text(&r);
+        assert!(
+            estimate_tokens(text) <= 400 + 120,
+            "{}",
+            estimate_tokens(text)
+        );
+    }
+
+    #[test]
+    fn find_references_pages_with_offset() {
+        let many: Vec<Location> = (0..40).map(|i| loc("src/lib.rs", i, 0)).collect();
+        let tools = fake_refs(Precise::exact(many));
+        let first = tools.find_references(Parameters(refs_params(60, None, None)));
+        let s1 = first.structured_content.clone().unwrap();
+        assert_eq!(s1["truncated"], json!(true));
+        let next = s1["next_offset"].as_u64().unwrap() as usize;
+        assert!(next > 0);
+        let t1 = first_text(&first).to_string();
+        assert!(t1.contains(&format!("offset={next}")), "{t1}");
+        let second = tools.find_references(Parameters(refs_params(60, Some(next), None)));
+        let t2 = first_text(&second);
+        assert!(t2.contains(&format!("@src/lib.rs:{}", next + 1)), "{t2}");
+        assert!(!t2.contains("@src/lib.rs:1 "), "{t2}");
+        // Zero budget still advances.
+        let z = tools.find_references(Parameters(refs_params(0, Some(3), None)));
+        assert_eq!(z.structured_content.unwrap()["next_offset"], json!(4));
+    }
+
+    #[test]
+    fn goto_definition_pages_and_lists_all_definitions() {
+        let defs: Vec<Location> = (0..3).map(|i| loc("a.go", i * 10, 5)).collect();
+        let tools = tools_with(Fake {
+            references: Precise::exact(Vec::new()),
+            definition: Precise {
+                value: defs,
+                confidence: Confidence::Scoped,
+                note: Some(format!(
+                    "{AMBIGUOUS_DEFINITIONS_MARK} `Run` has 3 declarations"
+                )),
+            },
+            diagnostics: Precise::exact(Vec::new()),
+        });
+        let r = tools.goto_definition(Parameters(GotoDefinitionParams {
+            path: "a.go".into(),
+            symbol: Some("Run".into()),
+            line: None,
+            character: None,
+            budget_tokens: 800,
+            offset: None,
+        }));
+        let text = first_text(&r);
+        assert!(
+            text.contains("@a.go:1 ") && text.contains("@a.go:11 ") && text.contains("@a.go:21 "),
+            "{text}"
+        );
+        assert!(text.contains("3 declarations"), "{text}");
+        assert!(!text.contains("confidence: Exact"), "{text}");
+    }
+
+    #[test]
+    fn coordinates_are_one_based_and_stated() {
+        let tools = fake_refs(Precise::exact(vec![loc("a.go", 5, 11)]));
+        let r = tools.find_references(Parameters(refs_params(800, None, Some("Go"))));
+        let text = first_text(&r);
+        assert!(text.contains("@a.go:6  col 12"), "{text}");
+        assert!(text.contains("L6:12"), "{text}");
+        assert!(text.contains("UTF-16"), "{text}");
+    }
+
+    #[test]
+    fn install_hint_only_when_server_is_missing() {
+        let tools = fake_refs(Precise::unknown(
+            Vec::new(),
+            "symbol `NoSuchThing` not found in a.go; cannot provide precise references.",
+        ));
+        let r = tools.find_references(Parameters(refs_params(800, None, None)));
+        let text = first_text(&r);
+        assert!(text.contains("not found in a.go"), "{text}");
+        assert!(!text.contains("go install"), "{text}");
+        assert!(!text.contains("语言服务器不可用"), "{text}");
     }
 }

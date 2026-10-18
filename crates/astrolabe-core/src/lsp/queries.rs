@@ -32,6 +32,11 @@ pub enum SymbolAt<'a> {
     Name(&'a str),
 }
 
+/// Marker put in a result note when a by-name query matched several
+/// declarations and their answers were merged. Callers (the MCP rename
+/// preview) refuse to present such a list as one symbol's exact checklist.
+pub const AMBIGUOUS_DEFINITIONS_MARK: &str = "[ambiguous-definitions]";
+
 const TEXT_SEARCH_HINT: &str =
     "search_code can fall back to a text search but will have false positives";
 
@@ -77,6 +82,7 @@ pub fn find_references(
     let mut result = guard_cold_index(finalize_hits(hits, repo_root, path), server);
     let all_external = result.value.is_empty() && result.note.is_some();
     let mut notes: Vec<String> = result.note.take().into_iter().collect();
+    cap_confidence(&mut result.confidence, sites.cap);
     if let Some(note) = sites.note {
         notes.push(note);
     }
@@ -187,6 +193,9 @@ struct QuerySites {
     note: Option<String>,
     /// A caller-given position that sits inside a comment / string.
     in_comment: bool,
+    /// Highest confidence the merged answer may claim: several declarations
+    /// of one name were merged (`Scoped`) or some were dropped (`Syntactic`).
+    cap: Option<Confidence>,
 }
 
 /// Why no references query site could be produced.
@@ -296,28 +305,96 @@ pub fn goto_definition(
     let Some(server) = server else {
         return unavailable_definition_without_server(path);
     };
-    let position = match resolve_definition_position(repo_root, path, target) {
-        Ok(position) => position,
+    let resolved = match resolve_definition_positions(repo_root, path, target) {
+        Ok(resolved) => resolved,
         Err(failed) => return failed,
     };
-    match server.definition(path, position) {
-        Ok(hits) => guard_cold_index(finalize_hits(hits, repo_root, path), server),
-        Err(err) => degrade_definition(&err),
+    let mut hits = Vec::new();
+    let mut errors = Vec::new();
+    for position in &resolved.positions {
+        match server.definition(path, *position) {
+            Ok(found) => hits.extend(found),
+            Err(err) => errors.push(err),
+        }
     }
+    if errors.len() == resolved.positions.len() {
+        return degrade_definition(&errors[0]);
+    }
+    let mut result = guard_cold_index(finalize_hits(hits, repo_root, path), server);
+    cap_confidence(&mut result.confidence, resolved.cap);
+    let mut notes: Vec<String> = result.note.take().into_iter().collect();
+    if let Some(note) = resolved.note {
+        notes.push(note);
+    }
+    if !errors.is_empty() {
+        result.confidence = Confidence::Unknown;
+        notes.push(format!(
+            "{} of {} definition queries failed ({}); results may be incomplete",
+            errors.len(),
+            resolved.positions.len(),
+            errors[0]
+        ));
+    }
+    result.note = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("; "))
+    };
+    result
 }
 
-/// Locate the cursor for a definition query without anchoring through a
+struct DefinitionPositions {
+    positions: Vec<Position>,
+    note: Option<String>,
+    cap: Option<Confidence>,
+}
+
+/// Locate the cursor(s) for a definition query without anchoring through a
 /// prior `definition` round-trip (unlike [`resolve_named_site`] for references).
-fn resolve_definition_position(
+/// A name with several declarations yields one position per declaration (at
+/// most [`MAX_DEFINITION_ANCHORS`]) and a note saying so.
+fn resolve_definition_positions(
     repo_root: &Path,
     path: &RelPath,
     target: SymbolAt<'_>,
-) -> Result<Position, Precise<Vec<Location>>> {
+) -> Result<DefinitionPositions, Precise<Vec<Location>>> {
+    let single = |position| DefinitionPositions {
+        positions: vec![position],
+        note: None,
+        cap: None,
+    };
     match target {
-        SymbolAt::Position(position) => Ok(position),
+        SymbolAt::Position(position) => Ok(single(position)),
         SymbolAt::Name(name) => match locate_named(repo_root, path, name, "definitions") {
-            Ok(Anchor::Definitions(defs)) => Ok(defs[0]),
-            Ok(Anchor::Usage(position)) => Ok(position),
+            Ok(Anchor::Definitions(mut defs)) => {
+                let total = defs.len();
+                if total > MAX_DEFINITION_ANCHORS {
+                    defs.truncate(MAX_DEFINITION_ANCHORS);
+                    Ok(DefinitionPositions {
+                        note: Some(format!(
+                            "{AMBIGUOUS_DEFINITIONS_MARK} `{name}` has {total} declarations in {}; \
+                             definitions of the first {MAX_DEFINITION_ANCHORS} only (incomplete). \
+                             Pass line/character to target one",
+                            path.as_str()
+                        )),
+                        positions: defs,
+                        cap: Some(Confidence::Syntactic),
+                    })
+                } else if total > 1 {
+                    Ok(DefinitionPositions {
+                        note: Some(format!(
+                            "{AMBIGUOUS_DEFINITIONS_MARK} `{name}` has {total} declarations in {}; \
+                             definitions of all of them are listed. Pass line/character to target one",
+                            path.as_str()
+                        )),
+                        positions: defs,
+                        cap: Some(Confidence::Scoped),
+                    })
+                } else {
+                    Ok(single(defs[0]))
+                }
+            }
+            Ok(Anchor::Usage(position)) => Ok(single(position)),
             Ok(_) => unreachable!("mapped to Err"),
             Err(reason) => Err(Precise::unknown(Vec::new(), reason)),
         },
@@ -618,6 +695,7 @@ fn resolve_query_site(
                 sites: vec![(path.clone(), position)],
                 note: None,
                 in_comment,
+                cap: None,
             })
         }
         SymbolAt::Name(name) => resolve_named_site(server, repo_root, path, name),
@@ -690,17 +768,20 @@ fn resolve_named_site(
     };
     let total = sites.len();
     let mut note = None;
+    let mut cap = None;
     let mut sites = sites;
     if total > MAX_DEFINITION_ANCHORS {
         sites.truncate(MAX_DEFINITION_ANCHORS);
+        cap = Some(Confidence::Syntactic);
         note = Some(format!(
-            "`{name}` has {total} definitions; merged references of the first {MAX_DEFINITION_ANCHORS} only. \
+            "{AMBIGUOUS_DEFINITIONS_MARK} `{name}` has {total} definitions; merged results of the first {MAX_DEFINITION_ANCHORS} only (incomplete). \
              Pass line/character to target one"
         ));
     } else if total > 1 {
+        cap = Some(Confidence::Scoped);
         note = Some(format!(
-            "`{name}` has {total} definitions ({}); references of all of them were merged. \
-             Pass line/character to target one",
+            "{AMBIGUOUS_DEFINITIONS_MARK} `{name}` has {total} definitions ({}); results of all of them were merged, \
+             so this is not the list for one symbol. Pass line/character to target one",
             describe_sites(&sites)
         ));
     }
@@ -708,7 +789,23 @@ fn resolve_named_site(
         sites,
         note,
         in_comment: false,
+        cap,
     })
+}
+
+/// Lower `confidence` to at most `cap` (Exact > Scoped > Syntactic > Unknown).
+fn cap_confidence(confidence: &mut Confidence, cap: Option<Confidence>) {
+    let rank = |c: Confidence| match c {
+        Confidence::Exact => 0,
+        Confidence::Scoped => 1,
+        Confidence::Syntactic => 2,
+        Confidence::Unknown => 3,
+    };
+    if let Some(cap) = cap {
+        if rank(*confidence) < rank(cap) {
+            *confidence = cap;
+        }
+    }
 }
 
 fn finalize_hits(
@@ -772,7 +869,8 @@ fn external_note(in_repo: &[Location], external: &[String]) -> Option<String> {
     let shown = format_external_list(external);
     if in_repo.is_empty() {
         Some(format!(
-            "all {} result(s) sit outside the repository (stdlib or dependencies) and were omitted: {shown}",
+            "{} 条结果全部在仓库外（标准库或依赖）已省略；all {} result(s) sit outside the repository (stdlib or dependencies) and were omitted: {shown}",
+            external.len(),
             external.len()
         ))
     } else {
@@ -2221,7 +2319,74 @@ mod tests {
         let ref_calls = server.ref_calls.lock().unwrap().clone();
         assert_eq!(ref_calls.len(), 2);
         assert_eq!(result.value.len(), 1, "merged hits are de-duplicated");
-        assert!(result.note.unwrap().contains("2 definitions"));
+        assert!(result.note.as_ref().unwrap().contains("2 definitions"));
+        assert_eq!(
+            result.confidence,
+            Confidence::Scoped,
+            "merged definitions must not claim Exact"
+        );
+        assert!(result
+            .note
+            .unwrap()
+            .contains(super::AMBIGUOUS_DEFINITIONS_MARK));
+    }
+
+    #[test]
+    fn more_than_max_definitions_is_syntactic_and_incomplete() {
+        let mut src = String::new();
+        for i in 0..(MAX_DEFINITION_ANCHORS + 2) {
+            src.push_str(&format!("func (T{i}) Run() {{}}\n"));
+        }
+        let repo = TempRepo::new(&[("m.go", &format!("package m\n{src}"))]);
+        let server = FakeServer::refs(vec![loc("m.go", 1, 10)]);
+        let result = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("m.go"),
+            SymbolAt::Name("Run"),
+        );
+        assert_eq!(
+            server.ref_calls.lock().unwrap().len(),
+            MAX_DEFINITION_ANCHORS
+        );
+        assert_eq!(result.confidence, Confidence::Syntactic);
+        assert!(result.note.unwrap().contains("incomplete"));
+    }
+
+    #[test]
+    fn goto_definition_by_name_queries_every_declaration() {
+        let repo = TempRepo::new(&[(
+            "a.go",
+            "package a\nfunc (A) Run() {}\nfunc (B) Run() {}\nfunc Run() {}\n",
+        )]);
+        let mut server = FakeServer::refs(Vec::new());
+        server.definition = Script::Ok(vec![loc("a.go", 1, 10)]);
+        let result = goto_definition(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("a.go"),
+            SymbolAt::Name("Run"),
+        );
+        assert_eq!(server.def_calls.lock().unwrap().len(), 3);
+        assert_eq!(result.confidence, Confidence::Scoped);
+        let note = result.note.unwrap();
+        assert!(note.contains("3 declarations"), "{note}");
+        assert!(note.contains(super::AMBIGUOUS_DEFINITIONS_MARK), "{note}");
+    }
+
+    #[test]
+    fn goto_definition_single_declaration_stays_exact() {
+        let repo = TempRepo::new(&[("a.go", "package a\nfunc Only() {}\n")]);
+        let mut server = FakeServer::refs(Vec::new());
+        server.definition = Script::Ok(vec![loc("a.go", 1, 5)]);
+        let result = goto_definition(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("a.go"),
+            SymbolAt::Name("Only"),
+        );
+        assert_eq!(result.confidence, Confidence::Exact);
+        assert!(result.note.is_none());
     }
 
     #[test]
