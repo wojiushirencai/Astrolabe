@@ -1732,6 +1732,62 @@ serde = "1"
     }
 
     #[test]
+    fn nested_groups_mod_decl_and_workspace_path_dep_all_resolve() {
+        let repo = TempRepo::new(
+            "nested",
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"app\", \"libs/*\"]\n"),
+                (
+                    "app/Cargo.toml",
+                    "[package]\nname = \"app\"\n[dependencies]\nutil = { path = \"../libs/util\" }\nserde = \"1\"\n",
+                ),
+                ("app/src/main.rs", "mod foo;\nmod bar;"),
+                ("app/src/foo.rs", ""),
+                ("app/src/bar/mod.rs", "pub mod deep;"),
+                ("app/src/bar/deep.rs", ""),
+                ("libs/util/Cargo.toml", "[package]\nname = \"util\"\n"),
+                ("libs/util/src/lib.rs", "pub mod io;"),
+                ("libs/util/src/io.rs", ""),
+            ],
+        );
+        let files = repo.index();
+        let m = RustResolver.detect(&files);
+        let from = RelPath::new("app/src/main.rs");
+        let r = RustResolver.resolve_import(
+            &from,
+            "use {crate::{foo::A, bar::{deep::B, self}}, util::io::C, serde::X};",
+            &files,
+            &m,
+        );
+        match r {
+            ImportResolution::Files(v) => {
+                let v: Vec<&str> = v.iter().map(|p| p.as_str()).collect();
+                for want in [
+                    "app/src/foo.rs",
+                    "app/src/bar/deep.rs",
+                    "libs/util/src/io.rs",
+                ] {
+                    assert!(v.contains(&want), "missing {want} in {v:?}");
+                }
+                assert!(!v.iter().any(|p| p.contains("serde")));
+            }
+            other => panic!("expected files, got {other:?}"),
+        }
+        assert_eq!(
+            res(&files, &m, "app/src/main.rs", "use serde::Deserialize;"),
+            None
+        );
+        assert_eq!(
+            res(&files, &m, "app/src/main.rs", "mod foo;"),
+            Some("app/src/foo.rs".into())
+        );
+        assert_eq!(
+            res(&files, &m, "app/src/main.rs", "use util::io::C;"),
+            Some("libs/util/src/io.rs".into())
+        );
+    }
+
+    #[test]
     fn expand_use_tree_flattens_nested_groups() {
         let paths = expand_use_tree("a::{b, c::{d, e as f}, g::*, h::{self}}");
         let joined: Vec<String> = paths.iter().map(|p| p.join("::")).collect();
