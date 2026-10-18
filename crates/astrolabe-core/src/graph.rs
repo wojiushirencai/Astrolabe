@@ -98,7 +98,7 @@ pub fn rank_for_task(g: &CodeGraph, task: &str, base: &Centrality) -> Centrality
         };
         let compact = compact_lower(&symbol.name);
         let (explicit_match, split_match) =
-            symbol_matches(symbol, &compact, &task_words, &task_compact, 3);
+            symbol_matches(&symbol.name, &compact, &task_words, &task_compact, 3);
 
         if explicit_match || split_match {
             boosts[i] *= 10.0;
@@ -276,13 +276,26 @@ fn compact_lower(text: &str) -> String {
 /// the whole compacted name (>= `min_explicit_len` chars) occurs in the task;
 /// `split` means the name's words occur among the task's words.
 fn symbol_matches(
-    symbol: &CodeSymbol,
+    name: &str,
     compact: &str,
     task_words: &BTreeSet<String>,
     task_compact: &str,
     min_explicit_len: usize,
 ) -> (bool, bool) {
-    let words = split_words(&symbol.name);
+    let explicit_match = compact.len() >= min_explicit_len && task_compact.contains(compact);
+    // A split match needs at least one task word (>= 3 bytes) inside the
+    // name; every name word is a contiguous run of `compact`. Skipping the
+    // allocation-heavy `split_words` for the vast majority of symbols keeps
+    // resolve_context fast on large graphs. ASCII names only, so lowercase
+    // folding is identical.
+    if compact.is_ascii()
+        && !task_words
+            .iter()
+            .any(|w| w.len() >= 3 && compact.contains(w.as_str()))
+    {
+        return (explicit_match, false);
+    }
+    let words = split_words(name);
     let meaningful: Vec<&String> = words.iter().filter(|word| word.len() >= 3).collect();
     let split_match = !meaningful.is_empty()
         && meaningful
@@ -290,7 +303,6 @@ fn symbol_matches(
             .filter(|word| task_words.contains((*word).as_str()))
             .count()
             >= meaningful.len().min(2);
-    let explicit_match = compact.len() >= min_explicit_len && task_compact.contains(compact);
     (explicit_match, split_match)
 }
 
@@ -372,7 +384,8 @@ pub fn match_task(g: &CodeGraph, task: &str) -> TaskMatch {
     }
     for (idx, symbol) in g.symbols.iter().enumerate() {
         let compact = compact_lower(&symbol.name);
-        let (explicit, split) = symbol_matches(symbol, &compact, &task_words, &task_compact, 4);
+        let (explicit, split) =
+            symbol_matches(&symbol.name, &compact, &task_words, &task_compact, 4);
         if explicit || split {
             out.symbols.insert(idx);
         }
@@ -746,5 +759,48 @@ mod tests {
         let g2 = graph(vec![import(0, 1)]);
         assert_eq!(dependents(&g2, FileId(1)), vec![FileId(0)]);
         assert_eq!(first.len(), 2);
+    }
+
+    #[test]
+    fn symbol_matches_prefilter_keeps_results() {
+        // Reference: the unfiltered definition.
+        fn reference(name: &str, tw: &BTreeSet<String>, tc: &str, min: usize) -> (bool, bool) {
+            let words = split_words(name);
+            let meaningful: Vec<&String> = words.iter().filter(|w| w.len() >= 3).collect();
+            let split = !meaningful.is_empty()
+                && meaningful
+                    .iter()
+                    .filter(|w| tw.contains((*w).as_str()))
+                    .count()
+                    >= meaningful.len().min(2);
+            let c = compact_lower(name);
+            (c.len() >= min && tc.contains(&c), split)
+        }
+        let task = "how does the JsonSerializer handle errors in redis cluster";
+        let tw = split_words(task);
+        let tc = compact_lower(task);
+        for name in [
+            "JsonSerializer",
+            "serialize",
+            "ErrorHandler",
+            "handle",
+            "RedisCluster",
+            "cluster",
+            "x",
+            "run",
+            "HTTPServer",
+            "is_json",
+            "Json",
+            "errors",
+            "Zzz",
+            "über_cluster",
+        ] {
+            let c = compact_lower(name);
+            assert_eq!(
+                symbol_matches(name, &c, &tw, &tc, 4),
+                reference(name, &tw, &tc, 4),
+                "{name}"
+            );
+        }
     }
 }
