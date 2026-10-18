@@ -843,6 +843,8 @@ public class Outer<T> extends Base implements Runnable {
                 ("const", "CODE"),
                 ("const", "RED"),
                 ("const", "GREEN"),
+                ("field", "a"),
+                ("field", "b"),
                 ("field", "count"),
                 ("field", "items"),
             ],

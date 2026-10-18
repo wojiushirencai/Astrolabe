@@ -162,3 +162,11 @@
         name: (qualified_identifier
           name: (qualified_identifier
             name: [(identifier) (destructor_name)] @name)))))) @definition.method
+
+;; ------------------------------------------------------------------ macros
+(preproc_def
+  name: (identifier) @name
+  value: (preproc_arg)) @definition.macro
+
+(preproc_function_def
+  name: (identifier) @name) @definition.macro

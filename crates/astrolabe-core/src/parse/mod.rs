@@ -31,6 +31,8 @@ pub mod queries;
 mod razor;
 mod vue;
 // lang-batch-8 per-language hooks (one file per worker).
+mod dart;
+mod decor;
 mod kotlin;
 mod lua;
 mod objc;
@@ -456,7 +458,8 @@ fn extract_symbols(
                 Language::Kotlin => kotlin::symbol_name(definition_node, name, kind, source),
                 Language::Shell => shell::symbol_name(definition_node, name, kind, source),
                 Language::Ruby => ruby::symbol_name(definition_node, name, kind, source),
-                Language::Lua => lua::symbol_name(definition_node, name, kind, source),
+                Language::Lua => lua::symbol_name(definition_node, name_node, name, kind, source),
+                Language::Dart => (name.to_owned(), dart::refine_kind(definition_node, kind)),
                 _ => (name.to_owned(), kind),
             }
         };
@@ -473,7 +476,10 @@ fn extract_symbols(
         let (sig, start_row) = if anchor_on_name {
             (signature_from_row(source, name_row), name_row)
         } else {
-            (signature(definition_node, source), def_row)
+            (
+                signature(definition_node, source),
+                decor::start_row(definition_node).map_or(def_row, |r| r.min(def_row)),
+            )
         };
         let exported = is_exported(lang, &name, definition_node, source);
         symbols.push(CodeSymbol {

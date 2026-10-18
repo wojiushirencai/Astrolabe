@@ -320,3 +320,18 @@
     (parenthesized_expression) (as_expression) (satisfies_expression)
     (non_null_expression) (this) (super)
   ]) @definition.field
+
+;; Constructor parameter properties: `constructor(private x: number, readonly y)`
+;; declare fields.
+(method_definition
+  name: (property_identifier) @_ctor
+  parameters: (formal_parameters
+    [
+      (required_parameter
+        [(accessibility_modifier) "readonly"]
+        pattern: (identifier) @name)
+      (optional_parameter
+        [(accessibility_modifier) "readonly"]
+        pattern: (identifier) @name)
+    ] @definition.field)
+  (#eq? @_ctor "constructor"))

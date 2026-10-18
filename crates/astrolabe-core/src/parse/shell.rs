@@ -261,6 +261,10 @@ fn code_line_starts(text: &str) -> Vec<bool> {
     let b = text.as_bytes();
     let mut starts = vec![true];
     let (mut sq, mut dq, mut comment) = (false, false, false);
+    // `$'…'` (ANSI-C quoting: `\'` is an escaped quote) and `((…))` / `$((…))`
+    // arithmetic, where `<<` is a left shift and not a heredoc.
+    let mut ansi = false;
+    let mut arith = 0u32;
     let mut heredoc: Option<Vec<u8>> = None;
     let mut pending: Option<Vec<u8>> = None;
     let mut i = 0;
@@ -295,16 +299,38 @@ fn code_line_starts(text: &str) -> Vec<bool> {
             continue;
         }
         if sq {
-            sq = c != b'\'';
+            if ansi && c == b'\\' && b.get(i + 1).is_some_and(|&n| n != b'\n') {
+                i += 1;
+            } else {
+                sq = c != b'\'';
+                ansi &= sq;
+            }
         } else if c == b'\\' {
             i += 1;
         } else if dq {
             dq = c != b'"';
         } else {
             match c {
-                b'\'' => sq = true,
+                b'\'' => {
+                    sq = true;
+                    ansi = i > 0 && b[i - 1] == b'$';
+                }
                 b'"' => dq = true,
                 b'#' if is_word_start(b, i) => comment = true,
+                b'(' if b.get(i + 1) == Some(&b'(') => {
+                    arith += 1;
+                    i += 2;
+                    continue;
+                }
+                b')' if arith > 0 && b.get(i + 1) == Some(&b')') => {
+                    arith -= 1;
+                    i += 2;
+                    continue;
+                }
+                b'<' if arith > 0 && b[i..].starts_with(b"<<") => {
+                    i += 2;
+                    continue;
+                }
                 b'<' if b[i..].starts_with(b"<<") && !b[i..].starts_with(b"<<<") => {
                     let mut j = i + 2;
                     while j < b.len() && matches!(b[j], b'-' | b'~' | b' ' | b'\t' | b'\'' | b'"') {
@@ -1305,5 +1331,25 @@ mod backslash_dot_tests {
         );
         assert_eq!(got.len(), src.len());
         assert_eq!(normalize_backslash_dot("source a.sh\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod audit_fix_tests {
+    use super::code_line_starts;
+
+    #[test]
+    fn shift_and_ansi_quote_do_not_hide_later_lines() {
+        let a = code_line_starts("x=$((1<<bits))\nf() { :; }\ng() { :; }\n");
+        assert!(a.iter().all(|&c| c), "{a:?}");
+        let b = code_line_starts("(( y = 1<<n ))\nf() { :; }\n");
+        assert!(b.iter().all(|&c| c), "{b:?}");
+        let c = code_line_starts("x=$'it\\'s'\nf() { :; }\ng() { :; }\n");
+        assert!(c.iter().all(|&c| c), "{c:?}");
+        // real heredocs and multi-line quotes still hide their bodies
+        let d = code_line_starts("cat <<EOF\nf() {\nEOF\nh() { :; }\n");
+        assert_eq!(d, vec![true, false, false, true, true]);
+        let e = code_line_starts("echo 'a\nf() { :; }\n'\n");
+        assert!(!e[1], "{e:?}");
     }
 }
