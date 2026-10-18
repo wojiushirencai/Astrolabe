@@ -46,6 +46,7 @@ use std::sync::Arc;
 use crate::types::{FileIndex, Language, ModuleResolver, ProjectMeta, RelPath};
 
 pub mod c_cpp;
+pub mod c_cpp;
 pub mod csharp;
 pub mod dart;
 pub mod go;
@@ -76,6 +77,8 @@ pub fn all() -> Vec<Box<dyn ModuleResolver>> {
         Box::new(visualbasic::VisualBasicResolver),
         Box::new(swift::SwiftResolver),
         Box::new(objc::ObjCResolver),
+        Box::new(c_cpp::CResolver),
+        Box::new(c_cpp::CppResolver),
         Box::new(c_cpp::CResolver),
         Box::new(c_cpp::CppResolver),
         Box::new(kotlin::KotlinResolver),
