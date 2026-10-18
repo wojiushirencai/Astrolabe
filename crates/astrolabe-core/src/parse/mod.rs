@@ -541,6 +541,9 @@ fn extract_symbols(
         QueryCursorOptions::new().progress_callback(&mut progress),
     );
     let mut symbols = Vec::new();
+    // Built lazily (only annotated Java/C#/VB/Swift symbols need it) so
+    // `signature_from_row` is O(1) per symbol instead of O(rows).
+    let mut rows: Option<Vec<&str>> = None;
 
     while let Some(query_match) = matches.next() {
         let definition = query_match.captures().iter().find_map(|capture| {
@@ -598,7 +601,13 @@ fn extract_symbols(
             Language::Java | Language::CSharp | Language::VisualBasic | Language::Swift
         ) && name_row > def_row;
         let (sig, start_row) = if anchor_on_name {
-            (signature_from_row(source, name_row), name_row)
+            {
+                let rows = rows.get_or_insert_with(|| source.lines().collect());
+                (
+                    signature_from_line(rows.get(name_row).copied().unwrap_or_default()),
+                    name_row,
+                )
+            }
         } else {
             (
                 signature(definition_node, source),
@@ -1437,7 +1446,10 @@ fn signature(node: tree_sitter::Node<'_>, source: &str) -> String {
 
 /// 取源码第 `row` 行（0-based）在 `{` 之前的部分作为签名。
 fn signature_from_row(source: &str, row: usize) -> String {
-    let line = source.lines().nth(row).unwrap_or_default();
+    signature_from_line(source.lines().nth(row).unwrap_or_default())
+}
+
+fn signature_from_line(line: &str) -> String {
     let before_body = line.split('{').next().unwrap_or(line).trim();
     let mut result: String = before_body.chars().take(MAX_SIGNATURE_CHARS).collect();
     if before_body.chars().count() > MAX_SIGNATURE_CHARS {
@@ -1478,6 +1490,56 @@ mod tests {
         assert!(got.contains(&("a::b", 1)), "{got:?}");
         assert!(got.contains(&("~X", 4)), "{got:?}");
         assert!(got.contains(&("~X", 6)), "{got:?}");
+    #[test]
+    fn annotated_symbols_anchor_on_name_row_with_signature() {
+        let pool = ParserPool::new();
+        let src = "class A {\n  @Override\n  public void m() {}\n  @Deprecated\n  @X\n  void n(int a) {}\n}\n";
+        let p = pool
+            .parse(Language::Java, &RelPath::new("A.java"), src)
+            .expect("java parses");
+        let m = p.symbols.iter().find(|s| s.name == "m").expect("m");
+        assert_eq!(
+            (m.start_line, m.signature.as_str()),
+            (3, "public void m() "[..15].trim())
+        );
+        let n = p.symbols.iter().find(|s| s.name == "n").expect("n");
+        assert_eq!((n.start_line, n.signature.as_str()), (6, "void n(int a)"));
+    }
+
+    /// Perf probe (ignored): `cargo test -p astrolabe-core --lib parse::tests::perf_probe --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_probe() {
+        use std::hash::{Hash, Hasher};
+        let pool = ParserPool::new();
+        let mut java = String::from("class A {\n");
+        for i in 0..20000 {
+            java.push_str(&format!("  @Override\n  public void m{i}() {{}}\n"));
+        }
+        java.push_str("}\n");
+        let mut sh = String::from("if [[ ( ]]; then\n");
+        for i in 0..3000 {
+            sh.push_str(&format!("f{i}() {{\n  echo {i}\n}}\n"));
+        }
+        for (lang, path, src) in [
+            (Language::Java, "A.java", &java),
+            (Language::Shell, "a.sh", &sh),
+        ] {
+            let t = std::time::Instant::now();
+            let p = pool.parse(lang, &RelPath::new(path), src).expect("parses");
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for s in &p.symbols {
+                (&s.name, &s.signature, s.start_line, s.end_line).hash(&mut h);
+            }
+            eprintln!(
+                "PERF {path}: {} symbols, {:?}, digest {:x}",
+                p.symbols.len(),
+                t.elapsed(),
+                h.finish()
+            );
+        }
+    }
+
     }
 
     #[test]
