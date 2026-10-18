@@ -380,7 +380,7 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
     let max_inline = session.knobs.barrier_max;
     let decision = barrier_decision(
         watermark_age,
-        FRESH_WINDOW,
+        fresh_window_for(&session.knobs),
         distrusted,
         &suspects,
         max_inline,
@@ -427,6 +427,20 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
             trigger_background_rebuild_arc(session);
             BarrierEffect::StaleNote(staleness_note(suspects))
         }
+    }
+}
+
+/// Freshness window for the barrier. With native events and a safety scan,
+/// the watermark only advances on that scan while idle, but every change
+/// arrives as a suspect, so an idle watermark older than `FRESH_WINDOW` does
+/// not need a full-tree verification per query (M1). In that mode the window
+/// is the safety interval plus slack; otherwise it is `FRESH_WINDOW`.
+pub(crate) fn fresh_window_for(knobs: &crate::knobs::McpKnobs) -> Duration {
+    match knobs.watch_mode {
+        Some(crate::knobs::WatchMode::Events) if !knobs.safety_interval.is_zero() => {
+            (knobs.safety_interval + Duration::from_secs(60)).max(FRESH_WINDOW)
+        }
+        _ => FRESH_WINDOW,
     }
 }
 
@@ -688,6 +702,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    #[test]
+    fn fresh_window_wide_only_for_events_with_safety_scan() {
+        let mut k = McpKnobs::default();
+        assert_eq!(fresh_window_for(&k), Duration::from_secs(1860));
+        k.safety_interval = Duration::ZERO;
+        assert_eq!(fresh_window_for(&k), FRESH_WINDOW);
+        k.safety_interval = Duration::from_secs(1800);
+        k.watch_mode = Some(crate::knobs::WatchMode::Poll(Duration::from_secs(10)));
+        assert_eq!(fresh_window_for(&k), FRESH_WINDOW);
     }
 
     #[test]
