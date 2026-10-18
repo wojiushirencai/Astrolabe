@@ -57,6 +57,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::gitignore::Gitignore;
 use ignore::{DirEntry, Match, WalkBuilder, WalkState};
 use memchr::memchr;
+use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, Metadata};
 use std::io::{self, ErrorKind, Read, Take};
@@ -263,41 +264,59 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> ScanResult {
         None
     };
 
+    // Stat + binary sniff are independent per file and dominate on cold disks,
+    // network mounts and Windows. `par_iter().collect()` on an indexed source
+    // keeps candidate order, and the sorts below make the result independent
+    // of scheduling regardless.
+    let outcomes: Vec<ScanOutcome> = candidates
+        .par_iter()
+        .map(|path| classify_candidate(&root, path, opts, &excludes, admitted.as_ref()))
+        .collect();
     let mut result = ScanResult::default();
-    for path in candidates {
-        let rel = RelPath::new(path_to_rel(&root, &path));
-
-        let gitignored = admitted
-            .as_ref()
-            .is_some_and(|admitted| !admitted.contains(&path));
-        if gitignored || excludes.matches_file(&root, &path) {
-            result.skipped.push((rel, SkipReason::Ignored));
-            continue;
-        }
-
-        let metadata = match path.metadata() {
-            Ok(metadata) if metadata.is_file() => metadata,
-            Ok(_) => continue,
-            Err(_) => {
-                result.skipped.push((rel, SkipReason::ReadError));
-                continue;
-            }
-        };
-        if metadata.len() > opts.max_file_bytes {
-            result.skipped.push((rel, SkipReason::TooLarge));
-            continue;
-        }
-
-        match looks_binary_cached(&path, &metadata, Language::from_path(&rel).is_some()) {
-            Ok(true) => result.skipped.push((rel, SkipReason::Binary)),
-            Ok(false) => result.files.push(rel),
-            Err(_) => result.skipped.push((rel, SkipReason::ReadError)),
+    for outcome in outcomes {
+        match outcome {
+            ScanOutcome::Drop => {}
+            ScanOutcome::File(rel) => result.files.push(rel),
+            ScanOutcome::Skip(rel, reason) => result.skipped.push((rel, reason)),
         }
     }
 
     result.files.sort();
     result.skipped.sort_by(|a, b| a.0.cmp(&b.0));
     result
+}
+
+enum ScanOutcome {
+    Drop,
+    File(RelPath),
+    Skip(RelPath, SkipReason),
+}
+
+fn classify_candidate(
+    root: &Path,
+    path: &Path,
+    opts: &ScanOptions,
+    excludes: &ExcludeMatcher,
+    admitted: Option<&BTreeSet<PathBuf>>,
+) -> ScanOutcome {
+    let rel = RelPath::new(path_to_rel(root, path));
+    let gitignored = admitted.is_some_and(|admitted| !admitted.contains(path));
+    if gitignored || excludes.matches_file(root, path) {
+        return ScanOutcome::Skip(rel, SkipReason::Ignored);
+    }
+    let metadata = match path.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return ScanOutcome::Drop,
+        Err(_) => return ScanOutcome::Skip(rel, SkipReason::ReadError),
+    };
+    if metadata.len() > opts.max_file_bytes {
+        return ScanOutcome::Skip(rel, SkipReason::TooLarge);
+    }
+    match looks_binary_cached(path, &metadata, Language::from_path(&rel).is_some()) {
+        Ok(true) => ScanOutcome::Skip(rel, SkipReason::Binary),
+        Ok(false) => ScanOutcome::File(rel),
+        Err(_) => ScanOutcome::Skip(rel, SkipReason::ReadError),
+    }
 }
 
 /// Replay the scan gates for one path without walking the whole tree.
