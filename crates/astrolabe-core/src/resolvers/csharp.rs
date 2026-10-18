@@ -253,27 +253,39 @@ impl ModuleResolver for CSharpResolver {
                 .get(prep.facts.manifest.as_str())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            for path in compile_files(files, prep, bucket) {
-                let Some(text) = files.read(&path) else {
-                    continue;
-                };
-                let text = declarations_source(&path, text);
-                let (namespaces, types) = extract_declarations(&text);
-                // Namespaces the repo itself declares are kept even under
-                // `System.*` (dotnet/runtime, System.Reactive, ...): a name is
-                // only treated as framework when no file here declares it.
-                for ns in namespaces {
-                    ns_files.entry(ns).or_default().insert(path.clone());
-                }
-                for (ns, name) in types {
-                    if name.is_empty() {
+            // Read + extract in parallel (chunked to bound memory); the merge
+            // into the sets below stays sequential, in the same path order.
+            let compiled = compile_files(files, prep, bucket);
+            for chunk in compiled.chunks(crate::types::READ_CHUNK) {
+                use rayon::prelude::*;
+                let extracted: Vec<Option<Declarations>> = chunk
+                    .par_iter()
+                    .map(|path| {
+                        let text = files.read(path)?;
+                        let text = declarations_source(path, text);
+                        Some(extract_declarations(&text))
+                    })
+                    .collect();
+                for (path, got) in chunk.iter().zip(extracted) {
+                    let Some((namespaces, types)) = got else {
                         continue;
+                    };
+                    // Namespaces the repo itself declares are kept even under
+                    // `System.*` (dotnet/runtime, System.Reactive, ...): a name
+                    // is only treated as framework when no file here declares it.
+                    for ns in namespaces {
+                        ns_files.entry(ns).or_default().insert(path.clone());
                     }
-                    type_decls.insert(TypeDecl {
-                        namespace: ns,
-                        name,
-                        file: path.clone(),
-                    });
+                    for (ns, name) in types {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        type_decls.insert(TypeDecl {
+                            namespace: ns,
+                            name,
+                            file: path.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1419,7 +1431,10 @@ fn strip_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn extract_declarations(src: &str) -> (BTreeSet<String>, Vec<(String, String)>) {
+/// `(namespaces, (namespace, type name) pairs)` declared by one source file.
+type Declarations = (BTreeSet<String>, Vec<(String, String)>);
+
+fn extract_declarations(src: &str) -> Declarations {
     let masked = mask_csharp(src);
     let toks = tokenize(&masked);
     let mut ns_stack: Vec<String> = Vec::new();

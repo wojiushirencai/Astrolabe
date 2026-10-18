@@ -1,7 +1,7 @@
 //! Core types shared by every module. This file is the contract between the
 //! parallel workstreams — treat it as frozen unless a change is agreed upon.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Repo-relative path, always normalized to forward slashes and never starting
@@ -50,10 +50,27 @@ impl RelPath {
     }
 }
 
+/// Lets a `BTreeSet<RelPath>` / `HashMap<RelPath, _>` be probed with a `&str`
+/// that is already normalised, without allocating a `RelPath`. `Eq`/`Ord`/
+/// `Hash` are derived from the inner `String`, so they agree with `str`.
+impl std::borrow::Borrow<str> for RelPath {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for RelPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Files read per parallel batch by `detect` scans ([`FileIndex::read_many`]).
+pub const READ_CHUNK: usize = 512;
+
+/// `true` when `p` is exactly what [`RelPath::new`] would return for it.
+fn is_normal_rel(p: &str) -> bool {
+    !p.contains('\\') && !p.starts_with('/') && !p.starts_with("./")
 }
 
 /// Join repo-relative segments and collapse `.`/`..`, staying repo-relative.
@@ -462,6 +479,7 @@ pub struct FileIndex {
     paths: BTreeSet<RelPath>,
     by_dir: BTreeMap<String, Vec<RelPath>>,
     dirs: BTreeSet<String>,
+    by_name: std::sync::OnceLock<HashMap<String, Vec<RelPath>>>,
     root: PathBuf,
     /// Paths passed to [`FileIndex::read`] while recording is on, so a
     /// caller can learn which files a `detect` depended on.
@@ -498,7 +516,52 @@ impl FileIndex {
     }
 
     pub fn contains(&self, p: &str) -> bool {
-        self.paths.contains(&RelPath::new(p))
+        // Already-normal paths (every resolver probe) are looked up by
+        // borrowed `&str`; only `\\` or a leading `/` / `./` needs the
+        // normalising (allocating) `RelPath::new`.
+        if is_normal_rel(p) {
+            self.paths.contains(p)
+        } else {
+            self.paths.contains(&RelPath::new(p))
+        }
+    }
+
+    /// Files whose path starts with `prefix`, in path order, found by a range
+    /// seek instead of a full scan.
+    pub fn iter_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a RelPath> + 'a {
+        self.paths
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |p| p.as_str().starts_with(prefix))
+    }
+
+    /// Every file whose base name is exactly `name`, in path order. Built
+    /// lazily on first use so resolvers can do suffix lookups without walking
+    /// the whole repo for each import.
+    pub fn files_named(&self, name: &str) -> &[RelPath] {
+        self.by_name
+            .get_or_init(|| {
+                let mut m: HashMap<String, Vec<RelPath>> = HashMap::new();
+                for p in &self.paths {
+                    m.entry(p.file_name().to_string())
+                        .or_default()
+                        .push(p.clone());
+                }
+                m
+            })
+            .get(name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Read many repo files in parallel (order preserved). Same semantics as
+    /// calling [`Self::read`] for each; used by `detect` implementations that
+    /// scan every source file.
+    pub fn read_many<S: AsRef<str> + Sync>(&self, paths: &[S]) -> Vec<Option<String>> {
+        use rayon::prelude::*;
+        paths.par_iter().map(|p| self.read(p.as_ref())).collect()
     }
 
     /// Files directly inside `dir` (not recursive). `""` means the repo root.
@@ -677,7 +740,12 @@ impl ProjectMeta {
     pub fn module_for(&self, spec: &str) -> Option<&ModuleUnit> {
         self.modules
             .iter()
-            .filter(|m| spec == m.name || spec.starts_with(&format!("{}/", m.name)))
+            .filter(|m| {
+                spec == m.name
+                    || (spec.len() > m.name.len()
+                        && spec.starts_with(m.name.as_str())
+                        && spec.as_bytes()[m.name.len()] == b'/')
+            })
             .min_by_key(|m| (std::cmp::Reverse(m.name.len()), m.dir.len(), m.dir.as_str()))
     }
 
@@ -1134,6 +1202,80 @@ mod tests {
         assert!(!idx.has_dir("src/test"));
         assert_eq!(idx.entries("src/main/java/com/x").len(), 2);
         assert_eq!(idx.entries("").len(), 1);
+    }
+
+    #[test]
+    fn module_for_needs_a_slash_boundary() {
+        let meta = ProjectMeta {
+            modules: vec![ModuleUnit {
+                name: "a".into(),
+                dir: "a".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(meta.module_for("a").is_some());
+        assert!(meta.module_for("a/").is_some());
+        assert!(meta.module_for("a/x").is_some());
+        assert!(meta.module_for("ab").is_none());
+        assert!(meta.module_for("ab/x").is_none());
+    }
+
+    #[test]
+    fn contains_normalises_like_relpath() {
+        let idx = FileIndex::new(
+            "/nonexistent",
+            [RelPath::new("a/b.rs"), RelPath::new("c.rs")],
+        );
+        for p in [
+            "a/b.rs",
+            "./a/b.rs",
+            "././a/b.rs",
+            "/a/b.rs",
+            "a\\b.rs",
+            "c.rs",
+            ".\\c.rs",
+        ] {
+            assert!(idx.contains(p), "{p}");
+        }
+        for p in ["a/b", "a/b.rs/", "b.rs", "", "a//b.rs"] {
+            assert_eq!(idx.contains(p), idx.paths.contains(&RelPath::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn files_named_and_iter_prefix_match_full_scans() {
+        let names = ["a/x.sh", "b/x.sh", "b/c/y.sh", "bb/x.sh", "x.sh", "b"];
+        let idx = FileIndex::new("/nonexistent", names.iter().map(RelPath::new));
+        let by_scan: Vec<&str> = idx
+            .iter()
+            .filter(|p| p.file_name() == "x.sh")
+            .map(RelPath::as_str)
+            .collect();
+        let got: Vec<&str> = idx
+            .files_named("x.sh")
+            .iter()
+            .map(RelPath::as_str)
+            .collect();
+        assert_eq!(got, by_scan);
+        assert!(idx.files_named("nope").is_empty());
+        let scan: Vec<&str> = idx
+            .iter()
+            .filter(|p| p.as_str().starts_with("b/"))
+            .map(RelPath::as_str)
+            .collect();
+        let got: Vec<&str> = idx.iter_prefix("b/").map(RelPath::as_str).collect();
+        assert_eq!(got, scan);
+        assert_eq!(got, vec!["b/c/y.sh", "b/x.sh"]);
+    }
+
+    #[test]
+    fn read_many_keeps_order_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "A").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "B").unwrap();
+        let idx = FileIndex::new(dir.path(), [RelPath::new("a.txt"), RelPath::new("b.txt")]);
+        let got = idx.read_many(&["b.txt", "missing", "a.txt", "../x"]);
+        assert_eq!(got, vec![Some("B".into()), None, Some("A".into()), None]);
     }
 
     #[test]

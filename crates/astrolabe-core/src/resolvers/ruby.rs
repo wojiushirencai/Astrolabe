@@ -91,7 +91,11 @@ impl ModuleResolver for RubyResolver {
         let enclosing = meta
             .source_roots
             .iter()
-            .filter(|r| from_s.starts_with(&format!("{r}/")))
+            .filter(|r| {
+                from_s.len() > r.len()
+                    && from_s.starts_with(r.as_str())
+                    && from_s.as_bytes()[r.len()] == b'/'
+            })
             .max_by_key(|r| r.len());
         if let Some(hit) = enclosing.and_then(|r| probe(r)) {
             return Some(hit);

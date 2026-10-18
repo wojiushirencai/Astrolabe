@@ -53,6 +53,7 @@ pub struct KotlinResolver;
 
 /// Upper bound on files read during `detect`.
 const MAX_FILES: usize = 250_000;
+use crate::types::READ_CHUNK;
 
 impl ModuleResolver for KotlinResolver {
     fn language(&self) -> Language {
@@ -62,41 +63,49 @@ impl ModuleResolver for KotlinResolver {
     fn detect(&self, files: &FileIndex) -> ProjectMeta {
         let mut decls: BTreeSet<TypeDecl> = BTreeSet::new();
         let mut namespaces: BTreeSet<String> = BTreeSet::new();
-        let mut read = 0usize;
+        let mut cands: Vec<&RelPath> = Vec::new();
         for p in files.iter() {
             let ext = p.extension();
-            let java = ext == Some("java");
-            if !(java || matches!(ext, Some("kt" | "kts"))) {
+            if !(ext == Some("java") || matches!(ext, Some("kt" | "kts"))) {
                 continue;
             }
-            read += 1;
-            if read > MAX_FILES {
+            if cands.len() >= MAX_FILES {
                 tracing::warn!(
                     limit = MAX_FILES,
                     "kotlin declaration scan stopped: too many source files; later declarations stay unresolved"
                 );
                 break;
             }
-            let Some(src) = files.read(p.as_str()) else {
-                continue;
-            };
-            let pkg = package_decl(&src).unwrap_or_default();
-            namespaces.insert(pkg.clone());
-            if java {
-                let stem = p.file_name().trim_end_matches(".java");
-                decls.insert(TypeDecl {
-                    namespace: pkg,
-                    name: stem.to_owned(),
-                    file: p.as_str().to_owned(),
-                });
-                continue;
-            }
-            for name in top_level_names(&src) {
-                decls.insert(TypeDecl {
-                    namespace: pkg.clone(),
-                    name,
-                    file: p.as_str().to_owned(),
-                });
+            cands.push(p);
+        }
+        // Read in parallel, chunked so memory stays bounded on huge repos;
+        // the fold below stays sequential and in path order.
+        for chunk in cands.chunks(READ_CHUNK) {
+            let names: Vec<&str> = chunk.iter().map(|p| p.as_str()).collect();
+            let texts = files.read_many(&names);
+            for (p, src) in chunk.iter().zip(texts) {
+                let java = p.extension() == Some("java");
+                let Some(src) = src else {
+                    continue;
+                };
+                let pkg = package_decl(&src).unwrap_or_default();
+                namespaces.insert(pkg.clone());
+                if java {
+                    let stem = p.file_name().trim_end_matches(".java");
+                    decls.insert(TypeDecl {
+                        namespace: pkg,
+                        name: stem.to_owned(),
+                        file: p.as_str().to_owned(),
+                    });
+                    continue;
+                }
+                for name in top_level_names(&src) {
+                    decls.insert(TypeDecl {
+                        namespace: pkg.clone(),
+                        name,
+                        file: p.as_str().to_owned(),
+                    });
+                }
             }
         }
         ProjectMeta {

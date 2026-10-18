@@ -140,12 +140,7 @@ fn representative(dir: &str, module: &str, files: &FileIndex) -> Option<RelPath>
         return Some(p.clone());
     }
     let prefix = format!("{dir}/");
-    files
-        .iter()
-        .filter(is_swift)
-        .filter(|p| p.as_str().starts_with(&prefix))
-        .min()
-        .cloned()
+    files.iter_prefix(&prefix).filter(is_swift).min().cloned()
 }
 
 const TARGET_CALLS: &[(&str, bool)] = &[

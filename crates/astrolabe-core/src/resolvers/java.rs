@@ -178,26 +178,32 @@ impl ModuleResolver for JavaResolver {
 
         // 5. Kotlin declarations, so Java can import Kotlin classes.
         let mut decls: BTreeSet<TypeDecl> = BTreeSet::new();
-        let mut kt_seen = 0usize;
+        let mut kt: Vec<&RelPath> = Vec::new();
         for p in files.iter().filter(|p| p.extension() == Some("kt")) {
-            kt_seen += 1;
-            if kt_seen > KOTLIN_FILE_LIMIT {
+            if kt.len() >= KOTLIN_FILE_LIMIT {
                 tracing::warn!(
                     limit = KOTLIN_FILE_LIMIT,
                     "java->kotlin declaration scan stopped: too many .kt files; later Kotlin classes cannot be imported from Java"
                 );
                 break;
             }
-            let Some(src) = files.read(p.as_str()) else {
-                continue;
-            };
-            let pkg = crate::resolvers::kotlin::package_decl(&src).unwrap_or_default();
-            for name in crate::resolvers::kotlin::top_level_names(&src) {
-                decls.insert(TypeDecl {
-                    namespace: pkg.clone(),
-                    name,
-                    file: p.as_str().to_owned(),
-                });
+            kt.push(p);
+        }
+        for chunk in kt.chunks(crate::types::READ_CHUNK) {
+            let names: Vec<&str> = chunk.iter().map(|p| p.as_str()).collect();
+            let texts = files.read_many(&names);
+            for (p, src) in chunk.iter().zip(texts) {
+                let Some(src) = src else {
+                    continue;
+                };
+                let pkg = crate::resolvers::kotlin::package_decl(&src).unwrap_or_default();
+                for name in crate::resolvers::kotlin::top_level_names(&src) {
+                    decls.insert(TypeDecl {
+                        namespace: pkg.clone(),
+                        name,
+                        file: p.as_str().to_owned(),
+                    });
+                }
             }
         }
 

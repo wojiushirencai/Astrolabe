@@ -121,11 +121,18 @@ fn literal_tail(spec: &str) -> Option<&str> {
 }
 
 fn unique_suffix(files: &FileIndex, tail: &str) -> Option<RelPath> {
-    let needle = format!("/{tail}");
+    // Only files whose base name equals the tail's last segment can match
+    // `s == tail || s.ends_with("/tail")`; the name index replaces a walk
+    // over every file in the repo per unresolved `source`.
+    let base = tail.rsplit('/').next().unwrap_or(tail);
     let mut found: Option<&RelPath> = None;
-    for p in files.iter() {
+    for p in files.files_named(base) {
         let s = p.as_str();
-        if s == tail || s.ends_with(&needle) {
+        let hit = s == tail
+            || (s.len() > tail.len()
+                && s.ends_with(tail)
+                && s.as_bytes()[s.len() - tail.len() - 1] == b'/');
+        if hit {
             if found.is_some() {
                 return None;
             }
@@ -171,6 +178,21 @@ mod tests {
         );
         assert_eq!(res(&f, "bin/run.sh", "/etc/profile"), None);
         assert_eq!(res(&f, "bin/run.sh", "missing.sh"), None);
+    }
+
+    #[test]
+    fn unique_suffix_needs_a_path_boundary() {
+        let f = index(&["xlib/a.sh", "ops/lib/a.sh", "lib/b.sh", "b.sh.bak"]);
+        // `xlib/a.sh` must not satisfy the tail `lib/a.sh`.
+        assert_eq!(
+            res(&f, "run.sh", "$D/lib/a.sh").as_deref(),
+            Some("ops/lib/a.sh")
+        );
+        assert_eq!(
+            res(&f, "run.sh", "$D/lib/b.sh").as_deref(),
+            Some("lib/b.sh")
+        );
+        assert_eq!(res(&f, "run.sh", "$D/b.sh").as_deref(), Some("lib/b.sh"));
     }
 
     #[test]
