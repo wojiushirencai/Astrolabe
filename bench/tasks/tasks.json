@@ -1,0 +1,227 @@
+[
+ {
+  "id": "H1",
+  "repo": "new-api",
+  "kind": "nav",
+  "prompt": "In this Go repository (do not modify files): find every non-test call site of processChannelError (exclude the function definition itself). For each call site give the file path and the name of the enclosing function. Also give the file and line-ish location of the processChannelError definition. End with a line starting ANSWER: that lists definition plus callers as Def=<file> Callers=<Func1@file, Func2@file, ...>.",
+  "must": [
+   "controller/relay\\.go",
+   "\\bRelay\\b",
+   "\\bRelayTask\\b",
+   "testChannelForHealthCheck|channel-test\\.go"
+  ],
+  "group": "control",
+  "answer_only": false
+ },
+ {
+  "id": "H2",
+  "repo": "new-api",
+  "kind": "nav",
+  "prompt": "In this Go repository (do not modify files): Where is ShouldDisableChannel defined? Which non-test functions call it (enclosing function name + file)? Name the three specialized detector helpers it consults for Grok spending-limit, Antigravity validation, and Codex usage-limit (exact Go identifiers). End with ANSWER: Def=... Callers=... Detectors=A,B,C",
+  "must": [
+   "service/channel\\.go",
+   "ShouldDisableChannel",
+   "processChannelError",
+   "IsGrokSpendingLimitError",
+   "IsAntigravityValidationError",
+   "IsCodexUsageLimitError"
+  ],
+  "group": "control",
+  "answer_only": false
+ },
+ {
+  "id": "H3",
+  "repo": "new-api",
+  "kind": "nav",
+  "prompt": "In this Go repository (do not modify files): Who calls IsGrokSpendingLimitError outside its own definition (non-test)? Give each enclosing function name and file. Also: if IsGrokSpendingLimitError started returning true for ChannelTypeXaiOAuth errors that previously returned false, which higher-level function in controller/relay.go would change behavior because it calls both IsGrokSpendingLimitError and ShouldDisableChannel? End with ANSWER: Callers=... ImpactFn=...",
+  "must": [
+   "ShouldDisableChannel|service/channel\\.go",
+   "processChannelError",
+   "IsGrokSpendingLimitError"
+  ],
+  "group": "control",
+  "answer_only": false
+ },
+ {
+  "id": "H6",
+  "repo": "cobra",
+  "kind": "nav",
+  "prompt": "In this spf13/cobra tree (do not modify files): Where is (c *Command) MarkFlagRequired defined? Which non-test method on *Command calls c.MarkFlagRequired (not counting MarkFlagRequired itself / MarkPersistentFlagRequired helpers in shell_completions.go)? End with ANSWER: Def=file Callers=...",
+  "must": [
+   "shell_completions\\.go",
+   "MarkFlagRequired",
+   "enforceFlagGroupsForCompletion"
+  ],
+  "group": "control",
+  "answer_only": false
+ },
+ {
+  "id": "H7",
+  "repo": "express",
+  "kind": "nav",
+  "prompt": "In this Express tree (do not modify files): Where is exports.compileTrust defined? In application.js, which app setting name triggers compileTrust when set? Also name the sibling compile helper used for the 'etag' setting. End with ANSWER: Def=... Setting=... EtagHelper=...",
+  "must": [
+   "utils\\.js",
+   "compileTrust",
+   "trust proxy",
+   "compileETag"
+  ],
+  "group": "control",
+  "answer_only": false
+ },
+ {
+  "id": "E2",
+  "repo": "cobra",
+  "kind": "edit",
+  "prompt": "In this cobra repo: change the MinimumNArgs error format string so it says \"needs at least\" instead of \"requires at least\" (keep the rest of the format identical). Update the test helper that asserts the old phrasing (minimumNArgsWithLessArgs in args_test.go) and any other assertions on that exact old string. Run: go test -count=1 -run 'MinimumNArgs' . When done print ANSWER: phrase=needs at least tests=PASS or FAIL.",
+  "must": [
+   "needs at least",
+   "tests=PASS|PASS"
+  ],
+  "verify": [
+   "go test -count=1 -run 'MinimumNArgs' .",
+   "needs at least"
+  ],
+  "group": "control",
+  "answer_only": false
+ },
+ {
+  "id": "N1",
+  "repo": "cobra",
+  "kind": "nav",
+  "group": "discovery",
+  "feature": "same-name method vs decoys",
+  "prompt": "In this spf13/cobra Go tree (do not modify files): list every call of the method (*Command).Execute() i.e. `.Execute()` invoked on a cobra Command value, in ALL .go files, test files included. Do NOT count text/template's Execute, ExecuteC, ExecuteContext, or mentions inside comments. Report the number of calls per file. Also name the one non-test function that calls Execute() on a Command. End with a line starting ANSWER: in the form `ANSWER: Counts=<file=N, file=N, ...> NonTest=<Func@file>`.",
+  "answer_only": true,
+  "must": [
+   "flag_groups_test\\.go\\W{0,3}1\\b",
+   "command_test\\.go\\W{0,3}5\\b",
+   "completions_test\\.go\\W{0,3}7\\b",
+   "(?<![_A-Za-z])command\\.go\\W{0,3}1\\b",
+   "ExecuteContext"
+  ],
+  "must_not": [
+   "(?<![A-Za-z_])cobra\\.go",
+   "cobra_test\\.go\\W{0,3}[1-9]"
+  ]
+ },
+ {
+  "id": "N2",
+  "repo": "new-api",
+  "kind": "nav",
+  "group": "discovery",
+  "feature": "concept query, no identifier, wrapper indirection",
+  "prompt": "In this Go repository (do not modify files): upstream error messages are sanitised before reaching users so that URLs, IP addresses and domain names are replaced with asterisks. Find the function that really implements that masking (not a thin wrapper) and the thin wrapper in the host `common` package, then list every non-test call site of the real implementation, whether called directly or through the wrapper, with the enclosing function name. Do not include PII e-mail masking. End with a line starting ANSWER: in the form `ANSWER: Impl=<file> Wrapper=<file> Callers=<Func@file, ...>`.",
+  "answer_only": true,
+  "must": [
+   "kitutil/mask\\.go",
+   "common/str\\.go",
+   "\\bMaskSensitiveError\\b",
+   "\\bToOpenAIError\\b",
+   "\\bToClaudeError\\b",
+   "\\btruncateHealthMessage\\b",
+   "\\bDoDownloadRequest\\b",
+   "\\bTaskErrorWrapper\\b"
+  ],
+  "must_not": [
+   "MaskEmail"
+  ]
+ },
+ {
+  "id": "N3",
+  "repo": "new-api",
+  "kind": "nav",
+  "group": "discovery",
+  "feature": "interface implementors (LSP) + same-name interface in other pkg",
+  "prompt": "In this Go repository (do not modify files): which concrete (non-test) types implement the `Provider` interface declared in the top-level `oauth` package (oauth/provider.go)? There is another unrelated `Provider` interface in the `providerauth` package — do not include its implementors. Give each type and its file. End with a line starting ANSWER: in the form `ANSWER: Implementors=<Type@file, Type@file, ...>`.",
+  "answer_only": true,
+  "must": [
+   "GitHubProvider\\W{0,3}oauth/github\\.go|GitHubProvider@\\S*github\\.go",
+   "DiscordProvider\\S*discord\\.go",
+   "LinuxDOProvider\\S*linuxdo\\.go",
+   "OIDCProvider\\S*oidc\\.go",
+   "GenericOAuthProvider\\S*generic\\.go"
+  ],
+  "must_not": [
+   "authFlowTest",
+   "providerauth/",
+   "\\bXAIProvider\\b"
+  ]
+ },
+ {
+  "id": "N5",
+  "repo": "new-api",
+  "kind": "nav",
+  "group": "discovery",
+  "feature": "literal with >60 hits, counting per directory",
+  "prompt": "In this Go repository (do not modify files): count the calls to `common.SysError(` in non-test .go source files (ignore node_modules, web/ and *_test.go). Report, for each of the top-level directories controller, relay, model, service, providerauth and setting, the number of files that contain at least one such call and the number of calls, and the total number of calls across the whole repository (including root main.go and every other directory). End with a line starting ANSWER: in the form `ANSWER: controller=F/C relay=F/C model=F/C service=F/C providerauth=F/C setting=F/C total=N`.",
+  "answer_only": true,
+  "must_with_comments": [
+   "controller=23/108",
+   "relay=20/61",
+   "model=15/44",
+   "service=19/66",
+   "providerauth=10/22",
+   "setting=4/10",
+   "total=321\\b"
+  ],
+  "must_skip_comments": [
+   "controller=23/108",
+   "relay=20/61",
+   "model=15/43",
+   "service=19/66",
+   "providerauth=10/22",
+   "setting=4/10",
+   "total=319\\b"
+  ],
+  "note": "Reference counts include 2 call sites that sit inside comments (with_comments: model=15/44 total=321). A search that skips comments (e.g. search_code skip_comments=true) legitimately answers model=15/43 total=319. Both are accepted by score.py; report them separately."
+ },
+ {
+  "id": "N6",
+  "repo": "cobra",
+  "kind": "nav",
+  "group": "discovery",
+  "feature": "concept query, no identifier (v0.12 resolve_context/search_code)",
+  "prompt": "In this spf13/cobra tree (do not modify files): when a user types an unknown subcommand the program adds a \"Did you mean this?\" hint to the error. Without being given any identifiers, find (1) the function that computes the edit distance between the typed text and command names (give its file), (2) the exported method on *Command that chooses the candidate command names, (3) the method that builds the hint text, and (4) every non-test call site of the hint-building method, with the enclosing function name. End with a line starting ANSWER: in the form `ANSWER: Distance=<func@file> Chooser=<method> Hint=<method> Callers=<Func@file, ...>`.",
+  "answer_only": true,
+  "must": [
+   "\\bld\\b",
+   "cobra\\.go",
+   "\\bSuggestionsFor\\b",
+   "\\bfindSuggestions\\b",
+   "\\blegacyArgs\\b",
+   "\\bOnlyValidArgs\\b"
+  ],
+  "must_not": [
+   "Callers=[^\\n]*\\bSuggestionsFor@",
+   "Callers=[^\\n]*\\bFind@",
+   "_test\\.go"
+  ]
+ },
+ {
+  "id": "N8",
+  "repo": "new-api",
+  "kind": "nav",
+  "group": "discovery",
+  "feature": "literal with >100 hits, per-directory aggregation with exclusions",
+  "prompt": "In this Go repository (do not modify files): count the calls to `common.SysLog(` in non-test .go source files (ignore node_modules, web/ and *_test.go). Report, for each of the top-level directories controller, relay, model, service and middleware, the number of files that contain at least one such call and the number of calls, and the total number of calls across the whole repository EXCLUDING everything under relay/ (include root main.go and every other directory). End with a line starting ANSWER: in the form `ANSWER: controller=F/C relay=F/C model=F/C service=F/C middleware=F/C total_excl_relay=N`.",
+  "answer_only": true,
+  "must_with_comments": [
+   "controller=24/157\\b",
+   "relay=54/157\\b",
+   "model=23/129\\b",
+   "service=20/78\\b",
+   "middleware=4/12\\b",
+   "total_excl_relay=406\\b"
+  ],
+  "must_skip_comments": [
+   "controller=24/157\\b",
+   "relay=54/157\\b",
+   "model=23/129\\b",
+   "service=20/77\\b",
+   "middleware=4/12\\b",
+   "total_excl_relay=405\\b"
+  ],
+  "note": "One counted call (service) is inside a comment: with_comments service=20/78 total=406; skip_comments service=20/77 total=405."
+ }
+]

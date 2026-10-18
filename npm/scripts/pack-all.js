@@ -69,7 +69,7 @@ function main() {
     );
   }
 
-  packed.push(packOne(path.join(NPM_ROOT, 'packages', 'astrolabe'), 'astrolabe'));
+  packed.push(packOne(path.join(NPM_ROOT, 'packages', 'astrolabe'), '@astrolabe-ai/astrolabe'));
   console.error(`\npacked ${packed.length} tarball(s) into ${DIST}`);
   for (const file of packed) console.error(`  ${file}`);
 }

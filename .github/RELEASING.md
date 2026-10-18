@@ -187,3 +187,7 @@ actionlint .github/workflows/release.yml
 ```
 
 真正的交叉编译和 tree-sitter 的 `cc` 调用只有推 tag 后才验证。第一次发布请预留时间看 musl job 的「Show compilers」和 `cargo build` 日志。
+
+## npm（`@astrolabe-ai/*`）
+
+npm 发布**不在** `release.yml` 里自动进行。把 `docs/distribution/npm-publish.workflow.yml` 复制为 `.github/workflows/npm-publish.yml` 后，GitHub Release 建好时在 Actions 手动运行 `npm-publish`（输入 `tag`，默认 `source_ref=main`，先 `dry_run=true`）。前提：npm org `astrolabe-ai` 已创建、仓库 secret `NPM_TOKEN` 已配置。平台包先于主包发布（`npm/scripts/publish.js` 保证）。`scripts/bump_version.py` 会同步 `npm/` 下所有 package.json 的版本与 `@astrolabe-ai/*` 依赖。

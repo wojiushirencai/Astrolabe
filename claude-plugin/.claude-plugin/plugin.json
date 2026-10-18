@@ -1,0 +1,17 @@
+{
+  "name": "astrolabe",
+  "description": "Astrolabe AI: local MCP server for code search and navigation (search_code, find_symbol, find_references, goto_definition). Requires the `astrolabe` binary on PATH.",
+  "author": {
+    "name": "wojiushirencai"
+  },
+  "homepage": "https://github.com/wojiushirencai/Astrolabe",
+  "repository": "https://github.com/wojiushirencai/Astrolabe",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "mcp",
+    "code-search",
+    "code-navigation",
+    "tree-sitter",
+    "lsp"
+  ]
+}

@@ -1,12 +1,22 @@
 {
-  "name": "astrolabe",
+  "name": "@astrolabe-ai/astrolabe",
   "version": "0.13.0",
-  "description": "Deterministic code-graph MCP server. Zero-dependency Node shim that runs a native binary.",
+  "mcpName": "io.github.wojiushirencai/astrolabe",
+  "description": "Local MCP server for code search and navigation (search_code, find_symbol, find_references, goto_definition) for AI coding agents. Node shim for the native Astrolabe AI binary.",
   "keywords": [
     "mcp",
-    "astrolabe",
-    "code-graph",
-    "stdio"
+    "mcp-server",
+    "model-context-protocol",
+    "code-search",
+    "code-navigation",
+    "code-intelligence",
+    "claude-code",
+    "codex",
+    "cursor",
+    "tree-sitter",
+    "lsp",
+    "ai-coding",
+    "coding-agent"
   ],
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -30,12 +40,12 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@astrolabe/darwin-arm64": "0.13.0",
-    "@astrolabe/darwin-x64": "0.13.0",
-    "@astrolabe/linux-x64-gnu": "0.13.0",
-    "@astrolabe/linux-x64-musl": "0.13.0",
-    "@astrolabe/linux-arm64-gnu": "0.13.0",
-    "@astrolabe/win32-x64-msvc": "0.13.0"
+    "@astrolabe-ai/darwin-arm64": "0.13.0",
+    "@astrolabe-ai/darwin-x64": "0.13.0",
+    "@astrolabe-ai/linux-x64-gnu": "0.13.0",
+    "@astrolabe-ai/linux-x64-musl": "0.13.0",
+    "@astrolabe-ai/linux-arm64-gnu": "0.13.0",
+    "@astrolabe-ai/win32-x64-msvc": "0.13.0"
   },
   "publishConfig": {
     "access": "public"

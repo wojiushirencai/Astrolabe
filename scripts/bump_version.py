@@ -7,7 +7,7 @@ Synchronizes version across:
   - crates/astrolabe-mcp/Cargo.toml (astrolabe-core version = "...")
   - npm/package.json ("version": "...")
   - npm/packages/*/package.json ("version": "...")
-  - npm/packages/astrolabe/package.json (optionalDependencies "@astrolabe/*": "...")
+  - npm/packages/astrolabe/package.json (optionalDependencies "@astrolabe-ai/*": "...")
   - Cargo.lock (refreshed via `cargo metadata`)
   - CHANGELOG.md (moves Unreleased to versioned section)
 """
@@ -107,7 +107,7 @@ def bump_version(part: str | None, target_version: str | None, dry_run: bool) ->
 
     if dry_run:
         print("[DRY-RUN] Would update Cargo.toml, astrolabe-mcp/Cargo.toml, CHANGELOG.md,")
-        print(f"[DRY-RUN] and {len(npm_json_files)} npm package.json files (version + @astrolabe/* optionalDependencies)")
+        print(f"[DRY-RUN] and {len(npm_json_files)} npm package.json files (version + @astrolabe-ai/* optionalDependencies)")
         return new_version
 
     cargo_path.write_text(new_cargo_text, encoding="utf-8")
@@ -126,7 +126,7 @@ def bump_version(part: str | None, target_version: str | None, dry_run: bool) ->
             optional = data.get("optionalDependencies")
             if isinstance(optional, dict):
                 for dep_name, dep_version in optional.items():
-                    if dep_name.startswith("@astrolabe/") and dep_version != new_version:
+                    if dep_name.startswith("@astrolabe-ai/") and dep_version != new_version:
                         optional[dep_name] = new_version
                         changed = True
             if changed:

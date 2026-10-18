@@ -1,9 +1,9 @@
-# astrolabe
+# @astrolabe-ai/astrolabe
 
-面向编码智能体的确定性代码图谱 MCP server。本包是**零依赖**的 Node shim：通过 `optionalDependencies` 安装当前平台的原生二进制，再把 stdin/stdout/stderr、退出码和信号原样交给它。
+Astrolabe AI：面向 AI 编码助手的本地代码检索与导航 MCP server（二进制名 `astrolabe`）。与 npm 上无关的 `astrolabe`、`astrolabe-ai` 包不是同一个项目。本包是**零依赖**的 Node shim：通过 `optionalDependencies` 安装当前平台的原生二进制，再把 stdin/stdout/stderr、退出码和信号原样交给它。
 
 ```bash
-npx -y astrolabe /path/to/repo
+npx -y @astrolabe-ai/astrolabe /path/to/repo
 ```
 
 MCP 客户端：
@@ -13,7 +13,7 @@ MCP 客户端：
   "mcpServers": {
     "astrolabe": {
       "command": "npx",
-      "args": ["-y", "astrolabe", "."]
+      "args": ["-y", "@astrolabe-ai/astrolabe", "."]
     }
   }
 }
