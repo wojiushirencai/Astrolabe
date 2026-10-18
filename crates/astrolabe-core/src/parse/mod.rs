@@ -554,11 +554,21 @@ fn extract_imports(
         return extract_php_imports(query, root, source);
     }
     if lang != Language::CSharp && lang != Language::VisualBasic {
+        // C/C++ keep the brackets of `<x.h>` so the resolver can tell a
+        // system include from a quoted one; `"x.h"` arrives as bare `x.h`.
+        let keep_angle = matches!(lang, Language::C | Language::Cpp);
         return extract_named_captures(query, root, source, |name| {
             name == "import" || name == "source" || name == "module"
         })
         .into_iter()
-        .map(|(text, _)| unquote(text.trim()).to_owned())
+        .map(|(text, _)| {
+            let t = text.trim();
+            if keep_angle && t.len() >= 2 && t.starts_with('<') && t.ends_with('>') {
+                t.to_owned()
+            } else {
+                unquote(t).to_owned()
+            }
+        })
         .collect();
     }
 
@@ -631,6 +641,86 @@ fn extract_php_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str)
     output
 }
 
+/// Number of directory levels above the including file that `node` denotes:
+/// `__DIR__` / `dirname(__FILE__)` = 0, `dirname(X)` = levels(X)+1,
+/// `dirname(X, n)` = levels(X)+n. Anything else is unresolvable.
+fn php_dir_levels(node: tree_sitter::Node<'_>, source: &str) -> Option<usize> {
+    let text = |n: tree_sitter::Node<'_>| n.utf8_text(source.as_bytes()).ok();
+    match node.kind() {
+        "parenthesized_expression" => php_dir_levels(node.named_child(0)?, source),
+        "name" | "constant" | "magic_constant" | "relative_scope" => {
+            text(node)?.eq_ignore_ascii_case("__DIR__").then_some(0)
+        }
+        "function_call_expression" => {
+            let f = node.child_by_field_name("function")?;
+            if !text(f)?.trim_start_matches('\\').eq_ignore_ascii_case("dirname") {
+                return None;
+            }
+            let args = node.child_by_field_name("arguments")?;
+            let mut c = args.walk();
+            let list: Vec<_> = args.named_children(&mut c).collect();
+            fn arg(a: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+                a.named_child(0).unwrap_or(a)
+            }
+            let first = arg(*list.first()?);
+            let n = match list.get(1) {
+                None => 1,
+                Some(a) => text(arg(*a))?.trim().parse::<usize>().ok()?,
+            };
+            if list.len() > 2 || n == 0 {
+                return None;
+            }
+            let base = if first.kind() == "function_call_expression" || first.kind() == "parenthesized_expression" {
+                php_dir_levels(first, source)?
+            } else if text(first)?.eq_ignore_ascii_case("__FILE__") {
+                return Some(n - 1);
+            } else {
+                php_dir_levels(first, source)?
+            };
+            Some(base + n)
+        }
+        _ => None,
+    }
+}
+
+/// `require __DIR__ . '/x.php'` and `dirname(__DIR__, 2) . '/x.php'`: emitted as
+/// `/` + `../` * levels + path, so `resolve_path` joins it to the file's dir.
+/// Left operands that cannot be evaluated (variables, constants) are dropped
+/// rather than guessed.
+fn collect_php_dir_includes(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    if matches!(
+        node.kind(),
+        "include_expression" | "include_once_expression" | "require_expression" | "require_once_expression"
+    ) {
+        let mut arg = node.named_child(0);
+        while let Some(a) = arg.filter(|a| a.kind() == "parenthesized_expression") {
+            arg = a.named_child(0);
+        }
+        if let Some(bin) = arg.filter(|a| a.kind() == "binary_expression") {
+            let is_dot = bin
+                .child_by_field_name("operator")
+                .and_then(|o| o.utf8_text(source.as_bytes()).ok())
+                == Some(".");
+            let (l, r) = (bin.child_by_field_name("left"), bin.child_by_field_name("right"));
+            if let (true, Some(l), Some(r)) = (is_dot, l, r) {
+                if let (Some(levels), true) = (php_dir_levels(l, source), matches!(r.kind(), "string" | "encapsed_string")) {
+                    if let Ok(t) = r.utf8_text(source.as_bytes()) {
+                        let t = unquote(t.trim()).trim_start_matches('/');
+                        if !t.is_empty() && !t.contains('$') {
+                            out.push(format!("/{}{t}", "../".repeat(levels)));
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_php_dir_includes(ch, source, out);
+    }
+}
+
 fn collect_php_use_nodes(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
     if node.kind() == "namespace_use_clause" {
         let mut c = node.walk();
@@ -656,16 +746,35 @@ fn php_clause_name<'a>(clause: tree_sitter::Node<'_>, source: &'a str) -> Option
     found.utf8_text(source.as_bytes()).ok()
 }
 
+/// `function:` / `const:` when the node carries a `function` / `const` keyword
+/// child (`use function A\b;`, or a clause inside `use A\{function f}`).
+fn php_use_kind(node: tree_sitter::Node<'_>) -> &'static str {
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        match ch.kind() {
+            "function" => return "function:",
+            "const" => return "const:",
+            _ => {}
+        }
+    }
+    ""
+}
+
 fn collect_php_uses(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
     if node.kind() == "namespace_use_declaration" {
         let mut prefix: Option<&str> = None;
+        let decl_kind = php_use_kind(node);
         let mut c = node.walk();
         for ch in node.children(&mut c) {
             match ch.kind() {
                 "namespace_name" => prefix = ch.utf8_text(source.as_bytes()).ok(),
                 "namespace_use_clause" => {
                     if let Some(n) = php_clause_name(ch, source) {
-                        out.push(n.trim_start_matches('\\').to_owned());
+                        let k = [decl_kind, php_use_kind(ch)]
+                            .into_iter()
+                            .find(|k| !k.is_empty())
+                            .unwrap_or("");
+                        out.push(format!("{k}{}", n.trim_start_matches('\\')));
                     }
                 }
                 "namespace_use_group" => {
@@ -678,10 +787,14 @@ fn collect_php_uses(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Str
                         ) {
                             if let Some(n) = php_clause_name(cl, source) {
                                 let n = n.trim_start_matches('\\');
+                                let k = [decl_kind, php_use_kind(cl)]
+                                    .into_iter()
+                                    .find(|k| !k.is_empty())
+                                    .unwrap_or("");
                                 out.push(if pre.is_empty() {
-                                    n.to_owned()
+                                    format!("{k}{n}")
                                 } else {
-                                    format!("{pre}\\{n}")
+                                    format!("{k}{pre}\\{n}")
                                 });
                             }
                         }
@@ -3426,10 +3539,36 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
                 "App\\B",
                 "App\\Models\\Post",
                 "App\\Models\\User",
-                "App\\helper",
+                "function:App\\helper",
                 "y.php"
             ]
         );
+    }
+
+    #[test]
+    fn php_dirname_levels_and_unresolvable_left_operands() {
+        let pool = ParserPool::new();
+        let src = "<?php\nrequire __DIR__ . '/a.php';\nrequire_once dirname(__DIR__) . '/b.php';\ninclude dirname(__DIR__, 2) . '/c.php';\nrequire dirname(dirname(__DIR__)) . \"/d.php\";\nrequire dirname(__FILE__) . '/e.php';\nrequire BASE_PATH . '/f.php';\nrequire $root . '/g.php';\nrequire 'h.php';\n";
+        let mut got = pool
+            .parse(Language::Php, &RelPath::new("a.php"), src)
+            .expect("parse php")
+            .imports;
+        got.sort();
+        assert_eq!(
+            got,
+            ["/../../c.php", "/../../d.php", "/../b.php", "/a.php", "/e.php", "h.php"]
+        );
+    }
+
+    #[test]
+    fn c_angle_includes_keep_brackets() {
+        let pool = ParserPool::new();
+        let mut got = pool
+            .parse(Language::C, &RelPath::new("a.c"), "#include <stdio.h>\n#include \"x.h\"\n")
+            .expect("parse c")
+            .imports;
+        got.sort();
+        assert_eq!(got, ["<stdio.h>", "x.h"]);
     }
 
     #[test]

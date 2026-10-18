@@ -31,9 +31,42 @@ pub struct PhpResolver;
 const PSR4: &str = "psr4:";
 const PSR0: &str = "psr0:";
 const CLASSMAP: &str = "classmap:";
+/// `files:<lowercased ns\\function>` / `files:const:<ns\\NAME>` -> declaring file.
+const FILES: &str = "files:";
 
 fn is_php_file(p: &str) -> bool {
     p.ends_with(".php") || p.ends_with(".inc") || p.ends_with(".phtml")
+}
+
+/// `function f` (lowercased, case-insensitive in PHP) and `const NAME` declared
+/// at top level, qualified by the file's `namespace`. Methods are skipped by
+/// requiring the declaration to start its line.
+fn declared_symbols(text: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static NS: OnceLock<regex::Regex> = OnceLock::new();
+    static FN: OnceLock<regex::Regex> = OnceLock::new();
+    static CONST: OnceLock<regex::Regex> = OnceLock::new();
+    let ns_re = NS.get_or_init(|| {
+        regex::Regex::new(r"(?m)^\s*namespace\s+([A-Za-z_][\w\\]*)\s*[;{]").expect("regex")
+    });
+    let fn_re = FN.get_or_init(|| {
+        regex::Regex::new(r"(?m)^(?:if\s*\([^)]*\)\s*\{\s*)?function\s+&?\s*([A-Za-z_]\w*)\s*\(")
+            .expect("regex")
+    });
+    let const_re =
+        CONST.get_or_init(|| regex::Regex::new(r"(?m)^const\s+([A-Za-z_]\w*)\s*=").expect("regex"));
+    let ns = ns_re
+        .captures(text)
+        .map(|c| format!("{}\\", &c[1]))
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for c in fn_re.captures_iter(text) {
+        out.push(format!("{ns}{}", &c[1]).to_ascii_lowercase());
+    }
+    for c in const_re.captures_iter(text) {
+        out.push(format!("const:{ns}{}", &c[1]));
+    }
+    out
 }
 
 fn dirs_of(v: &serde_json::Value) -> Vec<String> {
@@ -86,6 +119,28 @@ impl ModuleResolver for PhpResolver {
                                     dir,
                                 });
                             }
+                        }
+                    }
+                }
+                // `files` autoload entries declare functions / constants:
+                // index `namespace X; function f` as `X\\f` so `use function X\\f`
+                // can reach the file. Parsed with regexes, so best effort.
+                if let Some(fl) = al.get("files") {
+                    for d in dirs_of(fl) {
+                        let Some(path) = join_rel(base_dir, &d) else {
+                            continue;
+                        };
+                        if !files.contains(&path) {
+                            continue;
+                        }
+                        let Some(text) = files.read(&path) else {
+                            continue;
+                        };
+                        for name in declared_symbols(&text) {
+                            modules.push(ModuleUnit {
+                                name: format!("{FILES}{name}"),
+                                dir: path.clone(),
+                            });
                         }
                     }
                 }
@@ -148,6 +203,26 @@ impl ModuleResolver for PhpResolver {
         let spec = spec.trim();
         if spec.is_empty() || spec.contains('$') {
             return None;
+        }
+        // `use function A\\f` / `use const A\\C`: only composer `files` entries
+        // that declare the symbol can answer; otherwise unresolved.
+        if let Some((kind, name)) = spec
+            .strip_prefix("function:")
+            .map(|n| ("", n))
+            .or_else(|| spec.strip_prefix("const:").map(|n| ("const:", n)))
+        {
+            let name = name.trim_start_matches('\\');
+            let key = if kind.is_empty() {
+                format!("{FILES}{}", name.to_ascii_lowercase())
+            } else {
+                format!("{FILES}const:{name}")
+            };
+            let mut hits = meta.modules.iter().filter(|m| m.name == key);
+            let first = hits.next()?;
+            if hits.next().is_some() {
+                return None;
+            }
+            return (first.dir != from.as_str()).then(|| RelPath::new(&first.dir));
         }
         let is_path = spec.contains('/')
             || spec.starts_with('.')
@@ -312,6 +387,66 @@ mod tests {
                 "config.php",
             ],
         )
+    }
+
+    #[test]
+    fn dirname_levels_resolve_or_none() {
+        let f = fixture();
+        // From src/inc/x.php: `/../helpers.php` is src/helpers.php (absent) ...
+        assert_eq!(
+            r(&f, "src/inc/x.php", "/../index.php").as_deref(),
+            Some("src/index.php")
+        );
+        assert_eq!(
+            r(&f, "src/inc/x.php", "/../../config.php").as_deref(),
+            Some("config.php")
+        );
+        // ... and walking above the repo root is None, not a wrong file.
+        assert_eq!(r(&f, "src/inc/x.php", "/../../../config.php"), None);
+        // Same-named file in the includer's dir must not win for `../`.
+        let g = setup("{}", &["a/x.php", "a/b/x.php", "x.php"]);
+        assert_eq!(r(&g, "a/b/y.php", "/../x.php").as_deref(), Some("a/x.php"));
+    }
+
+    #[test]
+    fn use_function_const_via_composer_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("composer.json"),
+            r#"{"autoload":{"files":["src/helpers.php"],"psr-4":{"App\\":"src/"}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/helpers.php"),
+            "<?php\nnamespace App\\Support;\nfunction Fmt($x) {}\nconst LIMIT = 3;\nclass K { function method() {} }\n",
+        )
+        .unwrap();
+        let all = [
+            "composer.json",
+            "src/helpers.php",
+            "src/Support/Fmt.php",
+            "src/a.php",
+        ];
+        let files = FileIndex::new(dir.path(), all.iter().map(RelPath::new));
+        let meta = PhpResolver.detect(&files);
+        let rr = |spec: &str| {
+            PhpResolver
+                .resolve(&RelPath::new("src/a.php"), spec, &files, &meta)
+                .map(|p| p.to_string())
+        };
+        assert_eq!(
+            rr("function:App\\Support\\fmt").as_deref(),
+            Some("src/helpers.php")
+        );
+        assert_eq!(
+            rr("const:App\\Support\\LIMIT").as_deref(),
+            Some("src/helpers.php")
+        );
+        // Not declared in any `files` entry: no guess via psr-4 / classmap.
+        assert_eq!(rr("function:App\\Support\\Fmt2"), None);
+        assert_eq!(rr("function:App\\Support\\method"), None);
+        assert_eq!(rr("function:Vendor\\f"), None);
     }
 
     #[test]

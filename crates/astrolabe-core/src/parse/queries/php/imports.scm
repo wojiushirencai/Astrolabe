@@ -35,34 +35,5 @@
     (encapsed_string (string_content) @import)
   ])
 
-; `include_expression` with `__DIR__ . '/x.php'` (also `dirname(__DIR__) . '/x.php'`).
-(include_expression
-  (binary_expression
-    right: [
-      (string (string_content) @import)
-      (encapsed_string (string_content) @import)
-    ]))
-
-; `include_once_expression` with `__DIR__ . '/x.php'` (also `dirname(__DIR__) . '/x.php'`).
-(include_once_expression
-  (binary_expression
-    right: [
-      (string (string_content) @import)
-      (encapsed_string (string_content) @import)
-    ]))
-
-; `require_expression` with `__DIR__ . '/x.php'` (also `dirname(__DIR__) . '/x.php'`).
-(require_expression
-  (binary_expression
-    right: [
-      (string (string_content) @import)
-      (encapsed_string (string_content) @import)
-    ]))
-
-; `require_once_expression` with `__DIR__ . '/x.php'` (also `dirname(__DIR__) . '/x.php'`).
-(require_once_expression
-  (binary_expression
-    right: [
-      (string (string_content) @import)
-      (encapsed_string (string_content) @import)
-    ]))
+; `__DIR__ . '/x.php'` and `dirname(__DIR__, n) . '/x.php'` are handled by
+; `extract_php_imports` (it must read the left operand to count dirname levels).

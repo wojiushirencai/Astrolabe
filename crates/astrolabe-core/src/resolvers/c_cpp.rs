@@ -1,8 +1,11 @@
 //! C / C++ `#include` resolution (ObjC keeps its own resolver).
 //!
-//! The extractor strips quotes and angle brackets, so `"x.h"` and `<x.h>`
-//! reach the resolver as the same spec. Both therefore follow one rule: an
-//! include is an edge only when a file in this repository matches.
+//! The extractor strips quotes but keeps the brackets of `<x.h>`. Quoted
+//! includes are an edge when a file in this repository matches. Angle
+//! includes skip the includer's directory, the repo root and bare-name tail
+//! matching, so `<stdio.h>` never links to a local `stdio.h`; they match only
+//! through include directories or a path whose prefix ends in `include`,
+//! `inc`, `includes`, `public` or `pub`.
 //!
 //! Order:
 //! 1. relative to the including file's directory;
@@ -226,8 +229,12 @@ fn cmake_dirs(text: &str, cmake_dir: &str) -> Vec<String> {
 }
 
 fn resolve(from: &RelPath, spec: &str, files: &FileIndex, meta: &ProjectMeta) -> Option<RelPath> {
+    // `<x.h>` keeps its brackets from the extractor: a system-style include
+    // that only matches through include directories (or an `include/`-like
+    // directory), never the includer's own directory or a bare-name tail.
+    let spec = spec.trim();
+    let angle = spec.starts_with('<') && spec.ends_with('>');
     let spec = spec
-        .trim()
         .trim_matches(|c| c == '"' || c == '<' || c == '>')
         .trim_start_matches("./");
     if spec.is_empty() {
@@ -236,16 +243,20 @@ fn resolve(from: &RelPath, spec: &str, files: &FileIndex, meta: &ProjectMeta) ->
     let hit = |p: String| files.contains(&p).then(|| RelPath::new(&p));
     let is_target = |p: &String| files.contains(p) && p != from.as_str();
 
-    if let Some(p) = join_rel(from.dir(), spec).filter(is_target) {
-        return hit(p);
+    if !angle {
+        if let Some(p) = join_rel(from.dir(), spec).filter(is_target) {
+            return hit(p);
+        }
     }
     for d in &meta.source_roots {
         if let Some(p) = join_rel(d, spec).filter(is_target) {
             return hit(p);
         }
     }
-    if let Some(p) = join_rel("", spec).filter(is_target) {
-        return hit(p);
+    if !angle {
+        if let Some(p) = join_rel("", spec).filter(is_target) {
+            return hit(p);
+        }
     }
     // Tail match; needs an extension so `<vector>` stays external.
     let tail = spec.trim_start_matches("../");
@@ -260,6 +271,16 @@ fn resolve(from: &RelPath, spec: &str, files: &FileIndex, meta: &ProjectMeta) ->
         .take_while(|m| m.name == name)
         .map(|m| m.dir.as_str())
         .filter(|p| *p != from.as_str() && (*p == tail || p.ends_with(&suffix)))
+        .filter(|p| {
+            !angle || {
+                // Angle form: the matched prefix must end in an include-style dir.
+                let prefix = p.strip_suffix(tail).unwrap_or("").trim_end_matches('/');
+                matches!(
+                    prefix.rsplit('/').next().unwrap_or(""),
+                    "include" | "includes" | "inc" | "public" | "pub"
+                )
+            }
+        })
         .collect();
     nearest(from.dir(), &pool).map(RelPath::new)
 }
@@ -337,6 +358,30 @@ mod tests {
             run(&f, "src/a.c", "<mylib/api.h>").as_deref(),
             Some("include/mylib/api.h")
         );
+    }
+
+    #[test]
+    fn angle_does_not_link_same_named_local_file() {
+        let f = index(
+            "/nonexistent",
+            &["src/a.c", "src/stdio.h", "stdio.h", "util/stdio.h"],
+        );
+        assert_eq!(run(&f, "src/a.c", "<stdio.h>"), None);
+        assert_eq!(
+            run(&f, "src/a.c", "stdio.h").as_deref(),
+            Some("src/stdio.h")
+        );
+    }
+
+    #[test]
+    fn angle_matches_include_dir_and_include_named_dirs() {
+        let f = index("/nonexistent", &["src/a.c", "include/stdio.h", "src/x.h"]);
+        assert_eq!(
+            run(&f, "src/a.c", "<stdio.h>").as_deref(),
+            Some("include/stdio.h")
+        );
+        // Not an include dir: no relative lookup for angle form.
+        assert_eq!(run(&f, "src/a.c", "<x.h>"), None);
     }
 
     #[test]
