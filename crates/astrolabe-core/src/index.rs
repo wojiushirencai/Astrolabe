@@ -708,8 +708,11 @@ fn parse_one(
 /// start never accumulates the whole repo's encoding just to write it at the
 /// end. The `Arc`s are shared with the in-memory product cache, so pending
 /// entries cost no extra memory while that cache still holds them.
+/// `(entries, total bytes)` not yet written.
+type PendingWrites = (Vec<(String, Arc<[u8]>)>, usize);
+
 struct CacheWrites {
-    pending: Mutex<(Vec<(String, Arc<[u8]>)>, usize)>,
+    pending: Mutex<PendingWrites>,
     stored: AtomicUsize,
     flush_bytes: usize,
 }
