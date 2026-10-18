@@ -1494,7 +1494,11 @@ fn make_stamp(
     prev_hash: Option<u64>,
 ) -> FileStamp {
     let unsettled = is_unsettled(meta.mtime, meta.mtime_ok, now);
-    let hash = if unsettled {
+    let want_hash = unsettled
+        || (prev_hash.is_none()
+            && (meta.len <= BASELINE_HASH_MAX_BYTES
+                || is_far_future(meta.mtime, meta.mtime_ok, now)));
+    let hash = if want_hash {
         hash_file(&root.join(path.as_str())).or(prev_hash)
     } else {
         prev_hash
@@ -1541,6 +1545,8 @@ fn confirm(
         // metadata also changed. Settling unreadable→readable (or other
         // unsettled→hashed) with unchanged mtime/size must not spuriously
         // report modified — the hash becomes the new baseline.
+        // Without a baseline hash (large file) a metadata change is the only
+        // evidence we have.
         (None, Some(_)) => meta_changed,
         (None, None) => {
             if old.unsettled {
@@ -1570,25 +1576,51 @@ fn is_unsettled(mtime: SystemTime, mtime_ok: bool, now: SystemTime) -> bool {
     }
     match now.duration_since(mtime) {
         Ok(age) => age < MTIME_UNTRUSTED_WINDOW,
-        Err(_) => true,
+        // Small clock skew stays untrusted; a far-future mtime (tar unpack,
+        // container / NFS) would otherwise force a full re-read every scan.
+        Err(e) => e.duration() <= FAR_FUTURE,
     }
 }
 
+/// Mtimes further ahead than this are hashed once and then trusted via
+/// `len` + `mtime` like any settled file.
+const FAR_FUTURE: Duration = Duration::from_secs(24 * 3600);
+
+/// Files up to this size get a baseline hash when first seen so a later
+/// touch / checkout that leaves content intact is not reported as modified.
+const BASELINE_HASH_MAX_BYTES: u64 = 64 * 1024;
+
+fn is_far_future(mtime: SystemTime, mtime_ok: bool, now: SystemTime) -> bool {
+    mtime_ok && mtime.duration_since(now).is_ok_and(|d| d > FAR_FUTURE)
+}
+
 fn hash_file(path: &Path) -> Option<u64> {
+    // Word-at-a-time multiply-xorshift mix: several times faster than the
+    // byte-wise FNV loop. Only compared against earlier values of itself.
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut file = File::open(path).ok()?;
-    let mut buf = [0u8; 8192];
-    let mut h = FNV_OFFSET;
+    let mut buf = [0u8; 65536];
+    let mut h: u64 = FNV_OFFSET;
+    let mut total: u64 = 0;
     loop {
         let n = file.read(&mut buf).ok()?;
         if n == 0 {
             break;
         }
-        for b in &buf[..n] {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(FNV_PRIME);
+        total += n as u64;
+        let mut chunks = buf[..n].chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+            h = (h ^ w).wrapping_mul(K);
+            h ^= h >> 29;
+        }
+        for b in chunks.remainder() {
+            h = (h ^ u64::from(*b)).wrapping_mul(K);
+            h ^= h >> 29;
         }
     }
-    Some(h)
+    h ^= total;
+    Some(h.wrapping_mul(K))
 }
 
 /// Whether `abs` is, or lies below, a symlink that points at a directory
@@ -2796,6 +2828,83 @@ mod tests {
             }
         }
         assert!(!leaked, "excluded tree must not produce events");
+    }
+
+    #[test]
+    fn touch_without_content_change_is_not_modified() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        let _ = w.check();
+        // Move mtime well outside the untrusted window, content untouched.
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+        let _ = w.check(); // observes meta change; hashes now settled
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        drop(f);
+        let cs = w.check();
+        assert!(cs.is_empty(), "touch must not report modified: {cs:?}");
+        let cs = w.check_paths(&[dir.abs("a.rs")]);
+        assert!(cs.is_empty(), "{cs:?}");
+        // A real content change with a new mtime is still reported.
+        rewrite_and_bump(&dir, "a.rs", "fn a() { 2 }");
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(9000))
+            .unwrap();
+        drop(f);
+        assert_eq!(w.check().modified, vec![RelPath::new("a.rs")]);
+    }
+
+    #[test]
+    fn far_future_mtime_is_not_permanently_unsettled() {
+        let now = SystemTime::now();
+        let skew = now + Duration::from_secs(30);
+        let far = now + Duration::from_secs(10 * 24 * 3600);
+        assert!(is_unsettled(skew, true, now));
+        assert!(!is_unsettled(far, true, now));
+        assert!(is_far_future(far, true, now));
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(far).unwrap();
+        drop(f);
+        let mut w = watcher(&dir);
+        let _ = w.check();
+        let st = w.snapshot.get(&RelPath::new("a.rs")).unwrap();
+        assert!(!st.unsettled && st.hash.is_some());
+        assert!(w.check().is_empty());
+    }
+
+    #[test]
+    fn hash_file_detects_changes_incl_tail_bytes() {
+        let dir = TestDir::new();
+        dir.write("h", "0123456789abcdefX");
+        let a = hash_file(&dir.abs("h")).unwrap();
+        dir.write("h", "0123456789abcdefY");
+        let b = hash_file(&dir.abs("h")).unwrap();
+        dir.write("h", "0123456789abcdef");
+        let c = hash_file(&dir.abs("h")).unwrap();
+        assert!(a != b && a != c && b != c);
+        assert_eq!(b, {
+            dir.write("h", "0123456789abcdefY");
+            hash_file(&dir.abs("h")).unwrap()
+        });
     }
 
     #[test]
