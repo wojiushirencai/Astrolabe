@@ -2174,6 +2174,7 @@ mod tests {
                 symbols: extract_symbols(lang, sq, root, src),
                 imports: extract_imports(lang, iq, root, src),
                 calls: extract_calls_for(lang, cq, root, src),
+                partial: root.has_error(),
             })
         }
     }

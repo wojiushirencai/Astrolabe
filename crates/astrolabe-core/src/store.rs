@@ -445,6 +445,8 @@ impl From<ParsedWire> for crate::parse::ParsedFile {
             symbols: parsed.symbols.into_iter().map(CodeSymbol::from).collect(),
             imports: parsed.imports,
             calls: parsed.calls,
+            // Partial parses are never cached (see index::parse_one).
+            partial: false,
         }
     }
 }
@@ -797,6 +799,7 @@ mod tests {
             }],
             imports: vec!["fmt".into()],
             calls: vec![("Println".into(), 2)],
+            partial: false,
         };
         let bytes = encode_parsed(&parsed).unwrap();
         let key = parse_cache_key(Language::Go, "abc");

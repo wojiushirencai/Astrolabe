@@ -46,9 +46,11 @@ pub(crate) fn parse_sfc(
             symbols,
             imports,
             calls,
+            partial: false,
         });
     }
 
+    let mut partial = false;
     for block in blocks {
         let parsed = pool.parse(block.lang, path, &block.body)?;
         let line_offset = block.body_start_line.saturating_sub(1);
@@ -84,6 +86,7 @@ pub(crate) fn parse_sfc(
                 symbols.push(sym);
             }
         }
+        partial |= parsed.partial;
         imports.extend(parsed.imports);
         for (name, line) in parsed.calls {
             calls.push((name, line.saturating_add(line_offset)));
@@ -94,6 +97,7 @@ pub(crate) fn parse_sfc(
         symbols,
         imports,
         calls,
+        partial,
     })
 }
 

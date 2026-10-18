@@ -483,7 +483,18 @@ fn parse_one(
 
     match pool.parse(language, path, &source) {
         Ok(parsed) => {
-            if store.is_some() {
+            if parsed.partial {
+                // Syntax errors: symbols/imports/calls may be incomplete.
+                // Keep what was extracted but surface it, and do not cache
+                // it so the signal is not lost on the next (cache-hit) run.
+                failures
+                    .lock()
+                    .expect("failure list poisoned")
+                    .push((
+                        path.clone(),
+                        "partial parse: syntax errors in file".to_owned(),
+                    ));
+            } else if store.is_some() {
                 match store::encode_parsed(&parsed) {
                     Ok(bytes) => cache_writes
                         .lock()
@@ -1418,10 +1429,14 @@ mod tests {
             report.files_scanned, 1,
             "the file was discovered regardless of its contents"
         );
-        assert_eq!(
-            report.files_parsed + report.parse_failures.len(),
-            1,
-            "every scanned source file is either parsed or reported"
+        // A syntax-error file is still parsed (partial symbols kept) AND
+        // reported, so incompleteness is never silent.
+        assert_eq!(report.files_parsed, 1);
+        assert_eq!(report.parse_failures.len(), 1, "{:?}", report.parse_failures);
+        assert!(
+            report.parse_failures[0].1.starts_with("partial parse"),
+            "{:?}",
+            report.parse_failures
         );
         std::fs::remove_dir_all(&root).ok();
     }
