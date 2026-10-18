@@ -25,7 +25,7 @@ pub(crate) fn identifier_at(
     path: &RelPath,
     position: Position,
 ) -> Option<String> {
-    let source = std::fs::read_to_string(repo_root.join(path.as_str())).ok()?;
+    let source = crate::text::read_source(&repo_root.join(path.as_str())).ok()?;
     let line = source.split('\n').nth(position.line as usize)?;
     let line = line.strip_suffix('\r').unwrap_or(line);
     // Map the UTF-16 column to a char index.
@@ -39,7 +39,6 @@ pub(crate) fn identifier_at(
         }
         utf16 += ch.len_utf16() as u32;
     }
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     if idx >= chars.len() || !is_ident(chars[idx]) {
         return None;
     }
@@ -61,12 +60,22 @@ pub(crate) fn text_references(
     name: &str,
     reason: &str,
 ) -> Precise<Vec<Location>> {
-    let language = Language::from_path(origin);
+    let Some(language) = Language::from_path(origin) else {
+        // Unknown origin language: matching "every unknown file" would sweep
+        // docs, configs and binaries.
+        return Precise {
+            value: Vec::new(),
+            confidence: Confidence::Unknown,
+            note: Some(format!(
+                "{reason}; the file's language is not recognised, so no text search was run for `{name}`"
+            )),
+        };
+    };
     let (hits, truncated) = collect(
         repo_root,
         origin,
         name,
-        |f| Language::from_path(f) == language,
+        |f| Language::from_path(f) == Some(language),
         false,
     );
     let mut note = format!(
@@ -144,6 +153,25 @@ fn collect(
         let f = files.remove(pos);
         files.insert(0, f);
     }
+    // Only files that can contain the name need the sequential decode and
+    // line scan; the byte-level rejection runs on all cores. `collect`
+    // keeps the original order, so the origin-first guarantee holds.
+    let files: Vec<RelPath> = {
+        use rayon::prelude::*;
+        let window = files.len().min(MAX_FILES + 1);
+        let (head, tail) = files.split_at(window);
+        let mut kept: Vec<RelPath> = head
+            .par_iter()
+            .filter(|f| {
+                std::fs::read(repo_root.join(f.as_str()))
+                    .map(|bytes| !cannot_contain_name(&bytes, name))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        kept.extend(tail.iter().cloned());
+        kept
+    };
     let mut hits = Vec::new();
     let mut truncated = false;
     for (n, file) in files.iter().enumerate() {
@@ -151,9 +179,14 @@ fn collect(
             truncated = true;
             break;
         }
-        let Ok(source) = std::fs::read_to_string(repo_root.join(file.as_str())) else {
+        let Ok(source) = crate::text::read_source(&repo_root.join(file.as_str())) else {
             continue;
         };
+        // One substring search over the whole file rules out almost every
+        // file before any per-line work (a whole-word hit is also a substring).
+        if !source.contains(name) {
+            continue;
+        }
         let mut file_hits = Vec::new();
         for (line_idx, line) in source.split('\n').enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
@@ -180,12 +213,39 @@ fn collect(
             }
         }
         hits.extend(file_hits);
+        if hits.len() > MAX_HITS {
+            // A single huge file can overshoot the cap inside one iteration.
+            hits.truncate(MAX_HITS);
+            truncated = true;
+            break;
+        }
     }
     (hits, truncated)
 }
 
+/// Identifier characters; `$` covers JS/PHP names (`$name`, `$el`).
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Cheap byte-level rejection before decoding. Only sound for an ASCII name
+/// and a file in an ASCII-compatible encoding (UTF-8, GBK, Shift-JIS …): then
+/// any decoded occurrence of the name is also a byte occurrence. UTF-16 (BOM
+/// or NUL bytes up front) is never rejected here.
+fn cannot_contain_name(bytes: &[u8], name: &str) -> bool {
+    if !name.is_ascii() || name.is_empty() {
+        return false;
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return false;
+    }
+    if memchr::memchr(0, &bytes[..bytes.len().min(512)]).is_some() {
+        return false;
+    }
+    memchr::memmem::find(bytes, name.as_bytes()).is_none()
+}
+
 fn word_columns(line: &str, name: &str) -> Vec<u32> {
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = Vec::new();
     if name.is_empty() {
         return out;
@@ -208,7 +268,86 @@ fn word_columns(line: &str, name: &str) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// Timing probe: `cargo test -p astrolabe-core --lib bench_text_references -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_text_references_many_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in 0..50 {
+            let sub = dir.path().join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..100 {
+                let mut src = String::new();
+                for l in 0..300 {
+                    src.push_str(&format!(
+                        "fn item_{d}_{f}_{l}(x: i32) -> i32 {{ x + {l} }}\n"
+                    ));
+                }
+                if f % 50 == 0 {
+                    src.push_str("fn caller() { needle_fn(); }\n");
+                }
+                std::fs::write(sub.join(format!("m{f}.rs")), src).unwrap();
+            }
+        }
+        let t = Instant::now();
+        let mut n = 0;
+        for _ in 0..5 {
+            n = text_references(dir.path(), &RelPath::new("d0/m0.rs"), "needle_fn", "x")
+                .value
+                .len();
+        }
+        let ts = Instant::now();
+        let nfiles = scan(dir.path(), &ScanOptions::default()).files.len();
+        let tr = Instant::now();
+        let files = scan(dir.path(), &ScanOptions::default()).files;
+        let total: usize = files
+            .iter()
+            .map(|f| std::fs::read(dir.path().join(f.as_str())).unwrap().len())
+            .sum();
+        eprintln!(
+            "BENCH5 scan+raw read of {total} bytes (floor): {:?}",
+            tr.elapsed()
+        );
+        eprintln!("BENCH5 scan alone {nfiles} files: {:?}", ts.elapsed());
+        eprintln!("BENCH5 5000 files, {n} hits: {:?}/call", t.elapsed() / 5);
+    }
+
+    #[test]
+    fn text_references_unknown_language_searches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.weird1"), "foo\n").unwrap();
+        std::fs::write(dir.path().join("b.weird2"), "foo\n").unwrap();
+        let out = text_references(dir.path(), &RelPath::new("a.weird1"), "foo", "x");
+        assert!(out.value.is_empty());
+        assert_eq!(out.confidence, Confidence::Unknown);
+        assert!(out.note.unwrap().contains("not recognised"));
+    }
+
     use super::*;
+
+    #[test]
+    fn byte_prefilter_never_hides_utf16_or_gbk_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut le = vec![0xFF, 0xFE];
+        for u in "fn x() { needle_fn(); }\n".encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(dir.path().join("a.rs"), le).unwrap();
+        let (gbk, _, _) =
+            encoding_rs::GBK.encode("// 中文注释，这是一个测试\nfn y() { needle_fn(); }\n");
+        std::fs::write(dir.path().join("b.rs"), &gbk).unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn z() {}\n").unwrap();
+        let r = text_references(dir.path(), &RelPath::new("a.rs"), "needle_fn", "x");
+        let mut paths: Vec<_> = r
+            .value
+            .iter()
+            .map(|l| l.path.as_str().to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["a.rs", "b.rs"]);
+        assert!(cannot_contain_name(b"fn z() {}", "needle_fn"));
+        assert!(!cannot_contain_name(b"a needle_fn b", "needle_fn"));
+    }
 
     #[test]
     fn finds_whole_words_across_same_language_files() {
@@ -273,6 +412,38 @@ mod tests {
             .map(|l| l.path.as_str().to_string())
             .collect();
         assert_eq!(got, vec!["C.swift", "D.swift"]);
+    }
+
+    #[test]
+    fn dollar_names_match_as_whole_words() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "$name = 1;\necho $name; echo name;\necho $names;\n",
+        )
+        .unwrap();
+        let r = text_references(dir.path(), &RelPath::new("a.php"), "$name", "x");
+        assert_eq!(r.value.len(), 2);
+        // `name` alone must not match inside `$name`.
+        let r = text_references(dir.path(), &RelPath::new("a.php"), "name", "x");
+        assert_eq!(r.value.len(), 1);
+        let pos = Position {
+            line: 1,
+            character: 7,
+        };
+        assert_eq!(
+            identifier_at(dir.path(), &RelPath::new("a.php"), pos).as_deref(),
+            Some("$name")
+        );
+    }
+
+    #[test]
+    fn single_huge_file_cannot_exceed_hit_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.rs"), "foo\n".repeat(MAX_HITS * 3)).unwrap();
+        let r = text_references(dir.path(), &RelPath::new("big.rs"), "foo", "x");
+        assert_eq!(r.value.len(), MAX_HITS);
+        assert!(r.note.unwrap().contains("budget"));
     }
 
     #[test]

@@ -26,8 +26,22 @@ pub(crate) struct RepoIndex {
     pub root: PathBuf,
     inner: InnerIndex,
     in_graph_paths: OnceLock<HashSet<String>>,
+    names: OnceLock<NameIndex>,
     /// Process-unique stamp; every index replacement (edit, rebuild) gets a new one.
     generation: u64,
+}
+
+/// Lookup tables over `graph().symbols`, built once per index snapshot (the
+/// snapshot is immutable, so they never go stale): lowercase names so
+/// `find_symbol` does not allocate per symbol per query, an exact-name set,
+/// a lowercase-name → positions map for exact lookups, and id → position.
+pub(crate) struct NameIndex {
+    pub lower: Vec<String>,
+    pub exact: HashSet<String>,
+    pub by_lower: std::collections::HashMap<String, Vec<u32>>,
+    pub by_id: std::collections::HashMap<astrolabe_core::SymbolId, usize>,
+    pub name_path: astrolabe_core::name_path::NamePathIndex,
+    pub file_pos: std::collections::HashMap<FileId, usize>,
 }
 
 enum InnerIndex {
@@ -65,6 +79,7 @@ impl RepoIndex {
             root,
             inner: InnerIndex::Incremental(incremental),
             in_graph_paths: OnceLock::new(),
+            names: OnceLock::new(),
             generation: next_generation(),
         }
     }
@@ -75,8 +90,43 @@ impl RepoIndex {
             root,
             inner: InnerIndex::Static { graph, report },
             in_graph_paths: OnceLock::new(),
+            names: OnceLock::new(),
             generation: next_generation(),
         }
+    }
+
+    pub(crate) fn names(&self) -> &NameIndex {
+        self.names.get_or_init(|| {
+            let symbols = &self.graph().symbols;
+            let mut idx = NameIndex {
+                lower: Vec::with_capacity(symbols.len()),
+                exact: HashSet::new(),
+                by_lower: std::collections::HashMap::new(),
+                by_id: std::collections::HashMap::with_capacity(symbols.len()),
+                name_path: astrolabe_core::name_path::NamePathIndex::new(symbols),
+                file_pos: self
+                    .graph()
+                    .files
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(i, f)| (f.id, i))
+                    .collect(),
+            };
+            for (i, symbol) in symbols.iter().enumerate() {
+                let lower = symbol.name.to_lowercase();
+                idx.by_lower
+                    .entry(lower.clone())
+                    .or_default()
+                    .push(i as u32);
+                idx.lower.push(lower);
+                if !idx.exact.contains(&symbol.name) {
+                    idx.exact.insert(symbol.name.clone());
+                }
+                idx.by_id.entry(symbol.id).or_insert(i);
+            }
+            idx
+        })
     }
 
     pub(crate) fn graph(&self) -> &CodeGraph {
@@ -152,7 +202,9 @@ impl RepoIndex {
     }
 
     pub fn file(&self, id: FileId) -> Option<&CodeFile> {
-        self.graph().files.iter().find(|file| file.id == id)
+        // `.rev()` above makes the first file with this id win, as `find` did.
+        let pos = *self.names().file_pos.get(&id)?;
+        self.graph().files.get(pos)
     }
 
     /// Count occurrences of unindexed code file extensions among admitted paths.

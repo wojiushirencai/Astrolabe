@@ -15,24 +15,19 @@
 pub mod body;
 pub mod budget;
 pub mod cache;
-pub mod churn;
 pub mod elect;
 pub mod freshness;
 pub mod graph;
-pub mod group_graph;
 pub mod index;
 pub mod lsp;
 pub mod name_path;
-pub mod neighborhood;
 pub mod parse;
 pub mod render;
 pub mod resolvers;
-pub mod rewrite;
 pub mod scan;
 pub mod store;
 pub mod text;
 pub mod text_search;
-pub mod trace_tree;
 pub mod types;
 pub mod watch;
 

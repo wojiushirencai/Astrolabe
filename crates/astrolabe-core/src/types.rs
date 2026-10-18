@@ -1,7 +1,7 @@
 //! Core types shared by every module. This file is the contract between the
 //! parallel workstreams — treat it as frozen unless a change is agreed upon.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Repo-relative path, always normalized to forward slashes and never starting
@@ -12,8 +12,20 @@ pub struct RelPath(String);
 impl RelPath {
     pub fn new(s: impl AsRef<str>) -> Self {
         let s = s.as_ref().replace('\\', "/");
-        let s = s.strip_prefix("./").unwrap_or(&s);
-        RelPath(s.trim_start_matches('/').to_string())
+        // Strip every leading `./` (and `/`), so `././a.rs` and `./a.rs`
+        // both normalise to `a.rs` as the type's contract promises.
+        let mut s = s.as_str();
+        loop {
+            let t = s.trim_start_matches('/');
+            match t.strip_prefix("./") {
+                Some(rest) => s = rest,
+                None => {
+                    s = t;
+                    break;
+                }
+            }
+        }
+        RelPath(s.to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -38,10 +50,27 @@ impl RelPath {
     }
 }
 
+/// Lets a `BTreeSet<RelPath>` / `HashMap<RelPath, _>` be probed with a `&str`
+/// that is already normalised, without allocating a `RelPath`. `Eq`/`Ord`/
+/// `Hash` are derived from the inner `String`, so they agree with `str`.
+impl std::borrow::Borrow<str> for RelPath {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for RelPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Files read per parallel batch by `detect` scans ([`FileIndex::read_many`]).
+pub const READ_CHUNK: usize = 512;
+
+/// `true` when `p` is exactly what [`RelPath::new`] would return for it.
+fn is_normal_rel(p: &str) -> bool {
+    !p.contains('\\') && !p.starts_with('/') && !p.starts_with("./")
 }
 
 /// Join repo-relative segments and collapse `.`/`..`, staying repo-relative.
@@ -346,6 +375,14 @@ impl Language {
                 None
             };
         };
+        // `.m` is also MATLAB/Octave: without any Objective-C marker and with
+        // MATLAB-style `%` comments or `function … end`, it is not ObjC.
+        if lang == Language::ObjC
+            && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("m"))
+            && looks_matlab(source)
+        {
+            return None;
+        }
         if lang == Language::C && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("h")) {
             // `@interface` / `#import` headers carry the public ObjC API.
             if let Some(objc) = crate::parse::objc_header_language(source) {
@@ -442,7 +479,11 @@ pub struct FileIndex {
     paths: BTreeSet<RelPath>,
     by_dir: BTreeMap<String, Vec<RelPath>>,
     dirs: BTreeSet<String>,
+    by_name: std::sync::OnceLock<HashMap<String, Vec<RelPath>>>,
     root: PathBuf,
+    /// Paths passed to [`FileIndex::read`] while recording is on, so a
+    /// caller can learn which files a `detect` depended on.
+    reads: std::sync::Mutex<Option<BTreeSet<String>>>,
 }
 
 impl FileIndex {
@@ -475,7 +516,52 @@ impl FileIndex {
     }
 
     pub fn contains(&self, p: &str) -> bool {
-        self.paths.contains(&RelPath::new(p))
+        // Already-normal paths (every resolver probe) are looked up by
+        // borrowed `&str`; only `\\` or a leading `/` / `./` needs the
+        // normalising (allocating) `RelPath::new`.
+        if is_normal_rel(p) {
+            self.paths.contains(p)
+        } else {
+            self.paths.contains(&RelPath::new(p))
+        }
+    }
+
+    /// Files whose path starts with `prefix`, in path order, found by a range
+    /// seek instead of a full scan.
+    pub fn iter_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a RelPath> + 'a {
+        self.paths
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |p| p.as_str().starts_with(prefix))
+    }
+
+    /// Every file whose base name is exactly `name`, in path order. Built
+    /// lazily on first use so resolvers can do suffix lookups without walking
+    /// the whole repo for each import.
+    pub fn files_named(&self, name: &str) -> &[RelPath] {
+        self.by_name
+            .get_or_init(|| {
+                let mut m: HashMap<String, Vec<RelPath>> = HashMap::new();
+                for p in &self.paths {
+                    m.entry(p.file_name().to_string())
+                        .or_default()
+                        .push(p.clone());
+                }
+                m
+            })
+            .get(name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Read many repo files in parallel (order preserved). Same semantics as
+    /// calling [`Self::read`] for each; used by `detect` implementations that
+    /// scan every source file.
+    pub fn read_many<S: AsRef<str> + Sync>(&self, paths: &[S]) -> Vec<Option<String>> {
+        use rayon::prelude::*;
+        paths.par_iter().map(|p| self.read(p.as_ref())).collect()
     }
 
     /// Files directly inside `dir` (not recursive). `""` means the repo root.
@@ -502,7 +588,33 @@ impl FileIndex {
     /// Read a repo file from disk. Intended for build config during `detect`,
     /// not for bulk source reading on the resolve hot path.
     pub fn read(&self, p: &str) -> Option<String> {
-        std::fs::read_to_string(self.root.join(p)).ok()
+        if let Ok(mut guard) = self.reads.lock() {
+            if let Some(set) = guard.as_mut() {
+                set.insert(RelPath::new(p).as_str().to_string());
+            }
+        }
+        if escapes_root(p) {
+            return None;
+        }
+        crate::text::read_source(&self.root.join(p)).ok()
+    }
+
+    /// Start recording every path given to [`Self::read`] (clears any
+    /// previous recording).
+    pub fn start_recording_reads(&self) {
+        if let Ok(mut guard) = self.reads.lock() {
+            *guard = Some(BTreeSet::new());
+        }
+    }
+
+    /// Stop recording and return the paths read since
+    /// [`Self::start_recording_reads`].
+    pub fn take_recorded_reads(&self) -> BTreeSet<String> {
+        self.reads
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .unwrap_or_default()
     }
 }
 
@@ -628,7 +740,12 @@ impl ProjectMeta {
     pub fn module_for(&self, spec: &str) -> Option<&ModuleUnit> {
         self.modules
             .iter()
-            .filter(|m| spec == m.name || spec.starts_with(&format!("{}/", m.name)))
+            .filter(|m| {
+                spec == m.name
+                    || (spec.len() > m.name.len()
+                        && spec.starts_with(m.name.as_str())
+                        && spec.as_bytes()[m.name.len()] == b'/')
+            })
             .min_by_key(|m| (std::cmp::Reverse(m.name.len()), m.dir.len(), m.dir.as_str()))
     }
 
@@ -765,6 +882,50 @@ pub struct CodeEdge {
     pub kind: EdgeKind,
     pub weight: u32,
     pub confidence: Confidence,
+}
+
+/// True when `p` is absolute or climbs above the repo root via `..`.
+fn escapes_root(p: &str) -> bool {
+    if p.starts_with('/') || p.starts_with('\\') || p.as_bytes().get(1) == Some(&b':') {
+        return true;
+    }
+    let mut depth: i32 = 0;
+    for seg in p.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
+/// A `.m` file that is MATLAB/Octave rather than Objective-C.
+fn looks_matlab(source: &str) -> bool {
+    const OBJC: [&str; 8] = [
+        "@interface",
+        "@implementation",
+        "@protocol",
+        "@end",
+        "#import",
+        "#include",
+        "#define",
+        "@property",
+    ];
+    if OBJC.iter().any(|m| source.contains(m)) {
+        return false;
+    }
+    source.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('%')
+            || (t.starts_with("function ") && !t.contains('{'))
+            || t.starts_with("classdef ")
+    })
 }
 
 #[cfg(test)]
@@ -1044,6 +1205,80 @@ mod tests {
     }
 
     #[test]
+    fn module_for_needs_a_slash_boundary() {
+        let meta = ProjectMeta {
+            modules: vec![ModuleUnit {
+                name: "a".into(),
+                dir: "a".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(meta.module_for("a").is_some());
+        assert!(meta.module_for("a/").is_some());
+        assert!(meta.module_for("a/x").is_some());
+        assert!(meta.module_for("ab").is_none());
+        assert!(meta.module_for("ab/x").is_none());
+    }
+
+    #[test]
+    fn contains_normalises_like_relpath() {
+        let idx = FileIndex::new(
+            "/nonexistent",
+            [RelPath::new("a/b.rs"), RelPath::new("c.rs")],
+        );
+        for p in [
+            "a/b.rs",
+            "./a/b.rs",
+            "././a/b.rs",
+            "/a/b.rs",
+            "a\\b.rs",
+            "c.rs",
+            ".\\c.rs",
+        ] {
+            assert!(idx.contains(p), "{p}");
+        }
+        for p in ["a/b", "a/b.rs/", "b.rs", "", "a//b.rs"] {
+            assert_eq!(idx.contains(p), idx.paths.contains(&RelPath::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn files_named_and_iter_prefix_match_full_scans() {
+        let names = ["a/x.sh", "b/x.sh", "b/c/y.sh", "bb/x.sh", "x.sh", "b"];
+        let idx = FileIndex::new("/nonexistent", names.iter().map(RelPath::new));
+        let by_scan: Vec<&str> = idx
+            .iter()
+            .filter(|p| p.file_name() == "x.sh")
+            .map(RelPath::as_str)
+            .collect();
+        let got: Vec<&str> = idx
+            .files_named("x.sh")
+            .iter()
+            .map(RelPath::as_str)
+            .collect();
+        assert_eq!(got, by_scan);
+        assert!(idx.files_named("nope").is_empty());
+        let scan: Vec<&str> = idx
+            .iter()
+            .filter(|p| p.as_str().starts_with("b/"))
+            .map(RelPath::as_str)
+            .collect();
+        let got: Vec<&str> = idx.iter_prefix("b/").map(RelPath::as_str).collect();
+        assert_eq!(got, scan);
+        assert_eq!(got, vec!["b/c/y.sh", "b/x.sh"]);
+    }
+
+    #[test]
+    fn read_many_keeps_order_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "A").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "B").unwrap();
+        let idx = FileIndex::new(dir.path(), [RelPath::new("a.txt"), RelPath::new("b.txt")]);
+        let got = idx.read_many(&["b.txt", "missing", "a.txt", "../x"]);
+        assert_eq!(got, vec![Some("B".into()), None, Some("A".into()), None]);
+    }
+
+    #[test]
     fn module_for_prefers_longest_prefix() {
         let meta = ProjectMeta {
             modules: vec![
@@ -1061,5 +1296,42 @@ mod tests {
         assert_eq!(meta.module_for("a/b/c").unwrap().name, "a/b");
         assert_eq!(meta.module_for("a/z").unwrap().name, "a");
         assert!(meta.module_for("zzz").is_none());
+    }
+
+    #[test]
+    fn relpath_strips_every_leading_dot_slash() {
+        assert_eq!(RelPath::new("././a.rs").as_str(), "a.rs");
+        assert_eq!(RelPath::new("././/b/c.rs").as_str(), "b/c.rs");
+        assert_eq!(RelPath::new("a/./b.rs").as_str(), "a/./b.rs");
+    }
+
+    #[test]
+    fn file_index_read_refuses_paths_outside_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repo");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/in.txt"), "in").unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "secret").unwrap();
+        let idx = FileIndex::new(&root, [RelPath::new("sub/in.txt")]);
+        assert_eq!(idx.read("sub/in.txt").as_deref(), Some("in"));
+        assert_eq!(idx.read("sub/../sub/in.txt").as_deref(), Some("in"));
+        assert!(idx.read("../secret.txt").is_none());
+        assert!(idx.read("sub/../../secret.txt").is_none());
+        let abs = outer.path().join("secret.txt");
+        assert!(idx.read(abs.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn dot_m_matlab_is_not_objective_c() {
+        let p = RelPath::new("a.m");
+        let matlab = "% solve\nfunction y = f(x)\n  y = x + 1;\nend\n";
+        assert_eq!(Language::from_path_and_source(&p, matlab), None);
+        let objc = "#import <Foundation/Foundation.h>\n@implementation A\n@end\n";
+        assert_eq!(
+            Language::from_path_and_source(&p, objc),
+            Some(Language::ObjC)
+        );
+        // Unknown/empty content keeps the historical ObjC default.
+        assert_eq!(Language::from_path_and_source(&p, ""), Some(Language::ObjC));
     }
 }

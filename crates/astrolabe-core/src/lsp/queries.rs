@@ -70,13 +70,23 @@ pub fn find_references(
     };
     let mut hits = Vec::new();
     let mut errors = Vec::new();
+    let mut attempted = 0;
     for (query_path, query_pos) in &sites.sites {
+        attempted += 1;
         match server.references(query_path, *query_pos) {
             Ok(found) => hits.extend(found),
-            Err(err) => errors.push(err),
+            Err(err) => {
+                let timed_out = matches!(err, LspError::Timeout(_));
+                errors.push(err);
+                // One timeout is a verdict on the server; do not stack
+                // another 30s per remaining anchor.
+                if timed_out {
+                    break;
+                }
+            }
         }
     }
-    if errors.len() == sites.sites.len() {
+    if errors.len() == attempted {
         return references_failed(repo_root, path, target, &errors[0]);
     }
     let mut result = guard_cold_index(finalize_hits(hits, repo_root, path), server);
@@ -175,7 +185,7 @@ fn is_apple_source(repo_root: &Path, path: &RelPath) -> bool {
     match Language::from_path(path) {
         Some(Language::Swift | Language::ObjC | Language::ObjCpp) => true,
         Some(Language::C) => {
-            std::fs::read_to_string(repo_root.join(path.as_str())).is_ok_and(|src| {
+            crate::text::read_source(&repo_root.join(path.as_str())).is_ok_and(|src| {
                 matches!(
                     Language::from_path_and_source(path, &src),
                     Some(Language::ObjC | Language::ObjCpp)
@@ -687,7 +697,7 @@ fn resolve_query_site(
 ) -> Result<QuerySites, SiteError> {
     match target {
         SymbolAt::Position(position) => {
-            let in_comment = std::fs::read_to_string(repo_root.join(path.as_str()))
+            let in_comment = crate::text::read_source(&repo_root.join(path.as_str()))
                 .ok()
                 .and_then(|src| anchor::position_in_comment_or_string(path, &src, position))
                 .unwrap_or(false);
@@ -713,7 +723,7 @@ fn locate_named(
     if name.is_empty() {
         return Err(format!("empty symbol name; cannot provide precise {what}"));
     }
-    let source = std::fs::read_to_string(repo_root.join(path.as_str())).map_err(|err| {
+    let source = crate::text::read_source(&repo_root.join(path.as_str())).map_err(|err| {
         format!(
             "could not read {} to locate `{name}` ({err}); cannot provide precise {what}",
             path.as_str()
@@ -2137,6 +2147,27 @@ mod tests {
         );
         let note = result.note.as_deref().unwrap();
         assert!(note.contains("timed out"), "got: {note}");
+    }
+
+    #[test]
+    fn multi_anchor_references_stop_after_first_timeout() {
+        let repo = TempRepo::new(&[
+            ("a.go", "package p\n\nfunc helper() {}\n"),
+            ("b.go", "package p\n\nfunc helper() {}\n"),
+        ]);
+        let mut server = FakeServer::failing(Script::Timeout);
+        server.definition = Script::Ok(vec![loc("a.go", 2, 5), loc("b.go", 2, 5)]);
+        let _ = find_references(
+            Some(&server),
+            &repo.root,
+            &RelPath::new("a.go"),
+            SymbolAt::Name("helper"),
+        );
+        assert_eq!(
+            server.ref_calls.lock().unwrap().len(),
+            1,
+            "a timeout on the first anchor must not be repeated per anchor"
+        );
     }
 
     #[test]

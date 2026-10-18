@@ -37,7 +37,7 @@ use rayon::prelude::*;
 
 use crate::graph::CodeGraph;
 use crate::parse::{ParsedFile, ParserPool};
-use crate::resolvers::ResolverSet;
+use crate::resolvers::{resolver_owner, ResolverSet};
 use crate::scan::{self, ScanOptions, ScanResult};
 use crate::store::{self, Store};
 use crate::types::{
@@ -180,6 +180,11 @@ struct ParsedRow {
     sha: String,
     loc: u32,
     parsed: ParsedFile,
+    /// The cache encoding of `parsed`, produced once (by the parse thread, or
+    /// read back from the store) and shared by the persistent store write and
+    /// the in-memory product cache, so a cold start holds one copy of it and
+    /// never re-encodes. `None` when encoding failed.
+    encoded: Option<Arc<[u8]>>,
 }
 
 #[derive(Clone)]
@@ -551,6 +556,7 @@ fn stamp_hit(
         sha: stamp.sha,
         loc: stamp.loc,
         parsed,
+        encoded: Some(Arc::from(bytes)),
     })
 }
 
@@ -561,9 +567,10 @@ fn parse_one(
     pool: &ParserPool,
     store: Option<&Store>,
     failures: &Mutex<Vec<(RelPath, String)>>,
-    cache_writes: &Mutex<Vec<(String, Vec<u8>)>>,
+    cache_writes: &CacheWrites,
     cache_hits: &AtomicUsize,
     side: &ParseSide,
+    keep_encoded: bool,
 ) -> Option<ParsedRow> {
     let by_path = Language::from_path(path);
     // Extension-less files may still be scripts (`#!/usr/bin/env bash`);
@@ -582,7 +589,10 @@ fn parse_one(
         .ok()
         .and_then(|m| FileStat::of(&m));
     if let (Some(store), Some(stat)) = (store, stat.as_ref()) {
-        if let Some(row) = stamp_hit(store, path, stat, side, cache_hits) {
+        if let Some(mut row) = stamp_hit(store, path, stat, side, cache_hits) {
+            if !keep_encoded {
+                row.encoded = None;
+            }
             return Some(row);
         }
     }
@@ -622,6 +632,7 @@ fn parse_one(
                         sha,
                         loc,
                         parsed,
+                        encoded: keep_encoded.then(|| Arc::from(bytes)),
                     });
                 }
                 Err(error) => {
@@ -645,6 +656,7 @@ fn parse_one(
 
     match pool.parse(language, path, &source) {
         Ok(parsed) => {
+            let mut encoded = None;
             if parsed.partial {
                 // Syntax errors: symbols/imports/calls may be incomplete.
                 // Keep what was extracted but surface it, and do not cache
@@ -653,13 +665,16 @@ fn parse_one(
                     path.clone(),
                     "partial parse: syntax errors in file".to_owned(),
                 ));
-            } else if store.is_some() {
-                side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
+            } else if store.is_some() || keep_encoded {
                 match store::encode_parsed(&parsed) {
-                    Ok(bytes) => cache_writes
-                        .lock()
-                        .expect("cache write list poisoned")
-                        .push((cache_key, bytes)),
+                    Ok(bytes) => {
+                        let bytes: Arc<[u8]> = Arc::from(bytes);
+                        if let Some(store) = store {
+                            side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
+                            cache_writes.push(store, cache_key, Arc::clone(&bytes));
+                        }
+                        encoded = keep_encoded.then_some(bytes);
+                    }
                     Err(error) => {
                         tracing::warn!(
                             error = %error,
@@ -675,6 +690,7 @@ fn parse_one(
                 sha,
                 loc,
                 parsed,
+                encoded,
             })
         }
         Err(error) => {
@@ -687,10 +703,85 @@ fn parse_one(
     }
 }
 
+/// Encoded parses waiting for the next store write. Bounded: once the pending
+/// bytes pass [`CACHE_FLUSH_BYTES`] a parse thread flushes them, so a cold
+/// start never accumulates the whole repo's encoding just to write it at the
+/// end. The `Arc`s are shared with the in-memory product cache, so pending
+/// entries cost no extra memory while that cache still holds them.
+/// `(entries, total bytes)` not yet written.
+type PendingWrites = (Vec<(String, Arc<[u8]>)>, usize);
+
+struct CacheWrites {
+    pending: Mutex<PendingWrites>,
+    stored: AtomicUsize,
+    flush_bytes: usize,
+}
+
+/// Pending-bytes threshold that triggers a flush from a parse thread.
+const CACHE_FLUSH_BYTES: usize = 32 * 1024 * 1024;
+
+impl CacheWrites {
+    fn new() -> Self {
+        Self::with_flush_bytes(CACHE_FLUSH_BYTES)
+    }
+
+    fn with_flush_bytes(flush_bytes: usize) -> Self {
+        Self {
+            pending: Mutex::new((Vec::new(), 0)),
+            stored: AtomicUsize::new(0),
+            flush_bytes,
+        }
+    }
+
+    fn push(&self, store: &Store, key: String, bytes: Arc<[u8]>) {
+        if store.is_read_only() {
+            return;
+        }
+        let batch = {
+            let mut pending = self.pending.lock().expect("cache write list poisoned");
+            pending.1 += bytes.len();
+            pending.0.push((key, bytes));
+            if pending.1 >= self.flush_bytes {
+                pending.1 = 0;
+                Some(std::mem::take(&mut pending.0))
+            } else {
+                None
+            }
+        };
+        if let Some(batch) = batch {
+            self.write(store, batch);
+        }
+    }
+
+    fn write(&self, store: &Store, batch: Vec<(String, Arc<[u8]>)>) {
+        if batch.is_empty() {
+            return;
+        }
+        self.stored.fetch_add(batch.len(), Ordering::Relaxed);
+        if let Err(error) =
+            store.put_cached_parses(batch.iter().map(|(key, bytes)| (key.as_str(), &bytes[..])))
+        {
+            tracing::warn!(
+                error = %error,
+                "parse cache write failed; index is still valid"
+            );
+        }
+    }
+
+    fn flush(&self, store: &Store) {
+        let batch = {
+            let mut pending = self.pending.lock().expect("cache write list poisoned");
+            pending.1 = 0;
+            std::mem::take(&mut pending.0)
+        };
+        self.write(store, batch);
+    }
+}
+
 fn persist_cache_writes(
     root: &Path,
     store: Option<&Store>,
-    cache_writes: Mutex<Vec<(String, Vec<u8>)>>,
+    cache_writes: CacheWrites,
     cache_hits: AtomicUsize,
     side: ParseSide,
     prune: bool,
@@ -706,22 +797,8 @@ fn persist_cache_writes(
         );
         return;
     }
-    let writes = cache_writes
-        .into_inner()
-        .expect("cache write list poisoned");
-    let stored = writes.len();
-    if stored > 0 {
-        if let Err(error) = store.put_cached_parses(
-            writes
-                .iter()
-                .map(|(key, bytes)| (key.as_str(), bytes.as_slice())),
-        ) {
-            tracing::warn!(
-                error = %error,
-                "parse cache write failed; index is still valid"
-            );
-        }
-    }
+    cache_writes.flush(store);
+    let stored = cache_writes.stored.load(Ordering::Relaxed);
     let stamps = side.stamps.into_inner().expect("stamps poisoned");
     if let Err(error) = store.put_file_stamps(&stamps) {
         tracing::warn!(error = %error, "file stamp write failed; index is still valid");
@@ -768,12 +845,13 @@ fn parse_paths(
     paths: &[RelPath],
     opts: &IndexOptions,
     full_scan: bool,
+    keep_encoded: bool,
 ) -> ParseOutcome {
     let pool = ParserPool::new();
     let store = open_store(root, opts);
     let side = ParseSide::new(store.as_ref(), full_scan);
     let failures = Mutex::new(Vec::new());
-    let cache_writes = Mutex::new(Vec::new());
+    let cache_writes = CacheWrites::new();
     let cache_hits = AtomicUsize::new(0);
     let parsed: Vec<ParsedRow> = paths
         .par_iter()
@@ -787,6 +865,7 @@ fn parse_paths(
                 &cache_writes,
                 &cache_hits,
                 &side,
+                keep_encoded,
             )
         })
         .collect();
@@ -809,14 +888,20 @@ struct ParseOutcome {
 }
 
 fn insert_product(cache: &ParseProductCache, row: &ParsedRow) {
-    match store::encode_parsed(&row.parsed) {
-        Ok(bytes) => cache.insert(
+    // Reuse the encoding made on the parse thread; encode only when absent
+    // (partial parses are never encoded, nor are encode failures).
+    let encoded = match &row.encoded {
+        Some(bytes) => Ok(Arc::clone(bytes)),
+        None => store::encode_parsed(&row.parsed).map(Arc::from),
+    };
+    match encoded {
+        Ok(encoded) => cache.insert(
             row.path.clone(),
             CachedProduct {
                 language: row.language,
                 sha: row.sha.clone(),
                 loc: row.loc,
-                encoded: Arc::from(bytes),
+                encoded,
             },
         ),
         Err(error) => {
@@ -849,18 +934,56 @@ fn row_from_product(
         sha: product.sha.clone(),
         loc: product.loc,
         parsed,
+        encoded: None,
     })
 }
 
 /// Parallel collection order is not stable; sort before assigning ids so
 /// FileId is a deterministic function of the repo contents.
 fn assemble_graph(
+    parsed: Vec<ParsedRow>,
+    files: &FileIndex,
+    resolvers: &ResolverSet,
+    opts: &IndexOptions,
+    report: IndexReport,
+) -> (CodeGraph, IndexReport) {
+    let (graph, report, _) =
+        assemble_graph_with(parsed, files, resolvers, opts, report, None, false);
+    (graph, report)
+}
+
+/// Import resolutions of one file, in `imports` order.
+struct FileResolutions {
+    /// Language the specs were resolved as.
+    lang: Language,
+    items: Vec<(String, ImportResolution)>,
+}
+
+/// Per-file import resolutions kept by an [`IncrementalIndex`] so an edit
+/// re-resolves only the files whose imports (or resolver metadata) changed.
+#[derive(Default)]
+struct ResolutionCache {
+    by_path: HashMap<RelPath, Arc<FileResolutions>>,
+}
+
+/// Cached resolutions from the previous snapshot, usable only when the file
+/// set is identical (resolution reads paths, never contents) and for
+/// languages whose resolver metadata did not change.
+struct ResolveReuse<'a> {
+    cache: &'a ResolutionCache,
+    changed: &'a [Language],
+}
+
+fn assemble_graph_with(
     mut parsed: Vec<ParsedRow>,
     files: &FileIndex,
     resolvers: &ResolverSet,
     opts: &IndexOptions,
     mut report: IndexReport,
-) -> (CodeGraph, IndexReport) {
+    reuse: Option<ResolveReuse<'_>>,
+    record: bool,
+) -> (CodeGraph, IndexReport, Option<ResolutionCache>) {
+    let mut new_cache = record.then(ResolutionCache::default);
     parsed.sort_by(|a, b| a.path.cmp(&b.path));
     report.files_parsed = parsed.len();
 
@@ -878,14 +1001,21 @@ fn assemble_graph(
         });
     }
 
+    // Symbols move into the graph (no second copy of every name/signature);
+    // nothing below reads `row.parsed.symbols`. The cache encoding is not
+    // needed past this point either.
     let mut next_symbol = 0u32;
-    for row in &parsed {
+    graph
+        .symbols
+        .reserve(parsed.iter().map(|r| r.parsed.symbols.len()).sum());
+    for row in &mut parsed {
         let file = index_of[&row.path];
-        for sym in &row.parsed.symbols {
+        row.encoded = None;
+        for sym in std::mem::take(&mut row.parsed.symbols) {
             graph.symbols.push(CodeSymbol {
                 id: SymbolId(next_symbol),
                 file,
-                ..sym.clone()
+                ..sym
             });
             next_symbol += 1;
         }
@@ -901,11 +1031,39 @@ fn assemble_graph(
         // Path language first (keeps `.h` on the C resolver); content-sniffed
         // language only for extension-less shebang scripts.
         let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
-        for spec in &row.parsed.imports {
-            match resolvers.resolve_import_as(import_lang, &row.path, spec, files) {
+        let cached = reuse.as_ref().and_then(|r| {
+            let entry = r.cache.by_path.get(&row.path)?;
+            let same = entry.lang == import_lang
+                && !r.changed.contains(&resolver_owner(import_lang))
+                && entry.items.len() == row.parsed.imports.len()
+                && entry
+                    .items
+                    .iter()
+                    .zip(&row.parsed.imports)
+                    .all(|((spec, _), now)| spec == now);
+            same.then(|| Arc::clone(entry))
+        });
+        let entry = cached.unwrap_or_else(|| {
+            Arc::new(FileResolutions {
+                lang: import_lang,
+                items: row
+                    .parsed
+                    .imports
+                    .iter()
+                    .map(|spec| {
+                        (
+                            spec.clone(),
+                            resolvers.resolve_import_as(import_lang, &row.path, spec, files),
+                        )
+                    })
+                    .collect(),
+            })
+        });
+        for (spec, resolution) in &entry.items {
+            match resolution {
                 ImportResolution::Files(targets) => {
                     for target in targets {
-                        if let Some(&to) = index_of.get(&target) {
+                        if let Some(&to) = index_of.get(target) {
                             if to == from {
                                 continue;
                             }
@@ -920,7 +1078,7 @@ fn assemble_graph(
                     }
                 }
                 ImportResolution::File(target) => {
-                    if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
+                    if let Some(&to) = index_of.get(target).filter(|&&to| to != from) {
                         edges.push(CodeEdge {
                             from: from.0,
                             to: to.0,
@@ -935,7 +1093,7 @@ fn assemble_graph(
                     // Every declaring file, partials included. Not an Import:
                     // PageRank stays on real file edges.
                     for target in targets {
-                        if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
+                        if let Some(&to) = index_of.get(target).filter(|&&to| to != from) {
                             edges.push(CodeEdge {
                                 from: from.0,
                                 to: to.0,
@@ -954,6 +1112,9 @@ fn assemble_graph(
                     }
                 }
             }
+        }
+        if let Some(cache) = new_cache.as_mut() {
+            cache.by_path.insert(row.path.clone(), entry);
         }
     }
 
@@ -994,15 +1155,15 @@ fn assemble_graph(
         for row in &parsed {
             let file = index_of[&row.path];
             let in_file = symbols_by_file.get(&file);
-            for (callee, line) in &row.parsed.calls {
-                // A call belongs to the smallest symbol spanning its line;
-                // attributing it to the file would collapse every caller in
-                // the file into one node.
-                let Some(caller) = in_file.and_then(|syms| {
-                    syms.iter()
-                        .filter(|s| s.start_line <= *line && *line <= s.end_line)
-                        .min_by_key(|s| s.end_line - s.start_line)
-                }) else {
+            // A call belongs to the smallest symbol spanning its line;
+            // attributing it to the file would collapse every caller in
+            // the file into one node.
+            let callers: Vec<Option<&CodeSymbol>> = match in_file {
+                Some(syms) => enclosing_symbols(syms, &row.parsed.calls),
+                None => Vec::new(),
+            };
+            for ((callee, _line), caller) in row.parsed.calls.iter().zip(&callers) {
+                let Some(caller) = caller else {
                     continue;
                 };
                 // Take the trailing segment so `a.b.c()` matches `c`.
@@ -1051,7 +1212,73 @@ fn assemble_graph(
     graph.edges = merged;
     report.unresolved_imports.sort();
 
-    (graph, report)
+    (graph, report, new_cache)
+}
+
+/// Linear-scan threshold of [`enclosing_symbols`]: below it the plain scan is
+/// cheaper than building the sweep structures.
+const ENCLOSING_SWEEP_MIN_SYMBOLS: usize = 48;
+
+/// For each call `(callee, line)` the smallest symbol whose line span contains
+/// `line` (ties: the earliest in `syms`), or `None`. Same answer as
+/// `syms.filter(span contains line).min_by_key(span)` per call, but a large
+/// (generated) file with S symbols and C calls costs O((S + C) log S) instead
+/// of O(S·C): lines are swept in order with an ordered set of open symbols.
+fn enclosing_symbols<'a>(
+    syms: &[&'a CodeSymbol],
+    calls: &[(String, u32)],
+) -> Vec<Option<&'a CodeSymbol>> {
+    let smallest_linear = |line: u32| {
+        syms.iter()
+            .filter(|s| s.start_line <= line && line <= s.end_line)
+            .min_by_key(|s| s.end_line - s.start_line)
+            .copied()
+    };
+    if syms.len() < ENCLOSING_SWEEP_MIN_SYMBOLS || calls.len() < 2 {
+        return calls
+            .iter()
+            .map(|(_, line)| smallest_linear(*line))
+            .collect();
+    }
+    // Symbols by start line, calls by line.
+    let mut by_start: Vec<usize> = (0..syms.len()).collect();
+    by_start.sort_by_key(|&i| syms[i].start_line);
+    let mut call_order: Vec<usize> = (0..calls.len()).collect();
+    call_order.sort_by_key(|&i| calls[i].1);
+
+    let mut out = vec![None; calls.len()];
+    // Open symbols keyed (span, original index): first element is the answer.
+    let mut open: std::collections::BTreeSet<(u32, usize)> = std::collections::BTreeSet::new();
+    // Min-heap of (end_line, key) to retire symbols whose span has ended.
+    let mut ends: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32, usize)>> =
+        std::collections::BinaryHeap::new();
+    let mut next = 0usize;
+    for ci in call_order {
+        let line = calls[ci].1;
+        while next < by_start.len() && syms[by_start[next]].start_line <= line {
+            let i = by_start[next];
+            let s = syms[i];
+            // A reversed span (`end < start`) never contains a line.
+            if s.start_line <= s.end_line {
+                open.insert((s.end_line - s.start_line, i));
+                ends.push(std::cmp::Reverse((
+                    s.end_line,
+                    s.end_line - s.start_line,
+                    i,
+                )));
+            }
+            next += 1;
+        }
+        while let Some(&std::cmp::Reverse((end, span, i))) = ends.peek() {
+            if end >= line {
+                break;
+            }
+            open.remove(&(span, i));
+            ends.pop();
+        }
+        out[ci] = open.iter().next().map(|&(_, i)| syms[i]);
+    }
+    out
 }
 
 /// Build the graph for a repository.
@@ -1069,7 +1296,7 @@ pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) 
         too_large: too_large_sources(root, &scanned),
         ..IndexReport::default()
     };
-    let outcome = parse_paths(root, &scanned.files, opts, true);
+    let outcome = parse_paths(root, &scanned.files, opts, true, false);
     report.parse_failures = outcome.failures;
     assemble_graph(outcome.parsed, &files, &resolvers, opts, report)
 }
@@ -1106,6 +1333,11 @@ pub struct IncrementalIndex {
     /// How many times a transient failure (read error, parse budget) has
     /// been retried on an apply, to bound the retries.
     failure_retries: HashMap<RelPath, u8>,
+    /// Resolver metadata of this snapshot. An apply that leaves the file set
+    /// unchanged re-runs `detect` only for resolvers that read a modified file.
+    resolvers: Arc<ResolverSet>,
+    /// Per-file import resolutions, reused while the file set is unchanged.
+    resolutions: Arc<ResolutionCache>,
 }
 
 impl std::fmt::Debug for IncrementalIndex {
@@ -1127,11 +1359,12 @@ impl IncrementalIndex {
             too_large: too_large_sources(root, &scanned),
             ..IndexReport::default()
         };
-        let outcome = parse_paths(root, &scanned.files, opts, true);
+        let outcome = parse_paths(root, &scanned.files, opts, true, true);
         let failures = outcome.failures.clone();
         report.parse_failures = outcome.failures;
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
-        let (graph, report) = assemble_graph(outcome.parsed, &files, &resolvers, opts, report);
+        let (graph, report, resolutions) =
+            assemble_graph_with(outcome.parsed, &files, &resolvers, opts, report, None, true);
         Self {
             graph,
             report,
@@ -1140,6 +1373,8 @@ impl IncrementalIndex {
             products,
             failures,
             failure_retries: HashMap::new(),
+            resolvers: Arc::new(resolvers),
+            resolutions: Arc::new(resolutions.unwrap_or_default()),
         }
     }
 
@@ -1220,7 +1455,19 @@ pub fn index_repo_incremental(
         skipped: Vec::new(),
     };
     let file_index = scan::to_index(root, &scanned);
-    let resolvers = ResolverSet::detect(&file_index);
+    // Resolver metadata and import resolution read paths and (during
+    // `detect`) the content of build/declaration files. With an unchanged
+    // path set only `modified` contents can differ, so unaffected resolvers
+    // and per-file resolutions carry over; any added/removed path (or a file
+    // crossing the size cap) redoes everything, as a cold start would.
+    let same_paths = scanned.files == previous.files;
+    let (resolvers, changed_langs) = if same_paths {
+        let modified: BTreeSet<RelPath> = changes.modified.iter().cloned().collect();
+        let (set, changed) = previous.resolvers.redetect(&file_index, &modified);
+        (set, Some(changed))
+    } else {
+        (ResolverSet::detect(&file_index), None)
+    };
     let (scanned, file_index, newly_dropped) = apply_declared_excludes(root, scanned, &resolvers);
     let mut excluded_sources: BTreeSet<RelPath> = previous
         .excluded_sources
@@ -1315,7 +1562,7 @@ pub fn index_repo_incremental(
     }
 
     let reused_count = reused.len();
-    let outcome = parse_paths(root, &to_parse, opts, false);
+    let outcome = parse_paths(root, &to_parse, opts, false, true);
     let parsed_count = outcome.parsed.len();
     for (path, _) in &outcome.failures {
         if let Some(tries) = retried.get(path) {
@@ -1346,7 +1593,12 @@ pub fn index_repo_incremental(
     products.run_pending();
 
     reused.extend(outcome.parsed);
-    let (graph, report) = assemble_graph(reused, &file_index, &resolvers, opts, report);
+    let reuse = changed_langs.as_deref().map(|changed| ResolveReuse {
+        cache: &previous.resolutions,
+        changed,
+    });
+    let (graph, report, resolutions) =
+        assemble_graph_with(reused, &file_index, &resolvers, opts, report, reuse, true);
     IncrementalIndex {
         graph,
         report,
@@ -1355,6 +1607,8 @@ pub fn index_repo_incremental(
         products,
         failures,
         failure_retries,
+        resolvers: Arc::new(resolvers),
+        resolutions: Arc::new(resolutions.unwrap_or_default()),
     }
 }
 
@@ -1818,6 +2072,88 @@ mod tests {
                     "run {run}: {file} must expose component `{name}`"
                 );
             }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn sym(name: &str, start: u32, end: u32) -> CodeSymbol {
+        CodeSymbol {
+            id: SymbolId(0),
+            file: FileId(0),
+            name: name.to_owned(),
+            kind: crate::types::SymbolKind::Function,
+            start_line: start,
+            end_line: end,
+            signature: String::new(),
+            exported: false,
+        }
+    }
+
+    #[test]
+    fn enclosing_symbols_sweep_matches_linear_scan() {
+        // Deterministic pseudo-random nested/overlapping spans, including
+        // equal spans (tie: earliest wins) and a reversed span.
+        let mut x = 12345u64;
+        let mut next = |m: u32| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 33) as u32) % m
+        };
+        let owned: Vec<CodeSymbol> = (0..300)
+            .map(|i| {
+                let a = next(400);
+                let len = next(60);
+                sym(&format!("s{i}"), a, a + len)
+            })
+            .chain(std::iter::once(sym("rev", 50, 10)))
+            .collect();
+        let syms: Vec<&CodeSymbol> = owned.iter().collect();
+        let calls: Vec<(String, u32)> = (0..2000).map(|_| (String::new(), next(480))).collect();
+        let fast = enclosing_symbols(&syms, &calls);
+        for ((_, line), got) in calls.iter().zip(&fast) {
+            let want = syms
+                .iter()
+                .filter(|s| s.start_line <= *line && *line <= s.end_line)
+                .min_by_key(|s| s.end_line - s.start_line)
+                .copied();
+            assert_eq!(got.map(|s| &s.name), want.map(|s| &s.name), "line {line}");
+        }
+    }
+
+    #[test]
+    fn cache_writes_flush_in_bounded_batches() {
+        let root = scratch("flush");
+        std::fs::create_dir_all(store_path(&root).parent().unwrap()).unwrap();
+        let store = Store::open(&store_path(&root)).unwrap();
+        let writes = CacheWrites::with_flush_bytes(100);
+        for i in 0..50 {
+            let key = format!("k{i}");
+            writes.push(&store, key, Arc::from(vec![7u8; 30]));
+            let pending = writes.pending.lock().unwrap();
+            assert!(pending.1 < 100 + 30, "pending bytes stay bounded");
+        }
+        // Most entries were already written before the final flush.
+        assert!(store.parse_cache_len().unwrap() >= 40);
+        writes.flush(&store);
+        assert_eq!(store.parse_cache_len().unwrap(), 50);
+        assert_eq!(writes.stored.load(Ordering::Relaxed), 50);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cold_build_products_reuse_cache_encoding() {
+        let root = scratch("reuse-enc");
+        write(&root, "a.py", "def a():\n    return 1\n");
+        write(&root, "b.go", "package b\nfunc B() {}\n");
+        let inc = IncrementalIndex::build(&root, &IndexOptions::default());
+        // The product bytes held in memory equal what the store holds.
+        let store = Store::open(&store_path(&root)).unwrap();
+        for f in &inc.graph.files {
+            let key = store::parse_cache_key(f.language.unwrap(), &f.sha);
+            let stored = store.cached_parse(&key).unwrap().expect("stored");
+            let held = inc.products.get(&f.path).expect("product");
+            assert_eq!(&stored[..], &held.encoded[..]);
         }
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2904,5 +3240,250 @@ mod persist_audit_tests {
         let prev = with_failure(&root, &opts, "read: busy", MAX_FAILURE_RETRIES);
         let next = prev.apply_changeset(&root, &noop(), &opts);
         assert_eq!(next.failures.len(), 1, "retries are capped");
+    }
+}
+
+#[cfg(test)]
+mod incremental_resolve_tests {
+    //! Incremental apply must equal a cold build while reusing resolver
+    //! metadata and per-file import resolutions (audit scan-index-store #1).
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "astrolabe-incres-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    fn opts() -> IndexOptions {
+        IndexOptions {
+            persist: false,
+            ..IndexOptions::default()
+        }
+    }
+
+    type Fingerprint = (
+        Vec<String>,
+        Vec<String>,
+        Vec<(u32, u32, u8, u32)>,
+        Vec<(String, String)>,
+    );
+
+    fn fingerprint(inc: &IncrementalIndex) -> Fingerprint {
+        (
+            inc.graph
+                .files
+                .iter()
+                .map(|f| f.path.as_str().to_string())
+                .collect(),
+            inc.graph
+                .symbols
+                .iter()
+                .map(|s| format!("{}@{}", s.name, s.file.0))
+                .collect(),
+            inc.graph
+                .edges
+                .iter()
+                .map(|e| (e.from, e.to, e.kind as u8, e.weight))
+                .collect(),
+            inc.report
+                .unresolved_imports
+                .iter()
+                .map(|(p, s)| (p.as_str().to_string(), s.clone()))
+                .collect(),
+        )
+    }
+
+    fn changes(added: &[&str], modified: &[&str], removed: &[&str]) -> ChangeSet {
+        let to = |v: &[&str]| v.iter().map(RelPath::new).collect();
+        ChangeSet {
+            added: to(added),
+            modified: to(modified),
+            removed: to(removed),
+        }
+    }
+
+    fn step(root: &Path, prev: &IncrementalIndex, c: ChangeSet) -> IncrementalIndex {
+        let next = prev.apply_changeset(root, &c, &opts());
+        let cold = IncrementalIndex::build(root, &opts());
+        assert_eq!(fingerprint(&next), fingerprint(&cold), "changes: {c:?}");
+        next
+    }
+
+    fn fixture(root: &Path) {
+        write(root, "pkg/__init__.py", "");
+        write(
+            root,
+            "pkg/a.py",
+            "from pkg import b\n\ndef fa():\n    pass\n",
+        );
+        write(root, "pkg/b.py", "def fb():\n    pass\n");
+        write(root, "pkg/c.py", "def fc():\n    pass\n");
+        write(root, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        write(
+            root,
+            "main.go",
+            "package main\n\nimport \"example.com/app/util\"\n\nfunc main() { util.U() }\n",
+        );
+        write(root, "util/util.go", "package util\n\nfunc U() {}\n");
+        write(root, "util2/util.go", "package util2\n\nfunc V() {}\n");
+        write(
+            root,
+            "App/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>",
+        );
+        write(
+            root,
+            "App/Program.cs",
+            "using Lib.Core;\nnamespace App { class Program { static void Main() { } } }\n",
+        );
+        write(
+            root,
+            "App/Lib1.cs",
+            "namespace Lib.Core { public class One { } }\n",
+        );
+        write(
+            root,
+            "App/Lib2.cs",
+            "namespace Lib.Core { public class Two { } }\n",
+        );
+        write(
+            root,
+            "App/Other.cs",
+            "namespace Other.Ns { public class Three { } }\n",
+        );
+    }
+
+    #[test]
+    fn incremental_chain_matches_cold_build() {
+        let root = scratch("chain");
+        fixture(&root);
+        let mut inc = IncrementalIndex::build(&root, &opts());
+
+        // Python edit adds an import; nothing else may change.
+        write(
+            &root,
+            "pkg/a.py",
+            "from pkg import b, c\n\ndef fa():\n    pass\n",
+        );
+        inc = step(&root, &inc, changes(&[], &["pkg/a.py"], &[]));
+
+        // A C# declaration file moves namespaces: namespace edges follow.
+        write(
+            &root,
+            "App/Lib2.cs",
+            "namespace Other.Ns { public class Two { } }\n",
+        );
+        inc = step(&root, &inc, changes(&[], &["App/Lib2.cs"], &[]));
+
+        // The importer edits its `using`.
+        write(
+            &root,
+            "App/Program.cs",
+            "using Other.Ns;\nnamespace App { class Program { static void Main() { } } }\n",
+        );
+        inc = step(&root, &inc, changes(&[], &["App/Program.cs"], &[]));
+
+        // go.mod module rename changes how main.go's import resolves.
+        write(&root, "go.mod", "module example.com/renamed\n\ngo 1.21\n");
+        inc = step(&root, &inc, changes(&[], &["go.mod"], &[]));
+        write(&root, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        inc = step(&root, &inc, changes(&[], &["go.mod"], &[]));
+
+        // csproj edit.
+        write(
+            &root,
+            "App/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>",
+        );
+        inc = step(&root, &inc, changes(&[], &["App/App.csproj"], &[]));
+
+        // Add and remove files (path set changes: full redo).
+        write(&root, "pkg/d.py", "from pkg import a\n");
+        inc = step(&root, &inc, changes(&["pkg/d.py"], &[], &[]));
+        std::fs::remove_file(root.join("pkg/b.py")).unwrap();
+        inc = step(&root, &inc, changes(&[], &[], &["pkg/b.py"]));
+
+        // A no-op apply stays equal too.
+        step(&root, &inc, changes(&[], &[], &[]));
+    }
+
+    #[test]
+    fn unrelated_edit_reuses_resolver_metadata_and_resolutions() {
+        let root = scratch("reuse");
+        fixture(&root);
+        let inc = IncrementalIndex::build(&root, &opts());
+
+        write(
+            &root,
+            "pkg/c.py",
+            "from pkg import b\n\ndef fc2():\n    pass\n",
+        );
+        let next = inc.apply_changeset(&root, &changes(&[], &["pkg/c.py"], &[]), &opts());
+
+        // Untouched files keep the very same resolution entry.
+        for path in ["pkg/a.py", "main.go", "App/Program.cs"] {
+            let p = RelPath::new(path);
+            assert!(
+                Arc::ptr_eq(&inc.resolutions.by_path[&p], &next.resolutions.by_path[&p]),
+                "{path} should reuse its resolutions"
+            );
+        }
+        // The edited file was re-resolved.
+        let c = RelPath::new("pkg/c.py");
+        assert!(!Arc::ptr_eq(
+            &inc.resolutions.by_path[&c],
+            &next.resolutions.by_path[&c]
+        ));
+
+        // Only resolvers that read a modified file re-run `detect`.
+        let mods: BTreeSet<RelPath> = [RelPath::new("pkg/c.py")].into();
+        let files = scan::to_index(
+            &root,
+            &ScanResult {
+                files: inc.files.clone(),
+                skipped: Vec::new(),
+            },
+        );
+        let (_, changed) = inc.resolvers.redetect(&files, &mods);
+        assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    #[test]
+    fn declaration_edit_redetects_only_its_language() {
+        let root = scratch("lang");
+        fixture(&root);
+        let inc = IncrementalIndex::build(&root, &opts());
+        write(
+            &root,
+            "App/Lib2.cs",
+            "namespace Other.Ns { public class Two { } }\n",
+        );
+        let files = scan::to_index(
+            &root,
+            &ScanResult {
+                files: inc.files.clone(),
+                skipped: Vec::new(),
+            },
+        );
+        let mods: BTreeSet<RelPath> = [RelPath::new("App/Lib2.cs")].into();
+        let (_, changed) = inc.resolvers.redetect(&files, &mods);
+        assert_eq!(changed, vec![Language::CSharp]);
     }
 }

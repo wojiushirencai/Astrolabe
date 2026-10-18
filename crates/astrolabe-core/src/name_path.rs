@@ -71,6 +71,26 @@ pub fn match_name_path(
     kind: KindFilter,
     depth: u8,
 ) -> Vec<NamePathMatch> {
+    match_name_path_with(
+        symbols,
+        &NamePathIndex::new(symbols),
+        query,
+        substring,
+        kind,
+        depth,
+    )
+}
+
+/// [`match_name_path`] with a prebuilt [`NamePathIndex`] (built once per
+/// immutable symbol table instead of once per query).
+pub fn match_name_path_with(
+    symbols: &[CodeSymbol],
+    index: &NamePathIndex,
+    query: &str,
+    substring: bool,
+    kind: KindFilter,
+    depth: u8,
+) -> Vec<NamePathMatch> {
     let Some(mut query) = parse_query(query) else {
         return Vec::new();
     };
@@ -115,8 +135,8 @@ pub fn match_name_path(
             }
         }
     }
-    let ctx = Ctx::new(symbols);
-    let by_id = &ctx.by_id;
+    let ctx = Ctx::new(symbols, index);
+    let by_id = ctx.by_id;
     // 查询段只小写一次；符号名比较走 ASCII 快路，不再逐符号分配。
     let lowered: Vec<String> = query.segments.iter().map(|s| lower_once(s)).collect();
     let last = lowered.last().expect("解析结果至少一段");
@@ -198,7 +218,16 @@ pub fn match_name_path(
 /// 每个目标（`symbols` 下标）在同文件内的最内层包含者（`symbols` 下标）。
 /// 供 find_symbol 在每行标注"所属容器"；按文件分桶，不做全库扫描。
 pub fn innermost_containers(symbols: &[CodeSymbol], targets: &[usize]) -> Vec<Option<usize>> {
-    let ctx = Ctx::new(symbols);
+    innermost_containers_with(symbols, &NamePathIndex::new(symbols), targets)
+}
+
+/// [`innermost_containers`] with a prebuilt [`NamePathIndex`].
+pub fn innermost_containers_with(
+    symbols: &[CodeSymbol],
+    index: &NamePathIndex,
+    targets: &[usize],
+) -> Vec<Option<usize>> {
+    let ctx = Ctx::new(symbols, index);
     targets
         .iter()
         .map(|&t| {
@@ -305,20 +334,37 @@ fn strictly_contains(outer: &CodeSymbol, inner: &CodeSymbol) -> bool {
 ///（O(Σ n_file²) 而非 O(N²)），id→下标映射一次建好。
 struct Ctx<'a> {
     symbols: &'a [CodeSymbol],
+    by_id: &'a HashMap<SymbolId, usize>,
+    buckets: &'a HashMap<crate::types::FileId, Vec<usize>>,
+}
+
+/// Lookup tables over one symbol table (id → position, per-file buckets).
+/// Immutable-snapshot callers build it once and reuse it across queries.
+#[derive(Debug, Default)]
+pub struct NamePathIndex {
     by_id: HashMap<SymbolId, usize>,
     buckets: HashMap<crate::types::FileId, Vec<usize>>,
 }
 
-impl<'a> Ctx<'a> {
-    fn new(symbols: &'a [CodeSymbol]) -> Self {
+impl NamePathIndex {
+    pub fn new(symbols: &[CodeSymbol]) -> Self {
         let mut buckets: HashMap<crate::types::FileId, Vec<usize>> = HashMap::new();
         for (i, s) in symbols.iter().enumerate() {
             buckets.entry(s.file).or_default().push(i);
         }
-        Ctx {
-            symbols,
+        NamePathIndex {
             by_id: index_by_id(symbols),
             buckets,
+        }
+    }
+}
+
+impl<'a> Ctx<'a> {
+    fn new(symbols: &'a [CodeSymbol], index: &'a NamePathIndex) -> Self {
+        Ctx {
+            symbols,
+            by_id: &index.by_id,
+            buckets: &index.buckets,
         }
     }
 

@@ -35,10 +35,6 @@ redb.workspace = true
 tracing.workspace = true
 lsp-types.workspace = true
 ast-grep-core.workspace = true
-oxc_allocator.workspace = true
-oxc_parser.workspace = true
-oxc_semantic.workspace = true
-oxc_span.workspace = true
 tree-sitter.workspace = true
 tree-sitter-python.workspace = true
 tree-sitter-go.workspace = true
@@ -71,3 +67,6 @@ tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

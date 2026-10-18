@@ -207,7 +207,32 @@ impl ParserPool {
                 },
             );
         }
-        self.parse_raw(lang, path, source)
+        // TypeScript 5.0 `export type * from './x'` is unknown to
+        // tree-sitter-typescript 0.23 (ERROR node, whole file flagged partial).
+        // Blank the `type` keyword (same byte length) so it parses as the
+        // equivalent `export * from`, which keeps the re-export import edge.
+        if matches!(lang, Language::TypeScript | Language::Tsx) {
+            if let Some(fixed) = normalize_export_type_star(source) {
+                return self.parse_raw(lang, path, &fixed);
+            }
+        }
+        let parsed = self.parse_raw(lang, path, source)?;
+        // TS import types in generics (`f<typeof import('x')>()`,
+        // `Ref<import('vue').Ref<T>>`) make tree-sitter-typescript emit ERROR
+        // nodes. Only when the first pass is partial, blank those
+        // `import('lit')` spans with an identifier of equal length and keep
+        // the retry only if it parses cleanly. Dynamic `import()` calls are
+        // never touched (see `normalize_import_types`).
+        if parsed.partial && matches!(lang, Language::TypeScript | Language::Tsx) {
+            if let Some(fixed) = normalize_import_types(source) {
+                if let Ok(retry) = self.parse_raw(lang, path, &fixed) {
+                    if !retry.partial {
+                        return Ok(retry);
+                    }
+                }
+            }
+        }
+        Ok(parsed)
     }
 
     /// One tree-sitter parse + query extraction, no per-language pre-pass.
@@ -285,6 +310,105 @@ impl ParserPool {
             partial,
         })
     }
+}
+
+/// Replace `type` with spaces in statement-leading `export type * [as ns] from`
+/// (TS 5.0 syntax). Byte offsets, lines and columns are unchanged. Returns
+/// `None` when nothing matches.
+fn normalize_export_type_star(source: &str) -> Option<String> {
+    if !source.contains("export type") {
+        return None;
+    }
+    let mut out: Option<String> = None;
+    let mut pos = 0usize;
+    for line in source.split_inclusive('\n') {
+        let lead = line.len() - line.trim_start().len();
+        let rest = &line[lead..];
+        if let Some(after) = rest.strip_prefix("export") {
+            let after_ws = after.trim_start();
+            let ws = after.len() - after_ws.len();
+            if ws > 0 {
+                if let Some(tail) = after_ws.strip_prefix("type") {
+                    let t = tail.trim_start();
+                    if t.starts_with('*') {
+                        let at = pos + lead + "export".len() + ws;
+                        let buf = out.get_or_insert_with(|| source.to_owned());
+                        buf.replace_range(at..at + 4, "    ");
+                    }
+                }
+            }
+        }
+        pos += line.len();
+    }
+    out
+}
+
+/// Replace type-position `import('lit')` (preceded by `typeof`, `<`, `|` or
+/// `&`) with `_` of the same byte length so it reads as a type name.
+/// Offsets are unchanged. Calls after `await`, `=`, `(`, `,` etc. are left
+/// alone. `None` when nothing matches.
+fn normalize_import_types(source: &str) -> Option<String> {
+    let b = source.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut from = 0usize;
+    while let Some(off) = source[from..].find("import") {
+        let at = from + off;
+        from = at + 6;
+        if at > 0
+            && (b[at - 1].is_ascii_alphanumeric()
+                || b[at - 1] == b'_'
+                || b[at - 1] == b'$'
+                || b[at - 1] == b'.')
+        {
+            continue;
+        }
+        let mut j = at + 6;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) != Some(&b'(') {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let Some(&q) = b.get(j) else { continue };
+        if !matches!(q, b'\'' | b'"') {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j] != q && b[j] != b'\n' && b[j] != b'\\' {
+            j += 1;
+        }
+        if b.get(j) != Some(&q) {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) != Some(&b')') {
+            continue;
+        }
+        let end = j + 1;
+        let before = source[..at].trim_end();
+        let typed = before.ends_with('<')
+            || before.ends_with('|')
+            || before.ends_with('&')
+            || before.strip_suffix("typeof").is_some_and(|r| {
+                !r.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+            });
+        if !typed {
+            continue;
+        }
+        let buf = out.get_or_insert_with(|| b.to_vec());
+        for x in &mut buf[at..end] {
+            *x = b'_';
+        }
+        from = end;
+    }
+    out.and_then(|v| String::from_utf8(v).ok())
 }
 
 impl Default for ParserPool {
@@ -417,6 +541,9 @@ fn extract_symbols(
         QueryCursorOptions::new().progress_callback(&mut progress),
     );
     let mut symbols = Vec::new();
+    // Built lazily (only annotated Java/C#/VB/Swift symbols need it) so
+    // `signature_from_row` is O(1) per symbol instead of O(rows).
+    let mut rows: Option<Vec<&str>> = None;
 
     while let Some(query_match) = matches.next() {
         let definition = query_match.captures().iter().find_map(|capture| {
@@ -474,7 +601,13 @@ fn extract_symbols(
             Language::Java | Language::CSharp | Language::VisualBasic | Language::Swift
         ) && name_row > def_row;
         let (sig, start_row) = if anchor_on_name {
-            (signature_from_row(source, name_row), name_row)
+            {
+                let rows = rows.get_or_insert_with(|| source.lines().collect());
+                (
+                    signature_from_line(rows.get(name_row).copied().unwrap_or_default()),
+                    name_row,
+                )
+            }
         } else {
             (
                 signature(definition_node, source),
@@ -510,12 +643,25 @@ fn extract_imports(
     if lang == Language::Ruby {
         return extract_ruby_imports(query, root, source);
     }
+    if lang == Language::Php {
+        return extract_php_imports(query, root, source);
+    }
     if lang != Language::CSharp && lang != Language::VisualBasic {
+        // C/C++ keep the brackets of `<x.h>` so the resolver can tell a
+        // system include from a quoted one; `"x.h"` arrives as bare `x.h`.
+        let keep_angle = matches!(lang, Language::C | Language::Cpp);
         return extract_named_captures(query, root, source, |name| {
             name == "import" || name == "source" || name == "module"
         })
         .into_iter()
-        .map(|(text, _)| unquote(text.trim()).to_owned())
+        .map(|(text, _)| {
+            let t = text.trim();
+            if keep_angle && t.len() >= 2 && t.starts_with('<') && t.ends_with('>') {
+                t.to_owned()
+            } else {
+                unquote(t).to_owned()
+            }
+        })
         .collect();
     }
 
@@ -564,6 +710,215 @@ fn extract_imports(
 /// Ruby: `require_relative "x"` is emitted as `relative:x` so the resolver
 /// resolves it against the requiring file only — never a same-named file on
 /// the `$LOAD_PATH` (`lib/x.rb`). `require` / `load` / `autoload` stay raw.
+/// PHP: the query supplies include/require literals. `use` declarations are
+/// walked here instead so grouped `use A\\{B, C as D}` yields the full
+/// `A\\B`, `A\\C` (the query alone would only see the bare `B`, `C`), and a
+/// leading `\\` is dropped.
+fn extract_php_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let mut output: Vec<String> =
+        extract_named_captures(query, root, source, |name| name == "import")
+            .into_iter()
+            .filter_map(|(text, _)| {
+                // Skipped here: `use` names, collected by the walk below.
+                let t = unquote(text.trim());
+                (!t.is_empty()).then(|| t.to_owned())
+            })
+            .collect();
+    // Drop the query's bare `use` names; keep only include/require literals.
+    let mut uses = Vec::new();
+    collect_php_uses(root, source, &mut uses);
+    let mut bare = Vec::new();
+    collect_php_use_nodes(root, source, &mut bare);
+    output.retain(|t| !bare.contains(t));
+    output.extend(uses);
+    collect_php_dir_includes(root, source, &mut output);
+    output
+}
+
+/// Number of directory levels above the including file that `node` denotes:
+/// `__DIR__` / `dirname(__FILE__)` = 0, `dirname(X)` = levels(X)+1,
+/// `dirname(X, n)` = levels(X)+n. Anything else is unresolvable.
+fn php_dir_levels(node: tree_sitter::Node<'_>, source: &str) -> Option<usize> {
+    let text = |n: tree_sitter::Node<'_>| n.utf8_text(source.as_bytes()).ok();
+    match node.kind() {
+        "parenthesized_expression" => php_dir_levels(node.named_child(0)?, source),
+        "name" | "constant" | "magic_constant" | "relative_scope" => {
+            text(node)?.eq_ignore_ascii_case("__DIR__").then_some(0)
+        }
+        "function_call_expression" => {
+            let f = node.child_by_field_name("function")?;
+            if !text(f)?
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case("dirname")
+            {
+                return None;
+            }
+            let args = node.child_by_field_name("arguments")?;
+            let mut c = args.walk();
+            let list: Vec<_> = args.named_children(&mut c).collect();
+            fn arg(a: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+                a.named_child(0).unwrap_or(a)
+            }
+            let first = arg(*list.first()?);
+            let n = match list.get(1) {
+                None => 1,
+                Some(a) => text(arg(*a))?.trim().parse::<usize>().ok()?,
+            };
+            if list.len() > 2 || n == 0 {
+                return None;
+            }
+            let base = if first.kind() == "function_call_expression"
+                || first.kind() == "parenthesized_expression"
+            {
+                php_dir_levels(first, source)?
+            } else if text(first)?.eq_ignore_ascii_case("__FILE__") {
+                return Some(n - 1);
+            } else {
+                php_dir_levels(first, source)?
+            };
+            Some(base + n)
+        }
+        _ => None,
+    }
+}
+
+/// `require __DIR__ . '/x.php'` and `dirname(__DIR__, 2) . '/x.php'`: emitted as
+/// `/` + `../` * levels + path, so `resolve_path` joins it to the file's dir.
+/// Left operands that cannot be evaluated (variables, constants) are dropped
+/// rather than guessed.
+fn collect_php_dir_includes(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    if matches!(
+        node.kind(),
+        "include_expression"
+            | "include_once_expression"
+            | "require_expression"
+            | "require_once_expression"
+    ) {
+        let mut arg = node.named_child(0);
+        while let Some(a) = arg.filter(|a| a.kind() == "parenthesized_expression") {
+            arg = a.named_child(0);
+        }
+        if let Some(bin) = arg.filter(|a| a.kind() == "binary_expression") {
+            let is_dot = bin
+                .child_by_field_name("operator")
+                .and_then(|o| o.utf8_text(source.as_bytes()).ok())
+                == Some(".");
+            let (l, r) = (
+                bin.child_by_field_name("left"),
+                bin.child_by_field_name("right"),
+            );
+            if let (true, Some(l), Some(r)) = (is_dot, l, r) {
+                if let (Some(levels), true) = (
+                    php_dir_levels(l, source),
+                    matches!(r.kind(), "string" | "encapsed_string"),
+                ) {
+                    if let Ok(t) = r.utf8_text(source.as_bytes()) {
+                        let t = unquote(t.trim()).trim_start_matches('/');
+                        if !t.is_empty() && !t.contains('$') {
+                            out.push(format!("/{}{t}", "../".repeat(levels)));
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_php_dir_includes(ch, source, out);
+    }
+}
+
+fn collect_php_use_nodes(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    if node.kind() == "namespace_use_clause" {
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if matches!(ch.kind(), "name" | "qualified_name") {
+                if let Ok(t) = ch.utf8_text(source.as_bytes()) {
+                    out.push(unquote(t.trim()).to_owned());
+                }
+            }
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_php_use_nodes(ch, source, out);
+    }
+}
+
+fn php_clause_name<'a>(clause: tree_sitter::Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut c = clause.walk();
+    let found = clause
+        .children(&mut c)
+        .find(|n| matches!(n.kind(), "name" | "qualified_name"))?;
+    found.utf8_text(source.as_bytes()).ok()
+}
+
+/// `function:` / `const:` when the node carries a `function` / `const` keyword
+/// child (`use function A\b;`, or a clause inside `use A\{function f}`).
+fn php_use_kind(node: tree_sitter::Node<'_>) -> &'static str {
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        match ch.kind() {
+            "function" => return "function:",
+            "const" => return "const:",
+            _ => {}
+        }
+    }
+    ""
+}
+
+fn collect_php_uses(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    if node.kind() == "namespace_use_declaration" {
+        let mut prefix: Option<&str> = None;
+        let decl_kind = php_use_kind(node);
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            match ch.kind() {
+                "namespace_name" => prefix = ch.utf8_text(source.as_bytes()).ok(),
+                "namespace_use_clause" => {
+                    if let Some(n) = php_clause_name(ch, source) {
+                        let k = [decl_kind, php_use_kind(ch)]
+                            .into_iter()
+                            .find(|k| !k.is_empty())
+                            .unwrap_or("");
+                        out.push(format!("{k}{}", n.trim_start_matches('\\')));
+                    }
+                }
+                "namespace_use_group" => {
+                    let pre = prefix.unwrap_or("").trim_matches('\\');
+                    let mut g = ch.walk();
+                    for cl in ch.children(&mut g) {
+                        if matches!(
+                            cl.kind(),
+                            "namespace_use_clause" | "namespace_use_group_clause"
+                        ) {
+                            if let Some(n) = php_clause_name(cl, source) {
+                                let n = n.trim_start_matches('\\');
+                                let k = [decl_kind, php_use_kind(cl)]
+                                    .into_iter()
+                                    .find(|k| !k.is_empty())
+                                    .unwrap_or("");
+                                out.push(if pre.is_empty() {
+                                    format!("{k}{n}")
+                                } else {
+                                    format!("{k}{pre}\\{n}")
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_php_uses(ch, source, out);
+    }
+}
+
 fn extract_ruby_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
@@ -1106,7 +1461,10 @@ fn signature(node: tree_sitter::Node<'_>, source: &str) -> String {
 
 /// 取源码第 `row` 行（0-based）在 `{` 之前的部分作为签名。
 fn signature_from_row(source: &str, row: usize) -> String {
-    let line = source.lines().nth(row).unwrap_or_default();
+    signature_from_line(source.lines().nth(row).unwrap_or_default())
+}
+
+fn signature_from_line(line: &str) -> String {
     let before_body = line.split('{').next().unwrap_or(line).trim();
     let mut result: String = before_body.chars().take(MAX_SIGNATURE_CHARS).collect();
     if before_body.chars().count() > MAX_SIGNATURE_CHARS {
@@ -1132,6 +1490,56 @@ fn unquote(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn annotated_symbols_anchor_on_name_row_with_signature() {
+        let pool = ParserPool::new();
+        let src = "class A {\n  @Override\n  public void m() {}\n  @Deprecated\n  @X\n  void n(int a) {}\n}\n";
+        let p = pool
+            .parse(Language::Java, &RelPath::new("A.java"), src)
+            .expect("java parses");
+        let m = p.symbols.iter().find(|s| s.name == "m").expect("m");
+        assert_eq!(
+            (m.start_line, m.signature.as_str()),
+            (3, "public void m() "[..15].trim())
+        );
+        let n = p.symbols.iter().find(|s| s.name == "n").expect("n");
+        assert_eq!((n.start_line, n.signature.as_str()), (6, "void n(int a)"));
+    }
+
+    /// Perf probe (ignored): `cargo test -p astrolabe-core --lib parse::tests::perf_probe --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_probe() {
+        use std::hash::{Hash, Hasher};
+        let pool = ParserPool::new();
+        let mut java = String::from("class A {\n");
+        for i in 0..20000 {
+            java.push_str(&format!("  @Override\n  public void m{i}() {{}}\n"));
+        }
+        java.push_str("}\n");
+        let mut sh = String::from("if [[ ( ]]; then\n");
+        for i in 0..3000 {
+            sh.push_str(&format!("f{i}() {{\n  echo {i}\n}}\n"));
+        }
+        for (lang, path, src) in [
+            (Language::Java, "A.java", &java),
+            (Language::Shell, "a.sh", &sh),
+        ] {
+            let t = std::time::Instant::now();
+            let p = pool.parse(lang, &RelPath::new(path), src).expect("parses");
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for s in &p.symbols {
+                (&s.name, &s.signature, s.start_line, s.end_line).hash(&mut h);
+            }
+            eprintln!(
+                "PERF {path}: {} symbols, {:?}, digest {:x}",
+                p.symbols.len(),
+                t.elapsed(),
+                h.finish()
+            );
+        }
+    }
+
     #[test]
     fn cpp_destructors_and_nested_namespaces_are_symbols() {
         let pool = ParserPool::new();
@@ -1352,6 +1760,62 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             .unwrap()
             .len();
         assert!((1..=4).contains(&idle), "idle parsers: {idle}");
+    }
+
+    #[test]
+    fn ts_export_type_star_parses_cleanly_and_keeps_import_edges() {
+        let src = "export type * from './user';\nexport type * as ns from '@v/typings';\nexport type Foo = 1;\nexport function f() {}\n";
+        let pool = ParserPool::new();
+        for lang in [Language::TypeScript, Language::Tsx] {
+            let p = pool.parse(lang, &RelPath::new("index.ts"), src).unwrap();
+            assert!(!p.partial, "{lang:?} flagged partial");
+            assert!(
+                p.imports.iter().any(|i| i.contains("./user")),
+                "{:?}",
+                p.imports
+            );
+            assert!(p.symbols.iter().any(|s| s.name == "f" && s.start_line == 4));
+            assert!(p.symbols.iter().any(|s| s.name == "Foo"));
+        }
+        // String contents are untouched.
+        assert!(normalize_export_type_star("const s = \"export type * x\";\n").is_none());
+    }
+
+    #[test]
+    fn ts_generic_import_types_parse_cleanly_and_dynamic_import_edges_stay() {
+        let src = "const m = await vi.importActual<typeof import('vue')>('vue');\nlet r: Readonly<import('vue').Ref<string>>;\nexpect(x).toEqualTypeOf<Readonly<import('vue').Ref<string>>>();\nconst lazy = () => import('./lazy');\nexport function f() {}\n";
+        let pool = ParserPool::new();
+        for lang in [Language::TypeScript, Language::Tsx] {
+            let p = pool.parse(lang, &RelPath::new("a.ts"), src).unwrap();
+            assert!(!p.partial, "{lang:?} partial");
+            assert!(p.symbols.iter().any(|s| s.name == "f" && s.start_line == 5));
+            assert!(
+                p.imports.iter().any(|i| i.contains("./lazy")),
+                "{:?}",
+                p.imports
+            );
+        }
+        let fixed = normalize_import_types(src).unwrap();
+        assert_eq!(fixed.len(), src.len());
+        assert!(fixed.contains("import('./lazy')"));
+        assert!(!fixed.contains("import('vue')"));
+        assert!(
+            normalize_import_types("const a = await import('x');\nf(import('y'));\n").is_none()
+        );
+    }
+
+    #[test]
+    fn top_level_for_loop_counter_is_indexed_but_nested_is_not() {
+        let src = "const n = 3;\nfor (let i = 0; i < n; i++) {}\nfunction f() {\n  for (let j = 0; j < 2; j++) {}\n}\n";
+        let pool = ParserPool::new();
+        for lang in [Language::TypeScript, Language::JavaScript] {
+            let p = pool.parse(lang, &RelPath::new("a.ts"), src).unwrap();
+            assert!(
+                p.symbols.iter().any(|s| s.name == "i" && s.start_line == 2),
+                "{lang:?}"
+            );
+            assert!(!p.symbols.iter().any(|s| s.name == "j"), "{lang:?}");
+        }
     }
 
     #[test]
@@ -3240,6 +3704,66 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             }
         }
         s
+    }
+
+    #[test]
+    fn php_dirname_levels_and_unresolvable_left_operands() {
+        let pool = ParserPool::new();
+        let src = "<?php\nrequire __DIR__ . '/a.php';\nrequire_once dirname(__DIR__) . '/b.php';\ninclude dirname(__DIR__, 2) . '/c.php';\nrequire dirname(dirname(__DIR__)) . \"/d.php\";\nrequire dirname(__FILE__) . '/e.php';\nrequire BASE_PATH . '/f.php';\nrequire $root . '/g.php';\nrequire 'h.php';\n";
+        let mut got = pool
+            .parse(Language::Php, &RelPath::new("a.php"), src)
+            .expect("parse php")
+            .imports;
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "/../../c.php",
+                "/../../d.php",
+                "/../b.php",
+                "/a.php",
+                "/e.php",
+                "h.php"
+            ]
+        );
+    }
+
+    #[test]
+    fn c_angle_includes_keep_brackets() {
+        let pool = ParserPool::new();
+        let mut got = pool
+            .parse(
+                Language::C,
+                &RelPath::new("a.c"),
+                "#include <stdio.h>\n#include \"x.h\"\n",
+            )
+            .expect("parse c")
+            .imports;
+        got.sort();
+        assert_eq!(got, ["<stdio.h>", "x.h"]);
+    }
+
+    #[test]
+    fn php_use_forms_and_include_literals() {
+        let pool = ParserPool::new();
+        let src = "<?php\nnamespace X;\nuse \\App\\A;\nuse App\\B as Bee;\nuse App\\Models\\{User, Post as P};\nuse function App\\helper;\nrequire_once __DIR__ . '/inc/x.php';\ninclude 'y.php';\n";
+        let mut got = pool
+            .parse(Language::Php, &RelPath::new("a.php"), src)
+            .expect("parse php")
+            .imports;
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "/inc/x.php",
+                "App\\A",
+                "App\\B",
+                "App\\Models\\Post",
+                "App\\Models\\User",
+                "function:App\\helper",
+                "y.php"
+            ]
+        );
     }
 
     #[test]

@@ -57,6 +57,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::gitignore::Gitignore;
 use ignore::{DirEntry, Match, WalkBuilder, WalkState};
 use memchr::memchr;
+use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, Metadata};
 use std::io::{self, ErrorKind, Read, Take};
@@ -263,41 +264,59 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> ScanResult {
         None
     };
 
+    // Stat + binary sniff are independent per file and dominate on cold disks,
+    // network mounts and Windows. `par_iter().collect()` on an indexed source
+    // keeps candidate order, and the sorts below make the result independent
+    // of scheduling regardless.
+    let outcomes: Vec<ScanOutcome> = candidates
+        .par_iter()
+        .map(|path| classify_candidate(&root, path, opts, &excludes, admitted.as_ref()))
+        .collect();
     let mut result = ScanResult::default();
-    for path in candidates {
-        let rel = RelPath::new(path_to_rel(&root, &path));
-
-        let gitignored = admitted
-            .as_ref()
-            .is_some_and(|admitted| !admitted.contains(&path));
-        if gitignored || excludes.matches_file(&root, &path) {
-            result.skipped.push((rel, SkipReason::Ignored));
-            continue;
-        }
-
-        let metadata = match path.metadata() {
-            Ok(metadata) if metadata.is_file() => metadata,
-            Ok(_) => continue,
-            Err(_) => {
-                result.skipped.push((rel, SkipReason::ReadError));
-                continue;
-            }
-        };
-        if metadata.len() > opts.max_file_bytes {
-            result.skipped.push((rel, SkipReason::TooLarge));
-            continue;
-        }
-
-        match looks_binary_cached(&path, &metadata, Language::from_path(&rel).is_some()) {
-            Ok(true) => result.skipped.push((rel, SkipReason::Binary)),
-            Ok(false) => result.files.push(rel),
-            Err(_) => result.skipped.push((rel, SkipReason::ReadError)),
+    for outcome in outcomes {
+        match outcome {
+            ScanOutcome::Drop => {}
+            ScanOutcome::File(rel) => result.files.push(rel),
+            ScanOutcome::Skip(rel, reason) => result.skipped.push((rel, reason)),
         }
     }
 
     result.files.sort();
     result.skipped.sort_by(|a, b| a.0.cmp(&b.0));
     result
+}
+
+enum ScanOutcome {
+    Drop,
+    File(RelPath),
+    Skip(RelPath, SkipReason),
+}
+
+fn classify_candidate(
+    root: &Path,
+    path: &Path,
+    opts: &ScanOptions,
+    excludes: &ExcludeMatcher,
+    admitted: Option<&BTreeSet<PathBuf>>,
+) -> ScanOutcome {
+    let rel = RelPath::new(path_to_rel(root, path));
+    let gitignored = admitted.is_some_and(|admitted| !admitted.contains(path));
+    if gitignored || excludes.matches_file(root, path) {
+        return ScanOutcome::Skip(rel, SkipReason::Ignored);
+    }
+    let metadata = match path.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return ScanOutcome::Drop,
+        Err(_) => return ScanOutcome::Skip(rel, SkipReason::ReadError),
+    };
+    if metadata.len() > opts.max_file_bytes {
+        return ScanOutcome::Skip(rel, SkipReason::TooLarge);
+    }
+    match looks_binary_cached(path, &metadata, Language::from_path(&rel).is_some()) {
+        Ok(true) => ScanOutcome::Skip(rel, SkipReason::Binary),
+        Ok(false) => ScanOutcome::File(rel),
+        Err(_) => ScanOutcome::Skip(rel, SkipReason::ReadError),
+    }
 }
 
 /// Replay the scan gates for one path without walking the whole tree.
@@ -624,7 +643,7 @@ fn gitignore_ignores(root: &Path, rel: &RelPath) -> bool {
     // Same sources as the `ignore` walker in `scan` (lowest precedence
     // first, last match wins): global ignore file, `.gitignore`/`.ignore`
     // in directories above the root, `.git/info/exclude`, then the root.
-    let (global, _) = Gitignore::global();
+    let global = cached_global_gitignore();
     if !global.is_empty() {
         chain.push(global);
     }
@@ -633,12 +652,8 @@ fn gitignore_ignores(root: &Path, rel: &RelPath) -> bool {
         push_gitignore(&mut chain, ancestor);
     }
     let exclude = root.join(".git").join("info").join("exclude");
-    if exclude.is_file() {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-        let _ = builder.add(&exclude);
-        if let Ok(gi) = builder.build() {
-            chain.push(gi);
-        }
+    if let Some(gi) = cached_matcher(&exclude, MatcherKind::InfoExclude(root)) {
+        chain.push(gi);
     }
     push_gitignore(&mut chain, &dir);
 
@@ -667,12 +682,87 @@ fn gitignore_ignores(root: &Path, rel: &RelPath) -> bool {
 fn push_gitignore(chain: &mut Vec<Gitignore>, dir: &Path) {
     // `.ignore` outranks `.gitignore` in the same directory.
     for name in [".gitignore", ".ignore"] {
-        let path = dir.join(name);
-        if path.is_file() {
-            let (gi, _) = Gitignore::new(path);
+        if let Some(gi) = cached_matcher(&dir.join(name), MatcherKind::Plain) {
             chain.push(gi);
         }
     }
+}
+
+enum MatcherKind<'a> {
+    /// `.gitignore` / `.ignore`: patterns are relative to the file's directory.
+    Plain,
+    /// `.git/info/exclude`: patterns are relative to the repo root.
+    InfoExclude(&'a Path),
+}
+
+type MatcherStamp = Option<(SystemTime, u64)>;
+
+/// Parsed ignore files keyed by path. An entry is reused only while the
+/// file's (mtime, len) is unchanged and the mtime is older than
+/// [`MTIME_UNTRUSTED_WINDOW`], so a rewrite inside one mtime tick is re-read.
+/// `None` stamp = the file did not exist.
+type MatcherEntry = (MatcherStamp, Option<Gitignore>);
+static MATCHER_CACHE: LazyLock<Mutex<HashMap<PathBuf, MatcherEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const MATCHER_CACHE_CAP: usize = 4096;
+
+fn matcher_stamp(path: &Path) -> MatcherStamp {
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+fn stamp_trusted(stamp: &MatcherStamp) -> bool {
+    match stamp {
+        None => true,
+        Some((mtime, _)) => SystemTime::now()
+            .duration_since(*mtime)
+            .is_ok_and(|age| age >= MTIME_UNTRUSTED_WINDOW),
+    }
+}
+
+fn cached_matcher(path: &Path, kind: MatcherKind<'_>) -> Option<Gitignore> {
+    let stamp = matcher_stamp(path);
+    // A file that cannot report an mtime is never cached.
+    let cacheable = stamp.is_none() && !path.exists() || (stamp.is_some() && stamp_trusted(&stamp));
+    if cacheable {
+        let cache = MATCHER_CACHE.lock().expect("matcher cache poisoned");
+        if let Some((cached_stamp, gi)) = cache.get(path) {
+            if *cached_stamp == stamp {
+                return gi.clone();
+            }
+        }
+    }
+    let built = stamp.as_ref().and_then(|_| match kind {
+        MatcherKind::Plain => Some(Gitignore::new(path).0),
+        MatcherKind::InfoExclude(root) => {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+            let _ = builder.add(path);
+            builder.build().ok()
+        }
+    });
+    if cacheable {
+        let mut cache = MATCHER_CACHE.lock().expect("matcher cache poisoned");
+        if cache.len() >= MATCHER_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (stamp, built.clone()));
+    }
+    built
+}
+
+/// Global gitignore (core.excludesFile / XDG), re-read at most every 5 s.
+fn cached_global_gitignore() -> Gitignore {
+    static CACHE: LazyLock<Mutex<Option<(std::time::Instant, Gitignore)>>> =
+        LazyLock::new(|| Mutex::new(None));
+    let mut g = CACHE.lock().expect("global gitignore cache poisoned");
+    if let Some((at, gi)) = g.as_ref() {
+        if at.elapsed() < Duration::from_secs(5) {
+            return gi.clone();
+        }
+    }
+    let (gi, _) = Gitignore::global();
+    *g = Some((std::time::Instant::now(), gi.clone()));
+    gi
 }
 
 fn chain_ignores(chain: &[Gitignore], path: &Path, is_dir: bool) -> bool {
@@ -773,6 +863,39 @@ fn sniff_binary(path: &Path, known_source: bool) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gitignore_matcher_cache_reuses_and_invalidates() {
+        let dir = std::env::temp_dir().join(format!("astro-gi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gi = dir.join(".gitignore");
+        std::fs::write(&gi, "a.rs\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&gi)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let rel = |s: &str| RelPath::new(s);
+        assert!(gitignore_ignores(&dir, &rel("a.rs")));
+        assert!(!gitignore_ignores(&dir, &rel("b.rs")));
+        // Cached now; rewrite with different length -> must be re-read.
+        std::fs::write(&gi, "b.rs\n# longer\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&gi)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!gitignore_ignores(&dir, &rel("a.rs")));
+        assert!(gitignore_ignores(&dir, &rel("b.rs")));
+        // Deleted -> nothing ignored.
+        std::fs::remove_file(&gi).unwrap();
+        assert!(!gitignore_ignores(&dir, &rel("b.rs")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn build_output_dirs_only_pruned_at_project_roots() {
         let dir = TestDir::new();

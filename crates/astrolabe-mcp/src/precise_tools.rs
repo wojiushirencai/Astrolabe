@@ -314,7 +314,16 @@ pub(crate) fn run_find_references(
 
     let offset = params.offset.unwrap_or(0);
     let items: Vec<String> = locations.iter().map(render_location).collect();
-    let (kept, omitted) = page(&items, offset, params.budget_tokens);
+    // The header (confidence, note, coordinate line, truncation marker) is
+    // part of the output, so it is charged to the budget before the list.
+    let overhead = estimate_tokens(&preamble)
+        + estimate_tokens(COORD_NOTE)
+        + estimate_tokens(&omitted_line(items.len(), items.len()));
+    let (kept, omitted) = page(
+        &items,
+        offset,
+        params.budget_tokens.saturating_sub(overhead),
+    );
 
     let mut body = preamble;
     if !kept.is_empty() {
@@ -521,7 +530,14 @@ pub(crate) fn run_goto_definition(
 
     let offset = params.offset.unwrap_or(0);
     let items: Vec<String> = locations.iter().map(render_location).collect();
-    let (kept, omitted) = page(&items, offset, params.budget_tokens);
+    let overhead = estimate_tokens(&preamble)
+        + estimate_tokens(COORD_NOTE)
+        + estimate_tokens(&omitted_line(items.len(), items.len()));
+    let (kept, omitted) = page(
+        &items,
+        offset,
+        params.budget_tokens.saturating_sub(overhead),
+    );
 
     let mut body = preamble;
     if !kept.is_empty() {
@@ -1541,6 +1557,20 @@ mod tests {
             "{}",
             estimate_tokens(text)
         );
+    }
+
+    #[test]
+    fn find_references_output_including_header_fits_budget() {
+        let many: Vec<Location> = (0..2_000).map(|i| loc("src/lib.rs", i, 0)).collect();
+        let tools = fake_refs(Precise::exact(many));
+        for budget in [60usize, 150, 400, 1000] {
+            let r = tools.find_references(Parameters(refs_params(budget, None, None)));
+            let tokens = estimate_tokens(first_text(&r));
+            assert!(
+                tokens <= budget,
+                "budget {budget}: output is {tokens} tokens"
+            );
+        }
     }
 
     #[test]

@@ -119,7 +119,12 @@ impl ModuleResolver for DartResolver {
                 .modules
                 .iter()
                 // Same match semantics as `ProjectMeta::module_for`.
-                .filter(|m| pkg_spec == m.name || pkg_spec.starts_with(&format!("{}/", m.name)))
+                .filter(|m| {
+                    pkg_spec == m.name
+                        || (pkg_spec.len() > m.name.len()
+                            && pkg_spec.starts_with(m.name.as_str())
+                            && pkg_spec.as_bytes()[m.name.len()] == b'/')
+                })
                 .collect();
             candidates.sort_by(|a, b| {
                 common_prefix_depth(&b.dir, from.dir())

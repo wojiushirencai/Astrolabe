@@ -76,43 +76,100 @@ pub fn rank_for_task(g: &CodeGraph, task: &str, base: &Centrality) -> Centrality
     }
 
     let task_words = split_words(task);
-    let task_compact: String = task
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
+    let task_compact: String = compact_lower(task);
+    let hits = symbol_hits(g, &task_words, &task_compact);
+    rank_with_hits(g, task, base, &task_words, &task_compact, &hits)
+}
+
+/// `rank_for_task` and `match_task` in one pass over the symbols.
+pub fn rank_and_match(g: &CodeGraph, task: &str, base: &Centrality) -> (Centrality, TaskMatch) {
+    let task_words = split_words(task);
+    let task_compact = compact_lower(task);
+    let hits = symbol_hits(g, &task_words, &task_compact);
+    let ranked = rank_with_hits(g, task, base, &task_words, &task_compact, &hits);
+    let mut m = match_task_files(g, task, &task_words, &task_compact);
+    for h in &hits {
+        if (h.explicit && h.compact_len >= 4) || h.split {
+            m.symbols.insert(h.idx);
+        }
+    }
+    (ranked, m)
+}
+
+/// One symbol that matches the task (explicit with min len 3, or split).
+struct SymHit {
+    idx: usize,
+    compact_len: usize,
+    explicit: bool,
+    split: bool,
+}
+
+fn symbol_hits(g: &CodeGraph, task_words: &BTreeSet<String>, task_compact: &str) -> Vec<SymHit> {
+    let mut buf = String::new();
+    let mut hits = Vec::new();
+    for (idx, symbol) in g.symbols.iter().enumerate() {
+        buf.clear();
+        buf.extend(
+            symbol
+                .name
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase),
+        );
+        let (explicit, split) = symbol_matches(&symbol.name, &buf, task_words, task_compact, 3);
+        if explicit || split {
+            hits.push(SymHit {
+                idx,
+                compact_len: buf.len(),
+                explicit,
+                split,
+            });
+        }
+    }
+    hits
+}
+
+fn rank_with_hits(
+    g: &CodeGraph,
+    task: &str,
+    base: &Centrality,
+    task_words: &BTreeSet<String>,
+    task_compact: &str,
+    hits: &[SymHit],
+) -> Centrality {
+    let files = sorted_files(g);
+    let n = files.len();
+    if n == 0 {
+        return Centrality::default();
+    }
     let mut boosts = vec![1.0; n];
     let positions = file_positions(&files);
-
-    let mut symbols: Vec<&CodeSymbol> = g.symbols.iter().collect();
-    symbols.sort_by(|a, b| {
+    // Only matching symbols touch `boosts`; sort just those, in the same
+    // (file, line, name, id) order as before.
+    let mut matched: Vec<(&CodeSymbol, usize)> = hits
+        .iter()
+        .map(|h| (&g.symbols[h.idx], h.compact_len))
+        .collect();
+    matched.sort_by(|(a, _), (b, _)| {
         a.file
             .cmp(&b.file)
             .then_with(|| a.start_line.cmp(&b.start_line))
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.id.cmp(&b.id))
     });
-    for symbol in symbols {
+    for (symbol, compact_len) in matched {
         let Some(&i) = positions.get(&symbol.file) else {
             continue;
         };
-        let compact = compact_lower(&symbol.name);
-        let (explicit_match, split_match) =
-            symbol_matches(symbol, &compact, &task_words, &task_compact, 3);
-
-        if explicit_match || split_match {
+        boosts[i] *= 10.0;
+        if compact_len >= 12
+            || split_words(&symbol.name)
+                .iter()
+                .filter(|word| word.len() >= 3)
+                .count()
+                >= 3
+        {
             boosts[i] *= 10.0;
-            // Specific names encode more relationship information than generic
-            // names such as `run` or `helper`.
-            if compact.len() >= 12
-                || split_words(&symbol.name)
-                    .iter()
-                    .filter(|word| word.len() >= 3)
-                    .count()
-                    >= 3
-            {
-                boosts[i] *= 10.0;
-            }
         }
     }
 
@@ -126,7 +183,7 @@ pub fn rank_for_task(g: &CodeGraph, task: &str, base: &Centrality) -> Centrality
     // "loop guard") is task-relevant even when the task never types the
     // extension. Weaker than an explicit path (10x, not 50x).
     for file in &files {
-        if context_files.contains(&file.id) || !stem_matches(file, &task_words, &task_compact) {
+        if context_files.contains(&file.id) || !stem_matches(file, task_words, task_compact) {
             continue;
         }
         if let Some(&i) = positions.get(&file.id) {
@@ -211,11 +268,8 @@ fn import_adjacency(
             1
         };
         let weight = u64::from(edge.weight.max(1)).saturating_mul(context_multiplier);
-        *aggregated.entry((from_i, to_i)).or_default() = aggregated
-            .get(&(from_i, to_i))
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(weight);
+        let slot = aggregated.entry((from_i, to_i)).or_default();
+        *slot = slot.saturating_add(weight);
     }
 
     let mut outgoing = vec![Vec::new(); positions.len()];
@@ -227,6 +281,12 @@ fn import_adjacency(
 
 fn run_pagerank(outgoing: &[Vec<(usize, f64)>], restart: &[f64], scores: &mut Vec<f64>) {
     let n = scores.len();
+    // Edge weights do not change between iterations; same summation order as
+    // before, so the scores are bit-identical.
+    let total_weights: Vec<f64> = outgoing
+        .iter()
+        .map(|edges| edges.iter().map(|(_, weight)| *weight).sum())
+        .collect();
     for _ in 0..PAGERANK_ITERATIONS {
         let dangling: f64 = (0..n)
             .filter(|&i| outgoing[i].is_empty())
@@ -241,7 +301,7 @@ fn run_pagerank(outgoing: &[Vec<(usize, f64)>], restart: &[f64], scores: &mut Ve
             if outgoing[from].is_empty() {
                 continue;
             }
-            let total_weight: f64 = outgoing[from].iter().map(|(_, weight)| *weight).sum();
+            let total_weight = total_weights[from];
             for &(to, weight) in &outgoing[from] {
                 next[to] += PAGERANK_DAMPING * scores[from] * weight / total_weight;
             }
@@ -273,13 +333,26 @@ fn compact_lower(text: &str) -> String {
 /// the whole compacted name (>= `min_explicit_len` chars) occurs in the task;
 /// `split` means the name's words occur among the task's words.
 fn symbol_matches(
-    symbol: &CodeSymbol,
+    name: &str,
     compact: &str,
     task_words: &BTreeSet<String>,
     task_compact: &str,
     min_explicit_len: usize,
 ) -> (bool, bool) {
-    let words = split_words(&symbol.name);
+    let explicit_match = compact.len() >= min_explicit_len && task_compact.contains(compact);
+    // A split match needs at least one task word (>= 3 bytes) inside the
+    // name; every name word is a contiguous run of `compact`. Skipping the
+    // allocation-heavy `split_words` for the vast majority of symbols keeps
+    // resolve_context fast on large graphs. ASCII names only, so lowercase
+    // folding is identical.
+    if compact.is_ascii()
+        && !task_words
+            .iter()
+            .any(|w| w.len() >= 3 && compact.contains(w.as_str()))
+    {
+        return (explicit_match, false);
+    }
+    let words = split_words(name);
     let meaningful: Vec<&String> = words.iter().filter(|word| word.len() >= 3).collect();
     let split_match = !meaningful.is_empty()
         && meaningful
@@ -287,7 +360,6 @@ fn symbol_matches(
             .filter(|word| task_words.contains((*word).as_str()))
             .count()
             >= meaningful.len().min(2);
-    let explicit_match = compact.len() >= min_explicit_len && task_compact.contains(compact);
     (explicit_match, split_match)
 }
 
@@ -357,24 +429,32 @@ impl TaskMatch {
     }
 }
 
-pub fn match_task(g: &CodeGraph, task: &str) -> TaskMatch {
-    let task_words = split_words(task);
-    let task_compact = compact_lower(task);
+fn match_task_files(
+    g: &CodeGraph,
+    task: &str,
+    task_words: &BTreeSet<String>,
+    task_compact: &str,
+) -> TaskMatch {
     let task_lower = task.to_lowercase();
     let mut out = TaskMatch::default();
     for file in &g.files {
-        if file_mentioned(&task_lower, file) || stem_matches(file, &task_words, &task_compact) {
+        if file_mentioned(&task_lower, file) || stem_matches(file, task_words, task_compact) {
             out.files.insert(file.id);
         }
     }
-    for (idx, symbol) in g.symbols.iter().enumerate() {
-        let compact = compact_lower(&symbol.name);
-        let (explicit, split) = symbol_matches(symbol, &compact, &task_words, &task_compact, 4);
-        if explicit || split {
-            out.symbols.insert(idx);
+    out
+}
+
+pub fn match_task(g: &CodeGraph, task: &str) -> TaskMatch {
+    let task_words = split_words(task);
+    let task_compact = compact_lower(task);
+    let mut m = match_task_files(g, task, &task_words, &task_compact);
+    for h in symbol_hits(g, &task_words, &task_compact) {
+        if (h.explicit && h.compact_len >= 4) || h.split {
+            m.symbols.insert(h.idx);
         }
     }
-    out
+    m
 }
 
 fn split_words(text: &str) -> BTreeSet<String> {
@@ -743,5 +823,105 @@ mod tests {
         let g2 = graph(vec![import(0, 1)]);
         assert_eq!(dependents(&g2, FileId(1)), vec![FileId(0)]);
         assert_eq!(first.len(), 2);
+    }
+
+    #[test]
+    fn symbol_matches_prefilter_keeps_results() {
+        // Reference: the unfiltered definition.
+        fn reference(name: &str, tw: &BTreeSet<String>, tc: &str, min: usize) -> (bool, bool) {
+            let words = split_words(name);
+            let meaningful: Vec<&String> = words.iter().filter(|w| w.len() >= 3).collect();
+            let split = !meaningful.is_empty()
+                && meaningful
+                    .iter()
+                    .filter(|w| tw.contains((*w).as_str()))
+                    .count()
+                    >= meaningful.len().min(2);
+            let c = compact_lower(name);
+            (c.len() >= min && tc.contains(&c), split)
+        }
+        let task = "how does the JsonSerializer handle errors in redis cluster";
+        let tw = split_words(task);
+        let tc = compact_lower(task);
+        for name in [
+            "JsonSerializer",
+            "serialize",
+            "ErrorHandler",
+            "handle",
+            "RedisCluster",
+            "cluster",
+            "x",
+            "run",
+            "HTTPServer",
+            "is_json",
+            "Json",
+            "errors",
+            "Zzz",
+            "über_cluster",
+        ] {
+            let c = compact_lower(name);
+            assert_eq!(
+                symbol_matches(name, &c, &tw, &tc, 4),
+                reference(name, &tw, &tc, 4),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rank_and_match_equals_separate_rank_and_match_passes() {
+        let mut g = graph(vec![import(0, 1), import(2, 1), import(0, 2)]);
+        let names = [
+            "processStripeWebhook",
+            "StripeWebhook",
+            "helper",
+            "run",
+            "JsonSerializer",
+            "serialize",
+            "ErrorHandler",
+            "über_cluster",
+            "HTTPServer",
+            "tie",
+            "tie",
+            "x",
+        ];
+        g.symbols = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| CodeSymbol {
+                id: SymbolId(i as u32),
+                file: FileId([0, 1, 2][i % 3]),
+                name: (*name).into(),
+                kind: SymbolKind::Function,
+                signature: String::new(),
+                // Same file+line for the two `tie` symbols: ordering falls
+                // through to name and id.
+                start_line: if *name == "tie" { 5 } else { i as u32 + 1 },
+                end_line: 20,
+                exported: true,
+            })
+            .collect();
+        g.symbols[10].file = g.symbols[9].file;
+        let base = compute_centrality(&g);
+        for task in [
+            "fix the stripe webhook processing",
+            "look at a.rs and the JsonSerializer",
+            "zzzz qqqq nonexistent thing",
+            "!!! ??? ###",
+            "",
+            "tie tie tie",
+            "how does the json serializer handle errors in über cluster",
+            "HTTPServer run x",
+        ] {
+            let (ranked_both, matched_both) = rank_and_match(&g, task, &base);
+            assert_eq!(ranked_both, rank_for_task(&g, task, &base), "rank: {task}");
+            let separate = match_task(&g, task);
+            assert_eq!(matched_both.files, separate.files, "files: {task}");
+            assert_eq!(matched_both.symbols, separate.symbols, "symbols: {task}");
+        }
+        let (_, none) = rank_and_match(&g, "zzzz qqqq nonexistent thing", &base);
+        assert!(none.is_empty());
+        let (_, some) = rank_and_match(&g, "fix the stripe webhook processing", &base);
+        assert!(!some.symbols.is_empty());
     }
 }

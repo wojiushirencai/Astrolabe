@@ -39,14 +39,18 @@
 //! Each resolver owns exactly one file in this directory and must not touch
 //! another. Shared behaviour belongs in [`crate::types`].
 
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use crate::types::{FileIndex, Language, ModuleResolver, ProjectMeta, RelPath};
 
+pub mod c_cpp;
 pub mod csharp;
 pub mod dart;
 pub mod go;
 pub mod java;
+pub mod php;
 pub mod python;
 pub mod rust;
 pub mod typescript;
@@ -72,10 +76,13 @@ pub fn all() -> Vec<Box<dyn ModuleResolver>> {
         Box::new(visualbasic::VisualBasicResolver),
         Box::new(swift::SwiftResolver),
         Box::new(objc::ObjCResolver),
+        Box::new(c_cpp::CResolver),
+        Box::new(c_cpp::CppResolver),
         Box::new(kotlin::KotlinResolver),
         Box::new(shell::ShellResolver),
         Box::new(ruby::RubyResolver),
         Box::new(lua::LuaResolver),
+        Box::new(php::PhpResolver),
     ]
 }
 
@@ -87,28 +94,102 @@ pub fn all() -> Vec<Box<dyn ModuleResolver>> {
 /// is named (`detect_failures`) is better than an index that looks complete
 /// because one `todo!()` took the whole run down.
 pub struct ResolverSet {
-    resolvers: Vec<Box<dyn ModuleResolver>>,
+    resolvers: Vec<Arc<dyn ModuleResolver>>,
     meta: Vec<(Language, ProjectMeta)>,
     detect_failures: Vec<Language>,
+    /// Per resolver (same order as `resolvers`): the files its `detect` read.
+    /// Together with the path set this is everything `detect` depends on.
+    detect_reads: Vec<BTreeSet<String>>,
+}
+
+/// The resolver that owns `lang`'s imports (TS/TSX/JS/Vue share one, ObjC++
+/// is ObjC).
+pub fn resolver_owner(lang: Language) -> Language {
+    match lang {
+        Language::Tsx | Language::JavaScript | Language::Vue => Language::TypeScript,
+        Language::ObjCpp => Language::ObjC,
+        other => other,
+    }
 }
 
 impl ResolverSet {
     pub fn detect(files: &FileIndex) -> Self {
-        Self::from_resolvers(all(), files)
+        Self::from_resolvers(all().into_iter().map(Arc::from).collect(), files)
+    }
+
+    /// Incremental `detect`. `self` was detected over a file set identical to
+    /// `files` (the caller must guarantee that: added/removed paths force a
+    /// full [`Self::detect`]); only the content of `modified` paths may
+    /// differ. A resolver whose recorded `detect` reads do not include any
+    /// modified path would produce the same metadata, so it is reused
+    /// as-is; the others re-run `detect`.
+    ///
+    /// Returns the new set and the languages whose metadata actually
+    /// changed (re-run resolvers that came out different, or panicked).
+    pub fn redetect(
+        &self,
+        files: &FileIndex,
+        modified: &BTreeSet<RelPath>,
+    ) -> (Self, Vec<Language>) {
+        let mut meta = Vec::with_capacity(self.resolvers.len());
+        let mut detect_failures = Vec::new();
+        let mut detect_reads = Vec::with_capacity(self.resolvers.len());
+        let mut changed = Vec::new();
+        for (i, r) in self.resolvers.iter().enumerate() {
+            let lang = r.language();
+            let old_failed = self.detect_failures.contains(&lang);
+            let stale = old_failed
+                || self.detect_reads[i]
+                    .iter()
+                    .any(|p| modified.contains(&RelPath::new(p)));
+            if !stale {
+                meta.push(self.meta[i].clone());
+                detect_reads.push(self.detect_reads[i].clone());
+                continue;
+            }
+            files.start_recording_reads();
+            let detected = isolate_resolver(lang, "detect", || r.detect(files));
+            let reads = files.take_recorded_reads();
+            let new_meta = match detected {
+                Some(m) => m,
+                None => {
+                    detect_failures.push(lang);
+                    ProjectMeta::default()
+                }
+            };
+            if new_meta != self.meta[i].1 {
+                changed.push(lang);
+            }
+            meta.push((lang, new_meta));
+            detect_reads.push(reads);
+        }
+        (
+            ResolverSet {
+                resolvers: self.resolvers.clone(),
+                meta,
+                detect_failures,
+                detect_reads,
+            },
+            changed,
+        )
     }
 
     /// Same isolated `detect` path as [`Self::detect`], with an injected
     /// resolver list. `pub(crate)` so tests can plant a panicking double
     /// without changing [`all`].
     pub(crate) fn from_resolvers(
-        resolvers: Vec<Box<dyn ModuleResolver>>,
+        resolvers: Vec<Arc<dyn ModuleResolver>>,
         files: &FileIndex,
     ) -> Self {
         let mut meta = Vec::with_capacity(resolvers.len());
         let mut detect_failures = Vec::new();
+        let mut detect_reads = Vec::with_capacity(resolvers.len());
         for r in &resolvers {
             let lang = r.language();
-            match isolate_resolver(lang, "detect", || r.detect(files)) {
+            files.start_recording_reads();
+            let detected = isolate_resolver(lang, "detect", || r.detect(files));
+            detect_reads.push(files.take_recorded_reads());
+            match detected {
                 Some(m) => meta.push((lang, m)),
                 None => {
                     detect_failures.push(lang);
@@ -120,6 +201,7 @@ impl ResolverSet {
             resolvers,
             meta,
             detect_failures,
+            detect_reads,
         }
     }
 
@@ -171,11 +253,7 @@ impl ResolverSet {
         files: &FileIndex,
     ) -> crate::types::ImportResolution {
         // TS and TSX and JS share one resolver.
-        let owner = match lang {
-            Language::Tsx | Language::JavaScript | Language::Vue => Language::TypeScript,
-            Language::ObjCpp => Language::ObjC,
-            other => other,
-        };
+        let owner = resolver_owner(lang);
         let Some(r) = self.resolvers.iter().find(|r| r.language() == owner) else {
             return crate::types::ImportResolution::Unresolved;
         };
@@ -314,15 +392,15 @@ mod tests {
         let files = empty_index();
         let set = ResolverSet::from_resolvers(
             vec![
-                Box::new(OkResolver {
+                Arc::new(OkResolver {
                     lang: Language::Python,
                 }),
-                Box::new(PanicResolver {
+                Arc::new(PanicResolver {
                     lang: Language::Rust,
                     panic_detect: true,
                     panic_resolve: false,
                 }),
-                Box::new(OkResolver { lang: Language::Go }),
+                Arc::new(OkResolver { lang: Language::Go }),
             ],
             &files,
         );
@@ -347,10 +425,10 @@ mod tests {
         let files = empty_index();
         let set = ResolverSet::from_resolvers(
             vec![
-                Box::new(OkResolver {
+                Arc::new(OkResolver {
                     lang: Language::Python,
                 }),
-                Box::new(PanicResolver {
+                Arc::new(PanicResolver {
                     lang: Language::Rust,
                     panic_detect: false,
                     panic_resolve: true,
@@ -372,10 +450,10 @@ mod tests {
         let files = empty_index();
         let set = ResolverSet::from_resolvers(
             vec![
-                Box::new(OkResolver {
+                Arc::new(OkResolver {
                     lang: Language::Python,
                 }),
-                Box::new(OkResolver {
+                Arc::new(OkResolver {
                     lang: Language::TypeScript,
                 }),
             ],

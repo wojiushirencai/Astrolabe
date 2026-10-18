@@ -145,6 +145,114 @@ enum State {
     LineBlock,
 }
 
+/// An open string interpolation (`${ … }`, `#{ … }`, `\( … )`, f-string `{ … }`):
+/// code until the matching close, then the string resumes in `resume`.
+struct Frame {
+    depth: u32,
+    open: u8,
+    close: u8,
+    resume: State,
+    fstr: bool,
+}
+
+enum Step {
+    Skip(usize),
+    /// Interpolation opener of this length, with its open/close delimiters.
+    Open(usize, u8, u8),
+    Plain,
+}
+
+/// Does the string quote at `i` carry an interpolating prefix (`f"`, `$"`, `s"`)?
+fn interp_prefix(lg: Lang, b: &[u8], i: usize) -> bool {
+    let mut s = i;
+    while s > 0 && (is_ident(b[s - 1]) || b[s - 1] == b'$' || b[s - 1] == b'@') && i - s < 3 {
+        s -= 1;
+    }
+    let p = &b[s..i];
+    if s > 0 && is_ident(b[s - 1]) {
+        return false;
+    }
+    match lg {
+        Lang::Python => p.iter().any(|c| matches!(c, b'f' | b'F')),
+        Lang::CSharp => p.contains(&b'$'),
+        Lang::Scala => matches!(p, b"s" | b"f") || p == b"raw",
+        _ => false,
+    }
+}
+
+/// What the string-body byte at `i` does: escape skip, interpolation, nothing.
+fn step(lg: Lang, q: u8, fstr: bool, b: &[u8], i: usize) -> Step {
+    let next = b.get(i + 1).copied().unwrap_or(0);
+    if lg == Lang::Swift && b[i] == b'\\' && next == b'(' {
+        return Step::Open(2, b'(', b')');
+    }
+    if b[i] == b'\\' && lg.escapes(q) {
+        return Step::Skip(2);
+    }
+    if fstr && matches!(lg, Lang::Python | Lang::CSharp) && b[i] == b'{' {
+        return if next == b'{' {
+            Step::Skip(2)
+        } else {
+            Step::Open(1, b'{', b'}')
+        };
+    }
+    let dollar = b[i] == b'$' && next == b'{';
+    let open = match lg {
+        Lang::Kotlin => q == b'"' && dollar,
+        Lang::Dart => dollar,
+        Lang::Js => q == b'`' && dollar,
+        Lang::Scala => q == b'"' && fstr && dollar,
+        Lang::Ruby => (q == b'"' || q == b'`') && b[i] == b'#' && next == b'{',
+        _ => false,
+    };
+    if open {
+        Step::Open(2, b'{', b'}')
+    } else {
+        Step::Plain
+    }
+}
+
+/// Can a `/` at `i` start a Ruby regex literal? (`a / b` is division.)
+fn ruby_regex_allowed(b: &[u8], i: usize) -> bool {
+    let mut j = i;
+    while j > 0 && (b[j - 1] == b' ' || b[j - 1] == b'\t') {
+        j -= 1;
+    }
+    if j == 0 {
+        return true;
+    }
+    let p = b[j - 1];
+    if b"=(,:[!&|?{;+-*%<>~^".contains(&p) {
+        return true;
+    }
+    if is_ident(p) {
+        let mut st = j;
+        while st > 0 && is_ident(b[st - 1]) {
+            st -= 1;
+        }
+        return matches!(
+            &b[st..j],
+            b"if"
+                | b"elsif"
+                | b"unless"
+                | b"while"
+                | b"until"
+                | b"when"
+                | b"case"
+                | b"and"
+                | b"or"
+                | b"not"
+                | b"then"
+                | b"else"
+                | b"do"
+                | b"return"
+                | b"yield"
+                | b"in"
+        );
+    }
+    false
+}
+
 fn find(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
     if pat.is_empty() || from > b.len() || b.len() - from < pat.len() {
         return None;
@@ -215,8 +323,10 @@ pub(crate) fn code_mask(
 ) -> Option<Vec<Vec<bool>>> {
     let lg = lang(path)?;
     let mut state = State::Code;
-    // JS template literals: brace depth of each open `${ … }`.
-    let mut tmpl: Vec<u32> = Vec::new();
+    // Open string interpolations (innermost last) and whether the current
+    // string is an f-string style one.
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut fs = false;
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         let b = line.as_bytes();
@@ -294,10 +404,18 @@ pub(crate) fn code_mask(
                 State::Str(q) => {
                     let start = i;
                     let mut closed = false;
+                    let mut opened = None;
                     while i < n {
-                        if b[i] == b'\\' {
-                            i += 2;
-                            continue;
+                        match step(lg, q, fs, b, i) {
+                            Step::Skip(k) => {
+                                i += k;
+                                continue;
+                            }
+                            Step::Open(len, o, c) => {
+                                opened = Some((len, o, c));
+                                break;
+                            }
+                            Step::Plain => {}
                         }
                         if b[i] == q {
                             i += 1;
@@ -306,28 +424,41 @@ pub(crate) fn code_mask(
                         }
                         i += 1;
                     }
-                    string(&mut mask, start, i);
-                    if closed {
+                    if let Some((len, open, close)) = opened {
+                        string(&mut mask, start, i + len);
+                        frames.push(Frame {
+                            depth: 0,
+                            open,
+                            close,
+                            resume: State::Str(q),
+                            fstr: fs,
+                        });
+                        fs = false;
+                        i += len;
                         state = State::Code;
+                    } else {
+                        string(&mut mask, start, i);
+                        if closed {
+                            state = State::Code;
+                        }
                     }
                 }
                 State::Multi(q) => {
                     let start = i;
-                    let mut interp = false;
+                    let mut opened = None;
                     while i < n {
-                        if b[i] == b'\\' && lg.escapes(q) {
-                            i += 2;
-                            continue;
-                        }
-                        if q == b'`' {
-                            if lg == Lang::Js && b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
-                                string(&mut mask, start, i + 2);
-                                i += 2;
-                                tmpl.push(0);
-                                state = State::Code;
-                                interp = true;
+                        match step(lg, q, fs, b, i) {
+                            Step::Skip(k) => {
+                                i += k;
+                                continue;
+                            }
+                            Step::Open(len, o, c) => {
+                                opened = Some((len, o, c));
                                 break;
                             }
+                            Step::Plain => {}
+                        }
+                        if q == b'`' {
                             if b[i] == b'`' {
                                 i += 1;
                                 state = State::Code;
@@ -341,7 +472,19 @@ pub(crate) fn code_mask(
                         }
                         i += 1;
                     }
-                    if !interp {
+                    if let Some((len, open, close)) = opened {
+                        string(&mut mask, start, i + len);
+                        frames.push(Frame {
+                            depth: 0,
+                            open,
+                            close,
+                            resume: State::Multi(q),
+                            fstr: fs,
+                        });
+                        fs = false;
+                        i += len;
+                        state = State::Code;
+                    } else {
                         string(&mut mask, start, i);
                     }
                 }
@@ -349,18 +492,23 @@ pub(crate) fn code_mask(
                     let c = b[i];
                     let next = b.get(i + 1).copied().unwrap_or(0);
                     let prev = if i > 0 { b[i - 1] } else { 0 };
-                    if lg == Lang::Js && !tmpl.is_empty() && (c == b'{' || c == b'}') {
-                        let top = tmpl.last_mut().expect("non-empty");
-                        if c == b'{' {
-                            *top += 1;
-                        } else if *top == 0 {
-                            tmpl.pop();
-                            state = State::Multi(b'`');
-                        } else {
-                            *top -= 1;
+                    if let Some(top) = frames.last_mut() {
+                        if c == top.open {
+                            top.depth += 1;
+                            i += 1;
+                            continue;
                         }
-                        i += 1;
-                        continue;
+                        if c == top.close {
+                            if top.depth == 0 {
+                                let f = frames.pop().expect("non-empty");
+                                state = f.resume;
+                                fs = f.fstr;
+                            } else {
+                                top.depth -= 1;
+                            }
+                            i += 1;
+                            continue;
+                        }
                     }
                     if lg.slash_line() && c == b'/' && next == b'/' {
                         comment(&mut mask, i, n);
@@ -457,10 +605,12 @@ pub(crate) fn code_mask(
                         && next == c
                         && b.get(i + 2) == Some(&c)
                     {
+                        fs = interp_prefix(lg, b, i);
                         state = State::Multi(c);
                         string(&mut mask, i, i + 3);
                         i += 3;
                     } else if c == b'`' && lg.backtick_multi() {
+                        fs = false;
                         state = State::Multi(b'`');
                         string(&mut mask, i, i + 1);
                         i += 1;
@@ -486,7 +636,9 @@ pub(crate) fn code_mask(
                     } else if lg == Lang::C && c == b'\'' && number_before(b, i) {
                         // C++14 digit separator `1'000`.
                         i += 1;
-                    } else if lg == Lang::Js && c == b'/' && regex_allowed(b, i) {
+                    } else if (lg == Lang::Js && c == b'/' && regex_allowed(b, i))
+                        || (lg == Lang::Ruby && c == b'/' && ruby_regex_allowed(b, i))
+                    {
                         match regex_end(b, i) {
                             Some(end) => {
                                 string(&mut mask, i, end);
@@ -505,29 +657,28 @@ pub(crate) fn code_mask(
                         // `don't`: an apostrophe inside a plain scalar.
                         i += 1;
                     } else if c == b'"' || c == b'\'' || c == b'`' {
-                        let start = i;
+                        fs = interp_prefix(lg, b, i);
+                        string(&mut mask, i, i + 1);
+                        state = State::Str(c);
                         i += 1;
-                        let mut closed = false;
-                        while i < n {
-                            if b[i] == b'\\' && lg.escapes(c) {
-                                i += 2;
-                                continue;
-                            }
-                            if b[i] == c {
-                                i += 1;
-                                closed = true;
-                                break;
-                            }
-                            i += 1;
-                        }
-                        string(&mut mask, start, i);
-                        // Rust strings may continue on the next line.
-                        if !closed && lg == Lang::Rust && c == b'"' {
-                            state = State::Str(b'"');
-                        }
                     } else {
                         i += 1;
                     }
+                }
+            }
+        }
+        // Single-line strings end with the line (Rust strings may continue).
+        if !(lg == Lang::Rust && state == State::Str(b'"')) {
+            if matches!(state, State::Str(_)) {
+                state = State::Code;
+            }
+            if let Some(p) = frames
+                .iter()
+                .position(|f| matches!(f.resume, State::Str(_)))
+            {
+                frames.truncate(p);
+                if !matches!(state, State::Multi(_)) {
+                    state = State::Code;
                 }
             }
         }
@@ -940,6 +1091,100 @@ mod tests {
             false
         ));
         assert!(!is_code("a.js", "x = /foo_call/;", 0, "foo_call", false));
+    }
+
+    #[test]
+    fn ruby_regex_literal_vs_division() {
+        for src in [
+            "x = /#/; foo_call",
+            "if /#/ =~ s then foo_call end",
+            "s.split(/#/); foo_call",
+            "a = [/#/, 1]; foo_call",
+            "when /#x/ then foo_call",
+            "/#/.match(s); foo_call",
+        ] {
+            assert!(is_code("a.rb", src, 0, "foo_call", false), "{src}");
+        }
+        assert!(!is_code("a.rb", "x = /foo_call/", 0, "foo_call", false));
+        // division, then a real comment
+        assert!(!is_code(
+            "a.rb",
+            "y = a / b # foo_call",
+            0,
+            "foo_call",
+            false
+        ));
+        assert!(is_code(
+            "a.rb",
+            "y = a / b; foo_call # c",
+            0,
+            "foo_call",
+            false
+        ));
+    }
+
+    #[test]
+    fn string_interpolation_is_code() {
+        let cases: &[(&str, &str)] = &[
+            ("a.kt", "val s = \"$x ${foo_call()}\""),
+            ("a.kt", "val s = \"${m.map { \"}\" + foo_call() }} tail\""),
+            ("a.kt", "val s = \"\"\"raw ${foo_call()} x\"\"\""),
+            ("a.swift", "let s = \"a \\(foo_call(1, (2))) b\""),
+            (
+                "a.swift",
+                "let s = \"a \\(x.map { \"\\($0)\" }.foo_call()) b\"",
+            ),
+            ("a.rb", "s = \"a #{foo_call({a: 1})} b\""),
+            ("a.js", "const s = `a ${foo_call()} b`;"),
+            ("a.py", "s = f\"a {foo_call()} b\""),
+            ("a.py", "s = f'{{lit}} {foo_call(\"x\")}'"),
+            ("a.py", "s = rf\"\"\"x {foo_call()}\"\"\""),
+            ("a.cs", "var s = $\"a {foo_call()} b\";"),
+            ("a.cs", "var s = $@\"a {foo_call(\"x\")} b\";"),
+            ("a.scala", "val s = s\"a ${foo_call()} b\""),
+            ("a.dart", "var s = 'a ${foo_call()} b';"),
+        ];
+        for (p, src) in cases {
+            assert!(is_code(p, src, 0, "foo_call", false), "{p}: {src}");
+        }
+        // text outside the interpolation stays a string
+        let neg: &[(&str, &str)] = &[
+            ("a.kt", "val s = \"foo_call ${x}\""),
+            ("a.kt", "val s = \"${x} foo_call\""),
+            ("a.swift", "let s = \"foo_call \\(x)\""),
+            ("a.rb", "s = \"foo_call #{x}\""),
+            ("a.rb", "s = 'a #{foo_call}'"),
+            ("a.py", "s = \"{foo_call}\""),
+            ("a.py", "s = f\"{{foo_call}} {x}\""),
+            ("a.cs", "var s = \"{foo_call}\";"),
+            ("a.cs", "var s = $\"{{foo_call}}\";"),
+        ];
+        for (p, src) in neg {
+            assert!(!is_code(p, src, 0, "foo_call", false), "{p}: {src}");
+        }
+        // code after the string is still lexed (and a trailing comment masked)
+        assert!(is_code(
+            "a.kt",
+            "f(\"${a}\"); foo_call() // c",
+            0,
+            "foo_call",
+            false
+        ));
+        assert!(!is_code(
+            "a.kt",
+            "f(\"${a}\") // foo_call()",
+            0,
+            "foo_call",
+            false
+        ));
+        // multi-line triple string with interpolation
+        let src = "val s = \"\"\"\n a ${foo_call()} foo_call2\n\"\"\"\nrun_g()";
+        assert!(is_code("a.kt", src, 1, "foo_call()", false));
+        assert!(!is_code("a.kt", src, 1, "foo_call2", false));
+        assert!(is_code("a.kt", src, 3, "run_g", false));
+        // an unterminated interpolation never leaks past its line
+        let src = "val s = \"${oops\nrun_g()";
+        assert!(is_code("a.kt", src, 1, "run_g", false));
     }
 
     #[test]

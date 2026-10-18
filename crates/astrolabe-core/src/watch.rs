@@ -668,6 +668,12 @@ impl Watcher {
             if is_excluded_rel(&self.root, &rel, extra) {
                 continue;
             }
+            // Never follow symlinked directories (or paths below one): a full
+            // scan does not, so expanding them would index files from outside
+            // the repo that the next full check immediately removes.
+            if crosses_symlink_dir(&self.root, abs) {
+                continue;
+            }
             if abs.is_dir() {
                 if expand_dir_bounded(&self.root, abs, extra, cap, &mut work).is_err() {
                     self.freshness.note_distrust();
@@ -792,7 +798,7 @@ impl Watcher {
         // run_loop), not on the spawn caller. If already seeded, that initial
         // check preserves any non-empty delta since the prior check.
         let notify_ctx = if self.events {
-            match init_notify(&self.root) {
+            match init_notify(&self.root, &self.scan, SELECTIVE_WATCH) {
                 Some((feed, guard)) => Some((feed, guard)),
                 None => {
                     tracing::warn!(
@@ -899,6 +905,74 @@ trait EventFeed {
 struct NotifyFeed {
     rx: Receiver<Result<notify::Event, notify::Error>>,
     overflow: Arc<AtomicBool>,
+    /// Present only in selective (per-directory) mode; owns the watcher so
+    /// new directories can be registered from the consumer thread.
+    selective: Option<Selective>,
+}
+
+/// Per-directory, non-recursive inotify registration that skips excluded
+/// trees (node_modules, target, ...), so their files cost no kernel watches
+/// or events.
+struct Selective {
+    watcher: notify::RecommendedWatcher,
+    root: PathBuf,
+    extra: Vec<String>,
+    dirs: HashSet<PathBuf>,
+}
+
+impl Selective {
+    /// Register `start` and every non-excluded, non-symlink directory below
+    /// it. Files seen are appended to `found`. Err on registration failure.
+    fn register_tree(
+        &mut self,
+        start: &Path,
+        found: &mut Vec<PathBuf>,
+    ) -> Result<(), notify::Error> {
+        let mut stack = vec![start.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if d != self.root {
+                let Some(rel) = relativize(&self.root, &d) else {
+                    continue;
+                };
+                if is_excluded_rel(&self.root, &rel, &self.extra) {
+                    continue;
+                }
+            }
+            if self.dirs.contains(&d) {
+                continue;
+            }
+            self.watcher.watch(&d, RecursiveMode::NonRecursive)?;
+            self.dirs.insert(d.clone());
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for ent in rd.flatten() {
+                let Ok(ft) = ent.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(ent.path());
+                } else {
+                    found.push(ent.path());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Register directories newly appearing among `paths`; returns the files
+    /// found inside them (they may have been created before the watch).
+    fn adopt(&mut self, paths: &[PathBuf], overflow: &AtomicBool) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for p in paths {
+            let is_new_dir = fs::symlink_metadata(p)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if is_new_dir && !self.dirs.contains(p) && p.starts_with(&self.root) {
+                if let Err(e) = self.register_tree(p, &mut found) {
+                    tracing::warn!(%e, dir = %p.display(), "failed to watch new directory");
+                    overflow.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        found
+    }
 }
 
 impl EventFeed for NotifyFeed {
@@ -910,11 +984,15 @@ impl EventFeed for NotifyFeed {
                 // content. Our own scans, rebuilds and search reads generate a
                 // constant stream of these on inotify; treating them as
                 // suspects kept untouched repos permanently "stale".
-                let paths = if is_content_event(&ev.kind) {
+                let mut paths = if is_content_event(&ev.kind) {
                     ev.paths
                 } else {
                     Vec::new()
                 };
+                if let Some(sel) = self.selective.as_mut() {
+                    let found = sel.adopt(&paths, &self.overflow);
+                    paths.extend(found);
+                }
                 Ok(FeedWake::Events { paths, overflow })
             }
             Ok(Err(_)) => Ok(FeedWake::Error),
@@ -949,7 +1027,12 @@ fn is_content_event(kind: &notify::EventKind) -> bool {
 /// safety / debounce path recovers with a full check.
 const NOTIFY_CHANNEL_CAP: usize = 65536;
 
-fn init_notify(root: &Path) -> Option<(NotifyFeed, notify::RecommendedWatcher)> {
+/// Selective registration is Linux-only: inotify cost scales with the number
+/// of watched directories, whereas FSEvents / ReadDirectoryChangesW watch a
+/// whole subtree at no per-directory cost.
+const SELECTIVE_WATCH: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+fn init_notify(root: &Path, scan: &ScanOptions, selective: bool) -> Option<(NotifyFeed, ())> {
     let overflow = Arc::new(AtomicBool::new(false));
     let overflow_cb = Arc::clone(&overflow);
     let (tx, rx) = mpsc::sync_channel(NOTIFY_CHANNEL_CAP);
@@ -966,11 +1049,44 @@ fn init_notify(root: &Path) -> Option<(NotifyFeed, notify::RecommendedWatcher)> 
             return None;
         }
     };
-    if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
-        tracing::warn!(%e, root = %root.display(), "failed to register notify watch on root");
+    if !selective {
+        if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+            tracing::warn!(%e, root = %root.display(), "failed to register notify watch on root");
+            return None;
+        }
+        return Some((
+            NotifyFeed {
+                rx,
+                overflow,
+                selective: None,
+            },
+            (),
+        ));
+    }
+    let mut sel = Selective {
+        watcher,
+        root: root.to_path_buf(),
+        extra: scan.extra_excludes.clone(),
+        dirs: HashSet::new(),
+    };
+    let mut ignored = Vec::new();
+    if let Err(e) = sel.register_tree(root, &mut ignored) {
+        tracing::warn!(%e, root = %root.display(), "failed to register notify watches");
         return None;
     }
-    Some((NotifyFeed { rx, overflow }, watcher))
+    // `.git/info/exclude` changes the admitted set; `.git` itself is excluded.
+    let info = root.join(".git").join("info");
+    if info.is_dir() {
+        let _ = sel.watcher.watch(&info, RecursiveMode::NonRecursive);
+    }
+    Some((
+        NotifyFeed {
+            rx,
+            overflow,
+            selective: Some(sel),
+        },
+        (),
+    ))
 }
 
 /// Mix pid, a high-res clock, and a per-call counter into a u64.
@@ -1046,6 +1162,8 @@ fn is_ignore_rule_file(rel: &RelPath) -> bool {
     ) || rel.as_str() == ".git/info/exclude"
 }
 
+const FOREIGN_EVENT_LIMIT: usize = 64;
+
 fn event_loop<F: EventFeed, G>(
     mut watcher: Watcher,
     mut feed: F,
@@ -1064,6 +1182,8 @@ fn event_loop<F: EventFeed, G>(
     let mut last_safety = initial_last_safety(&watcher.config);
     let mut pending: HashSet<PathBuf> = HashSet::new();
     let mut all_dirty = false;
+    let mut foreign_events = 0usize;
+    let mut rooted_events = 0usize;
 
     // Seed baseline (!seeded → empty) or emit catch-up delta if already seeded.
     {
@@ -1084,6 +1204,11 @@ fn event_loop<F: EventFeed, G>(
                     watcher.freshness.note_distrust();
                 }
                 for p in paths {
+                    if p.is_absolute() && !p.starts_with(&watcher.root) {
+                        foreign_events += 1;
+                    } else {
+                        rooted_events += 1;
+                    }
                     if let Some((abs, rel)) = keep_event_path(&watcher.root, &watcher.scan, &p) {
                         if pending.insert(abs) {
                             noted.push(rel);
@@ -1100,6 +1225,11 @@ fn event_loop<F: EventFeed, G>(
                                 watcher.freshness.note_distrust();
                             }
                             for p in paths {
+                                if p.is_absolute() && !p.starts_with(&watcher.root) {
+                                    foreign_events += 1;
+                                } else {
+                                    rooted_events += 1;
+                                }
                                 if let Some((abs, rel)) =
                                     keep_event_path(&watcher.root, &watcher.scan, &p)
                                 {
@@ -1116,6 +1246,14 @@ fn event_loop<F: EventFeed, G>(
                         }
                         Err(_) => break,
                     }
+                }
+                // Backend reports paths we can never map under the root (e.g.
+                // `\\?\` prefix mismatch on Windows): events are useless, so
+                // degrade to polling instead of silently missing edits.
+                if rooted_events == 0 && foreign_events >= FOREIGN_EVENT_LIMIT {
+                    tracing::warn!("watch events never map under the root; degrading to polling");
+                    drop(guard);
+                    return (watcher, false);
                 }
                 if pending.len() > storm_paths {
                     all_dirty = true;
@@ -1215,7 +1353,15 @@ fn run_loop(mut watcher: Watcher, tx: mpsc::Sender<ChangeSet>, stop: Arc<AtomicB
     let mut last_activity: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
+        let scan_started = Instant::now();
         let batch = watcher.check();
+        // Keep full scans below ~10% duty cycle on huge trees.
+        let scan_took = scan_started.elapsed();
+        let poll_interval = if scan_took >= Duration::from_millis(200) {
+            poll_interval.max(scan_took * 10)
+        } else {
+            poll_interval
+        };
         if !batch.is_empty() {
             pending.merge(batch);
             last_activity = Some(Instant::now());
@@ -1348,7 +1494,11 @@ fn make_stamp(
     prev_hash: Option<u64>,
 ) -> FileStamp {
     let unsettled = is_unsettled(meta.mtime, meta.mtime_ok, now);
-    let hash = if unsettled {
+    let want_hash = unsettled
+        || (prev_hash.is_none()
+            && (meta.len <= BASELINE_HASH_MAX_BYTES
+                || is_far_future(meta.mtime, meta.mtime_ok, now)));
+    let hash = if want_hash {
         hash_file(&root.join(path.as_str())).or(prev_hash)
     } else {
         prev_hash
@@ -1395,6 +1545,8 @@ fn confirm(
         // metadata also changed. Settling unreadable→readable (or other
         // unsettled→hashed) with unchanged mtime/size must not spuriously
         // report modified — the hash becomes the new baseline.
+        // Without a baseline hash (large file) a metadata change is the only
+        // evidence we have.
         (None, Some(_)) => meta_changed,
         (None, None) => {
             if old.unsettled {
@@ -1424,25 +1576,71 @@ fn is_unsettled(mtime: SystemTime, mtime_ok: bool, now: SystemTime) -> bool {
     }
     match now.duration_since(mtime) {
         Ok(age) => age < MTIME_UNTRUSTED_WINDOW,
-        Err(_) => true,
+        // Small clock skew stays untrusted; a far-future mtime (tar unpack,
+        // container / NFS) would otherwise force a full re-read every scan.
+        Err(e) => e.duration() <= FAR_FUTURE,
     }
 }
 
+/// Mtimes further ahead than this are hashed once and then trusted via
+/// `len` + `mtime` like any settled file.
+const FAR_FUTURE: Duration = Duration::from_secs(24 * 3600);
+
+/// Files up to this size get a baseline hash when first seen so a later
+/// touch / checkout that leaves content intact is not reported as modified.
+const BASELINE_HASH_MAX_BYTES: u64 = 64 * 1024;
+
+fn is_far_future(mtime: SystemTime, mtime_ok: bool, now: SystemTime) -> bool {
+    mtime_ok && mtime.duration_since(now).is_ok_and(|d| d > FAR_FUTURE)
+}
+
 fn hash_file(path: &Path) -> Option<u64> {
+    // Word-at-a-time multiply-xorshift mix: several times faster than the
+    // byte-wise FNV loop. Only compared against earlier values of itself.
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut file = File::open(path).ok()?;
-    let mut buf = [0u8; 8192];
-    let mut h = FNV_OFFSET;
+    let mut buf = [0u8; 65536];
+    let mut h: u64 = FNV_OFFSET;
+    let mut total: u64 = 0;
     loop {
         let n = file.read(&mut buf).ok()?;
         if n == 0 {
             break;
         }
-        for b in &buf[..n] {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(FNV_PRIME);
+        total += n as u64;
+        let mut chunks = buf[..n].chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+            h = (h ^ w).wrapping_mul(K);
+            h ^= h >> 29;
+        }
+        for b in chunks.remainder() {
+            h = (h ^ u64::from(*b)).wrapping_mul(K);
+            h ^= h >> 29;
         }
     }
-    Some(h)
+    h ^= total;
+    Some(h.wrapping_mul(K))
+}
+
+/// Whether `abs` is, or lies below, a symlink that points at a directory
+/// (checked for every component between `root` and `abs`, using `lstat`).
+fn crosses_symlink_dir(root: &Path, abs: &Path) -> bool {
+    let mut cur = abs;
+    loop {
+        if cur == root {
+            return false;
+        }
+        if let Ok(md) = fs::symlink_metadata(cur) {
+            if md.file_type().is_symlink() && cur.is_dir() {
+                return true;
+            }
+        }
+        match cur.parent() {
+            Some(p) if p.starts_with(root) => cur = p,
+            _ => return false,
+        }
+    }
 }
 
 fn relativize(root: &Path, path: &Path) -> Option<RelPath> {
@@ -1453,6 +1651,37 @@ fn relativize(root: &Path, path: &Path) -> Option<RelPath> {
     Some(RelPath::new(stripped.to_string_lossy().as_ref()))
 }
 
+/// [`scan::is_default_excluded_dir`] with a short-lived per-thread cache:
+/// for `target`/`build`/`dist`/`obj` names it lists the parent directory to
+/// look for a project manifest, which is wasteful per event in a build storm.
+fn default_excluded_cached(root: &Path, dir: &Path) -> bool {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    const TTL: Duration = Duration::from_secs(2);
+    thread_local! {
+        static CACHE: RefCell<HashMap<PathBuf, (Instant, bool)>> = RefCell::new(HashMap::new());
+    }
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !matches!(name, "target" | "build" | "dist" | "obj") {
+        return crate::scan::is_default_excluded_dir(root, dir);
+    }
+    let now = Instant::now();
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some((t, v)) = c.get(dir) {
+            if now.duration_since(*t) < TTL {
+                return *v;
+            }
+        }
+        if c.len() > 4096 {
+            c.clear();
+        }
+        let v = crate::scan::is_default_excluded_dir(root, dir);
+        c.insert(dir.to_path_buf(), (now, v));
+        v
+    })
+}
+
 fn is_excluded_rel(root: &Path, rel: &RelPath, extra: &[String]) -> bool {
     let s = rel.as_str();
     let mut dir = root.to_path_buf();
@@ -1461,7 +1690,7 @@ fn is_excluded_rel(root: &Path, rel: &RelPath, extra: &[String]) -> bool {
             continue;
         }
         dir.push(comp);
-        if crate::scan::is_default_excluded_dir(root, &dir) {
+        if default_excluded_cached(root, &dir) {
             return true;
         }
     }
@@ -2514,6 +2743,168 @@ mod tests {
             thread::sleep(timeout);
             Err(RecvTimeoutError::Timeout)
         }
+    }
+
+    #[test]
+    fn directed_check_does_not_follow_symlinked_dirs() {
+        let outer = TestDir::new();
+        outer.write("d/inner.rs", "fn i() {}");
+        outer.write("ext.rs", "fn e() {}");
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        let _ = w.check();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outer.path(), dir.abs("linkdir")).unwrap();
+            let cs = w.check_paths(&[dir.abs("linkdir"), dir.abs("linkdir/ext.rs")]);
+            assert!(cs.is_empty(), "{cs:?}");
+            let full = w.check();
+            assert!(full.is_empty(), "{full:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selective_watch_skips_excluded_dirs_and_adopts_new_ones() {
+        let dir = TestDir::new();
+        dir.write("src/a.rs", "fn a() {}");
+        dir.write("node_modules/p/i.js", "x");
+        let scan = test_scan();
+        let (mut feed, ()) = init_notify(dir.path(), &scan, true).expect("init");
+        {
+            let sel = feed.selective.as_ref().unwrap();
+            assert!(sel.dirs.contains(&dir.abs("src")));
+            assert!(!sel
+                .dirs
+                .iter()
+                .any(|d| d.to_string_lossy().contains("node_modules")));
+        }
+        dir.write("fresh/sub/x.rs", "fn x() {}");
+        let mut seen = Vec::new();
+        let end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < end {
+            if let Ok(FeedWake::Events { paths, .. }) =
+                feed.recv_timeout(Duration::from_millis(100))
+            {
+                seen.extend(paths);
+            }
+            if feed
+                .selective
+                .as_ref()
+                .unwrap()
+                .dirs
+                .contains(&dir.abs("fresh/sub"))
+            {
+                break;
+            }
+        }
+        assert!(feed
+            .selective
+            .as_ref()
+            .unwrap()
+            .dirs
+            .contains(&dir.abs("fresh/sub")));
+        dir.write("fresh/sub/y.rs", "fn y() {}");
+        let end = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < end && !got {
+            if let Ok(FeedWake::Events { paths, .. }) =
+                feed.recv_timeout(Duration::from_millis(100))
+            {
+                got = paths.iter().any(|p| p.ends_with("fresh/sub/y.rs"));
+            }
+        }
+        assert!(got, "event from a newly adopted directory");
+        dir.write("node_modules/p/j.js", "y");
+        let mut leaked = false;
+        for _ in 0..5 {
+            if let Ok(FeedWake::Events { paths, .. }) =
+                feed.recv_timeout(Duration::from_millis(100))
+            {
+                leaked |= paths
+                    .iter()
+                    .any(|p| p.to_string_lossy().contains("node_modules"));
+            }
+        }
+        assert!(!leaked, "excluded tree must not produce events");
+    }
+
+    #[test]
+    fn touch_without_content_change_is_not_modified() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        let _ = w.check();
+        // Move mtime well outside the untrusted window, content untouched.
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+        let _ = w.check(); // observes meta change; hashes now settled
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        drop(f);
+        let cs = w.check();
+        assert!(cs.is_empty(), "touch must not report modified: {cs:?}");
+        let cs = w.check_paths(&[dir.abs("a.rs")]);
+        assert!(cs.is_empty(), "{cs:?}");
+        // A real content change with a new mtime is still reported.
+        rewrite_and_bump(&dir, "a.rs", "fn a() { 2 }");
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(9000))
+            .unwrap();
+        drop(f);
+        assert_eq!(w.check().modified, vec![RelPath::new("a.rs")]);
+    }
+
+    #[test]
+    fn far_future_mtime_is_not_permanently_unsettled() {
+        let now = SystemTime::now();
+        let skew = now + Duration::from_secs(30);
+        let far = now + Duration::from_secs(10 * 24 * 3600);
+        assert!(is_unsettled(skew, true, now));
+        assert!(!is_unsettled(far, true, now));
+        assert!(is_far_future(far, true, now));
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.abs("a.rs"))
+            .unwrap();
+        f.set_modified(far).unwrap();
+        drop(f);
+        let mut w = watcher(&dir);
+        let _ = w.check();
+        let st = w.snapshot.get(&RelPath::new("a.rs")).unwrap();
+        assert!(!st.unsettled && st.hash.is_some());
+        assert!(w.check().is_empty());
+    }
+
+    #[test]
+    fn hash_file_detects_changes_incl_tail_bytes() {
+        let dir = TestDir::new();
+        dir.write("h", "0123456789abcdefX");
+        let a = hash_file(&dir.abs("h")).unwrap();
+        dir.write("h", "0123456789abcdefY");
+        let b = hash_file(&dir.abs("h")).unwrap();
+        dir.write("h", "0123456789abcdef");
+        let c = hash_file(&dir.abs("h")).unwrap();
+        assert!(a != b && a != c && b != c);
+        assert_eq!(b, {
+            dir.write("h", "0123456789abcdefY");
+            hash_file(&dir.abs("h")).unwrap()
+        });
     }
 
     #[test]

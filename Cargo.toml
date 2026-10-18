@@ -26,6 +26,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 memchr = "2.7"
 libc = "0.2"
+windows-sys = { version = "0.61", default-features = false, features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 encoding_rs = "0.8"
 chardetng = "1.0"
 notify = "8"
@@ -37,10 +38,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Phase 2 (language-server routing) and Phase 3 (safe rewriting).
 lsp-types = "0.97"
 ast-grep-core = "0.45"
-oxc_allocator = "0.151"
-oxc_parser = "0.151"
-oxc_semantic = "0.151"
-oxc_span = "0.151"
 
 # Verified to share one ABI: grammars load under tree-sitter 0.27.0 (PHP LANGUAGE_PHP; C/C++ via tree-sitter-language).
 tree-sitter = "0.27"

@@ -22,12 +22,12 @@ pub(super) fn symbol_name(
     definition: tree_sitter::Node<'_>,
     name: &str,
     kind: SymbolKind,
-    _source: &str,
+    source: &str,
 ) -> (String, SymbolKind) {
     let name = clean_name(name);
     let kind = if kind == SymbolKind::Method
         && definition.kind() == "method"
-        && !inside_type_body(definition)
+        && !inside_type_body(definition, source)
     {
         SymbolKind::Function
     } else {
@@ -46,11 +46,31 @@ fn clean_name(name: &str) -> String {
     n.to_owned()
 }
 
-fn inside_type_body(node: tree_sitter::Node<'_>) -> bool {
+fn inside_type_body(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let source_text = |n: tree_sitter::Node<'_>| n.utf8_text(source.as_bytes()).unwrap_or("");
     let mut cur = node.parent();
     while let Some(p) = cur {
         if matches!(p.kind(), "class" | "module" | "singleton_class") {
             return true;
+        }
+        // `Point = Struct.new(:x) do … end` / `Class.new do … end`: the block
+        // body is a type body.
+        if matches!(p.kind(), "do_block" | "block") {
+            if let Some(call) = p.parent().filter(|c| c.kind() == "call") {
+                let recv = call
+                    .child_by_field_name("receiver")
+                    .map(|r| {
+                        r.kind() == "constant"
+                            && matches!(source_text(r), "Struct" | "Class" | "Module" | "Data")
+                    })
+                    .unwrap_or(false);
+                let is_new = call
+                    .child_by_field_name("method")
+                    .is_some_and(|m| matches!(source_text(m), "new" | "define"));
+                if recv && is_new {
+                    return true;
+                }
+            }
         }
         cur = p.parent();
     }
@@ -144,6 +164,17 @@ mod tests {
         ParserPool::new()
             .parse(lang, &RelPath::new("t.rb"), src)
             .ok()
+    }
+
+    #[test]
+    fn struct_and_class_new_blocks_hold_methods_not_functions() {
+        let src = "Pt = Struct.new(:x) do\n  def dist; end\nend\nK = Class.new do\n  def hi; end\nend\ndef top; end\nitems.each do |i|\n  def nested; end\nend\n";
+        let parsed = parse_source(Language::Ruby, src).expect("parse");
+        let kind = |n: &str| parsed.symbols.iter().find(|s| s.name == n).unwrap().kind;
+        assert_eq!(kind("dist"), SymbolKind::Method);
+        assert_eq!(kind("hi"), SymbolKind::Method);
+        assert_eq!(kind("top"), SymbolKind::Function);
+        assert_eq!(kind("nested"), SymbolKind::Function);
     }
 
     const SRC: &str = r#"require "foo/bar"

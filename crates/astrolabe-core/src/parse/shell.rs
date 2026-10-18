@@ -371,6 +371,11 @@ fn recover_headers(
         .collect();
     let have: std::collections::HashSet<u32> =
         parsed.symbols.iter().map(|s| s.start_line).collect();
+    let mut seen: std::collections::HashSet<(u32, String)> = parsed
+        .symbols
+        .iter()
+        .map(|s| (s.start_line, s.name.clone()))
+        .collect();
     let orig: Vec<&str> = source.lines().collect();
     for (k, &row) in headers.iter().enumerate() {
         if have.contains(&(row as u32 + 1)) {
@@ -406,10 +411,7 @@ fn recover_headers(
             let r = symbol.start_line as usize;
             if r <= row
                 || r > end.max(row + 1)
-                || parsed
-                    .symbols
-                    .iter()
-                    .any(|s| s.start_line == symbol.start_line && s.name == symbol.name)
+                || seen.contains(&(symbol.start_line, symbol.name.clone()))
             {
                 continue;
             }
@@ -422,6 +424,7 @@ fn recover_headers(
             if let Some(o) = orig.get(r - 1) {
                 symbol.signature = super::signature_from_row(o.trim_start(), 0);
             }
+            seen.insert((symbol.start_line, symbol.name.clone()));
             parsed.symbols.push(symbol);
         }
     }

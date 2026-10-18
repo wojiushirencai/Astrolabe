@@ -10,9 +10,10 @@ use std::{
 
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
-    cache::DEFAULT_MEMORY_BUDGET_BYTES,
-    graph::{cached_centrality, match_task, rank_for_task},
+    cache::{FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
+    graph::{cached_centrality, rank_and_match},
     render::{confidence_note, symbol_line},
+    types::RelPath,
     CodeSymbol, Confidence, FileId,
 };
 use rmcp::{
@@ -216,16 +217,15 @@ fn is_data_fixture(path: &str) -> bool {
 
 /// Compact list of literal hits in data/fixture files outside `filter`.
 fn data_hits_outside(
-    index: &RepoIndex,
+    all_text_paths: &[&RelPath],
     root: &Path,
     filter: &str,
     query: &str,
     sensitive: bool,
     excluded: &dyn Fn(&str) -> bool,
 ) -> String {
-    let rels: Vec<&str> = index
-        .text_only_paths(None)
-        .into_iter()
+    let rels: Vec<&str> = all_text_paths
+        .iter()
         .map(|p| p.as_str())
         .filter(|p| !p.contains(filter) && is_data_fixture(p) && !excluded(p))
         .collect();
@@ -433,10 +433,72 @@ fn loosened_filter(filter: &str) -> Option<String> {
 /// Role of a hit line. Tests: assertion vs plain reference; code: load/read,
 /// definition, or other use. Heuristic, text-based.
 fn hit_role(is_test: bool, text: &str) -> &'static str {
+    hit_role_split(is_test, text, text)
+}
+
+/// Lexer-aware view of a hit line: `code` is the line without comment bytes
+/// (string contents kept), `bare` also without string contents. `None` view
+/// means no lexer for the file type.
+struct RoleView {
+    code: String,
+    bare: String,
+}
+
+/// Role of hit lines using the file's `code_mask`: trailing comments no longer
+/// leak words into the label, and lines inside multi-line / raw strings (Go
+/// backticks, Python triple quotes) are tagged `字符串` instead of `定义`/`加载`.
+fn role_views(path: &str, lines: &[String], wanted: &[usize]) -> Option<HashMap<usize, RoleView>> {
+    let comments_only = crate::code_mask::code_mask(path, lines, true)?;
+    let bare_mask = crate::code_mask::code_mask(path, lines, false)?;
+    let pick = |line: &str, mask: &[bool]| -> String {
+        let bytes: Vec<u8> = line
+            .bytes()
+            .zip(mask.iter())
+            .filter(|(_, keep)| **keep)
+            .map(|(b, _)| b)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let mut out = HashMap::new();
+    for &i in wanted {
+        let (Some(line), Some(c), Some(b)) = (lines.get(i), comments_only.get(i), bare_mask.get(i))
+        else {
+            continue;
+        };
+        out.insert(
+            i,
+            RoleView {
+                code: pick(line, c),
+                bare: pick(line, b),
+            },
+        );
+    }
+    Some(out)
+}
+
+fn hit_role_view(is_test: bool, raw: &str, view: &RoleView) -> &'static str {
+    if view.code.trim().is_empty() {
+        return if raw.trim().is_empty() {
+            hit_role(is_test, raw)
+        } else {
+            "注释"
+        };
+    }
+    if view.bare.trim().is_empty() {
+        return "字符串";
+    }
+    hit_role_split(is_test, &view.bare, &view.code)
+}
+
+/// `words`: text used for word keys (strings blanked when known); `lit`: text
+/// used for keys that need a string literal (`= "`).
+fn hit_role_split(is_test: bool, words: &str, lit: &str) -> &'static str {
+    let text = words;
     if is_comment_line(text) {
         return "注释";
     }
     let any = |keys: &[&str]| keys.iter().any(|k| contains_word_start(text, k));
+    let any_lit = |keys: &[&str]| keys.iter().any(|k| contains_word_start(lit, k));
     if is_test {
         if any(&[
             "assert", "expect", "require.", "require(", "want", "equal", "eq!(", "should", "tobe",
@@ -468,9 +530,9 @@ fn hit_role(is_test: bool, text: &str) -> &'static str {
         "import ",
     ]) {
         "加载"
-    } else if any(&[
-        "const ", "static ", "#define", " := ", "let ", "var ", "= \"", "=\"", ": \"",
-    ]) {
+    } else if any(&["const ", "static ", "#define", " := ", "let ", "var "])
+        || any_lit(&["= \"", "=\"", ": \""])
+    {
         "定义"
     } else {
         "使用"
@@ -661,7 +723,7 @@ fn is_doc_path(path: &str) -> bool {
 }
 
 /// `aggregate=top|dir|file` / `count_only`: counts and a total, no hit lines.
-fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
+fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>, offset: usize) -> String {
     const MAX_ROWS: usize = 80;
     let total = hits.len();
     let mut all_files: BTreeSet<&str> = BTreeSet::new();
@@ -705,14 +767,23 @@ fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
         };
         out.push_str(&format!("{label}: N 行 / M 个文件\n"));
         let suffix = if aggregate == Some("file") { "" } else { "/" };
-        for (key, n, f) in rows.iter().take(MAX_ROWS) {
+        let start = offset.min(rows.len());
+        let end = (start + MAX_ROWS).min(rows.len());
+        if start > 0 {
+            out.push_str(&format!(
+                "  （从第 {} 项开始，共 {} 项）\n",
+                start + 1,
+                rows.len()
+            ));
+        }
+        for (key, n, f) in &rows[start..end] {
             out.push_str(&format!("  {n:>5} 行 / {f:>4} 个文件  {key}{suffix}\n"));
         }
-        if rows.len() > MAX_ROWS {
-            let rest: usize = rows[MAX_ROWS..].iter().map(|r| r.1).sum();
+        if end < rows.len() {
+            let rest: usize = rows[end..].iter().map(|r| r.1).sum();
             out.push_str(&format!(
-                "  …其余 {} 项共 {rest} 行（已计入总计）\n",
-                rows.len() - MAX_ROWS
+                "  …还有 {} 项共 {rest} 行未列出（已计入总计）；传 offset={end} 看后续各项，或用 path_filter 缩小范围。\n",
+                rows.len() - end
             ));
         }
         out.push_str(&format!(
@@ -723,8 +794,12 @@ fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
     out
 }
 
-/// Glob list -> matcher. A bare name (`vendor`) also excludes everything
-/// below a directory of that name; `*` crosses `/`.
+/// Glob list -> matcher. One rule for every consumer (search_code main path,
+/// aggregate/count, text-only scan, `data_hits_outside`): a bare name
+/// (`test`, `vendor`) matches a whole path segment, so a directory or a file
+/// of exactly that name (and everything under such a directory); it never
+/// matches part of a name (`test` skips neither `contest/` nor `test.rs`).
+/// `*` crosses `/`.
 fn build_exclude_set(globs: Option<&[String]>) -> Result<Option<globset::GlobSet>, String> {
     let Some(globs) = globs.filter(|g| !g.is_empty()) else {
         return Ok(None);
@@ -899,7 +974,12 @@ fn next_step_hint(task: &str) -> &'static str {
 }
 
 /// `group=true`: hits grouped per file, production first then tests.
-fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (String, usize) {
+fn render_grouped_hits(
+    index: &RepoIndex,
+    cache: &FileCache,
+    hits: &[SearchHit],
+    limit: usize,
+) -> (String, usize) {
     struct Row {
         line: usize,
         role: &'static str,
@@ -933,9 +1013,19 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
             continue;
         }
         let file_is_test = crate::explain::is_test_caller(path, "");
+        let wanted: Vec<usize> = rows.iter().map(|r| r.line.saturating_sub(1)).collect();
+        let views = index
+            .cached_lines(cache, path)
+            .and_then(|(lines, _)| role_views(path, &lines, &wanted));
         for r in &mut rows {
             let test = file_is_test || crate::explain::is_test_caller(path, &r.sym);
-            r.role = hit_role(test, &r.text);
+            r.role = match views
+                .as_ref()
+                .and_then(|v| v.get(&r.line.saturating_sub(1)))
+            {
+                Some(view) => hit_role_view(test, &r.text, view),
+                None => hit_role(test, &r.text),
+            };
         }
         if file_is_test {
             tests.push((path, rows));
@@ -947,7 +1037,7 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     tests.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     docs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     let mut out = format!(
-        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个，文档 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]，文档 [文档]。\n",
+        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个，文档 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]，字符串内 [字符串]，文档 [文档]。\n",
         hits.len(),
         prod.len() + tests.len() + docs.len(),
         prod.len(),
@@ -1486,7 +1576,7 @@ pub(crate) struct SearchParams {
     )]
     pub aggregate: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Skip paths: [\"vendor\",\"_test.go\",\"*_test.go\"].")]
+    #[schemars(description = "Skip paths; bare name=segment: [\"vendor\",\"_test.go\"]")]
     pub exclude: Option<Vec<String>>,
     #[serde(default)]
     #[schemars(description = "Only totals (hits, files).")]
@@ -1598,6 +1688,9 @@ pub struct AstrolabeServer {
     /// One-line digest of each whole `search_code` result, keyed like the
     /// query entries of `sent_ranges`, so a repeat query gets the gist back.
     search_digests: Arc<Mutex<HashMap<String, String>>>,
+    /// Index generation each `find_symbol` query (offset and budget aside) was
+    /// last served at, so a later page can say the index changed in between.
+    symbol_page_generations: Arc<Mutex<HashMap<String, u64>>>,
     call_seq: Arc<AtomicU64>,
 }
 
@@ -1716,6 +1809,7 @@ impl AstrolabeServer {
             tool_router: Self::tool_router(),
             sent_ranges: Arc::new(Mutex::new(HashMap::new())),
             search_digests: Arc::new(Mutex::new(HashMap::new())),
+            symbol_page_generations: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1957,17 +2051,30 @@ impl AstrolabeServer {
         } else {
             BarrierEffect::None
         };
-        let result = match &*session.state.read().expect("index state lock poisoned") {
-            IndexState::Building => self.finish_at(
+        // Clone the `Arc` and release the read guard before running the tool:
+        // a long scan must not keep a queued watcher write lock (and every
+        // reader behind it) waiting. The query runs on its own snapshot.
+        enum Snap {
+            Building,
+            Failed(String),
+            Ready(Arc<RepoIndex>),
+        }
+        let snap = match &*session.state.read().unwrap_or_else(|e| e.into_inner()) {
+            IndexState::Building => Snap::Building,
+            IndexState::Failed(error) => Snap::Failed(error.clone()),
+            IndexState::Ready(index) => Snap::Ready(Arc::clone(index)),
+        };
+        let result = match snap {
+            Snap::Building => self.finish_at(
                 &session.root,
                 text_error("索引正在后台构建；MCP 握手已完成，请稍后重试。confidence: unknown"),
             ),
-            IndexState::Failed(error) => self.finish_at(
+            Snap::Failed(error) => self.finish_at(
                 &session.root,
                 text_error(format!("索引构建失败：{error}\nconfidence: unknown")),
             ),
-            IndexState::Ready(index) => {
-                let result = f(&session, index);
+            Snap::Ready(index) => {
+                let result = f(&session, &index);
                 match index.coverage_note() {
                     Some(note) if result.is_error != Some(true) => append_stale_note(result, &note),
                     _ => result,
@@ -2026,13 +2133,9 @@ impl AstrolabeServer {
         tools
     }
 
-    /// Current index generation for the session `hint` routes to, after the
-    /// freshness barrier has absorbed pending edits. `None` when the index is
-    /// not ready (the call then just runs and is never counted).
-    fn index_stamp(&self, hint: &str) -> Option<u64> {
-        let session = self.session_for(hint).ok()?;
-        let _ = run_barrier(&session);
-        let state = session.state.read().expect("index state lock poisoned");
+    /// Generation of an already-routed session's Ready index; no barrier.
+    fn stamp_of(session: &RootSession) -> Option<u64> {
+        let state = session.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             IndexState::Ready(index) => Some(index.generation()),
             _ => None,
@@ -2052,7 +2155,14 @@ impl AstrolabeServer {
         signature: &str,
         run: impl FnOnce() -> CallToolResult,
     ) -> CallToolResult {
-        let Some(stamp) = self.index_stamp(hint) else {
+        // Route once; the barrier runs once here. The tool body's own
+        // `with_fresh_index` runs it again, and the post-run stamp reuses the
+        // routed session instead of routing and waiting a third time.
+        let Ok(session) = self.session_for(hint) else {
+            return run();
+        };
+        let _ = run_barrier(&session);
+        let Some(stamp) = Self::stamp_of(&session) else {
             return run();
         };
         let verdict = self
@@ -2071,7 +2181,7 @@ impl AstrolabeServer {
         let mut result = run();
         if result.is_error != Some(true) {
             // Re-read the stamp: the run itself may have absorbed edits.
-            if let Some(after) = self.index_stamp(hint) {
+            if let Some(after) = Self::stamp_of(&session) {
                 self.loop_guard
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2269,6 +2379,12 @@ mod cancel {
         let out = f();
         FLAG.with(|cell| *cell.borrow_mut() = None);
         out
+    }
+
+    /// The current thread's flag, for worker threads that cannot see the
+    /// thread-local.
+    pub(super) fn current() -> Option<Arc<AtomicBool>> {
+        FLAG.with(|cell| cell.borrow().clone())
     }
 
     pub(super) fn is_cancelled() -> bool {
@@ -2548,8 +2664,7 @@ impl AstrolabeServer {
             }
 
             let base = cached_centrality(graph);
-            let ranked = rank_for_task(graph, &params.task_description, &base);
-            let matched = match_task(graph, &params.task_description);
+            let (ranked, matched) = rank_and_match(graph, &params.task_description, &base);
             let mut ids: Vec<_> = graph.files.iter().map(|file| file.id).collect();
             ids.sort_by(|a, b| {
                 ranked
@@ -2736,6 +2851,31 @@ impl AstrolabeServer {
         Self::with_route_note(result, &route.note)
     }
 
+    /// Pages of one `find_symbol` query are cut from a ranking recomputed on
+    /// every call, so an index replacement between two pages shifts the page
+    /// boundaries (items skipped or repeated). Remember the generation each
+    /// query was last served at; on `offset > 0` with a different generation,
+    /// return a note telling the caller to restart from `offset=0`.
+    fn symbol_page_drift_note(&self, params: &QueryParams, generation: u64) -> Option<String> {
+        let key = format!(
+            "{}|{}|{:?}|{:?}|{:?}|{}",
+            params.root.as_deref().unwrap_or(""),
+            params.query,
+            params.kind,
+            params.substring,
+            params.path_filter,
+            params.depth
+        );
+        let mut map = self.symbol_page_generations.lock().ok()?;
+        if map.len() > 256 {
+            map.clear();
+        }
+        let previous = map.insert(key, generation);
+        (params.offset > 0 && previous.is_some_and(|g| g != generation)).then(|| {
+            "注意：索引在翻页期间已更新（文件有改动并重新索引），本页边界可能与上一页错位（漏项或重复）；需要完整结果请用 offset=0 重新查询。\n".to_string()
+        })
+    }
+
     fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
         if params.query.trim().is_empty() {
             return text_error(
@@ -2761,7 +2901,7 @@ impl AstrolabeServer {
             let literal = params.query.trim();
             let literal_hit = normalized.query != literal
                 && !literal.contains('/')
-                && index.graph().symbols.iter().any(|s| s.name == literal);
+                && index.names().exact.contains(literal);
             if normalized.query.contains('/') && !literal_hit {
                 let mut params = params.clone();
                 params.query = normalized.query;
@@ -2785,17 +2925,15 @@ impl AstrolabeServer {
             let exact_only = params.substring == Some(false);
             // 排序键：(档, 测试路径靠后, exported 优先, path, start_line)；
             // 末位 idx 保证全序。不再按渲染后的签名文本排序。
-            type RankKey = (u8, bool, bool, String, u32);
-            let mut ranked: Vec<(RankKey, String, usize)> = Vec::new();
-            for (idx, symbol) in index.graph().symbols.iter().enumerate() {
-                let Some(tier) = name_match_tier(&symbol.name, &needle) else {
-                    continue;
-                };
-                if exact_only && tier > 0 {
-                    continue;
-                }
+            type RankKey<'a> = (u8, bool, bool, &'a str, u32);
+            let names = index.names();
+            let symbols = &index.graph().symbols;
+            let mut ranked: Vec<(RankKey, usize)> = Vec::new();
+            let mut test_path_cache: HashMap<FileId, bool> = HashMap::new();
+            let mut consider = |idx: usize, tier: u8| {
+                let symbol = &symbols[idx];
                 if kind.is_some_and(|k| symbol.kind != k) {
-                    continue;
+                    return;
                 }
                 if let Some(file) = index.file(symbol.file) {
                     if params
@@ -2803,27 +2941,57 @@ impl AstrolabeServer {
                         .as_deref()
                         .is_some_and(|f| !file.path.as_str().contains(f))
                     {
-                        continue;
+                        return;
                     }
+                    let is_test = *test_path_cache
+                        .entry(symbol.file)
+                        .or_insert_with(|| is_test_path(file.path.as_str()));
                     let key = (
                         tier,
-                        is_test_path(file.path.as_str()),
+                        is_test,
                         !symbol.exported,
-                        file.path.as_str().to_owned(),
+                        file.path.as_str(),
                         symbol.start_line,
                     );
-                    ranked.push((key, symbol_line(symbol, &file.path), idx));
+                    ranked.push((key, idx));
+                }
+            };
+            if exact_only {
+                // Exact names only: O(1) map lookup instead of a full scan.
+                for &idx in names
+                    .by_lower
+                    .get(&needle)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                {
+                    consider(idx as usize, 0);
+                }
+            } else {
+                for (idx, lower) in names.lower.iter().enumerate() {
+                    if let Some(tier) = name_match_tier(lower, &needle) {
+                        consider(idx, tier);
+                    }
                 }
             }
-            ranked.sort_by(|a, b| (&a.0, a.2).cmp(&(&b.0, b.2)));
+            ranked.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
             let hits: Vec<(String, usize)> = ranked
                 .into_iter()
-                .map(|(_, line, idx)| (line, idx))
+                .map(|(_, idx)| {
+                    let symbol = &symbols[idx];
+                    let path = &index
+                        .file(symbol.file)
+                        .expect("ranked symbol has a file")
+                        .path;
+                    (symbol_line(symbol, path), idx)
+                })
                 .collect();
-            let lines = decorated_symbol_lines(index, &hits);
-            let total = lines.len();
+            let total = hits.len();
             let offset = params.offset.min(total);
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
+            let generation = index.generation();
+            if let Some(note) = self.symbol_page_drift_note(&params, generation) {
+                body.push_str(&note);
+            }
             if let Some(ignored) = &normalized.ignored {
                 body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
             }
@@ -2837,17 +3005,25 @@ impl AstrolabeServer {
                     params.budget_tokens,
                     params.offset,
                 ));
-            let (kept, omitted) = truncate_ranked(
-                &lines[offset..],
+            let (kept, omitted) = paged_symbol_lines(
+                index,
+                &hits,
+                offset,
                 params.budget_tokens.saturating_sub(reserve),
-                |line| format!("{line}\n"),
             );
             let kept_count = kept.len();
             let truncated = omitted > 0;
             // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
             let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
-            body.push_str(&render_search_page_status(total, offset, kept_count, omitted, params.budget_tokens, params.offset));
-            for line in kept {
+            body.push_str(&render_search_page_status(
+                total,
+                offset,
+                kept_count,
+                omitted,
+                params.budget_tokens,
+                params.offset,
+            ));
+            for line in &kept {
                 body.push_str(line);
                 body.push('\n');
             }
@@ -2877,7 +3053,8 @@ impl AstrolabeServer {
                 body,
                 json!({
                     "confidence": "syntactic",
-                    "matches": lines.len(), "total": total, "offset": offset, "next_offset": next_offset,
+                    "generation": generation,
+                    "matches": total, "total": total, "offset": offset, "next_offset": next_offset,
                     "shown": kept_count,
                     "omitted": omitted,
                     "truncated": truncated,
@@ -2920,10 +3097,20 @@ impl AstrolabeServer {
             |session, index| {
                 // A filter that only hits non-code text files (docs/, *.toml …)
                 // is valid here: those files are searched as [text-only].
-                if index
-                    .text_only_paths(params.path_filter.as_deref())
-                    .is_empty()
-                {
+                // Computed once per call; the path_filter view, the text-only
+                // scan and `data_hits_outside` all derive from it.
+                let all_text_paths = index.text_only_paths(None);
+                let filter_text_paths: Vec<&RelPath> = all_text_paths
+                    .iter()
+                    .copied()
+                    .filter(|p| {
+                        params
+                            .path_filter
+                            .as_deref()
+                            .is_none_or(|f| p.as_str().contains(f))
+                    })
+                    .collect();
+                if filter_text_paths.is_empty() {
                     if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
                         return text_error(message);
                     }
@@ -3023,84 +3210,114 @@ impl AstrolabeServer {
                 // skip_comments on a type without a lexer cannot filter anything;
                 // collect those types so the summary says so.
                 let mut unlexed: BTreeSet<String> = BTreeSet::new();
-                let mut scan_file = |path: &str, matches: &mut Vec<SearchHit>| {
-                    if cancel::is_cancelled() {
-                        return;
+                struct FileScan {
+                    hits: Vec<SearchHit>,
+                    cache_hit: bool,
+                    skipped: usize,
+                    unlexed: Option<String>,
+                }
+                // Per-file scan: pure (no shared mutable state), so files are
+                // scanned in parallel; results come back in graph order, which
+                // keeps the output identical to a sequential scan.
+                let cancel_flag = cancel::current();
+                let scan_file = |path: &str| -> Option<FileScan> {
+                    if cancel_flag
+                        .as_ref()
+                        .is_some_and(|f| f.load(Ordering::Relaxed))
+                    {
+                        return None;
                     }
-                    let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
-                        return;
+                    let (lines, cache_hit) = index.cached_lines(&session.file_cache, path)?;
+                    let mut out = FileScan {
+                        hits: Vec::new(),
+                        cache_hit,
+                        skipped: 0,
+                        unlexed: None,
                     };
                     // Lazy: the mask is only computed once a line matches.
                     let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
-                    if hit {
-                        hits += 1;
-                    } else {
-                        misses += 1;
-                    }
                     for (line_no, line) in lines.iter().enumerate() {
-                        if matcher.is_match(line) {
-                            if params.skip_comments {
-                                let mask = mask.get_or_insert_with(|| {
-                                    crate::code_mask::code_mask(path, &lines, strings_are_code)
-                                });
-                                if let Some(mask) = mask {
-                                    let real = matcher.find_iter(line).any(|m| {
-                                        mask[line_no].get(m.start()).copied().unwrap_or(true)
-                                    });
-                                    if !real {
-                                        skipped += 1;
-                                        continue;
-                                    }
-                                } else {
-                                    unlexed.insert(crate::code_mask::type_label(path));
-                                }
-                            }
-                            // P0：超长行先做单行安全切片（Unicode 边界安全），
-                            // 单条 match 不会把 budget 一口气吃光，也不会在
-                            // 大小写折叠差异上 panic。
-                            matches.push(SearchHit {
-                                path: path.to_string(),
-                                line: line_no + 1,
-                                text: if counting {
-                                    String::new()
-                                } else {
-                                    clip_match_line(line, &params.query, Some(&matcher))
-                                },
-                                text_only: false,
-                            });
+                        if !matcher.is_match(line) {
+                            continue;
                         }
+                        if params.skip_comments {
+                            let mask = mask.get_or_insert_with(|| {
+                                crate::code_mask::code_mask(path, &lines, strings_are_code)
+                            });
+                            if let Some(mask) = mask {
+                                let real = matcher
+                                    .find_iter(line)
+                                    .any(|m| mask[line_no].get(m.start()).copied().unwrap_or(true));
+                                if !real {
+                                    out.skipped += 1;
+                                    continue;
+                                }
+                            } else {
+                                out.unlexed = Some(crate::code_mask::type_label(path));
+                            }
+                        }
+                        // P0：超长行先做单行安全切片（Unicode 边界安全），
+                        // 单条 match 不会把 budget 一口气吃光，也不会在
+                        // 大小写折叠差异上 panic。
+                        out.hits.push(SearchHit {
+                            path: path.to_string(),
+                            line: line_no + 1,
+                            text: if counting {
+                                String::new()
+                            } else {
+                                clip_match_line(line, &params.query, Some(&matcher))
+                            },
+                            text_only: false,
+                        });
                     }
+                    Some(out)
                 };
-                for file in &index.graph().files {
-                    if params
-                        .path_filter
-                        .as_ref()
-                        .is_some_and(|filter| !file.path.as_str().contains(filter))
-                    {
-                        continue;
+                let candidates: Vec<&str> = index
+                    .graph()
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .filter(|path| {
+                        params
+                            .path_filter
+                            .as_ref()
+                            .is_none_or(|filter| path.contains(filter.as_str()))
+                            && !excluded(path)
+                    })
+                    .collect();
+                {
+                    use rayon::prelude::*;
+                    let scanned: Vec<Option<FileScan>> =
+                        candidates.par_iter().map(|path| scan_file(path)).collect();
+                    for scan in scanned.into_iter().flatten() {
+                        if scan.cache_hit {
+                            hits += 1;
+                        } else {
+                            misses += 1;
+                        }
+                        skipped += scan.skipped;
+                        unlexed.extend(scan.unlexed);
+                        matches.extend(scan.hits);
                     }
-                    if excluded(file.path.as_str()) {
-                        continue;
-                    }
-                    scan_file(file.path.as_str(), &mut matches);
                 }
                 // 非索引文本文件（md/sql/yaml/json/xml/gradle/kt/模板…）也搜，
                 // 排在代码命中之后并标注 [text-only]：它们没有符号/引用信息。
                 // ripgrep 引擎（grep-searcher）并行搜索，按输入顺序回收结果。
                 let code_matches = matches.len();
-                let text_paths: Vec<_> = index
-                    .text_only_paths(params.path_filter.as_deref())
-                    .into_iter()
+                let text_paths: Vec<&RelPath> = filter_text_paths
+                    .iter()
+                    .copied()
                     .filter(|p| !excluded(p.as_str()))
                     .collect();
                 let sensitive = params.case_sensitive.unwrap_or(params.regex);
                 {
                     let rels: Vec<&str> = text_paths.iter().map(|p| p.as_str()).collect();
-                    let found = astrolabe_core::text_search::search_files(
+                    let found = astrolabe_core::text_search::search_files_opts(
                         &session.root,
                         &rels,
                         &text_matcher,
                         TEXT_SEARCH_MAX_FILE_BYTES,
+                        !counting,
                     );
                     for (idx, file_hits) in found {
                         let mut file_hits = file_hits;
@@ -3173,7 +3390,7 @@ impl AstrolabeServer {
                         .path_filter
                         .as_deref()
                         .map(|filter| data_hits_outside(
-                            index,
+                            &all_text_paths,
                             &session.root,
                             filter,
                             &params.query,
@@ -3213,7 +3430,7 @@ impl AstrolabeServer {
                     let body = format!(
                         "confidence: exact (磁盘源码字面匹配)\n{}{}",
                         render_search_mode_header(params.regex, &params.query),
-                        render_search_counts(&matches, params.aggregate.as_deref()),
+                        render_search_counts(&matches, params.aggregate.as_deref(), params.offset),
                     ) + &skip_note;
                     return self.result_on(
                         &session.root,
@@ -3248,6 +3465,7 @@ impl AstrolabeServer {
                 if ((params.group == Some(true) && params.offset == 0) || auto_group) && total > 0 {
                     let (grouped, shown) = render_grouped_hits(
                         index,
+                        &session.file_cache,
                         &matches,
                         clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS),
                     );
@@ -3632,8 +3850,9 @@ impl AstrolabeServer {
             },
         };
         let symbols = &index.graph().symbols;
-        let mut matches = astrolabe_core::name_path::match_name_path(
+        let mut matches = astrolabe_core::name_path::match_name_path_with(
             symbols,
+            &index.names().name_path,
             &params.query,
             params.substring.unwrap_or(false),
             astrolabe_core::name_path::KindFilter(kind),
@@ -3681,7 +3900,11 @@ impl AstrolabeServer {
         // 命中对先收集 (锚点行, symbol 下标)，与名称分支同一 include_body 排序源。
         let mut hits: Vec<(String, usize)> = Vec::new();
         for m in &matches {
-            if let Some((idx, symbol)) = symbols.iter().enumerate().find(|(_, s)| s.id == m.symbol)
+            if let Some((idx, symbol)) = index
+                .names()
+                .by_id
+                .get(&m.symbol)
+                .map(|&idx| (idx, &symbols[idx]))
             {
                 if let Some(file) = index.file(symbol.file) {
                     if params
@@ -3703,12 +3926,15 @@ impl AstrolabeServer {
                 }
             }
         }
-        let lines = decorated_symbol_lines(index, &hits);
-        let total = lines.len();
+        let total = hits.len();
         let offset = params.offset.min(total);
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
                 .to_string();
+        let generation = index.generation();
+        if let Some(note) = self.symbol_page_drift_note(params, generation) {
+            body.push_str(&note);
+        }
         if let Some(ignored) = ignored {
             body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
         }
@@ -3724,10 +3950,11 @@ impl AstrolabeServer {
                 params.budget_tokens,
                 params.offset,
             ));
-        let (kept, omitted) = truncate_ranked(
-            &lines[offset..],
+        let (kept, omitted) = paged_symbol_lines(
+            index,
+            &hits,
+            offset,
             params.budget_tokens.saturating_sub(reserve),
-            |line| format!("{line}\n"),
         );
         let kept_count = kept.len();
         let truncated = omitted > 0;
@@ -3741,7 +3968,7 @@ impl AstrolabeServer {
             params.budget_tokens,
             params.offset,
         ));
-        for line in kept {
+        for line in &kept {
             body.push_str(line);
             body.push('\n');
         }
@@ -3776,7 +4003,8 @@ impl AstrolabeServer {
             body,
             json!({
                 "confidence": "syntactic",
-                "matches": lines.len(), "total": total, "offset": offset, "next_offset": next_offset,
+                "generation": generation,
+                "matches": total, "total": total, "offset": offset, "next_offset": next_offset,
                 "shown": kept_count,
                 "omitted": omitted,
                 "truncated": truncated,
@@ -4246,7 +4474,11 @@ fn kind_display_name(kind: astrolabe_core::SymbolKind) -> &'static str {
 fn decorated_symbol_lines(index: &RepoIndex, hits: &[(String, usize)]) -> Vec<String> {
     let symbols = &index.graph().symbols;
     let targets: Vec<usize> = hits.iter().map(|(_, idx)| *idx).collect();
-    let containers = astrolabe_core::name_path::innermost_containers(symbols, &targets);
+    let containers = astrolabe_core::name_path::innermost_containers_with(
+        symbols,
+        &index.names().name_path,
+        &targets,
+    );
     hits.iter()
         .zip(containers)
         .map(|((line, idx), container)| {
@@ -4274,9 +4506,33 @@ fn decorated_symbol_lines(index: &RepoIndex, hits: &[(String, usize)]) -> Vec<St
         .collect()
 }
 
-/// 名称匹配档位：0 精确、1 前缀、2 子串（needle 已小写）。
-fn name_match_tier(name: &str, needle: &str) -> Option<u8> {
-    let lower = name.to_lowercase();
+/// The page of decorated lines starting at `offset` that fits `limit` tokens,
+/// and how many hits remain after it. Decoration (container lookup, kind tag)
+/// is the costly part and only the shown page needs it, so hits are decorated
+/// in growing windows until the budget cuts the list or the hits run out.
+fn paged_symbol_lines(
+    index: &RepoIndex,
+    hits: &[(String, usize)],
+    offset: usize,
+    limit: usize,
+) -> (Vec<String>, usize) {
+    let rest = &hits[offset.min(hits.len())..];
+    let mut window = 256usize;
+    loop {
+        let end = window.min(rest.len());
+        let lines = decorated_symbol_lines(index, &rest[..end]);
+        let (kept, omitted_in_window) = truncate_ranked(&lines, limit, |line| format!("{line}\n"));
+        let kept_len = kept.len();
+        if omitted_in_window > 0 || end == rest.len() {
+            let kept: Vec<String> = lines.into_iter().take(kept_len).collect();
+            return (kept, rest.len() - kept_len);
+        }
+        window = window.saturating_mul(4);
+    }
+}
+
+/// 名称匹配档位：0 精确、1 前缀、2 子串（`lower`、`needle` 均已小写）。
+fn name_match_tier(lower: &str, needle: &str) -> Option<u8> {
     if lower == needle {
         Some(0)
     } else if lower.starts_with(needle) {
@@ -4471,6 +4727,34 @@ mod tests {
     };
     use std::collections::HashSet;
     use std::time::Duration;
+
+    #[test]
+    fn index_read_lock_is_released_while_a_tool_runs() {
+        let server = ready_server();
+        let session = Arc::clone(&server.primary);
+        let replacement = match &*session.state.read().unwrap() {
+            IndexState::Ready(i) => Arc::clone(i),
+            _ => panic!("ready"),
+        };
+        let result = server.with_index("", |_, _| {
+            // A watcher publishing a new index must not wait for this tool.
+            let s2 = Arc::clone(&session);
+            let handle = std::thread::spawn(move || {
+                *s2.state.write().unwrap() = IndexState::Ready(replacement);
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !handle.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writer blocked by running tool"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            handle.join().unwrap();
+            text_error("done")
+        });
+        assert!(fs_text(&result).contains("done"));
+    }
 
     fn ready_server() -> AstrolabeServer {
         let mut server =
@@ -5416,6 +5700,45 @@ mod tests {
     }
 
     #[test]
+    fn hit_roles_use_lexer_for_trailing_comments_and_raw_strings() {
+        let go: Vec<String> = [
+            "package p",
+            "func f() {",
+            "\ts := `",
+            "\tx := 1",
+            "\t`",
+            "\treturn s // a := b",
+            "}",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let v = role_views("a.go", &go, &[3, 5]).unwrap();
+        // inside a Go raw string: not a definition
+        assert_eq!(hit_role_view(false, &go[3], &v[&3]), "字符串");
+        // trailing comment words do not leak into the label
+        assert_eq!(hit_role_view(false, &go[5], &v[&5]), "使用");
+        let py: Vec<String> = [
+            "def g(thread):",
+            "    return thread  # read SysLog(x)",
+            "    # SysLog(x)",
+            "    x = 1  # note",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let v = role_views("b.py", &py, &[1, 2]).unwrap();
+        assert_eq!(hit_role_view(false, &py[1], &v[&1]), "使用");
+        assert_eq!(hit_role_view(false, &py[2], &v[&2]), "注释");
+        // no lexer: falls back to text heuristic
+        assert!(role_views("a.txt", &py, &[0]).is_none());
+        // string literal keys still see strings
+        let rs: Vec<String> = vec!["let k = \"v\"; // read".into()];
+        let v = role_views("a.rs", &rs, &[0]).unwrap();
+        assert_eq!(hit_role_view(false, &rs[0], &v[&0]), "定义");
+    }
+
+    #[test]
     fn hit_roles_tag_comments_and_definitions() {
         assert_eq!(hit_role(false, "// see MAGIC_KEY here"), "注释");
         assert_eq!(hit_role(false, "    # MAGIC_KEY note"), "注释");
@@ -5554,6 +5877,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn aggregate_file_over_row_cap_pages_with_offset_and_says_so() {
+        let files: Vec<(String, String)> = (0..95)
+            .map(|i| {
+                (
+                    format!("pkg/f{i:03}.go"),
+                    format!("package pkg\nfunc F{i}() {{ SysLog({i}) }}\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let mut p = search("SysLog(");
+        p.aggregate = Some("file".into());
+        let first = text_of(&server.search_code(Parameters(p.clone())));
+        assert!(first.contains("总计 95 行命中 / 95 个文件"), "{first}");
+        assert!(first.contains("还有 15 项"), "{first}");
+        assert!(first.contains("offset=80"), "{first}");
+        assert!(first.contains("pkg/f000.go"), "{first}");
+        assert!(!first.contains("pkg/f094.go"), "{first}");
+        p.offset = 80;
+        let second = text_of(&server.search_code(Parameters(p)));
+        assert!(second.contains("pkg/f094.go"), "{second}");
+        assert!(!second.contains("pkg/f000.go"), "{second}");
+        assert!(second.contains("从第 81 项开始"), "{second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_code_scan_keeps_graph_order_and_is_repeatable() {
+        let files: Vec<(String, String)> = (0..60)
+            .map(|i| {
+                (
+                    format!("d{}/f{i:02}.go", i % 7),
+                    format!("package p\nfunc F{i}() {{ SysLog({i}) }}\n// SysLog(c{i})\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let mut p = search("SysLog(");
+        p.dedup = Some(false);
+        p.budget_tokens = 20000;
+        let first = text_of(&server.search_code(Parameters(p.clone())));
+        // The loop guard blocks the 4th identical call, so stop at 3.
+        for _ in 0..2 {
+            assert_eq!(text_of(&server.search_code(Parameters(p.clone()))), first);
+        }
+        let mut c = p.clone();
+        c.skip_comments = true;
+        let skipped = text_of(&server.search_code(Parameters(c)));
+        assert!(
+            skipped.contains("已跳过注释/字符串/文档中的 60 处"),
+            "{skipped}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn nested_fixture() -> (AstrolabeServer, PathBuf) {
         smart_server(&[
             (
@@ -5670,6 +6053,17 @@ mod tests {
         assert!(is_doc_path("a/b.md"));
         assert!(!is_doc_path("cfg/CMakeLists.txt"));
         assert!(!is_doc_path("requirements.txt"));
+    }
+
+    #[test]
+    fn bare_exclude_name_is_whole_path_segment_for_dirs_and_files_alike() {
+        let set = build_exclude_set(Some(&["test".into()])).unwrap().unwrap();
+        assert!(set.is_match("test/a.rs"));
+        assert!(set.is_match("src/test/a.rs"));
+        assert!(set.is_match("src/test"));
+        assert!(!set.is_match("src/contest/a.rs"));
+        assert!(!set.is_match("src/test.rs"));
+        assert!(!set.is_match("src/tests/a.rs"));
     }
 
     #[test]
@@ -6210,6 +6604,103 @@ mod tests {
             skip_comments: false,
         }));
         result.content[0].as_text().unwrap().text.clone()
+    }
+
+    /// Timing probe (run with --ignored --nocapture): 3000 files, ~150k symbols.
+    #[test]
+    #[ignore]
+    fn bench_find_symbol_large_graph() {
+        let mut files = Vec::new();
+        let mut symbols = Vec::new();
+        for f in 0..3000u32 {
+            files.push(CodeFile {
+                id: FileId(f),
+                path: RelPath::new(format!("pkg{}/mod{}.rs", f % 50, f)),
+                language: Some(Language::Rust),
+                loc: 1000,
+                sha: String::new(),
+            });
+            let base = symbols.len() as u32;
+            symbols.push(CodeSymbol {
+                id: SymbolId(base),
+                file: FileId(f),
+                name: format!("Service{f}"),
+                kind: SymbolKind::Class,
+                signature: format!("pub struct Service{f}"),
+                start_line: 1,
+                end_line: 400,
+                exported: true,
+            });
+            for m in 0..49u32 {
+                symbols.push(CodeSymbol {
+                    id: SymbolId(base + 1 + m),
+                    file: FileId(f),
+                    name: if m % 7 == 0 {
+                        "handle".into()
+                    } else {
+                        format!("method_{m}_Helper")
+                    },
+                    kind: SymbolKind::Method,
+                    signature: format!("fn method_{m}()"),
+                    start_line: 2 + m * 8,
+                    end_line: 8 + m * 8,
+                    exported: m % 2 == 0,
+                });
+            }
+        }
+        let n = symbols.len();
+        let graph = CodeGraph {
+            files,
+            symbols,
+            edges: vec![],
+        };
+        let mut server =
+            AstrolabeServer::new_with_cache_budget(PathBuf::from("."), DEFAULT_MEMORY_BUDGET_BYTES);
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(
+            RepoIndex::from_graph(PathBuf::from("."), graph, Default::default()),
+        ));
+        server.structured_output = false;
+        let run = |q: &str, substring: Option<bool>| {
+            // Warm-up call: builds the per-snapshot lookup tables (once per index).
+            let t0 = std::time::Instant::now();
+            let _ = server.find_symbol(Parameters(QueryParams {
+                root: None,
+                query: q.into(),
+                include_body: false,
+                substring,
+                path_filter: None,
+                kind: None,
+                depth: 0,
+                budget_tokens: 2000,
+                offset: 0,
+            }));
+            eprintln!("BENCH first call {q:?}: {:?}", t0.elapsed());
+            let t = std::time::Instant::now();
+            let mut last = 0;
+            for _ in 0..5 {
+                let r = server.find_symbol(Parameters(QueryParams {
+                    root: None,
+                    query: q.into(),
+                    include_body: false,
+                    substring,
+                    path_filter: None,
+                    kind: None,
+                    depth: 0,
+                    budget_tokens: 2000,
+                    offset: 0,
+                }));
+                last = r.content[0].as_text().unwrap().text.len();
+            }
+            eprintln!(
+                "BENCH {n} symbols query={q:?} substring={substring:?}: {:?}/call (out {last}B)",
+                t.elapsed() / 5
+            );
+        };
+        run("handle", Some(false));
+        run("helper", Some(true));
+        run("Service1500", None);
+        run("Service1500/handle", None);
+        run("Service/handle", Some(true));
     }
 
     #[test]
@@ -6867,6 +7358,33 @@ mod tests {
         let text = fs_text(&server.find_symbol(Parameters(params)));
         assert!(text.contains("shown=0"), "{text}");
         assert!(!text.contains("next_offset="), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_later_page_warns_when_index_generation_changed() {
+        let src: String = (0..30)
+            .map(|i| format!("def drift_{i}():\n    pass\n"))
+            .collect();
+        let (server, dir) = server_on_files(&[("a.py", src.as_str())]);
+        let page = |offset: usize| {
+            let mut params = fs_query("drift");
+            params.budget_tokens = 120;
+            params.offset = offset;
+            fs_text(&server.find_symbol(Parameters(params)))
+        };
+        let first = page(0);
+        assert!(first.contains("truncated=true"), "{first}");
+        assert!(!first.contains("翻页期间"), "{first}");
+        // Same generation: no warning on the next page.
+        assert!(!page(5).contains("翻页期间"));
+        // Replace the index (what an edit + reindex does): a later page warns.
+        *server.primary.state.write().unwrap() =
+            IndexState::Ready(Arc::new(crate::index::build(&dir).expect("index")));
+        let drifted = page(10);
+        assert!(drifted.contains("翻页期间"), "{drifted}");
+        // The warning is stated once; the generation is now the current one.
+        assert!(!page(15).contains("翻页期间"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -49,9 +49,15 @@
 //! dependencies show up in the graph only through the `using` namespace
 //! edges of the files that actually use the referenced project.
 //!
-//! Element `Condition` attributes are honored only for the empty-property
-//! check `'$(Name)' == ''`. Anything else is skipped rather than guessed.
-//! ItemGroup-level conditions are not evaluated.
+//! `Condition` attributes (on the element and on every enclosing
+//! `PropertyGroup` / `ItemGroup` / `When`) are evaluated three-valued:
+//! `==`, `!=`, `!`, `and`, `or`, parentheses and quoted literals, with only
+//! the tracked properties known. `Exists(..)`, `$(Configuration)`,
+//! `$(TargetFramework)` and the like are Unknown. For `Compile`, False
+//! drops the element, True applies it, and Unknown is kept conservatively:
+//! an `Include` still adds files, a `Remove` does not remove. Property
+//! elements apply only on True (an Unknown group condition applies as if
+//! absent).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -247,27 +253,39 @@ impl ModuleResolver for CSharpResolver {
                 .get(prep.facts.manifest.as_str())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            for path in compile_files(files, prep, bucket) {
-                let Some(text) = files.read(&path) else {
-                    continue;
-                };
-                let text = declarations_source(&path, text);
-                let (namespaces, types) = extract_declarations(&text);
-                // Namespaces the repo itself declares are kept even under
-                // `System.*` (dotnet/runtime, System.Reactive, ...): a name is
-                // only treated as framework when no file here declares it.
-                for ns in namespaces {
-                    ns_files.entry(ns).or_default().insert(path.clone());
-                }
-                for (ns, name) in types {
-                    if name.is_empty() {
+            // Read + extract in parallel (chunked to bound memory); the merge
+            // into the sets below stays sequential, in the same path order.
+            let compiled = compile_files(files, prep, bucket);
+            for chunk in compiled.chunks(crate::types::READ_CHUNK) {
+                use rayon::prelude::*;
+                let extracted: Vec<Option<Declarations>> = chunk
+                    .par_iter()
+                    .map(|path| {
+                        let text = files.read(path)?;
+                        let text = declarations_source(path, text);
+                        Some(extract_declarations(&text))
+                    })
+                    .collect();
+                for (path, got) in chunk.iter().zip(extracted) {
+                    let Some((namespaces, types)) = got else {
                         continue;
+                    };
+                    // Namespaces the repo itself declares are kept even under
+                    // `System.*` (dotnet/runtime, System.Reactive, ...): a name
+                    // is only treated as framework when no file here declares it.
+                    for ns in namespaces {
+                        ns_files.entry(ns).or_default().insert(path.clone());
                     }
-                    type_decls.insert(TypeDecl {
-                        namespace: ns,
-                        name,
-                        file: path.clone(),
-                    });
+                    for (ns, name) in types {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        type_decls.insert(TypeDecl {
+                            namespace: ns,
+                            name,
+                            file: path.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -507,9 +525,20 @@ fn unique_type(meta: &ProjectMeta, qualified: &str) -> Option<String> {
 }
 
 fn files_declaring(meta: &ProjectMeta, qualified: &str) -> Vec<String> {
-    let mut files: Vec<String> = meta
-        .type_decls
+    // `type_decls` is sorted by (namespace, name, file) (BTreeSet order in
+    // `detect`) and a declared name is a single identifier, so the only split
+    // of `qualified` that can match is at its last dot: binary-search that
+    // (namespace, name) range instead of scanning every declaration.
+    let (ns, name) = match qualified.rsplit_once('.') {
+        Some((ns, name)) => (ns, name),
+        None => ("", qualified),
+    };
+    let decls = &meta.type_decls;
+    let key = |t: &TypeDecl| (t.namespace.as_str().cmp(ns)).then_with(|| t.name.as_str().cmp(name));
+    let start = decls.partition_point(|t| key(t).is_lt());
+    let mut files: Vec<String> = decls[start..]
         .iter()
+        .take_while(|t| key(t).is_eq())
         .filter(|t| decl_is(t, qualified))
         .map(|t| t.file.clone())
         .collect();
@@ -688,11 +717,28 @@ fn props_in_dir(dir: &str, files: &FileIndex) -> Option<String> {
 
 fn apply_xml(xml: &str, props: &mut BuildProps) {
     for tag in xml_tags(xml) {
-        if let Some(cond) = tag.attr("Condition") {
-            if !condition_allows(cond, props, &tag.name) {
-                continue;
-            }
+        // Enclosing group conditions: definitely False drops the element.
+        let group = tag
+            .conds
+            .iter()
+            .map(|c| eval_condition(c, props))
+            .fold(Tri::True, tri_and);
+        if group == Tri::False {
+            continue;
         }
+        let own = match tag.attr("Condition") {
+            Some(cond) => eval_condition(cond, props),
+            None => Tri::True,
+        };
+        if own == Tri::False {
+            continue;
+        }
+        let is_compile = tag.name == "Compile";
+        // Compile keeps Unknown (see module docs); everything else needs True.
+        if !is_compile && own != Tri::True {
+            continue;
+        }
+        let certain = own == Tri::True && group == Tri::True;
         match tag.name.as_str() {
             "Project" => {
                 if let Some(sdk) = tag.attr("Sdk") {
@@ -737,7 +783,9 @@ fn apply_xml(xml: &str, props: &mut BuildProps) {
                     props.compile_include.push(include.to_string());
                 }
                 if let Some(remove) = tag.attr("Remove") {
-                    props.compile_remove.push(remove.to_string());
+                    if certain {
+                        props.compile_remove.push(remove.to_string());
+                    }
                 }
             }
             "Using" => {
@@ -767,32 +815,284 @@ fn set_text(tag: &XmlTag, set: impl FnOnce(String)) {
     }
 }
 
-fn condition_allows(cond: &str, props: &BuildProps, element: &str) -> bool {
-    // Accept only `'$(Name)' == ''`. Other conditions are skipped, not guessed.
-    let flat: String = cond
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .replace('"', "'");
-    let Some(rest) = flat.strip_prefix("'$(") else {
-        return false;
-    };
-    let Some((key, tail)) = rest.split_once(")'==''") else {
-        return false;
-    };
-    if !tail.is_empty() || !key.eq_ignore_ascii_case(element) {
-        return false;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tri {
+    True,
+    False,
+    Unknown,
+}
+
+fn tri_and(a: Tri, b: Tri) -> Tri {
+    match (a, b) {
+        (Tri::False, _) | (_, Tri::False) => Tri::False,
+        (Tri::True, Tri::True) => Tri::True,
+        _ => Tri::Unknown,
     }
-    match key {
-        "RootNamespace" => props.root_namespace.as_deref().unwrap_or("").is_empty(),
-        "ImplicitUsings" => props.implicit_usings.is_none(),
-        "EnableDefaultItems" => props.enable_default_items.is_none(),
-        "EnableDefaultCompileItems" => props.enable_default_compile.is_none(),
-        "BaseOutputPath" | "OutputPath" => props.base_output.is_none(),
-        "BaseIntermediateOutputPath" | "IntermediateOutputPath" => {
-            props.base_intermediate.is_none()
+}
+
+fn tri_or(a: Tri, b: Tri) -> Tri {
+    match (a, b) {
+        (Tri::True, _) | (_, Tri::True) => Tri::True,
+        (Tri::False, Tri::False) => Tri::False,
+        _ => Tri::Unknown,
+    }
+}
+
+fn tri_not(a: Tri) -> Tri {
+    match a {
+        Tri::True => Tri::False,
+        Tri::False => Tri::True,
+        Tri::Unknown => Tri::Unknown,
+    }
+}
+
+/// Value of a tracked property; unset reads as empty. Other names: unknown.
+fn lookup_prop(name: &str, props: &BuildProps) -> Option<String> {
+    let b = |v: Option<bool>| Some(v.map(|x| x.to_string()).unwrap_or_default());
+    match name.to_ascii_lowercase().as_str() {
+        "rootnamespace" => Some(props.root_namespace.clone().unwrap_or_default()),
+        "implicitusings" => b(props.implicit_usings),
+        "enabledefaultitems" => b(props.enable_default_items),
+        "enabledefaultcompileitems" => b(props.enable_default_compile),
+        "baseoutputpath" | "outputpath" => Some(props.base_output.clone().unwrap_or_default()),
+        "baseintermediateoutputpath" | "intermediateoutputpath" => {
+            Some(props.base_intermediate.clone().unwrap_or_default())
         }
-        _ => false,
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CTok {
+    Str(String),
+    Word(String),
+    LParen,
+    RParen,
+    Eq,
+    Ne,
+    Not,
+    Comma,
+    Bad,
+}
+
+fn lex_condition(cond: &str) -> Vec<CTok> {
+    let c: Vec<char> = cond.chars().collect();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < c.len() {
+        match c[i] {
+            ch if ch.is_whitespace() => i += 1,
+            '(' => {
+                out.push(CTok::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(CTok::RParen);
+                i += 1;
+            }
+            ',' => {
+                out.push(CTok::Comma);
+                i += 1;
+            }
+            '=' if c.get(i + 1) == Some(&'=') => {
+                out.push(CTok::Eq);
+                i += 2;
+            }
+            '!' if c.get(i + 1) == Some(&'=') => {
+                out.push(CTok::Ne);
+                i += 2;
+            }
+            '!' => {
+                out.push(CTok::Not);
+                i += 1;
+            }
+            q @ ('\'' | '"') => {
+                let mut j = i + 1;
+                while j < c.len() && c[j] != q {
+                    j += 1;
+                }
+                if j >= c.len() {
+                    out.push(CTok::Bad);
+                    break;
+                }
+                out.push(CTok::Str(c[i + 1..j].iter().collect()));
+                i = j + 1;
+            }
+            ch if ch.is_alphanumeric() || ch == '_' => {
+                let mut j = i;
+                while j < c.len() && (c[j].is_alphanumeric() || c[j] == '_') {
+                    j += 1;
+                }
+                out.push(CTok::Word(c[i..j].iter().collect()));
+                i = j;
+            }
+            _ => {
+                out.push(CTok::Bad);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Expand `$(Name)` in a quoted literal. `None` when any piece is unknown
+/// (`@(..)`, `%(..)`, untracked property).
+fn expand_literal(text: &str, props: &BuildProps) -> Option<String> {
+    if text.contains("@(") || text.contains("%(") {
+        return None;
+    }
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("$(") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let end = after.find(')')?;
+        out.push_str(&lookup_prop(after[..end].trim(), props)?);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+struct CondParser<'a> {
+    toks: Vec<CTok>,
+    pos: usize,
+    props: &'a BuildProps,
+}
+
+enum Operand {
+    Lit(Option<String>),
+    Tri(Tri),
+}
+
+impl CondParser<'_> {
+    fn peek_word(&self, w: &str) -> bool {
+        matches!(self.toks.get(self.pos), Some(CTok::Word(x)) if x.eq_ignore_ascii_case(w))
+    }
+
+    fn or(&mut self) -> Tri {
+        let mut v = self.and();
+        while self.peek_word("or") {
+            self.pos += 1;
+            let r = self.and();
+            v = tri_or(v, r);
+        }
+        v
+    }
+
+    fn and(&mut self) -> Tri {
+        let mut v = self.not();
+        while self.peek_word("and") {
+            self.pos += 1;
+            let r = self.not();
+            v = tri_and(v, r);
+        }
+        v
+    }
+
+    fn not(&mut self) -> Tri {
+        if self.toks.get(self.pos) == Some(&CTok::Not) {
+            self.pos += 1;
+            return tri_not(self.not());
+        }
+        self.cmp()
+    }
+
+    fn operand(&mut self) -> Operand {
+        match self.toks.get(self.pos).cloned() {
+            Some(CTok::Str(s)) => {
+                self.pos += 1;
+                Operand::Lit(expand_literal(&s, self.props))
+            }
+            Some(CTok::LParen) => {
+                self.pos += 1;
+                let v = self.or();
+                if self.toks.get(self.pos) == Some(&CTok::RParen) {
+                    self.pos += 1;
+                    Operand::Tri(v)
+                } else {
+                    self.pos = self.toks.len();
+                    Operand::Tri(Tri::Unknown)
+                }
+            }
+            Some(CTok::Word(_)) => {
+                // `Exists(..)`, `HasTrailingSlash(..)`, bare words: Unknown.
+                self.pos += 1;
+                if self.toks.get(self.pos) == Some(&CTok::LParen) {
+                    let mut depth = 0;
+                    while let Some(t) = self.toks.get(self.pos) {
+                        match t {
+                            CTok::LParen => depth += 1,
+                            CTok::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    self.pos += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.pos += 1;
+                    }
+                }
+                Operand::Tri(Tri::Unknown)
+            }
+            _ => {
+                self.pos = self.toks.len();
+                Operand::Tri(Tri::Unknown)
+            }
+        }
+    }
+
+    fn cmp(&mut self) -> Tri {
+        let left = self.operand();
+        let op = match self.toks.get(self.pos) {
+            Some(CTok::Eq) => Some(true),
+            Some(CTok::Ne) => Some(false),
+            _ => None,
+        };
+        let Some(eq) = op else {
+            return match left {
+                Operand::Tri(t) => t,
+                Operand::Lit(Some(s)) => match parse_bool(&s) {
+                    Some(true) => Tri::True,
+                    Some(false) => Tri::False,
+                    None => Tri::Unknown,
+                },
+                Operand::Lit(None) => Tri::Unknown,
+            };
+        };
+        self.pos += 1;
+        let right = self.operand();
+        match (left, right) {
+            (Operand::Lit(Some(a)), Operand::Lit(Some(b))) => {
+                if a.trim().eq_ignore_ascii_case(b.trim()) == eq {
+                    Tri::True
+                } else {
+                    Tri::False
+                }
+            }
+            _ => Tri::Unknown,
+        }
+    }
+}
+
+/// Three-valued MSBuild condition. Anything unparsed or unknown is Unknown.
+fn eval_condition(cond: &str, props: &BuildProps) -> Tri {
+    let toks = lex_condition(&decode_xml(cond));
+    if toks.contains(&CTok::Bad) || toks.is_empty() {
+        return Tri::Unknown;
+    }
+    let mut p = CondParser {
+        toks,
+        pos: 0,
+        props,
+    };
+    let v = p.or();
+    if p.pos < p.toks.len() {
+        Tri::Unknown
+    } else {
+        v
     }
 }
 
@@ -845,13 +1145,27 @@ fn xml_tags(input: &str) -> Vec<XmlTag> {
     let b = input.as_bytes();
     let mut i = 0;
     let mut tags = Vec::new();
+    // Open elements and their `Condition`, innermost last.
+    let mut open: Vec<(String, Option<String>)> = Vec::new();
     while i < b.len() {
         if b[i] != b'<' {
             i += 1;
             continue;
         }
-        if b.get(i + 1) == Some(&b'/') || b.get(i + 1) == Some(&b'!') || b.get(i + 1) == Some(&b'?')
-        {
+        if b.get(i + 1) == Some(&b'/') {
+            let close_start = i + 2;
+            i += 1;
+            while i < b.len() && b[i] != b'>' {
+                i += 1;
+            }
+            let close = input[close_start..i.min(b.len())].trim();
+            if let Some(pos) = open.iter().rposition(|(n, _)| n == close) {
+                open.truncate(pos);
+            }
+            i = (i + 1).min(b.len());
+            continue;
+        }
+        if b.get(i + 1) == Some(&b'!') || b.get(i + 1) == Some(&b'?') {
             i += 1;
             while i < b.len() && b[i] != b'>' {
                 i += 1;
@@ -884,7 +1198,20 @@ fn xml_tags(input: &str) -> Vec<XmlTag> {
             decode_xml(&input[body_start..i])
         };
         if !name.is_empty() {
-            tags.push(XmlTag { name, attrs, body });
+            let conds: Vec<String> = open.iter().filter_map(|(_, c)| c.clone()).collect();
+            if !self_closing {
+                let own = attrs
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("Condition"))
+                    .map(|(_, v)| v.clone());
+                open.push((name.clone(), own));
+            }
+            tags.push(XmlTag {
+                name,
+                attrs,
+                body,
+                conds,
+            });
         }
     }
     tags
@@ -894,6 +1221,8 @@ struct XmlTag {
     name: String,
     attrs: Vec<(String, String)>,
     body: String,
+    /// `Condition`s of the enclosing elements, outermost first.
+    conds: Vec<String>,
 }
 
 impl XmlTag {
@@ -1102,7 +1431,10 @@ fn strip_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn extract_declarations(src: &str) -> (BTreeSet<String>, Vec<(String, String)>) {
+/// `(namespaces, (namespace, type name) pairs)` declared by one source file.
+type Declarations = (BTreeSet<String>, Vec<(String, String)>);
+
+fn extract_declarations(src: &str) -> Declarations {
     let masked = mask_csharp(src);
     let toks = tokenize(&masked);
     let mut ns_stack: Vec<String> = Vec::new();
@@ -1707,6 +2039,75 @@ mod tests {
             }
             Err(err) => panic!("unexpected C# parse error: {err}"),
         }
+    }
+
+    #[test]
+    fn compile_conditions_are_evaluated_or_kept_conservatively() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "c/C.csproj",
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Always.cs" />
+    <Compile Include="OffElement.cs" Condition="'$(RootNamespace)' != ''" />
+    <Compile Include="OnElement.cs" Condition="'$(RootNamespace)' == '' and '1' == '1'" />
+    <Compile Include="UnknownElement.cs" Condition="'$(Configuration)' == 'Debug'" />
+  </ItemGroup>
+  <ItemGroup Condition="'a' == 'b'">
+    <Compile Include="OffGroup.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('x.txt')">
+    <Compile Include="UnknownGroup.cs" />
+    <Compile Remove="Always.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(Configuration)' == 'Debug' Or '1' == '1'">
+    <Compile Include="OrTrue.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'1' == '1'">
+    <Compile Remove="Removed.cs" />
+    <Compile Include="Removed.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(Configuration)' == 'Debug'">
+    <Compile Remove="OnElement.cs" />
+  </ItemGroup>
+</Project>
+"#,
+        );
+        let names = [
+            "Always",
+            "OffElement",
+            "OnElement",
+            "UnknownElement",
+            "OffGroup",
+            "UnknownGroup",
+            "OrTrue",
+            "Removed",
+        ];
+        let mut paths = vec!["c/C.csproj".to_string()];
+        for n in names {
+            let rel = format!("c/{n}.cs");
+            write(root, &rel, &format!("namespace N;\nclass {n} {{}}\n"));
+            paths.push(rel);
+        }
+        let files = FileIndex::new(root, paths.iter().map(|p| RelPath::new(p.as_str())));
+        let meta = CSharpResolver.detect(&files);
+        let ns = meta.namespaces.iter().find(|n| n.namespace == "N").unwrap();
+        let got: BTreeSet<&str> = ns.files.iter().map(|f| f.as_str()).collect();
+        let want: BTreeSet<&str> = [
+            "c/Always.cs",
+            "c/OnElement.cs",
+            "c/UnknownElement.cs",
+            "c/UnknownGroup.cs",
+            "c/OrTrue.cs",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(got, want);
     }
 
     #[test]

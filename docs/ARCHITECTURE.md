@@ -188,9 +188,8 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 | `budget` | 按排名截断工具输出 | `TokenBudget`, `truncate_ranked` | 估计是 `chars/4` |
 | `render` | `path:line` 锚点、置信度附注 | `anchor`, `symbol_line`, `confidence_note` | 给智能体读，不是给人看的 UI |
 | `lsp` | Phase 2 已实现：按需 LSP、精确查询 | `LanguageServer`, `Precise<T>`, `LspError` | 图谱问题不得进入此模块 |
-| `rewrite` | Phase 3 计划层：先计划后写入、低于 scoped 不自动应用 | `RewritePlan`, `ScopeResolver`, `Evidence` | JS/TS 走 oxc；**哪些位点**由本模块决定。写入经 gated `apply_rename` 接到 MCP |
 
-`lsp/` 子模块（`discovery` / `transport` / `pool` / `queries` / `diagnostics` / `router`）已落地。`rewrite/` 的 `engine` 与 `scope_js`/`scope_ts` 能产出重命名计划；重命名的 MCP 工具（`plan_rename` / `apply_rename`）已移除，库内能力保留。约束不变：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
+`lsp/` 子模块（`discovery` / `transport` / `pool` / `queries` / `diagnostics` / `router`）已落地。重命名计划层（`rewrite/`）与重命名 MCP 工具均已移除。约束不变：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
 
 ### 5.2 `astrolabe-mcp`
 
@@ -202,7 +201,7 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 | `reindex` | 语言过滤、节流合并、leader 门控 persist |
 | `server` | 七个工具、索引状态机、watch 增量重建、`content[0]` 非空文本 |
 | `precise_tools` | 精确层渲染：`find_references` / `goto_definition` / `get_diagnostics` |
-| `live_backend` | 按需 `LspPool` + rewrite planner；缺服务器标 `unknown` |
+| `live_backend` | 按需 `LspPool`；缺服务器标 `unknown` |
 
 工具与置信度：
 
@@ -233,7 +232,7 @@ Cursor 会静默丢弃只有 `structuredContent`、没有文本的工具响应�
 
 **整图不持久化。** 原因在 §3.5：`FileId` 随文件集分配。增量的正确粒度是内容哈希后的 `ParsedFile`。
 
-**跨文件作用域分析只有 JS/TS 有成熟方案。** workspace 依赖了 oxc（parser + semantic）。`rewrite::scope_js` / `scope_ts` 是给这条路径留的。Python / Go / Java / Rust 没有同等可用的、许可证合适的进程内语义分析可塞进本 crate。那些语言的安全改名走 LSP（`Evidence::LanguageServer`），不要用名字匹配冒充 `ScopeBinding`。ast-grep 自己的文档写明它不做作用域、类型或数据流；**改哪些位点**不能委托给匹配器。
+**跨文件作用域分析只有 JS/TS 有成熟方案。** 曾有的 oxc 重命名作用域层（`rewrite/`）已随重命名工具一并移除。Python / Go / Java / Rust 没有同等可用的、许可证合适的进程内语义分析可塞进本 crate。那些语言的安全改名走 LSP（`Evidence::LanguageServer`），不要用名字匹配冒充 `ScopeBinding`。ast-grep 自己的文档写明它不做作用域、类型或数据流；**改哪些位点**不能委托给匹配器。
 
 **符号召回仍有已知残差**（`parse/mod.rs`，不用来缩小分母）：
 
@@ -246,7 +245,7 @@ Cursor 会静默丢弃只有 `structuredContent`、没有文本的工具响应�
 
 **CI 的语料门禁。** `.github/workflows/ci.yml` 在 push/PR 上跑 fmt、clippy `-D warnings`、`cargo test --workspace`、`cargo deny`，以及必过检查 `five-language corpus gate`。后者先用 `scripts/fetch-corpora.sh` 按锁定 commit / tag 浅克隆语料到 gitignore 的 `corpus/`（按脚本哈希缓存），再跑 `scripts/verify.sh`，里面两道门：Python / Go / Java / Rust / TypeScript import 解析，以及 `scripts/recall-gate/recall_gate.py`（Swift / ObjC / Kotlin / Ruby / Shell / Lua / Vue 声明召回，门槛 ≥99.9% 且 200 名抽查全中）。召回门的 ground truth 冻结在 `scripts/recall-gate/gt/`；语料 pin 变了要同步重生成 GT。新语言门约 45 秒（debug 构建，不含编译）。C# / VB / Dart / C / C++ / PHP 还没进 CI 门禁，改它们的解析器仍要本地跑召回基准。
 
-**Phase 2 已接线；Phase 3 重命名的 MCP 入口已移除，库内 rewrite 能力保留。** MCP 精确层暴露 `find_references`、`goto_definition`、`get_diagnostics`（目录共 7 个工具，`TOOL_COUNT=7`）。继续遵守：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
+**Phase 2 已接线；Phase 3 重命名的 MCP 入口已移除，`rewrite/` 已移除。** MCP 精确层暴露 `find_references`、`goto_definition`、`get_diagnostics`（目录共 7 个工具，`TOOL_COUNT=7`）。继续遵守：不常驻、不静默降级、计划与写入分离、写后重解析、失败回滚。
 
 ## 7. 动这些决策会付出什么
 

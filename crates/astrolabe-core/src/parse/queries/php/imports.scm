@@ -34,3 +34,6 @@
     (string (string_content) @import)
     (encapsed_string (string_content) @import)
   ])
+
+; `__DIR__ . '/x.php'` and `dirname(__DIR__, n) . '/x.php'` are handled by
+; `extract_php_imports` (it must read the left operand to count dirname levels).
