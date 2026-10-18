@@ -320,8 +320,7 @@ impl<'a> Router<'a> {
             Query::FileDependencies { target } => self.file_walk(kind, *target, false),
             Query::FileImpact { target } => self.file_walk(kind, *target, true),
             Query::RepoSkeleton => {
-                let ranked =
-                    files_by_centrality(self.graph, &graph::compute_centrality(self.graph));
+                let ranked = files_by_centrality(self.graph, &graph::cached_centrality(self.graph));
                 self.graph_answer(
                     kind,
                     import_confidence(self.graph),
@@ -330,7 +329,7 @@ impl<'a> Router<'a> {
                 )
             }
             Query::TaskRank { task } => {
-                let base = graph::compute_centrality(self.graph);
+                let base = graph::cached_centrality(self.graph);
                 let ranked =
                     files_by_centrality(self.graph, &graph::rank_for_task(self.graph, task, &base));
                 self.graph_answer(

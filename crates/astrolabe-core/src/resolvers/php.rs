@@ -271,7 +271,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("composer.json"), composer).unwrap();
         let mut all = vec![RelPath::new("composer.json")];
-        all.extend(paths.iter().map(|p| RelPath::new(p)));
+        all.extend(paths.iter().map(RelPath::new));
         let files = FileIndex::new(dir.path(), all);
         let meta = PhpResolver.detect(&files);
         (dir, files, meta)
