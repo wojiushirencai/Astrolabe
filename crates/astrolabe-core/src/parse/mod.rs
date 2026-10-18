@@ -216,7 +216,23 @@ impl ParserPool {
                 return self.parse_raw(lang, path, &fixed);
             }
         }
-        self.parse_raw(lang, path, source)
+        let parsed = self.parse_raw(lang, path, source)?;
+        // TS import types in generics (`f<typeof import('x')>()`,
+        // `Ref<import('vue').Ref<T>>`) make tree-sitter-typescript emit ERROR
+        // nodes. Only when the first pass is partial, blank those
+        // `import('lit')` spans with an identifier of equal length and keep
+        // the retry only if it parses cleanly. Dynamic `import()` calls are
+        // never touched (see `normalize_import_types`).
+        if parsed.partial && matches!(lang, Language::TypeScript | Language::Tsx) {
+            if let Some(fixed) = normalize_import_types(source) {
+                if let Ok(retry) = self.parse_raw(lang, path, &fixed) {
+                    if !retry.partial {
+                        return Ok(retry);
+                    }
+                }
+            }
+        }
+        Ok(parsed)
     }
 
     /// One tree-sitter parse + query extraction, no per-language pre-pass.
@@ -325,6 +341,74 @@ fn normalize_export_type_star(source: &str) -> Option<String> {
         pos += line.len();
     }
     out
+}
+
+/// Replace type-position `import('lit')` (preceded by `typeof`, `<`, `|` or
+/// `&`) with `_` of the same byte length so it reads as a type name.
+/// Offsets are unchanged. Calls after `await`, `=`, `(`, `,` etc. are left
+/// alone. `None` when nothing matches.
+fn normalize_import_types(source: &str) -> Option<String> {
+    let b = source.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut from = 0usize;
+    while let Some(off) = source[from..].find("import") {
+        let at = from + off;
+        from = at + 6;
+        if at > 0
+            && (b[at - 1].is_ascii_alphanumeric()
+                || b[at - 1] == b'_'
+                || b[at - 1] == b'$'
+                || b[at - 1] == b'.')
+        {
+            continue;
+        }
+        let mut j = at + 6;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) != Some(&b'(') {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let Some(&q) = b.get(j) else { continue };
+        if !matches!(q, b'\'' | b'"') {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j] != q && b[j] != b'\n' && b[j] != b'\\' {
+            j += 1;
+        }
+        if b.get(j) != Some(&q) {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) != Some(&b')') {
+            continue;
+        }
+        let end = j + 1;
+        let before = source[..at].trim_end();
+        let typed = before.ends_with('<')
+            || before.ends_with('|')
+            || before.ends_with('&')
+            || before.strip_suffix("typeof").is_some_and(|r| {
+                !r.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+            });
+        if !typed {
+            continue;
+        }
+        let buf = out.get_or_insert_with(|| b.to_vec());
+        for x in &mut buf[at..end] {
+            *x = b'_';
+        }
+        from = end;
+    }
+    out.and_then(|v| String::from_utf8(v).ok())
 }
 
 impl Default for ParserPool {
@@ -1618,6 +1702,29 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
         }
         // String contents are untouched.
         assert!(normalize_export_type_star("const s = \"export type * x\";\n").is_none());
+    }
+
+    #[test]
+    fn ts_generic_import_types_parse_cleanly_and_dynamic_import_edges_stay() {
+        let src = "const m = await vi.importActual<typeof import('vue')>('vue');\nlet r: Readonly<import('vue').Ref<string>>;\nexpect(x).toEqualTypeOf<Readonly<import('vue').Ref<string>>>();\nconst lazy = () => import('./lazy');\nexport function f() {}\n";
+        let pool = ParserPool::new();
+        for lang in [Language::TypeScript, Language::Tsx] {
+            let p = pool.parse(lang, &RelPath::new("a.ts"), src).unwrap();
+            assert!(!p.partial, "{lang:?} partial");
+            assert!(p.symbols.iter().any(|s| s.name == "f" && s.start_line == 5));
+            assert!(
+                p.imports.iter().any(|i| i.contains("./lazy")),
+                "{:?}",
+                p.imports
+            );
+        }
+        let fixed = normalize_import_types(src).unwrap();
+        assert_eq!(fixed.len(), src.len());
+        assert!(fixed.contains("import('./lazy')"));
+        assert!(!fixed.contains("import('vue')"));
+        assert!(
+            normalize_import_types("const a = await import('x');\nf(import('y'));\n").is_none()
+        );
     }
 
     #[test]
