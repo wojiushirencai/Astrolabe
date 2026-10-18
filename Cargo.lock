@@ -107,6 +107,7 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-vb-dotnet",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

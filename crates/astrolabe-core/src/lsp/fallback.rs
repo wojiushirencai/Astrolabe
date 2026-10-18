@@ -61,12 +61,22 @@ pub(crate) fn text_references(
     name: &str,
     reason: &str,
 ) -> Precise<Vec<Location>> {
-    let language = Language::from_path(origin);
+    let Some(language) = Language::from_path(origin) else {
+        // Unknown origin language: matching "every unknown file" would sweep
+        // docs, configs and binaries.
+        return Precise {
+            value: Vec::new(),
+            confidence: Confidence::Unknown,
+            note: Some(format!(
+                "{reason}; the file's language is not recognised, so no text search was run for `{name}`"
+            )),
+        };
+    };
     let (hits, truncated) = collect(
         repo_root,
         origin,
         name,
-        |f| Language::from_path(f) == language,
+        |f| Language::from_path(f) == Some(language),
         false,
     );
     let mut note = format!(
@@ -208,6 +218,17 @@ fn word_columns(line: &str, name: &str) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_references_unknown_language_searches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.weird1"), "foo\n").unwrap();
+        std::fs::write(dir.path().join("b.weird2"), "foo\n").unwrap();
+        let out = text_references(dir.path(), &RelPath::new("a.weird1"), "foo", "x");
+        assert!(out.value.is_empty());
+        assert_eq!(out.confidence, Confidence::Unknown);
+        assert!(out.note.unwrap().contains("not recognised"));
+    }
+
     use super::*;
 
     #[test]

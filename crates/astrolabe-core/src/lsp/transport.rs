@@ -224,6 +224,8 @@ impl LspTransport {
             .take()
             .ok_or_else(|| LspError::Startup(spec.language, "child stderr was not piped".into()))?;
         let pid = child.id();
+        #[cfg(windows)]
+        job::adopt(pid, &child);
 
         let (stdin_tx, stdin_rx) = mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_FRAMES);
         let shared = Arc::new(Shared {
@@ -849,6 +851,7 @@ pub struct LspSession {
     /// otherwise positions we compute from disk are matched against stale
     /// text and fresh references are silently missed.
     opened: Mutex<HashMap<String, OpenDoc>>,
+    tick: AtomicU64,
     query_timeout: Duration,
 }
 
@@ -856,7 +859,16 @@ pub struct LspSession {
 struct OpenDoc {
     version: i64,
     hash: [u8; 32],
+    last_used: u64,
 }
+
+/// Most documents kept open in one server; beyond this the least recently
+/// used is `didClose`d.
+const MAX_OPEN_DOCS: usize = 512;
+
+/// Watched-file events per notification, so a checkout touching thousands of
+/// files does not become one giant frame.
+const WATCHED_FILES_BATCH: usize = 500;
 
 /// `FileChangeType` values from the LSP spec.
 const FILE_CREATED: u8 = 1;
@@ -874,6 +886,7 @@ impl LspSession {
             transport,
             root,
             opened: Mutex::new(HashMap::new()),
+            tick: AtomicU64::new(0),
             query_timeout,
         }
     }
@@ -932,6 +945,24 @@ impl LspSession {
             }
         };
         let hash = content_hash(&text);
+        if !opened.contains_key(&key) && opened.len() >= MAX_OPEN_DOCS {
+            // Bound the server's memory: close the least recently used doc.
+            let oldest = opened
+                .iter()
+                .min_by_key(|(_, d)| d.last_used)
+                .map(|(k, _)| k.clone());
+            if let Some(old) = oldest {
+                opened.remove(&old);
+                let _ = self.transport.notify(
+                    "textDocument/didClose",
+                    json!({ "textDocument": { "uri": self.file_uri(&RelPath::new(old)) } }),
+                );
+            }
+        }
+        let tick = self.tick.fetch_add(1, Ordering::Relaxed);
+        if let Some(doc) = opened.get_mut(&key) {
+            doc.last_used = tick;
+        }
         match opened.get_mut(&key) {
             Some(doc) if doc.hash == hash => Ok(()),
             Some(doc) => {
@@ -943,7 +974,18 @@ impl LspSession {
                         "contentChanges": [ { "text": text } ],
                     }),
                 )?;
-                *doc = OpenDoc { version, hash };
+                *doc = OpenDoc {
+                    version,
+                    hash,
+                    last_used: tick,
+                };
+                // Servers that run their checks on save (rust-analyzer's
+                // flycheck) only refresh diagnostics after didSave; we
+                // advertise it, so send it.
+                let _ = self.transport.notify(
+                    "textDocument/didSave",
+                    json!({ "textDocument": { "uri": self.file_uri(path) } }),
+                );
                 Ok(())
             }
             None => {
@@ -958,7 +1000,14 @@ impl LspSession {
                         }
                     }),
                 )?;
-                opened.insert(key, OpenDoc { version: 1, hash });
+                opened.insert(
+                    key,
+                    OpenDoc {
+                        version: 1,
+                        hash,
+                        last_used: tick,
+                    },
+                );
                 Ok(())
             }
         }
@@ -1086,10 +1135,12 @@ impl LanguageServer for LspSession {
                 json!({ "uri": self.file_uri(&change.path), "type": kind })
             })
             .collect();
-        let _ = self.transport.notify(
-            "workspace/didChangeWatchedFiles",
-            json!({ "changes": events }),
-        );
+        for batch in events.chunks(WATCHED_FILES_BATCH) {
+            let _ = self.transport.notify(
+                "workspace/didChangeWatchedFiles",
+                json!({ "changes": batch }),
+            );
+        }
         for change in changes {
             match change.kind {
                 FileChangeKind::Deleted => self.close_if_open(&change.path),
@@ -1483,7 +1534,25 @@ fn uri_to_rel(uri: &str, root: &Path) -> Option<RelPath> {
     } else {
         percent_decode(uri)
     };
+    // `file:///C:/x` decodes to `/C:/x`; drop the slash before a drive letter.
+    let decoded = match decoded.as_bytes() {
+        [b'/', d, b':', ..] if d.is_ascii_alphabetic() => decoded[1..].to_string(),
+        _ => decoded,
+    };
     let path = PathBuf::from(decoded);
+    // Fast path: servers report paths under the root as we sent them, so a
+    // plain prefix strip answers without two canonicalize syscalls per hit.
+    if path.is_absolute() {
+        if let Ok(rel) = path.strip_prefix(root) {
+            if !rel.as_os_str().is_empty()
+                && !rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Some(RelPath::new(rel.to_string_lossy()));
+            }
+        }
+    }
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let abs = if path.is_absolute() {
         path.canonicalize().unwrap_or(path)
@@ -1491,6 +1560,12 @@ fn uri_to_rel(uri: &str, root: &Path) -> Option<RelPath> {
         return Some(RelPath::new(path.to_string_lossy()));
     };
     let rel = abs.strip_prefix(&root_abs).ok()?;
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     Some(RelPath::new(rel.to_string_lossy()))
 }
 
@@ -1646,9 +1721,93 @@ fn kill_process_group(pid: u32) {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    job::terminate(pid);
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
+    }
+}
+
+/// Windows counterpart of the Unix process group: every server runs inside a
+/// Job Object created with `KILL_ON_JOB_CLOSE`, so terminating (or closing)
+/// the job takes the whole descendant tree with it, even if Astrolabe itself
+/// dies abnormally.
+#[cfg(windows)]
+mod job {
+    use std::collections::HashMap;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::{Mutex, OnceLock};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    struct JobHandle(HANDLE);
+    // SAFETY: a job handle is a process-wide kernel object handle, usable from any thread.
+    unsafe impl Send for JobHandle {}
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // SAFETY: we own the handle; closing kills the job (KILL_ON_JOB_CLOSE).
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn jobs() -> &'static Mutex<HashMap<u32, JobHandle>> {
+        static JOBS: OnceLock<Mutex<HashMap<u32, JobHandle>>> = OnceLock::new();
+        JOBS.get_or_init(Default::default)
+    }
+
+    /// Put the freshly spawned server into its own kill-on-close job.
+    /// Best effort: on failure the caller falls back to `Child::kill`.
+    pub fn adopt(pid: u32, child: &Child) {
+        // SAFETY: plain Win32 calls; the handle is checked and closed on every path.
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return;
+            }
+            let job = JobHandle(handle);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set == 0 {
+                return;
+            }
+            if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
+                return;
+            }
+            jobs()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(pid, job);
+        }
+    }
+
+    /// Kill every process in the server's job and release the handle.
+    pub fn terminate(pid: u32) {
+        let job = jobs()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&pid);
+        if let Some(job) = job {
+            // SAFETY: valid job handle owned by `job`.
+            unsafe {
+                TerminateJobObject(job.0, 1);
+            }
+        }
     }
 }
 
@@ -3435,6 +3594,52 @@ while True:
         // Unchanged content: no new version.
         let _ = find_references(Some(&session), &tmp.0, &path, at);
         assert_eq!(session.open_version(&path), Some(2));
+    }
+
+    #[test]
+    fn open_documents_are_capped_lru() {
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        for i in 0..=MAX_OPEN_DOCS {
+            fs::write(tmp.0.join(format!("f{i}.py")), format!("x = {i}\n")).unwrap();
+            session
+                .ensure_open(&RelPath::new(format!("f{i}.py")))
+                .unwrap();
+        }
+        assert_eq!(session.open_version(&RelPath::new("f0.py")), None);
+        assert_eq!(session.open_version(&RelPath::new("f1.py")), Some(1));
+        let state = session.transport.request("fake-state", json!({})).unwrap();
+        assert_eq!(state["docs"].as_object().unwrap().len(), MAX_OPEN_DOCS);
+    }
+
+    #[test]
+    fn uri_to_rel_fast_path_and_drive_letters() {
+        let root = Path::new("/definitely/not/a/real/root");
+        assert_eq!(
+            uri_to_rel("file:///definitely/not/a/real/root/src/a%20b.rs", root),
+            Some(RelPath::new("src/a b.rs"))
+        );
+        assert_eq!(uri_to_rel("file:///elsewhere/x.rs", root), None);
+        assert_eq!(
+            uri_to_rel("file:///definitely/not/a/real/root/../x.rs", root),
+            None
+        );
+    }
+
+    #[test]
+    fn watched_file_events_are_batched() {
+        let (session, _tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        let changes: Vec<FileChange> = (0..WATCHED_FILES_BATCH + 10)
+            .map(|i| FileChange {
+                path: RelPath::new(format!("w{i}.py")),
+                kind: FileChangeKind::Created,
+            })
+            .collect();
+        session.files_changed(&changes);
+        let state = session.transport.request("fake-state", json!({})).unwrap();
+        assert_eq!(
+            state["watched"].as_array().unwrap().len(),
+            WATCHED_FILES_BATCH + 10
+        );
     }
 
     #[test]

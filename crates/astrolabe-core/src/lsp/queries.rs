@@ -70,13 +70,23 @@ pub fn find_references(
     };
     let mut hits = Vec::new();
     let mut errors = Vec::new();
+    let mut attempted = 0;
     for (query_path, query_pos) in &sites.sites {
+        attempted += 1;
         match server.references(query_path, *query_pos) {
             Ok(found) => hits.extend(found),
-            Err(err) => errors.push(err),
+            Err(err) => {
+                let timed_out = matches!(err, LspError::Timeout(_));
+                errors.push(err);
+                // One timeout is a verdict on the server; do not stack
+                // another 30s per remaining anchor.
+                if timed_out {
+                    break;
+                }
+            }
         }
     }
-    if errors.len() == sites.sites.len() {
+    if errors.len() == attempted {
         return references_failed(repo_root, path, target, &errors[0]);
     }
     let mut result = guard_cold_index(finalize_hits(hits, repo_root, path), server);
