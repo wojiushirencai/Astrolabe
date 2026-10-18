@@ -12,7 +12,6 @@
 //! 保证小行号右对齐、5 位数行号也不会挤压内容。
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::types::CodeSymbol;
@@ -39,14 +38,14 @@ fn prefix_width(end_line: u32) -> usize {
 /// file_abs: 文件绝对路径。
 ///
 /// 行为细节：
-/// - 逐行流式读取（`BufReader::lines`），只收集目标区间，不把整个文件读入
-///   内存；越过 `end_line` 后立即停止读。
+/// - 经 `text::read_source` 整体读入并解码（与索引一致，支持 GBK/Latin1），
+///   只收集目标区间；越过 `end_line` 后立即停止。
 /// - 输出统一用 `\n` 行尾（源文件的 `\r\n` 被归一）；源文件最后一行没有
 ///   换行符也接受，输出中每一行（含最后一行）都以 `\n` 结尾。
 /// - `start_line > end_line` 视为空区间，返回空字符串；但仍会 `open` 文件，
 ///   因此缺失文件同样返回 `Err`（与正常区间一致，调用方不必特判）。
 /// - 文件行数 < `start_line` 时返回 `Ok(String::new())`；文件不存在或读取
-///   失败（含非 UTF-8）返回 `Err`，由调用方决定降级策略。
+///   失败返回 `Err`，由调用方决定降级策略。
 pub fn extract_lines(file_abs: &Path, start_line: u32, end_line: u32) -> std::io::Result<String> {
     if start_line > end_line {
         // 仍 open：倒挂区间不掩盖"文件不存在"。
@@ -54,16 +53,17 @@ pub fn extract_lines(file_abs: &Path, start_line: u32, end_line: u32) -> std::io
         return Ok(String::new());
     }
     let width = prefix_width(end_line);
-    let reader = BufReader::new(File::open(file_abs)?);
+    // 与索引同一条解码路径（GBK/Latin1/BOM），行切分与符号行号一致；
+    // 非 UTF-8 文件不再整体失败。
+    let source = crate::text::read_source(file_abs)?;
 
     let mut out = String::new();
-    for (idx, line) in reader.lines().enumerate() {
+    for (idx, text) in source.lines().enumerate() {
         let line_no = idx as u32 + 1;
         if line_no > end_line {
-            // 已越过窗口右端，无需再读下去——对大文件提前退出。
+            // 已越过窗口右端，无需再处理后面的行。
             break;
         }
-        let text = line?;
         if line_no >= start_line {
             // 写入 String 不会失败，忽略 Result 是安全的。
             let _ =
@@ -228,5 +228,21 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 非 UTF-8（GBK）文件：与索引同一解码，前面的非 UTF-8 行也不影响（审计 parse-front #3）
+    #[test]
+    fn gbk_file_decodes_like_index() {
+        let d = scratch("gbk");
+        let (bytes, _, _) =
+            encoding_rs::GBK.encode("// 中文注释，测试\nint f() { return 1; }\nint g;\n");
+        let p = d.join("a.c");
+        std::fs::write(&p, bytes.as_ref()).unwrap();
+        let out = extract_lines(&p, 2, 3).unwrap();
+        assert!(out.contains("int f()"));
+        assert!(out.contains("int g;"));
+        let first = extract_lines(&p, 1, 1).unwrap();
+        assert!(first.contains("中文注释"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

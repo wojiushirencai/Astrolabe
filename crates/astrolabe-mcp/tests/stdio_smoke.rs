@@ -242,3 +242,103 @@ fn stdio_get_languages_returns_nonempty_text() {
         return;
     }
 }
+
+/// Startup failures must reach the client as MCP results, not a bare
+/// "connection closed": the handshake and tools/list work, tools/call returns
+/// the reason with `isError`, and the process exits non-zero afterwards.
+#[test]
+fn stdio_startup_failure_is_reported_as_tool_error() {
+    let missing = std::env::temp_dir().join("astrolabe-definitely-missing-dir-9f3a");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astrolabe"))
+        .arg(&missing)
+        .env("RUST_LOG", "warn")
+        .env_remove("ASTROLABE_ROOT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start astrolabe");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut rpc = |id: u64, method: &str, params: Value| -> Value {
+        let line = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string();
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+        let mut response = String::new();
+        stdout.read_line(&mut response).unwrap();
+        assert!(!response.trim().is_empty(), "no response to {method}");
+        serde_json::from_str(&response).unwrap()
+    };
+    let list = rpc(1, "tools/list", json!({}));
+    assert_tool_catalog(&list);
+    let call = rpc(
+        2,
+        "tools/call",
+        json!({"name": "search_code", "arguments": {"query": "x"}}),
+    );
+    assert_eq!(call["result"]["isError"], json!(true), "{call}");
+    let text = call["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("not a directory"), "{text}");
+    assert!(text.contains("启动失败"), "{text}");
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(1));
+}
+
+/// A parent directory holding exactly one git repo serves that repo directly:
+/// no `root` argument, no "cannot route" error.
+#[test]
+fn stdio_single_nested_repo_is_selected_automatically() {
+    let parent = unique_temp_dir();
+    // `unique_temp_dir` makes `parent` itself a repo; build a clean parent.
+    let outer = parent.join("outer");
+    let solo = outer.join("solo");
+    std::fs::create_dir_all(solo.join(".git")).unwrap();
+    std::fs::write(
+        solo.join("lib.py"),
+        "def only_here_marker():\n    return 1\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(parent.join(".git")).unwrap();
+    // `outer` has no marker of its own, but `parent/..` might: run from outer
+    // with a temp dir that is not inside a repo.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astrolabe"))
+        .arg(".")
+        .current_dir(&outer)
+        .env("RUST_LOG", "warn")
+        .env_remove("ASTROLABE_ROOT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start astrolabe");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut id = 1;
+    let text = loop {
+        let line = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"find_symbol","arguments":{"query":"only_here_marker"}}})
+        .to_string();
+        id += 1;
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+        let mut response = String::new();
+        stdout.read_line(&mut response).unwrap();
+        let value: Value = serde_json::from_str(&response).unwrap();
+        let text = value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if text.contains("索引正在后台构建") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        break text;
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&parent);
+    assert!(text.contains("only_here_marker"), "{text}");
+    assert!(!text.contains("无法路由"), "{text}");
+}

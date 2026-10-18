@@ -9,9 +9,17 @@
 //! `.razor` and `.cshtml` are included in that set as well, but only after
 //! [`crate::parse::extract_razor_csharp`] pulls C# out of them. Raw markup is
 //! never scanned. That is what lets a namespace declared in `@code` satisfy a
-//! `_ViewImports.cshtml` `@using`. `System` / `System.*` and names no file
-//! declares (NuGet) still resolve to nothing. This is Astrolabe's index set,
-//! not an MSBuild `Compile` item.
+//! `_ViewImports.cshtml` `@using`. Names no file declares (NuGet, the BCL
+//! including `System.*`) resolve to nothing. A `System.*` namespace that this
+//! repo declares itself (dotnet/runtime, `System.Reactive`) is a normal
+//! namespace and is linked. This is Astrolabe's index set, not an MSBuild
+//! `Compile` item.
+//!
+//! `Compile Include` / `Remove` take `;`-separated lists and MSBuild globs:
+//! `*` and `?` stay within one path segment, `**` spans segments, also in the
+//! middle (`Gen/**/Auto/*.cs`). Each project's files are bucketed once by
+//! owning project directory, so `detect` is linear in files, not
+//! projects x files.
 //!
 //! # Import specs
 //!
@@ -28,14 +36,24 @@
 //! * `using W = Acme.Lib.Helper;` / `alias:Acme.Lib.Helper` — same rule.
 //! * `project:../lib/Lib.csproj` — the in-repo `ProjectReference`, one file.
 //!
-//! `System` and `System.*` are never targets. A name no file declares (NuGet,
-//! the BCL beyond `System`, implicit usings) resolves to nothing.
+//! A name no file declares (NuGet, the BCL, implicit usings) resolves to
+//! nothing. A namespace declared by more than `NAMESPACE_FANOUT_CAP` files
+//! links to the nearest ones only (see `namespace_files`).
+//!
+//! # ProjectReference is metadata, not a graph edge
+//!
+//! `ProjectMeta::project_refs` records each in-repo `<ProjectReference>` as a
+//! manifest-to-manifest pair and `project:` specs resolve through it, but
+//! `.csproj` files are not parsed source files, so no node exists for them
+//! and `assemble_graph` adds no edge for these pairs. Project-level
+//! dependencies show up in the graph only through the `using` namespace
+//! edges of the files that actually use the referenced project.
 //!
 //! Element `Condition` attributes are honored only for the empty-property
 //! check `'$(Name)' == ''`. Anything else is skipped rather than guessed.
 //! ItemGroup-level conditions are not evaluated.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::types::{
     join_rel, FileIndex, ImportResolution, Language, ModuleResolver, ModuleUnit, NamespaceFiles,
@@ -43,6 +61,10 @@ use crate::types::{
 };
 
 pub struct CSharpResolver;
+
+/// Most declaring files one `using Namespace;` links to; see
+/// [`namespace_files`].
+const NAMESPACE_FANOUT_CAP: usize = 64;
 
 const SDK_USINGS: &[&str] = &[
     "System",
@@ -186,6 +208,33 @@ impl ModuleResolver for CSharpResolver {
             .map(|p| (p.manifest.clone(), p.directory.clone()))
             .collect();
 
+        // One pass: which project owns each C# source (deepest project
+        // directory above it; the last manifest wins a tie, as before).
+        let mut dir_owner: HashMap<&str, &str> = HashMap::new();
+        for (manifest, dir) in &directories {
+            dir_owner.insert(dir.as_str(), manifest.as_str());
+        }
+        let mut buckets: HashMap<&str, Vec<&str>> = HashMap::new();
+        for p in files.iter() {
+            let path = p.as_str();
+            if !is_csharp_source(path) || skipped_tree(path) {
+                continue;
+            }
+            let mut dir = p.dir();
+            let owner = loop {
+                if let Some(m) = dir_owner.get(dir) {
+                    break Some(*m);
+                }
+                if dir.is_empty() {
+                    break None;
+                }
+                dir = dir.rfind('/').map_or("", |i| &dir[..i]);
+            };
+            if let Some(m) = owner {
+                buckets.entry(m).or_default().push(path);
+            }
+        }
+
         let mut ns_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut type_decls: BTreeSet<TypeDecl> = BTreeSet::new();
         let mut source_roots: BTreeSet<String> = BTreeSet::new();
@@ -194,20 +243,24 @@ impl ModuleResolver for CSharpResolver {
             if prep.facts.default_compile_items || !prep.compile_include.is_empty() {
                 source_roots.insert(prep.facts.directory.clone());
             }
-            for path in compile_files(files, prep, &directories) {
+            let bucket = buckets
+                .get(prep.facts.manifest.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for path in compile_files(files, prep, bucket) {
                 let Some(text) = files.read(&path) else {
                     continue;
                 };
                 let text = declarations_source(&path, text);
                 let (namespaces, types) = extract_declarations(&text);
+                // Namespaces the repo itself declares are kept even under
+                // `System.*` (dotnet/runtime, System.Reactive, ...): a name is
+                // only treated as framework when no file here declares it.
                 for ns in namespaces {
-                    if framework_namespace(&ns) {
-                        continue;
-                    }
                     ns_files.entry(ns).or_default().insert(path.clone());
                 }
                 for (ns, name) in types {
-                    if framework_namespace(&ns) || name.is_empty() {
+                    if name.is_empty() {
                         continue;
                     }
                     type_decls.insert(TypeDecl {
@@ -251,6 +304,7 @@ impl ModuleResolver for CSharpResolver {
             project_refs,
             namespaces,
             type_decls: type_decls.into_iter().collect(),
+            scope_index: Default::default(),
         }
     }
 
@@ -263,7 +317,9 @@ impl ModuleResolver for CSharpResolver {
     ) -> Option<RelPath> {
         match self.resolve_import(from, spec, files, meta) {
             ImportResolution::File(path) => Some(path),
-            ImportResolution::Namespace { .. } | ImportResolution::Unresolved => None,
+            ImportResolution::Files(_)
+            | ImportResolution::Namespace { .. }
+            | ImportResolution::Unresolved => None,
         }
     }
 
@@ -285,10 +341,12 @@ impl ModuleResolver for CSharpResolver {
                 None => ImportResolution::Unresolved,
             },
             Spec::Namespace(name) => {
-                if name.is_empty() || framework_namespace(&name) {
+                if name.is_empty() {
                     return ImportResolution::Unresolved;
                 }
-                let files = namespace_files(meta, &name);
+                // Framework namespaces resolve to nothing unless this repo
+                // declares them itself.
+                let files = namespace_files(meta, &name, from);
                 if files.is_empty() {
                     ImportResolution::Unresolved
                 } else {
@@ -396,17 +454,48 @@ fn project_owning<'a>(path: &str, meta: &'a ProjectMeta) -> Option<&'a ProjectFa
         .max_by_key(|p| p.directory.len())
 }
 
-fn namespace_files(meta: &ProjectMeta, name: &str) -> Vec<RelPath> {
-    meta.namespaces
-        .iter()
-        .find(|n| n.namespace == name)
-        .map(|n| n.files.iter().map(RelPath::new).collect())
-        .unwrap_or_default()
+/// Files declaring `name` (the importer itself is dropped only when the
+/// cap applies; `assemble_graph` filters self-edges). A namespace with more than
+/// [`NAMESPACE_FANOUT_CAP`] declaring files links only to the cap nearest
+/// ones (longest shared directory prefix, then path order), so a single huge
+/// namespace costs O(importers x cap) edges instead of O(importers x files).
+/// Nothing in the query layer reads `Namespace` edges; `Import` edges, which
+/// carry dependents and PageRank, are not affected.
+fn namespace_files(meta: &ProjectMeta, name: &str, from: &RelPath) -> Vec<RelPath> {
+    let Ok(i) = meta
+        .namespaces
+        .binary_search_by(|n| n.namespace.as_str().cmp(name))
+    else {
+        return Vec::new();
+    };
+    let all = &meta.namespaces[i].files;
+    let mut picked: Vec<&String> = all.iter().collect();
+    if picked.len() > NAMESPACE_FANOUT_CAP {
+        picked.retain(|f| f.as_str() != from.as_str());
+        let from_dir = from.dir();
+        picked.select_nth_unstable_by(NAMESPACE_FANOUT_CAP, |a, b| {
+            shared_dirs(b, from_dir)
+                .cmp(&shared_dirs(a, from_dir))
+                .then_with(|| a.cmp(b))
+        });
+        picked.truncate(NAMESPACE_FANOUT_CAP);
+        picked.sort();
+    }
+    picked.into_iter().map(RelPath::new).collect()
+}
+
+/// Number of leading directory components `path` shares with `dir`.
+fn shared_dirs(path: &str, dir: &str) -> usize {
+    let pd = path.rsplit_once('/').map_or("", |(d, _)| d);
+    pd.split('/')
+        .zip(dir.split('/'))
+        .take_while(|(a, b)| a == b && !a.is_empty())
+        .count()
 }
 
 fn unique_type(meta: &ProjectMeta, qualified: &str) -> Option<String> {
     let qualified = qualified.trim().trim_end_matches(';').trim();
-    if qualified.is_empty() || framework_namespace(qualified) {
+    if qualified.is_empty() {
         return None;
     }
     let direct = files_declaring(meta, qualified);
@@ -414,9 +503,6 @@ fn unique_type(meta: &ProjectMeta, qualified: &str) -> Option<String> {
         return only_one(direct);
     }
     let (head, _) = qualified.rsplit_once('.')?;
-    if framework_namespace(head) {
-        return None;
-    }
     only_one(files_declaring(meta, head))
 }
 
@@ -424,7 +510,7 @@ fn files_declaring(meta: &ProjectMeta, qualified: &str) -> Vec<String> {
     let mut files: Vec<String> = meta
         .type_decls
         .iter()
-        .filter(|t| qualified_name(t) == qualified)
+        .filter(|t| decl_is(t, qualified))
         .map(|t| t.file.clone())
         .collect();
     files.sort();
@@ -440,16 +526,15 @@ fn only_one(files: Vec<String>) -> Option<String> {
     }
 }
 
-fn qualified_name(decl: &TypeDecl) -> String {
+/// `qualified_name(decl) == qualified` without allocating.
+fn decl_is(decl: &TypeDecl, qualified: &str) -> bool {
     if decl.namespace.is_empty() {
-        decl.name.clone()
-    } else {
-        format!("{}.{}", decl.namespace, decl.name)
+        return decl.name == qualified;
     }
-}
-
-fn framework_namespace(name: &str) -> bool {
-    name == "System" || name.starts_with("System.")
+    qualified.len() == decl.namespace.len() + 1 + decl.name.len()
+        && qualified.starts_with(decl.namespace.as_str())
+        && qualified[decl.namespace.len()..].starts_with('.')
+        && qualified.ends_with(decl.name.as_str())
 }
 
 fn implicit_usings_for(sdk: &str) -> Vec<&'static str> {
@@ -466,46 +551,27 @@ fn implicit_usings_for(sdk: &str) -> Vec<&'static str> {
     out
 }
 
-fn compile_files(files: &FileIndex, prep: &Prepared, projects: &[(String, String)]) -> Vec<String> {
+/// Compile items of one project. `bucket` is every C# source (not under
+/// `bin`/`obj`/`.vs`) that the project owns, computed once for all projects.
+fn compile_files(files: &FileIndex, prep: &Prepared, bucket: &[&str]) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     let dir = &prep.facts.directory;
+    let remove = Patterns::new(&prep.compile_remove);
     if prep.facts.default_compile_items {
-        for path in files.iter() {
-            if !is_csharp_source(path.as_str()) {
+        for &path in bucket {
+            if is_project_output(path, dir, &prep.output, &prep.intermediate) {
                 continue;
             }
-            let path = path.as_str();
-            if owning_manifest(path, projects) != Some(prep.facts.manifest.as_str()) {
-                continue;
-            }
-            if skipped_tree(path) || is_project_output(path, dir, &prep.output, &prep.intermediate)
-            {
-                continue;
-            }
-            let rel = rel_to(path, dir);
-            if prep
-                .compile_remove
-                .iter()
-                .any(|pattern| glob_match(pattern, rel))
-            {
+            if remove.is_match(rel_to(path, dir)) {
                 continue;
             }
             out.insert(path.to_string());
         }
     }
     for include in &prep.compile_include {
-        add_include(
-            files,
-            dir,
-            include,
-            &prep.facts.manifest,
-            projects,
-            &mut out,
-        );
+        add_include(files, dir, include, bucket, &mut out);
     }
-    for remove in &prep.compile_remove {
-        out.retain(|path| !glob_match(remove, rel_to(path, dir)));
-    }
+    out.retain(|path| !remove.is_match(rel_to(path, dir)));
     out.into_iter().filter(|path| !skipped_tree(path)).collect()
 }
 
@@ -513,70 +579,83 @@ fn add_include(
     files: &FileIndex,
     dir: &str,
     pattern: &str,
-    manifest: &str,
-    projects: &[(String, String)],
+    bucket: &[&str],
     out: &mut BTreeSet<String>,
 ) {
     let pattern = pattern.replace('\\', "/");
-    if !pattern.contains('*') {
-        if let Some(full) = normalize_include(dir, &pattern) {
+    let mut wildcards: Vec<String> = Vec::new();
+    // MSBuild lists are `;`-separated.
+    for item in pattern.split(';').map(str::trim).filter(|i| !i.is_empty()) {
+        if item.contains('*') || item.contains('?') {
+            wildcards.push(item.to_string());
+        } else if let Some(full) = normalize_include(dir, item) {
             if files.contains(&full) && is_csharp_source(&full) && !skipped_tree(&full) {
                 out.insert(full);
             }
         }
+    }
+    if wildcards.is_empty() {
         return;
     }
-    for path in files.iter() {
-        if !is_csharp_source(path.as_str()) {
-            continue;
-        }
-        let path = path.as_str();
-        if owning_manifest(path, projects) != Some(manifest) || skipped_tree(path) {
-            continue;
-        }
-        if glob_match(&pattern, rel_to(path, dir)) {
+    let set = Patterns::new(&wildcards);
+    for &path in bucket {
+        if set.is_match(rel_to(path, dir)) {
             out.insert(path.to_string());
         }
     }
 }
 
-fn owning_manifest<'a>(path: &str, projects: &'a [(String, String)]) -> Option<&'a str> {
-    projects
-        .iter()
-        .filter(|(_, dir)| is_under(path, dir))
-        .max_by_key(|(_, dir)| dir.len())
-        .map(|(manifest, _)| manifest.as_str())
-}
-
 fn is_project_output(path: &str, dir: &str, output: &str, intermediate: &str) -> bool {
     let rel = rel_to(path, dir);
-    for root in [output, intermediate, ".vs"] {
-        if rel == root || rel.starts_with(&format!("{root}/")) {
-            return true;
-        }
-    }
-    false
+    [output, intermediate, ".vs"].into_iter().any(|root| {
+        rel == root
+            || rel
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
-fn glob_match(pattern: &str, rel: &str) -> bool {
-    let pattern = pattern.trim().replace('\\', "/");
-    let pattern = pattern.trim_start_matches("./");
-    let rel = rel.trim_start_matches("./");
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        let prefix = prefix.trim_matches('/');
-        if prefix.is_empty() {
-            return true;
+/// MSBuild item patterns: `;`-separated, `*` and `?` stay inside one path
+/// segment, `**` spans segments (also in the middle: `Foo/**/Bar/*.cs`).
+/// Patterns without wildcards are exact relative paths.
+struct Patterns {
+    exact: BTreeSet<String>,
+    globs: globset::GlobSet,
+}
+
+impl Patterns {
+    fn new(list: &[String]) -> Self {
+        let mut exact = BTreeSet::new();
+        let mut builder = globset::GlobSetBuilder::new();
+        for raw in list {
+            for item in raw.split(';') {
+                let item = item.trim().replace('\\', "/");
+                let item = item.trim_start_matches("./");
+                if item.is_empty() {
+                    continue;
+                }
+                if item.contains('*') || item.contains('?') {
+                    if let Ok(g) = globset::GlobBuilder::new(item)
+                        .literal_separator(true)
+                        .build()
+                    {
+                        builder.add(g);
+                    }
+                } else {
+                    exact.insert(item.to_string());
+                }
+            }
         }
-        return rel == prefix || rel.starts_with(&format!("{prefix}/"));
+        let globs = builder
+            .build()
+            .unwrap_or_else(|_| globset::GlobSet::empty());
+        Patterns { exact, globs }
     }
-    if let Some(idx) = pattern.rfind('*') {
-        let suf = pattern[idx + 1..].trim_start_matches('/');
-        let pre = pattern[..idx].trim_end_matches('*').trim_matches('/');
-        let suf_ok = suf.is_empty() || rel.ends_with(suf);
-        let pre_ok = pre.is_empty() || rel == pre || rel.starts_with(&format!("{pre}/"));
-        return pre_ok && suf_ok;
+
+    fn is_match(&self, rel: &str) -> bool {
+        let rel = rel.trim_start_matches("./");
+        self.exact.contains(rel) || self.globs.is_match(rel)
     }
-    rel == pattern
 }
 
 fn nearest_directory_build_props(project_dir: &str, files: &FileIndex) -> Option<String> {
@@ -1050,7 +1129,37 @@ fn extract_declarations(src: &str) -> (BTreeSet<String>, Vec<(String, String)>) 
                     i += 1;
                 }
             }
-            Tok::Ident(kw) if is_type_keyword(kw) => {
+            Tok::Ident(kw) if kw == "delegate" => {
+                // `delegate R Name<T>(...)`: the name is the last identifier
+                // outside `<>` before the parameter list. `delegate (..) {}`
+                // and `delegate { }` are anonymous methods.
+                i += 1;
+                let (mut depth, mut last) = (0i32, None);
+                while let Some(tok) = toks.get(i) {
+                    match tok {
+                        Tok::Ident(n) if depth == 0 => last = Some(n.clone()),
+                        Tok::Lt => depth += 1,
+                        Tok::Gt => depth = (depth - 1).max(0),
+                        Tok::ParenOpen => break,
+                        Tok::Semi | Tok::BraceOpen | Tok::BraceClose => {
+                            last = None;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if let Some(name) = last {
+                    types.push((current_ns(&file_scoped, &ns_stack), name));
+                }
+            }
+            Tok::Ident(kw)
+                if is_type_keyword(kw)
+                    && !(matches!(kw.as_str(), "class" | "struct")
+                        && i > 0
+                        && matches!(toks[i - 1], Tok::Colon | Tok::Comma)) =>
+            {
+                // (`where T : class, new()` is a constraint, not a type.)
                 let keyword = kw.clone();
                 i += 1;
                 if keyword == "record" {
@@ -1110,6 +1219,11 @@ enum Tok {
     Semi,
     BraceOpen,
     BraceClose,
+    ParenOpen,
+    Lt,
+    Gt,
+    Colon,
+    Comma,
 }
 
 fn tokenize(masked: &str) -> Vec<Tok> {
@@ -1127,6 +1241,11 @@ fn tokenize(masked: &str) -> Vec<Tok> {
             b'}' => out.push(Tok::BraceClose),
             b';' => out.push(Tok::Semi),
             b'.' => out.push(Tok::Dot),
+            b'(' => out.push(Tok::ParenOpen),
+            b'<' => out.push(Tok::Lt),
+            b'>' => out.push(Tok::Gt),
+            b':' => out.push(Tok::Colon),
+            b',' => out.push(Tok::Comma),
             _ => {
                 if c == b'@' && i + 1 < b.len() && is_ident_start(b[i + 1]) {
                     i += 1;
@@ -1196,14 +1315,9 @@ fn mask_csharp(src: &str) -> String {
             blank(&mut b, start, i);
             continue;
         }
-        if starts_raw_string(&b, i) {
-            let start = i;
-            i += 3;
-            while i + 2 < b.len() && !(b[i] == b'"' && b[i + 1] == b'"' && b[i + 2] == b'"') {
-                i += 1;
-            }
-            i = (i + 3).min(b.len());
-            blank(&mut b, start, i);
+        if let Some(end) = raw_string_end(&b, i) {
+            blank(&mut b, i, end);
+            i = end;
             continue;
         }
         if let Some(end) = string_end(&b, i) {
@@ -1216,8 +1330,31 @@ fn mask_csharp(src: &str) -> String {
     String::from_utf8_lossy(&b).into_owned()
 }
 
-fn starts_raw_string(b: &[u8], i: usize) -> bool {
-    i + 2 < b.len() && b[i] == b'"' && b[i + 1] == b'"' && b[i + 2] == b'"'
+/// End of a raw string literal starting at `i`: optional `$`s, then a run of
+/// `n >= 3` quotes, closed by a run of `n` quotes. Covers `"""x"""`,
+/// `$"""x{y}"""`, `$$"""x"""` and longer quote fences.
+fn raw_string_end(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    while j < b.len() && b[j] == b'$' {
+        j += 1;
+    }
+    let q = b[j..].iter().take_while(|&&c| c == b'"').count();
+    if q < 3 {
+        return None;
+    }
+    let mut k = j + q;
+    while k < b.len() {
+        if b[k] == b'"' {
+            let run = b[k..].iter().take_while(|&&c| c == b'"').count();
+            if run >= q {
+                return Some(k + run);
+            }
+            k += run;
+        } else {
+            k += 1;
+        }
+    }
+    Some(b.len())
 }
 
 fn string_end(b: &[u8], i: usize) -> Option<usize> {
@@ -1465,7 +1602,8 @@ mod tests {
                 "lib/Widget.cs".to_string(),
             ]
         );
-        assert!(meta.namespaces.iter().all(|n| n.namespace != "System.Text"));
+        // A System.* namespace the repo declares itself is kept.
+        assert!(meta.namespaces.iter().any(|n| n.namespace == "System.Text"));
 
         let from = RelPath::new("app/Program.cs");
         let project = resolver.resolve_import(&from, "project:../lib/Lib.csproj", &files, &meta);
@@ -1510,10 +1648,12 @@ mod tests {
             resolver.resolve_import(&from, "using Newtonsoft.Json;", &files, &meta),
             ImportResolution::Unresolved
         );
-        assert_eq!(
-            resolver.resolve_import(&from, "using System.Text;", &files, &meta),
-            ImportResolution::Unresolved
-        );
+        match resolver.resolve_import(&from, "using System.Text;", &files, &meta) {
+            ImportResolution::Namespace { files, .. } => {
+                assert_eq!(files, vec![RelPath::new("lib/SystemHack.cs")]);
+            }
+            other => panic!("repo-declared System.* namespace must resolve: {other:?}"),
+        }
 
         assert_eq!(
             resolver.resolve_import(&from, "using static Acme.Lib.Helper;", &files, &meta),

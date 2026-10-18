@@ -20,10 +20,28 @@
 
 use astrolabe_mcp::{
     child_git_repos, count_root_files, is_cwd_sentinel, parse_launch, resolve_index_root,
-    resolve_root, AstrolabeServer, Launch, ResolvedRoot, DEFAULT_MAX_ROOT_FILES, USAGE,
+    resolve_root, AstrolabeServer, ClientContext, Launch, ResolvedRoot, StartupFailedServer,
+    DEFAULT_MAX_ROOT_FILES, USAGE,
 };
 use rmcp::{service::serve_directly, RoleServer};
+use std::io::IsTerminal;
 use std::path::Path;
+
+/// Startup failure: the message and the process exit code to use once the
+/// client has gone away.
+struct StartupFailure {
+    message: String,
+    code: i32,
+}
+
+impl StartupFailure {
+    fn new(message: impl Into<String>, code: i32) -> Self {
+        Self {
+            message: message.into(),
+            code,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -45,7 +63,24 @@ async fn main() -> anyhow::Result<()> {
     // for `.git` or `.serena/project.yml` and stores the absolute path. An
     // explicit directory is canonicalized as-is and is not replaced by an
     // ancestor marker.
-    let launch = parse_launch(std::env::args_os())?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let launch = match parse_launch(args.iter().cloned()) {
+        Ok(launch) => launch,
+        Err(error) => {
+            // `hooks ...` is not an MCP server: keep the plain error exit.
+            let subcommand = args.get(1).is_some_and(|a| {
+                matches!(
+                    a.to_string_lossy().as_ref(),
+                    "hooks" | "print-cc-system-prompt-override"
+                )
+            });
+            if subcommand {
+                return Err(error);
+            }
+            let failure = StartupFailure::new(format!("{error:#}"), 1);
+            return serve_startup_failure(failure, ClientContext::default_builtin()).await;
+        }
+    };
     let (requested, context) = match launch {
         Launch::Help => {
             print!("{USAGE}");
@@ -85,56 +120,9 @@ async fn main() -> anyhow::Result<()> {
         } => (requested_root, context),
     };
     let limit = max_root_files_from_env();
-    let server = if is_cwd_sentinel(&requested) {
-        let cwd = std::env::current_dir()?;
-        match resolve_root(&cwd, limit) {
-            ResolvedRoot::Repo(path) => {
-                emit_root_telemetry(&path, "repo", limit);
-                boot_single(path, context)
-            }
-            ResolvedRoot::Single(path) => {
-                emit_root_telemetry(&path, "single", limit);
-                boot_single(path, context)
-            }
-            ResolvedRoot::MultiProject { root, children } => {
-                emit_root_telemetry(&root, "multi", limit);
-                tracing::info!(
-                    root = %root.display(),
-                    children = children.len(),
-                    "starting in multi-project dispatch mode"
-                );
-                for child in &children {
-                    tracing::info!(child = %child.display(), "multi-project child");
-                }
-                AstrolabeServer::with_multi_project(root, children, context)
-            }
-            refuse @ ResolvedRoot::TooLarge { .. } => {
-                let msg = refuse
-                    .refuse_guidance()
-                    .expect("TooLarge always has guidance");
-                eprintln!("{msg}");
-                std::process::exit(2);
-            }
-        }
-    } else {
-        let path = resolve_index_root(&requested)?;
-        let nested = child_git_repos(&path);
-        if !nested.is_empty() {
-            tracing::warn!(
-                root = %path.display(),
-                nested_repos = nested.len(),
-                "explicit root contains nested git repositories; indexing anyway \
-                 (cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root)"
-            );
-        }
-        let mode =
-            if path.join(".git").exists() || path.join(".serena").join("project.yml").is_file() {
-                "repo"
-            } else {
-                "single"
-            };
-        emit_root_telemetry(&path, mode, limit);
-        boot_single(path, context)
+    let server = match build_server(&requested, context.clone(), limit) {
+        Ok(server) => server,
+        Err(failure) => return serve_startup_failure(failure, context).await,
     };
     // Indexing is spawn_blocking, so it never stalls stdio. Start it before the
     // accept loop so handshake-less clients can call tools as soon as the graph
@@ -181,6 +169,91 @@ async fn main() -> anyhow::Result<()> {
     }
     served?;
     Ok(())
+}
+
+fn build_server(
+    requested: &Path,
+    context: ClientContext,
+    limit: u64,
+) -> Result<AstrolabeServer, StartupFailure> {
+    let server = if is_cwd_sentinel(requested) {
+        let cwd = std::env::current_dir()
+            .map_err(|e| StartupFailure::new(format!("cannot read current directory: {e}"), 1))?;
+        match resolve_root(&cwd, limit) {
+            ResolvedRoot::Repo(path) => {
+                emit_root_telemetry(&path, "repo", limit);
+                boot_single(path, context)
+            }
+            ResolvedRoot::Single(path) => {
+                emit_root_telemetry(&path, "single", limit);
+                boot_single(path, context)
+            }
+            ResolvedRoot::MultiProject { root, children } => {
+                emit_root_telemetry(&root, "multi", limit);
+                tracing::info!(
+                    root = %root.display(),
+                    children = children.len(),
+                    "starting in multi-project dispatch mode"
+                );
+                for child in &children {
+                    tracing::info!(child = %child.display(), "multi-project child");
+                }
+                AstrolabeServer::with_multi_project(root, children, context)
+            }
+            refuse @ ResolvedRoot::TooLarge { .. } => {
+                let msg = refuse
+                    .refuse_guidance()
+                    .expect("TooLarge always has guidance");
+                return Err(StartupFailure::new(msg, 2));
+            }
+        }
+    } else {
+        let path =
+            resolve_index_root(requested).map_err(|e| StartupFailure::new(format!("{e:#}"), 1))?;
+        let nested = child_git_repos(&path);
+        if !nested.is_empty() {
+            tracing::warn!(
+                root = %path.display(),
+                nested_repos = nested.len(),
+                "explicit root contains nested git repositories; indexing anyway \
+                 (cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root)"
+            );
+        }
+        let mode =
+            if path.join(".git").exists() || path.join(".serena").join("project.yml").is_file() {
+                "repo"
+            } else {
+                "single"
+            };
+        emit_root_telemetry(&path, mode, limit);
+        boot_single(path, context)
+    };
+    Ok(server)
+}
+
+/// Report a startup failure. On stderr always; and, when a client is
+/// attached over a pipe, also over MCP: the handshake and `tools/list` work
+/// and every `tools/call` returns the reason as an `isError` result, so the
+/// user sees it instead of "connection closed". An interactive terminal just
+/// exits with the original code.
+async fn serve_startup_failure(
+    failure: StartupFailure,
+    context: ClientContext,
+) -> anyhow::Result<()> {
+    eprintln!("{}", failure.message);
+    if std::io::stdin().is_terminal() {
+        std::process::exit(failure.code);
+    }
+    let handler = StartupFailedServer::new(failure.message, context);
+    let service = serve_directly::<RoleServer, _, _, _, _>(handler, rmcp::transport::stdio(), None);
+    let cancellation = service.cancellation_token();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        cancellation.cancel();
+    });
+    let _ = service.waiting().await;
+    signal_task.abort();
+    std::process::exit(failure.code);
 }
 
 async fn shutdown_signal() {

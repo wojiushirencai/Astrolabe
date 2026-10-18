@@ -49,6 +49,8 @@ pub struct FileCache {
 struct CachedFile {
     lines: Arc<Vec<String>>,
     mtime_ms: u64,
+    /// On-disk byte length when the caller supplied one.
+    len: Option<u64>,
 }
 
 impl FileCache {
@@ -92,11 +94,44 @@ impl FileCache {
     }
 
     pub fn insert(&self, path: &str, lines: Vec<String>, mtime_ms: u64) {
+        self.insert_arc(path, Arc::new(lines), mtime_ms);
+    }
+
+    /// Insert already-shared lines without deep-copying them.
+    pub fn insert_arc(&self, path: &str, lines: Arc<Vec<String>>, mtime_ms: u64) {
         self.cache.insert(
             path.to_owned(),
             CachedFile {
-                lines: Arc::new(lines),
+                lines,
                 mtime_ms,
+                len: None,
+            },
+        );
+    }
+
+    /// Like [`Self::get`], but the file's byte length must match too. An
+    /// mtime restored by `cp -p`/`git stash`, or two writes inside one
+    /// timestamp tick, usually change the length; mtime alone cannot tell.
+    /// An entry stored without a length never matches here.
+    pub fn get_checked(&self, path: &str, mtime_ms: u64, len: u64) -> Option<Arc<Vec<String>>> {
+        let file = self.cache.get(path)?;
+        if file.mtime_ms == mtime_ms && file.len == Some(len) {
+            Some(file.lines)
+        } else {
+            self.cache.invalidate(path);
+            None
+        }
+    }
+
+    /// Store shared lines together with the file's byte length, for
+    /// [`Self::get_checked`].
+    pub fn insert_checked(&self, path: &str, lines: Arc<Vec<String>>, mtime_ms: u64, len: u64) {
+        self.cache.insert(
+            path.to_owned(),
+            CachedFile {
+                lines,
+                mtime_ms,
+                len: Some(len),
             },
         );
     }
@@ -118,6 +153,22 @@ mod tests {
             budget_bytes,
             idle_ttl,
         }
+    }
+
+    #[test]
+    fn checked_get_rejects_same_mtime_different_length() {
+        let cache = FileCache::new(CacheConfig::default());
+        cache.insert_checked("a.rs", Arc::new(vec!["old".into()]), 1000, 4);
+        assert!(cache.get_checked("a.rs", 1000, 4).is_some());
+        // Same mtime, different length: the file changed under a restored timestamp.
+        assert!(cache.get_checked("a.rs", 1000, 5).is_none());
+        assert!(
+            cache.get_checked("a.rs", 1000, 4).is_none(),
+            "a mismatch must evict the stale entry"
+        );
+        // Entries stored without a length never satisfy a checked read.
+        cache.insert("b.rs", vec!["x".into()], 7);
+        assert!(cache.get_checked("b.rs", 7, 1).is_none());
     }
 
     #[test]

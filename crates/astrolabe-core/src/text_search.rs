@@ -6,9 +6,9 @@
 //! in-memory `search_code` path: one line = one match, literal queries are
 //! escaped, and the caller picks case sensitivity.
 //!
-//! - **Encoding**: UTF-8, with BOM sniffing so UTF-16 files are transcoded
-//!   (via `encoding_rs`). Invalid UTF-8 is decoded lossily instead of
-//!   dropping the file.
+//! - **Encoding**: UTF-8 is searched as-is. UTF-16 (BOM) and other non-UTF-8
+//!   text (GBK, Shift-JIS, Latin-1 …) are transcoded via
+//!   [`crate::text::decode_source`] before matching.
 //! - **Binary**: a NUL byte stops the search of that file.
 //! - **Size**: files larger than `max_file_bytes` at search time are skipped
 //!   (the scanner already gates admission; this covers files that grew).
@@ -72,16 +72,34 @@ fn search_one(path: &Path, matcher: &RegexMatcher, max_file_bytes: u64) -> Vec<T
         Ok(meta) if meta.is_file() && meta.len() <= max_file_bytes => {}
         _ => return Vec::new(),
     }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    // UTF-16 BOM files contain NULs by design; everything else with a NUL is
+    // binary. Non-UTF-8 text (GBK, Shift-JIS, Latin-1 …) is detected and
+    // transcoded instead of being searched as lossy bytes.
+    let utf16_bom = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+    let decoded: Option<String> = if utf16_bom || std::str::from_utf8(&bytes).is_err() {
+        if !utf16_bom && bytes.contains(&0) {
+            return Vec::new();
+        }
+        Some(crate::text::decode_source(bytes.clone()))
+    } else {
+        None
+    };
+    let haystack: &[u8] = match &decoded {
+        Some(text) => text.as_bytes(),
+        None => &bytes,
+    };
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(b'\x00'))
-        .bom_sniffing(true)
         .line_terminator(LineTerminator::crlf())
         .line_number(true)
         .build();
     let mut hits = Vec::new();
-    let result = searcher.search_path(
+    let result = searcher.search_slice(
         matcher,
-        path,
+        haystack,
         sinks::Lossy(|line, text| {
             hits.push(TextHit {
                 line,
@@ -125,10 +143,9 @@ mod tests {
             utf16.extend_from_slice(&u.to_le_bytes());
         }
         std::fs::write(d.join("u16.txt"), utf16).unwrap();
-        // Invalid UTF-8 (GBK bytes) is decoded lossily, not dropped.
-        let mut gbk = b"hello ".to_vec();
-        gbk.extend_from_slice(&[0xC4, 0xE3, 0xBA, 0xC3, b'\n']);
-        std::fs::write(d.join("gbk.txt"), gbk).unwrap();
+        // GBK bytes are transcoded, not dropped or searched as mojibake.
+        let (gbk, _, _) = encoding_rs::GBK.encode("hello 你好，这是中文注释\n");
+        std::fs::write(d.join("gbk.txt"), &gbk).unwrap();
         let paths = [
             "a.md",
             "bin.dat",
@@ -169,6 +186,10 @@ mod tests {
         assert_eq!(search_files(&d, &["a.md"], &m, 100).len(), 1);
         let m = build_matcher("f.o\\.bar$", true, true).unwrap();
         assert_eq!(search_files(&d, &["a.md"], &m, 100).len(), 1);
+        let m = build_matcher("你好", false, true).unwrap();
+        let got = search_files(&d, &["gbk.txt"], &m, 100);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].1[0].text.contains("你好"));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

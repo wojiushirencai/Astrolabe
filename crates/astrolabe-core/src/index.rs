@@ -72,6 +72,11 @@ pub struct IndexOptions {
     /// skips unchanged files after a restart. Persistence is an optimisation:
     /// tests and one-shot runs can set this to `false`.
     pub persist: bool,
+    /// With `persist == false`: still *read* an existing store (never create,
+    /// write, prune or heal it). For a second process on the same repository,
+    /// which must not contend for the writer role but should not pay a cold
+    /// reparse either. Ignored when `persist` is on.
+    pub persist_read_only: bool,
     /// Byte budget for [`IncrementalIndex`]'s in-memory parse-product LRU.
     /// Unused by [`index_repo`]. Default [`DEFAULT_PARSE_CACHE_BYTES`].
     pub parse_cache_bytes: u64,
@@ -83,6 +88,7 @@ impl Default for IndexOptions {
             scan: ScanOptions::default(),
             call_edges: false,
             persist: true,
+            persist_read_only: false,
             parse_cache_bytes: DEFAULT_PARSE_CACHE_BYTES,
         }
     }
@@ -95,7 +101,25 @@ pub fn store_path(root: &Path) -> PathBuf {
 
 fn open_store(root: &Path, opts: &IndexOptions) -> Option<Store> {
     if !opts.persist {
-        return None;
+        if !opts.persist_read_only {
+            return None;
+        }
+        let path = store_path(root);
+        return match Store::open_read_only_with_retry(
+            &path,
+            Store::DEFAULT_RETRY_ATTEMPTS,
+            Store::DEFAULT_RETRY_DELAY,
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %path.display(),
+                    "read-only parse cache unavailable; parsing from source"
+                );
+                None
+            }
+        };
     }
     let dir = root.join(".astrolabe");
     if let Err(error) = std::fs::create_dir_all(&dir) {
@@ -406,6 +430,131 @@ fn apply_declared_excludes(
     }
 }
 
+/// `(mtime, len)` of a file as observed before it was read.
+#[derive(Clone, Copy)]
+struct FileStat {
+    mtime_ns: u128,
+    len: u64,
+    /// Old enough that a same-size rewrite cannot share this mtime.
+    trusted: bool,
+}
+
+impl FileStat {
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        let modified = metadata.modified().ok()?;
+        let mtime_ns = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let trusted = std::time::SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age >= SHEBANG_UNTRUSTED_WINDOW);
+        Some(Self {
+            mtime_ns,
+            len: metadata.len(),
+            trusted,
+        })
+    }
+}
+
+/// Per-run side channels of [`parse_one`]: stamps to persist and the keys
+/// that are still live (for pruning after a full scan).
+struct ParseSide {
+    /// Whether the store accepts writes.
+    writable: bool,
+    track_live: bool,
+    stamps: Mutex<Vec<(String, store::FileStamp)>>,
+    live_keys: Mutex<Vec<String>>,
+    live_paths: Mutex<Vec<String>>,
+}
+
+impl ParseSide {
+    fn new(store: Option<&Store>, track_live: bool) -> Self {
+        Self {
+            writable: store.is_some_and(|s| !s.is_read_only()),
+            track_live,
+            stamps: Mutex::new(Vec::new()),
+            live_keys: Mutex::new(Vec::new()),
+            live_paths: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn note_live(&self, path: &RelPath, key: &str) {
+        if self.track_live {
+            self.live_keys
+                .lock()
+                .expect("live keys poisoned")
+                .push(key.to_owned());
+            self.live_paths
+                .lock()
+                .expect("live paths poisoned")
+                .push(path.as_str().to_owned());
+        }
+    }
+
+    fn note_stamp(
+        &self,
+        path: &RelPath,
+        stat: Option<&FileStat>,
+        key: &str,
+        sha: &str,
+        loc: u32,
+        language: Language,
+    ) {
+        let Some(stat) = stat else {
+            return;
+        };
+        if !self.writable || !stat.trusted {
+            return;
+        }
+        self.stamps.lock().expect("stamps poisoned").push((
+            path.as_str().to_owned(),
+            store::FileStamp {
+                mtime_ns: stat.mtime_ns,
+                len: stat.len,
+                key: key.to_owned(),
+                sha: sha.to_owned(),
+                loc,
+                language: store::language_to_u8(language),
+            },
+        ));
+    }
+}
+
+/// Warm start without reading the file: the recorded `(mtime, len)` still
+/// matches, so reuse the cached parse stored under the recorded key.
+fn stamp_hit(
+    store: &Store,
+    path: &RelPath,
+    stat: &FileStat,
+    side: &ParseSide,
+    cache_hits: &AtomicUsize,
+) -> Option<ParsedRow> {
+    if !stat.trusted {
+        return None;
+    }
+    let stamp = store.file_stamp(path.as_str()).ok()??;
+    if stamp.mtime_ns != stat.mtime_ns
+        || stamp.len != stat.len
+        || !stamp.key.starts_with(&store::parse_cache_key_prefix())
+    {
+        return None;
+    }
+    let language = stamp.language()?;
+    let bytes = store.cached_parse(&stamp.key).ok()??;
+    let parsed = store::decode_parsed(&bytes).ok()?;
+    cache_hits.fetch_add(1, Ordering::Relaxed);
+    side.note_live(path, &stamp.key);
+    Some(ParsedRow {
+        path: path.clone(),
+        language,
+        sha: stamp.sha,
+        loc: stamp.loc,
+        parsed,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn parse_one(
     root: &Path,
     path: &RelPath,
@@ -414,6 +563,7 @@ fn parse_one(
     failures: &Mutex<Vec<(RelPath, String)>>,
     cache_writes: &Mutex<Vec<(String, Vec<u8>)>>,
     cache_hits: &AtomicUsize,
+    side: &ParseSide,
 ) -> Option<ParsedRow> {
     let by_path = Language::from_path(path);
     // Extension-less files may still be scripts (`#!/usr/bin/env bash`);
@@ -425,6 +575,16 @@ fn parse_one(
     // in full, and an unchanged one is not even reopened.
     if by_path.is_none() && !has_shebang(&root.join(path.as_str())) {
         return None;
+    }
+    // Stat before reading: a write that lands after this point changes the
+    // mtime/len we recorded, so the next run re-reads instead of trusting it.
+    let stat = std::fs::metadata(root.join(path.as_str()))
+        .ok()
+        .and_then(|m| FileStat::of(&m));
+    if let (Some(store), Some(stat)) = (store, stat.as_ref()) {
+        if let Some(row) = stamp_hit(store, path, stat, side, cache_hits) {
+            return Some(row);
+        }
     }
     let source = match crate::text::read_source(&root.join(path.as_str())) {
         Ok(source) => source,
@@ -449,11 +609,13 @@ fn parse_one(
         cache_key.push_str(&salt);
     }
 
+    side.note_live(path, &cache_key);
     if let Some(store) = store {
         match store.cached_parse(&cache_key) {
             Ok(Some(bytes)) => match store::decode_parsed(&bytes) {
                 Ok(parsed) => {
                     cache_hits.fetch_add(1, Ordering::Relaxed);
+                    side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
                     return Some(ParsedRow {
                         path: path.clone(),
                         language,
@@ -483,7 +645,16 @@ fn parse_one(
 
     match pool.parse(language, path, &source) {
         Ok(parsed) => {
-            if store.is_some() {
+            if parsed.partial {
+                // Syntax errors: symbols/imports/calls may be incomplete.
+                // Keep what was extracted but surface it, and do not cache
+                // it so the signal is not lost on the next (cache-hit) run.
+                failures.lock().expect("failure list poisoned").push((
+                    path.clone(),
+                    "partial parse: syntax errors in file".to_owned(),
+                ));
+            } else if store.is_some() {
+                side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
                 match store::encode_parsed(&parsed) {
                     Ok(bytes) => cache_writes
                         .lock()
@@ -521,10 +692,20 @@ fn persist_cache_writes(
     store: Option<&Store>,
     cache_writes: Mutex<Vec<(String, Vec<u8>)>>,
     cache_hits: AtomicUsize,
+    side: ParseSide,
+    prune: bool,
 ) {
     let Some(store) = store else {
         return;
     };
+    if store.is_read_only() {
+        tracing::info!(
+            hits = cache_hits.load(Ordering::Relaxed),
+            path = %store_path(root).display(),
+            "parse cache (read-only)"
+        );
+        return;
+    }
     let writes = cache_writes
         .into_inner()
         .expect("cache write list poisoned");
@@ -541,6 +722,33 @@ fn persist_cache_writes(
             );
         }
     }
+    let stamps = side.stamps.into_inner().expect("stamps poisoned");
+    if let Err(error) = store.put_file_stamps(&stamps) {
+        tracing::warn!(error = %error, "file stamp write failed; index is still valid");
+    }
+    if prune {
+        let live_keys: HashSet<String> = side
+            .live_keys
+            .into_inner()
+            .expect("live keys poisoned")
+            .into_iter()
+            .collect();
+        let live_paths: HashSet<String> = side
+            .live_paths
+            .into_inner()
+            .expect("live paths poisoned")
+            .into_iter()
+            .collect();
+        match store.prune_parse_cache(&live_keys, &live_paths) {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(removed, "parse cache pruned");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "parse cache prune failed; index is still valid");
+            }
+        }
+    }
     tracing::info!(
         hits = cache_hits.load(Ordering::Relaxed),
         stored,
@@ -552,9 +760,18 @@ fn persist_cache_writes(
 /// Parse every path that has a known language. Failures are collected, never
 /// swallowed. A disk-store cache hit skips tree-sitter; FileId assignment
 /// still happens later after a path sort, so rayon order does not leak.
-fn parse_paths(root: &Path, paths: &[RelPath], opts: &IndexOptions) -> ParseOutcome {
+///
+/// `full_scan` marks a parse over *every* admitted file (cold build): only
+/// then may the persistent cache be pruned down to what is still referenced.
+fn parse_paths(
+    root: &Path,
+    paths: &[RelPath],
+    opts: &IndexOptions,
+    full_scan: bool,
+) -> ParseOutcome {
     let pool = ParserPool::new();
     let store = open_store(root, opts);
+    let side = ParseSide::new(store.as_ref(), full_scan);
     let failures = Mutex::new(Vec::new());
     let cache_writes = Mutex::new(Vec::new());
     let cache_hits = AtomicUsize::new(0);
@@ -569,10 +786,18 @@ fn parse_paths(root: &Path, paths: &[RelPath], opts: &IndexOptions) -> ParseOutc
                 &failures,
                 &cache_writes,
                 &cache_hits,
+                &side,
             )
         })
         .collect();
-    persist_cache_writes(root, store.as_ref(), cache_writes, cache_hits);
+    persist_cache_writes(
+        root,
+        store.as_ref(),
+        cache_writes,
+        cache_hits,
+        side,
+        full_scan,
+    );
     let mut failures = failures.into_inner().expect("failure list poisoned");
     failures.sort();
     ParseOutcome { parsed, failures }
@@ -678,8 +903,24 @@ fn assemble_graph(
         let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
         for spec in &row.parsed.imports {
             match resolvers.resolve_import_as(import_lang, &row.path, spec, files) {
+                ImportResolution::Files(targets) => {
+                    for target in targets {
+                        if let Some(&to) = index_of.get(&target) {
+                            if to == from {
+                                continue;
+                            }
+                            edges.push(CodeEdge {
+                                from: from.0,
+                                to: to.0,
+                                kind: EdgeKind::Import,
+                                weight: 1,
+                                confidence: Confidence::Scoped,
+                            });
+                        }
+                    }
+                }
                 ImportResolution::File(target) => {
-                    if let Some(&to) = index_of.get(&target) {
+                    if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
                         edges.push(CodeEdge {
                             from: from.0,
                             to: to.0,
@@ -694,7 +935,7 @@ fn assemble_graph(
                     // Every declaring file, partials included. Not an Import:
                     // PageRank stays on real file edges.
                     for target in targets {
-                        if let Some(&to) = index_of.get(&target) {
+                        if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
                             edges.push(CodeEdge {
                                 from: from.0,
                                 to: to.0,
@@ -716,9 +957,9 @@ fn assemble_graph(
         }
     }
 
-    // ProjectReference is a file-level import even when no source file
-    // repeats it as a using. Endpoints that were not parsed are skipped;
-    // the relationship still lives on ProjectMeta::project_refs.
+    // ProjectReference pairs become an edge only when both manifests were
+    // parsed as files. In practice `.csproj` is not a parsed source, so this
+    // adds nothing today; the relationship lives on ProjectMeta::project_refs.
     for (_lang, meta) in resolvers.iter_meta() {
         for pref in &meta.project_refs {
             let from_path = RelPath::new(&pref.from);
@@ -828,7 +1069,7 @@ pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) 
         too_large: too_large_sources(root, &scanned),
         ..IndexReport::default()
     };
-    let outcome = parse_paths(root, &scanned.files, opts);
+    let outcome = parse_paths(root, &scanned.files, opts, true);
     report.parse_failures = outcome.failures;
     assemble_graph(outcome.parsed, &files, &resolvers, opts, report)
 }
@@ -862,6 +1103,9 @@ pub struct IncrementalIndex {
     products: ParseProductCache,
     /// Parse failures for files not re-read on the next apply.
     failures: Vec<(RelPath, String)>,
+    /// How many times a transient failure (read error, parse budget) has
+    /// been retried on an apply, to bound the retries.
+    failure_retries: HashMap<RelPath, u8>,
 }
 
 impl std::fmt::Debug for IncrementalIndex {
@@ -883,7 +1127,7 @@ impl IncrementalIndex {
             too_large: too_large_sources(root, &scanned),
             ..IndexReport::default()
         };
-        let outcome = parse_paths(root, &scanned.files, opts);
+        let outcome = parse_paths(root, &scanned.files, opts, true);
         let failures = outcome.failures.clone();
         report.parse_failures = outcome.failures;
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
@@ -895,6 +1139,7 @@ impl IncrementalIndex {
             excluded_sources,
             products,
             failures,
+            failure_retries: HashMap::new(),
         }
     }
 
@@ -954,6 +1199,22 @@ pub fn index_repo_incremental(
         }
     }
 
+    // The cold scan drops files over `max_file_bytes`; a live edit must agree,
+    // otherwise a file that grew past the cap enters the graph with every
+    // symbol and a restart makes it vanish.
+    let mut newly_too_large: Vec<RelPath> = Vec::new();
+    for path in dirty.clone() {
+        let too_large = std::fs::metadata(root.join(path.as_str()))
+            .is_ok_and(|m| m.is_file() && m.len() > opts.scan.max_file_bytes);
+        if too_large {
+            files.remove(&path);
+            dirty.remove(&path);
+            if Language::from_path(&path).is_some() || is_extensionless_script(root, &path) {
+                newly_too_large.push(path);
+            }
+        }
+    }
+
     let scanned = ScanResult {
         files: files.into_iter().collect(),
         skipped: Vec::new(),
@@ -973,13 +1234,18 @@ pub fn index_repo_incremental(
     }
 
     let admitted: HashSet<&RelPath> = scanned.files.iter().collect();
-    let too_large = previous
+    let mut too_large: Vec<RelPath> = previous
         .report
         .too_large
         .iter()
         .filter(|path| !changes.removed.contains(path) && !admitted.contains(path))
         .cloned()
         .collect();
+    for path in newly_too_large {
+        if !too_large.contains(&path) {
+            too_large.push(path);
+        }
+    }
     let mut report = IndexReport {
         files_scanned: scanned.files.len(),
         too_large,
@@ -991,6 +1257,10 @@ pub fn index_repo_incremental(
     let mut reused_products = Vec::new();
     let mut failures = Vec::new();
     let mut lru_misses = 0usize;
+    let previous_failures: HashMap<&RelPath, &String> =
+        previous.failures.iter().map(|(p, r)| (p, r)).collect();
+    let mut retried: HashMap<RelPath, u8> = HashMap::new();
+    let mut failure_retries: HashMap<RelPath, u8> = HashMap::new();
 
     for path in &scanned.files {
         if dirty.contains(path) {
@@ -1026,11 +1296,18 @@ pub fn index_repo_incremental(
                     to_parse.push(path.clone());
                 }
             }
-        } else if let Some((_, reason)) =
-            previous.failures.iter().find(|(failed, _)| failed == path)
-        {
-            // Unchanged previous failure: do not re-read.
-            failures.push((path.clone(), reason.clone()));
+        } else if let Some(reason) = previous_failures.get(path) {
+            let tries = previous.failure_retries.get(path).copied().unwrap_or(0);
+            if is_transient_failure(reason) && tries < MAX_FAILURE_RETRIES {
+                // A timeout or a read that raced a writer says nothing about
+                // the file itself: try again, a bounded number of times.
+                retried.insert(path.clone(), tries + 1);
+                to_parse.push(path.clone());
+            } else {
+                // Unchanged permanent failure: do not re-read.
+                failures.push((path.clone(), (*reason).clone()));
+                failure_retries.insert(path.clone(), tries);
+            }
         } else {
             lru_misses += 1;
             to_parse.push(path.clone());
@@ -1038,8 +1315,13 @@ pub fn index_repo_incremental(
     }
 
     let reused_count = reused.len();
-    let outcome = parse_paths(root, &to_parse, opts);
+    let outcome = parse_paths(root, &to_parse, opts, false);
     let parsed_count = outcome.parsed.len();
+    for (path, _) in &outcome.failures {
+        if let Some(tries) = retried.get(path) {
+            failure_retries.insert(path.clone(), *tries);
+        }
+    }
     failures.extend(outcome.failures);
     failures.sort();
     report.parse_failures = failures.clone();
@@ -1072,7 +1354,18 @@ pub fn index_repo_incremental(
         excluded_sources: excluded_sources.into_iter().collect(),
         products,
         failures,
+        failure_retries,
     }
+}
+
+/// Retries of a transient parse failure before it is treated as permanent.
+const MAX_FAILURE_RETRIES: u8 = 3;
+
+/// Failures that describe the moment, not the file.
+fn is_transient_failure(reason: &str) -> bool {
+    reason.starts_with("read:")
+        || reason == crate::parse::ParseError::Timeout.to_string()
+        || reason == crate::parse::ParseError::NoTree.to_string()
 }
 
 /// Code file extensions across known programming languages (46 pure programming language extensions).
@@ -1418,10 +1711,19 @@ mod tests {
             report.files_scanned, 1,
             "the file was discovered regardless of its contents"
         );
+        // A syntax-error file is still parsed (partial symbols kept) AND
+        // reported, so incompleteness is never silent.
+        assert_eq!(report.files_parsed, 1);
         assert_eq!(
-            report.files_parsed + report.parse_failures.len(),
+            report.parse_failures.len(),
             1,
-            "every scanned source file is either parsed or reported"
+            "{:?}",
+            report.parse_failures
+        );
+        assert!(
+            report.parse_failures[0].1.starts_with("partial parse"),
+            "{:?}",
+            report.parse_failures
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2242,5 +2544,365 @@ mod tests {
             Language::from_path(&RelPath::new("scripts/main.csx")),
             Some(Language::CSharp)
         );
+    }
+}
+
+#[cfg(test)]
+mod persist_audit_tests {
+    //! Regression tests for the persistent-cache / incremental-size /
+    //! transient-failure audit findings (scan-index-store #3 #4 #5 #7 #9 #11).
+    use super::*;
+    use crate::store::{self, Store};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "astrolabe-persist-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_old(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        age(&p);
+    }
+
+    /// Push mtime far enough back that the stamp logic trusts it.
+    fn age(path: &Path) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    fn names(inc: &IncrementalIndex) -> Vec<String> {
+        inc.graph.symbols.iter().map(|s| s.name.clone()).collect()
+    }
+
+    fn stored_entries(root: &Path) -> u64 {
+        Store::open_read_only(&store_path(root))
+            .unwrap()
+            .expect("store exists")
+            .parse_cache_len()
+            .unwrap()
+    }
+
+    #[test]
+    fn repeated_edits_do_not_grow_the_parse_cache() {
+        let root = scratch("prune");
+        write_old(&root, "keep.py", "def keep():\n    pass\n");
+        write_old(&root, "edit.py", "def v0():\n    pass\n");
+        let opts = IndexOptions::default();
+        IncrementalIndex::build(&root, &opts);
+        assert_eq!(stored_entries(&root), 2);
+        for i in 1..=8 {
+            write_old(&root, "edit.py", &format!("def v{i}():\n    pass\n"));
+            let inc = IncrementalIndex::build(&root, &opts);
+            assert!(names(&inc).contains(&format!("v{i}")));
+        }
+        // Before the fix every edit left one more dead entry (2 + 8).
+        assert_eq!(stored_entries(&root), 2, "stale entries must be pruned");
+    }
+
+    #[test]
+    fn entries_from_other_versions_are_pruned() {
+        let root = scratch("prune-ver");
+        write_old(&root, "a.py", "def a():\n    pass\n");
+        let opts = IndexOptions::default();
+        IncrementalIndex::build(&root, &opts);
+        {
+            let s = Store::open(&store_path(&root)).unwrap();
+            s.put_cached_parse("x0-v0.0.1:python:deadbeef", b"{}")
+                .unwrap();
+            assert_eq!(s.parse_cache_len().unwrap(), 2);
+        }
+        IncrementalIndex::build(&root, &opts);
+        assert_eq!(stored_entries(&root), 1);
+    }
+
+    #[test]
+    fn incremental_apply_never_prunes_unrelated_entries() {
+        let root = scratch("prune-inc");
+        write_old(&root, "a.py", "def a():\n    pass\n");
+        write_old(&root, "b.py", "def b():\n    pass\n");
+        let opts = IndexOptions::default();
+        let inc = IncrementalIndex::build(&root, &opts);
+        write_old(&root, "a.py", "def a2():\n    pass\n");
+        let changes = ChangeSet {
+            added: vec![],
+            modified: vec![RelPath::new("a.py")],
+            removed: vec![],
+        };
+        let inc = inc.apply_changeset(&root, &changes, &opts);
+        assert!(names(&inc).contains(&"a2".to_string()));
+        // b.py's entry survives (a's old one stays until the next cold build).
+        let s = Store::open_read_only(&store_path(&root)).unwrap().unwrap();
+        let (_, sha) = {
+            let src = std::fs::read_to_string(root.join("b.py")).unwrap();
+            let (sha, loc) = digest(&src);
+            (loc, sha)
+        };
+        assert!(s
+            .cached_parse(&store::parse_cache_key(Language::Python, &sha))
+            .unwrap()
+            .is_some());
+    }
+
+    /// Replace the cached payload for `rel` with one that names `decoy`, so a
+    /// test can see whether the cache (not the source) produced the symbols.
+    fn plant_decoy(root: &Path, rel: &str, decoy: &str) {
+        let src = std::fs::read_to_string(root.join(rel)).unwrap();
+        let (sha, _) = digest(&src);
+        let key = store::parse_cache_key(Language::Python, &sha);
+        let parsed = ParsedFile {
+            symbols: vec![CodeSymbol {
+                id: SymbolId(0),
+                file: FileId(0),
+                name: decoy.into(),
+                kind: crate::types::SymbolKind::Function,
+                signature: String::new(),
+                start_line: 1,
+                end_line: 1,
+                exported: true,
+            }],
+            ..ParsedFile::default()
+        };
+        let bytes = store::encode_parsed(&parsed).unwrap();
+        Store::open(&store_path(root))
+            .unwrap()
+            .put_cached_parse(&key, &bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn follower_reads_the_cache_without_writing_it() {
+        let root = scratch("follower");
+        write_old(&root, "a.py", "def real():\n    pass\n");
+        IncrementalIndex::build(&root, &IndexOptions::default());
+        plant_decoy(&root, "a.py", "from_cache");
+        let before = std::fs::metadata(store_path(&root))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let follower = IndexOptions {
+            persist: false,
+            persist_read_only: true,
+            ..IndexOptions::default()
+        };
+        let inc = IncrementalIndex::build(&root, &follower);
+        assert_eq!(names(&inc), vec!["from_cache".to_string()]);
+
+        let off = IndexOptions {
+            persist: false,
+            ..IndexOptions::default()
+        };
+        assert_eq!(
+            names(&IncrementalIndex::build(&root, &off)),
+            vec!["real".to_string()],
+            "persist=false without read-only must not touch the cache"
+        );
+        let after = std::fs::metadata(store_path(&root))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "read-only use must not modify the store");
+    }
+
+    #[test]
+    fn follower_does_not_create_a_missing_store() {
+        let root = scratch("follower-none");
+        write_old(&root, "a.py", "def real():\n    pass\n");
+        let follower = IndexOptions {
+            persist: false,
+            persist_read_only: true,
+            ..IndexOptions::default()
+        };
+        let inc = IncrementalIndex::build(&root, &follower);
+        assert_eq!(names(&inc), vec!["real".to_string()]);
+        assert!(!root.join(".astrolabe").exists());
+    }
+
+    #[test]
+    fn follower_ignores_a_writer_holding_the_lock() {
+        let root = scratch("follower-locked");
+        write_old(&root, "a.py", "def real():\n    pass\n");
+        IncrementalIndex::build(&root, &IndexOptions::default());
+        let _writer = Store::open(&store_path(&root)).unwrap();
+        let follower = IndexOptions {
+            persist: false,
+            persist_read_only: true,
+            ..IndexOptions::default()
+        };
+        let inc = IncrementalIndex::build(&root, &follower);
+        assert_eq!(names(&inc), vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn unchanged_stamp_skips_reading_but_any_change_reparses() {
+        let root = scratch("stamp");
+        write_old(&root, "a.py", "def real():\n    pass\n");
+        let opts = IndexOptions::default();
+        IncrementalIndex::build(&root, &opts);
+        // Point the stamp at a decoy entry that the file's content hash does
+        // NOT lead to: only a run that skips reading can return the decoy.
+        let decoy_key = format!("{}python:decoy", store::parse_cache_key_prefix());
+        {
+            let parsed = ParsedFile {
+                symbols: vec![CodeSymbol {
+                    id: SymbolId(0),
+                    file: FileId(0),
+                    name: "from_stamp".into(),
+                    kind: crate::types::SymbolKind::Function,
+                    signature: String::new(),
+                    start_line: 1,
+                    end_line: 1,
+                    exported: true,
+                }],
+                ..ParsedFile::default()
+            };
+            let s = Store::open(&store_path(&root)).unwrap();
+            s.put_cached_parse(&decoy_key, &store::encode_parsed(&parsed).unwrap())
+                .unwrap();
+            let mut stamp = s.file_stamp("a.py").unwrap().expect("stamp recorded");
+            stamp.key = decoy_key.clone();
+            s.put_file_stamps(&[("a.py".to_string(), stamp)]).unwrap();
+        }
+        let inc = IncrementalIndex::build(&root, &opts);
+        assert_eq!(names(&inc), vec!["from_stamp".to_string()]);
+        // The stamp entry was already live, so nothing was re-stamped to real.
+        // New length -> full read + reparse.
+        write_old(&root, "a.py", "def real_longer():\n    pass\n");
+        let inc = IncrementalIndex::build(&root, &opts);
+        assert_eq!(names(&inc), vec!["real_longer".to_string()]);
+        // Same length, different mtime -> reparse. Re-plant the decoy stamp
+        // for the new state first so a wrong skip would be visible.
+        {
+            let s = Store::open(&store_path(&root)).unwrap();
+            let mut stamp = s.file_stamp("a.py").unwrap().expect("stamp recorded");
+            stamp.key = decoy_key.clone();
+            s.put_cached_parse(
+                &decoy_key,
+                &store::encode_parsed(&ParsedFile::default()).unwrap(),
+            )
+            .unwrap();
+            s.put_file_stamps(&[("a.py".to_string(), stamp)]).unwrap();
+        }
+        write_old(&root, "a.py", "def real_longeR():\n    pass\n");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("a.py"))
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(10))
+            .unwrap();
+        let inc = IncrementalIndex::build(&root, &opts);
+        assert_eq!(names(&inc), vec!["real_longeR".to_string()]);
+    }
+
+    #[test]
+    fn young_files_are_never_stamped() {
+        let root = scratch("stamp-young");
+        // Not aged: mtime is "now", so a same-size rewrite could share it.
+        std::fs::write(root.join("a.py"), "def real():\n    pass\n").unwrap();
+        IncrementalIndex::build(&root, &IndexOptions::default());
+        let s = Store::open(&store_path(&root)).unwrap();
+        assert!(s.file_stamp("a.py").unwrap().is_none());
+    }
+
+    #[test]
+    fn incremental_edit_past_the_size_cap_matches_a_cold_scan() {
+        let root = scratch("toolarge");
+        write_old(&root, "a.py", "def small():\n    pass\n");
+        write_old(&root, "b.py", "def other():\n    pass\n");
+        let opts = IndexOptions {
+            persist: false,
+            scan: ScanOptions {
+                max_file_bytes: 200,
+                ..ScanOptions::default()
+            },
+            ..IndexOptions::default()
+        };
+        let inc = IncrementalIndex::build(&root, &opts);
+        let big: String = (0..40)
+            .map(|i| format!("def f{i}():\n    pass\n"))
+            .collect();
+        assert!(big.len() > 200);
+        write_old(&root, "a.py", &big);
+        let changes = ChangeSet {
+            added: vec![],
+            modified: vec![RelPath::new("a.py")],
+            removed: vec![],
+        };
+        let inc2 = inc.apply_changeset(&root, &changes, &opts);
+        assert!(
+            !names(&inc2).iter().any(|n| n.starts_with('f')),
+            "oversized file must not enter the graph: {:?}",
+            names(&inc2)
+        );
+        assert_eq!(inc2.report.too_large, vec![RelPath::new("a.py")]);
+        let cold = IncrementalIndex::build(&root, &opts);
+        assert_eq!(cold.report.too_large, inc2.report.too_large);
+        assert_eq!(names(&cold), names(&inc2));
+
+        // Shrinking it again brings it back and clears the report.
+        write_old(&root, "a.py", "def small2():\n    pass\n");
+        let inc3 = inc2.apply_changeset(&root, &changes, &opts);
+        assert!(names(&inc3).contains(&"small2".to_string()));
+        assert!(inc3.report.too_large.is_empty());
+    }
+
+    fn with_failure(root: &Path, opts: &IndexOptions, reason: &str, tries: u8) -> IncrementalIndex {
+        let mut prev = IncrementalIndex::build(root, opts);
+        // Pretend the last apply failed on a.py and kept no product for it.
+        prev.products = ParseProductCache::new(1 << 20);
+        prev.failures = vec![(RelPath::new("a.py"), reason.to_owned())];
+        prev.failure_retries.insert(RelPath::new("a.py"), tries);
+        prev
+    }
+
+    fn noop() -> ChangeSet {
+        ChangeSet {
+            added: vec![],
+            modified: vec![],
+            removed: vec![],
+        }
+    }
+
+    #[test]
+    fn transient_failure_is_retried_on_the_next_apply() {
+        let root = scratch("retry");
+        write_old(&root, "a.py", "def real():\n    pass\n");
+        let opts = IndexOptions {
+            persist: false,
+            ..IndexOptions::default()
+        };
+        for reason in ["read: interrupted", "parse exceeded its budget"] {
+            let prev = with_failure(&root, &opts, reason, 0);
+            let next = prev.apply_changeset(&root, &noop(), &opts);
+            assert!(next.failures.is_empty(), "{reason}: {:?}", next.failures);
+            assert!(names(&next).contains(&"real".to_string()));
+        }
+    }
+
+    #[test]
+    fn permanent_or_exhausted_failures_stay_sticky() {
+        let root = scratch("retry-sticky");
+        write_old(&root, "a.py", "def real():\n    pass\n");
+        let opts = IndexOptions {
+            persist: false,
+            ..IndexOptions::default()
+        };
+        let prev = with_failure(&root, &opts, "query error: boom", 0);
+        let next = prev.apply_changeset(&root, &noop(), &opts);
+        assert_eq!(next.failures.len(), 1, "non-transient failure not retried");
+        let prev = with_failure(&root, &opts, "read: busy", MAX_FAILURE_RETRIES);
+        let next = prev.apply_changeset(&root, &noop(), &opts);
+        assert_eq!(next.failures.len(), 1, "retries are capped");
     }
 }

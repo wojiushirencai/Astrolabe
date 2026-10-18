@@ -75,3 +75,9 @@
   type: (_)
   declarator: (variable_declarator
     name: (identifier) @name)) @definition.field
+
+;; Record components are fields: `record Pair(int a, int b)`.
+(record_declaration
+  parameters: (formal_parameters
+    (formal_parameter
+      name: (identifier) @name) @definition.field))

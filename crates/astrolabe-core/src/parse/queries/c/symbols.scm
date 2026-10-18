@@ -47,3 +47,26 @@
 ;; --------------------------------------------------------------- constants
 (enumerator
   name: (identifier) @name) @definition.const
+
+;; ------------------------------------------------------------------ macros
+;; Object-like (`#define K 3`) and function-like (`#define M(x) ...`) macros.
+;; Valueless `#define FOO_H` (include guards, feature switches) are skipped.
+(preproc_def
+  name: (identifier) @name
+  value: (preproc_arg)) @definition.macro
+
+(preproc_function_def
+  name: (identifier) @name) @definition.macro
+
+;; ------------------------------------------------------------------ fields
+;; Struct / union members, including those of anonymous `typedef struct { } T;`.
+(field_declaration
+  declarator: (field_identifier) @name) @definition.field
+
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (field_identifier) @name)) @definition.field
+
+(field_declaration
+  declarator: (array_declarator
+    declarator: (field_identifier) @name)) @definition.field

@@ -149,6 +149,12 @@ fn blank_razor_comment(source: &str, start: usize, out: &mut String) -> usize {
 fn rewrite_leading_directive(source: &str, i: usize, out: &mut String) -> Option<usize> {
     let rest = &source[i..];
     if rest.starts_with("@using") && keyword_boundary(source, i + "@using".len()) {
+        // `@using (var x = ...) { ... }` is a Razor statement, not a directive.
+        let after = source[i + "@using".len()..].trim_start_matches([' ', '\t']);
+        if after.starts_with('(') {
+            blank_range(source, i, i + "@using".len(), out);
+            return Some(i + "@using".len());
+        }
         let mut j = i + 1; // keep the word `using`
         let copy_from = j;
         let bytes = source.as_bytes();
@@ -186,17 +192,41 @@ fn rewrite_leading_directive(source: &str, i: usize, out: &mut String) -> Option
     None
 }
 
-/// `@code` + optional whitespace + `{ ... }`. Outer braces are blanked.
+/// `@code` / `@functions` + optional whitespace + `{ ... }`. The keyword is
+/// replaced by `class __R` and the braces are kept, so members parse as real
+/// class members (fields, properties, methods) with line numbers unchanged.
 fn try_at_code(source: &str, i: usize, out: &mut String) -> Option<usize> {
-    if !source[i..].starts_with("@code") || !keyword_boundary(source, i + "@code".len()) {
-        return None;
-    }
-    let after_kw = i + "@code".len();
+    let kw = ["@code", "@functions"]
+        .into_iter()
+        .find(|k| source[i..].starts_with(k) && keyword_boundary(source, i + k.len()))?;
+    let after_kw = i + kw.len();
     let brace = find_block_open(source, after_kw)?;
-    blank_range(source, i, after_kw, out);
-    // Whitespace between `@code` and `{` keeps its newlines.
+    out.push_str("class __R");
+    // Whitespace between the keyword and `{` keeps its newlines.
     out.push_str(&source[after_kw..brace]);
-    Some(splice_block(source, brace, out))
+    Some(copy_block_keep_braces(source, brace, out))
+}
+
+/// Copy a `{ ... }` block verbatim, including both outer braces.
+fn copy_block_keep_braces(source: &str, open: usize, out: &mut String) -> usize {
+    out.push('{');
+    let mut i = open + 1;
+    let mut depth = 1;
+    while i < source.len() && depth > 0 {
+        if let Some(next) = copy_opaque(source, i, out) {
+            i = next;
+            continue;
+        }
+        let c = source[i..].chars().next().unwrap();
+        out.push(c);
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+        }
+        i += c.len_utf8();
+    }
+    i
 }
 
 fn find_block_open(source: &str, mut i: usize) -> Option<usize> {
@@ -597,5 +627,29 @@ mod tests {
             .symbols
             .iter()
             .all(|s| s.name != "MarkupOnlyTitle" && s.name != "NotASymbol"));
+    }
+
+    #[test]
+    fn code_block_members_and_using_statement() {
+        let src = "@using (var c = new Disposable())\n{\n    <p>x</p>\n}\n@code {\n    [Parameter] public string Title { get; set; }\n    private int count;\n    private const int Max = 3;\n    void Inc() { count++; }\n}\n";
+        let ex = extract_razor_csharp(src);
+        assert_eq!(newlines(src), newlines(&ex));
+        assert!(ex.contains("class __R"), "{ex}");
+        assert!(!ex.contains("using (var"), "{ex}");
+        let pool = ParserPool::new();
+        let p = pool
+            .parse(Language::CSharp, &RelPath::new("C.razor"), src)
+            .unwrap();
+        let find = |n: &str| p.symbols.iter().find(|s| s.name == n);
+        for n in ["Title", "count", "Max", "Inc"] {
+            assert!(find(n).is_some(), "missing {n}: {:?}", p.symbols);
+        }
+        assert_eq!(find("Inc").unwrap().kind, crate::types::SymbolKind::Method);
+        assert_eq!(find("Inc").unwrap().start_line, 9);
+        assert!(
+            !p.calls.iter().any(|(c, _)| c.contains("Disposable")),
+            "{:?}",
+            p.calls
+        );
     }
 }

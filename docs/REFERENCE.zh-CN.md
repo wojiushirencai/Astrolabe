@@ -72,9 +72,9 @@ Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、�
 | `ASTROLABE_LSP_DART` | 覆盖 Dart 语言服务器（`dart language-server`）可执行文件路径 | 自动探测（随 Dart/Flutter SDK 自带） |
 | `ASTROLABE_LSP_<LANG>` | 覆盖指定语言 LSP 服务器可执行文件路径（如 `ASTROLABE_LSP_PYTHON`, `ASTROLABE_LSP_RUST`, `ASTROLABE_LSP_C` 等） | 自动探测对应 LSP |
 | `ASTROLABE_SEARCH_REPEAT_MAX` | 防循环：同一条 `search_code` / `find_symbol` 查询（查询串 + path_filter + 选项（含 budget_tokens、offset）完全相同）在窗口内最多执行几次，超出后不再重新搜索，直接返回“已执行过、请使用先前结果或换方法”的短提示（`0` 关闭） | `3` |
-| `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` | 上述重复查询的滑动窗口秒数 | `600` |
+| `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` | 上述重复查询的滑动窗口秒数；`0` 关闭重复拦截 | `600` |
 | `ASTROLABE_SEARCH_RATE_MAX` | 防循环：窗口内搜索工具（`search_code` + `find_symbol`）总调用次数超过该值后，在结果末尾追加循环警告（仍正常返回结果；`0` 关闭） | `300` |
-| `ASTROLABE_SEARCH_RATE_WINDOW_SECS` | 上述总频率的滑动窗口秒数 | `600` |
+| `ASTROLABE_SEARCH_RATE_WINDOW_SECS` | 上述总频率的滑动窗口秒数；`0` 关闭频率告警 | `600` |
 | `ASTROLABE_SLICE_READ_MAX` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为切片读 | `200` |
 | `ASTROLABE_SLICE_READ_THRESHOLD` | 连续切片读提醒阈值：连续 N 次切片读且期间无任何 Astrolabe 工具调用时触发 deny | `10` |
 | `ASTROLABE_READ_THRESHOLD` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） | `3` |

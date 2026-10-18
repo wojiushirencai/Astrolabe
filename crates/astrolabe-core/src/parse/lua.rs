@@ -15,6 +15,7 @@ use crate::types::SymbolKind;
 /// Final symbol name / kind for one `@definition.*` match.
 pub(super) fn symbol_name(
     definition: tree_sitter::Node<'_>,
+    name_node: tree_sitter::Node<'_>,
     name: &str,
     kind: SymbolKind,
     source: &str,
@@ -34,10 +35,20 @@ pub(super) fn symbol_name(
         return (name.to_owned(), kind);
     };
     let mut cursor = targets.walk();
-    let found = targets
+    let all: Vec<_> = targets
         .children_by_field_name("name", &mut cursor)
         .enumerate()
-        .find(|(_, target)| last_segment(*target, source) == Some(name));
+        .filter(|(_, target)| last_segment(*target, source) == Some(name))
+        .collect();
+    // Same name on several targets (`a.x, b.x = 1, function…`): pick the
+    // target the matched `@name` node belongs to.
+    let found = all
+        .iter()
+        .find(|(_, t)| {
+            last_segment_node(*t).is_some_and(|n| n.byte_range() == name_node.byte_range())
+        })
+        .or(all.first())
+        .copied();
     let Some((index, target)) = found else {
         return (name.to_owned(), kind);
     };
@@ -50,7 +61,10 @@ pub(super) fn symbol_name(
     });
     let kind = if value.is_some_and(|v| v.kind() == "function_definition") {
         SymbolKind::Function
-    } else if target.kind() == "dot_index_expression" {
+    } else if matches!(
+        target.kind(),
+        "dot_index_expression" | "bracket_index_expression"
+    ) {
         SymbolKind::Field
     } else {
         kind
@@ -65,7 +79,7 @@ pub(super) fn symbol_name(
 /// they are later returned, which a syntactic pass cannot see cheaply, so
 /// only `local` declarations at chunk level are reported as not exported.
 /// Members (`M.f`, `M:f`, table fields) and globals are exported.
-pub(super) fn exported(_name: &str, node: tree_sitter::Node<'_>, source: &str) -> bool {
+pub(super) fn exported(name: &str, node: tree_sitter::Node<'_>, source: &str) -> bool {
     let is_local = match node.kind() {
         "variable_declaration" => starts_with_keyword(node, source, "local"),
         "function_declaration" => {
@@ -76,7 +90,35 @@ pub(super) fn exported(_name: &str, node: tree_sitter::Node<'_>, source: &str) -
         }
         _ => false,
     };
-    !is_local
+    !is_local || returned_at_chunk_end(name, node, source)
+}
+
+/// `local M = {} … return M`: the returned binding is the module's export.
+fn returned_at_chunk_end(name: &str, node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let decl = if node.kind() == "function_declaration" {
+        node.parent().unwrap_or(node)
+    } else {
+        node
+    };
+    let Some(chunk) = decl.parent().filter(|p| p.kind() == "chunk") else {
+        return false;
+    };
+    let mut c = chunk.walk();
+    let found = chunk
+        .named_children(&mut c)
+        .filter(|n| n.kind() == "return_statement")
+        .any(|ret| {
+            let mut c2 = ret.walk();
+            let found = ret.named_children(&mut c2).any(|list| {
+                let mut c3 = list.walk();
+                let found = list.named_children(&mut c3).any(|e| {
+                    e.kind() == "identifier" && e.utf8_text(source.as_bytes()) == Ok(name)
+                });
+                found
+            });
+            found
+        });
+    found
 }
 
 fn starts_with_keyword(node: tree_sitter::Node<'_>, source: &str, keyword: &str) -> bool {
@@ -94,13 +136,25 @@ fn named_child_of_kind<'t>(
     found
 }
 
+fn last_segment_node<'t>(target: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+    match target.kind() {
+        "identifier" => Some(target),
+        "dot_index_expression" => target.child_by_field_name("field"),
+        // `M['key']`: the string content of a literal key.
+        "bracket_index_expression" => {
+            let key = target.child_by_field_name("field")?;
+            if key.kind() == "string" {
+                key.child_by_field_name("content")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn last_segment<'s>(target: tree_sitter::Node<'_>, source: &'s str) -> Option<&'s str> {
-    let node = match target.kind() {
-        "identifier" => target,
-        "dot_index_expression" => target.child_by_field_name("field")?,
-        _ => return None,
-    };
-    node.utf8_text(source.as_bytes()).ok()
+    last_segment_node(target)?.utf8_text(source.as_bytes()).ok()
 }
 
 #[cfg(test)]
@@ -182,6 +236,28 @@ mod tests {
             .filter(|n| n.chars().all(|c| c.is_alphanumeric() || c == '_'))
             .collect();
         assert_eq!(names, vec!["f", "g", "h", "i", "j"]);
+    }
+
+    #[test]
+    fn bracket_keys_return_export_and_same_name_targets() {
+        use SymbolKind::*;
+        let got = kinds(
+            "local M = {}\nlocal helper = 1\nM['c'] = function() end\nM[\"d\"] = 5\na.x, b.x = 1, function() end\nreturn M\n",
+        );
+        let find = |n: &str, l: u32| {
+            got.iter()
+                .find(|g| g.0 == n && g.2 == l)
+                .unwrap_or_else(|| panic!("missing {n}@{l}: {got:?}"))
+                .clone()
+        };
+        assert_eq!(find("c", 3).1, Function);
+        assert_eq!(find("d", 4).1, Field);
+        assert!(find("M", 1).3, "returned M is exported");
+        assert!(!find("helper", 2).3);
+        let xs: Vec<_> = got.iter().filter(|g| g.0 == "x").collect();
+        assert_eq!(xs.len(), 2, "{got:?}");
+        assert!(xs.iter().any(|g| g.1 == Function), "{xs:?}");
+        assert!(xs.iter().any(|g| g.1 == Field), "{xs:?}");
     }
 
     #[test]

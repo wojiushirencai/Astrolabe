@@ -11,17 +11,18 @@ use std::{
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
     cache::DEFAULT_MEMORY_BUDGET_BYTES,
-    graph::{compute_centrality, rank_for_task},
+    graph::{cached_centrality, match_task, rank_for_task},
     render::{confidence_note, symbol_line},
     CodeSymbol, Confidence, FileId,
 };
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CacheScope, CallToolResult, ContentBlock, Implementation, InitializeRequestParams,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-        ResourceContents, ServerCapabilities, ServerConfig,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        CustomRequest, CustomResult, Implementation, InitializeRequestParams, InitializeResult,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+        ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler,
@@ -46,6 +47,8 @@ use crate::{
 pub(crate) use crate::session::IndexState;
 
 const DEFAULT_BUDGET: usize = 2_500;
+/// `resolve_context` budget for counting/caller tasks (~3 KB of output).
+const COMPACT_CONTEXT_BUDGET: usize = 700;
 /// 资源卸载阈值基线：正文 token 估算超过阈值（含 SLACK）时转存为
 /// MCP resource。`ASTROLABE_RESOURCE_THRESHOLD` 可调，格式错误回退默认。
 pub(crate) const DEFAULT_RESOURCE_THRESHOLD_TOKENS: usize = 4_000;
@@ -218,12 +221,13 @@ fn data_hits_outside(
     filter: &str,
     query: &str,
     sensitive: bool,
+    excluded: &dyn Fn(&str) -> bool,
 ) -> String {
     let rels: Vec<&str> = index
         .text_only_paths(None)
         .into_iter()
         .map(|p| p.as_str())
-        .filter(|p| !p.contains(filter) && is_data_fixture(p))
+        .filter(|p| !p.contains(filter) && is_data_fixture(p) && !excluded(p))
         .collect();
     if rels.is_empty() {
         return String::new();
@@ -432,8 +436,7 @@ fn hit_role(is_test: bool, text: &str) -> &'static str {
     if is_comment_line(text) {
         return "注释";
     }
-    let t = text.to_lowercase();
-    let any = |keys: &[&str]| keys.iter().any(|k| t.contains(k));
+    let any = |keys: &[&str]| keys.iter().any(|k| contains_word_start(text, k));
     if is_test {
         if any(&[
             "assert", "expect", "require.", "require(", "want", "equal", "eq!(", "should", "tobe",
@@ -472,6 +475,34 @@ fn hit_role(is_test: bool, text: &str) -> &'static str {
     } else {
         "使用"
     }
+}
+
+/// ASCII-case-insensitive `contains` where a key starting with a letter or
+/// digit must begin at a word start (`read` matches `read_file` / `readFile` /
+/// `.read(` but not `thread`, `spread`, `download`). Keys that start with
+/// punctuation are plain substrings.
+fn contains_word_start(text: &str, key: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let needs_boundary = key
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric());
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(key) {
+        let i = from + pos;
+        if !needs_boundary || i == 0 {
+            return true;
+        }
+        let prev = bytes[i - 1];
+        let cur = bytes[i];
+        if !prev.is_ascii_alphanumeric() || (prev.is_ascii_lowercase() && cur.is_ascii_uppercase())
+        {
+            return true;
+        }
+        from = i + key.len();
+    }
+    false
 }
 
 /// A line that is only a comment (`//`, `///`, `#`, `--`, `/* */`, `*`, `<!--`).
@@ -555,7 +586,7 @@ fn closure_line(hits: &[SearchHit], shown: usize, offset: usize, broad: bool) ->
     let listed = offset + shown;
     if listed >= total {
         format!(
-            "汇总：{total}/{total} 处命中 / {files} 个文件，无截断，已全部列出（结果完整，无需重查）。\n"
+            "汇总：{total}/{total} 行命中 / {files} 个文件，无截断，已全部列出（结果完整，无需重查）。\n"
         )
     } else {
         let cont = if broad {
@@ -564,15 +595,33 @@ fn closure_line(hits: &[SearchHit], shown: usize, offset: usize, broad: bool) ->
             format!("offset={listed} 继续")
         };
         format!(
-            "汇总：已列 {listed}/{total} 处命中 / {files} 个文件，有截断，未列全（不完整；{cont}，或用 path_filter/exclude/aggregate 收窄）。\n"
+            "汇总：已列 {listed}/{total} 行命中 / {files} 个文件，有截断，未列全（不完整；{cont}，或用 path_filter/exclude/aggregate 收窄）。\n"
         )
     }
+}
+
+/// Closing line of a `group=true` page. Grouped output is not a prefix of the
+/// hit list, so a truncated page must not suggest `offset=` (which would not
+/// continue it).
+fn grouped_closure_line(hits: &[SearchHit], shown: usize) -> String {
+    let total = hits.len();
+    if shown >= total {
+        return closure_line(hits, shown, 0, false);
+    }
+    let files = hits
+        .iter()
+        .map(|h| h.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    format!(
+        "汇总：已列 {shown}/{total} 行命中 / {files} 个文件，有截断，未列全（不完整；分组视图不能用 offset 翻页：用 group=false 再 offset={shown} 逐页，或用 path_filter/exclude/aggregate 收窄）。\n"
+    )
 }
 
 /// Next-step line for results with many hits (> `GROUP_FULL_HITS`).
 fn many_hits_hint(total: usize) -> String {
     if total > GROUP_FULL_HITS {
-        "下一步：要统计各目录/各文件有多少处（计数、调用次数）用 aggregate=top|dir|file（可加 skip_comments=true、exclude=[\"_test.go\",\"vendor\"]）；要批量改名用 find_references dry_run_rename。\n".to_string()
+        "下一步：要统计各目录/各文件有多少行命中（按行计，同一行多次出现只算 1；要精确出现次数请另用 rg -o）用 aggregate=top|dir|file（可加 skip_comments=true、exclude=[\"_test.go\",\"vendor\"]）；要批量改名用 find_references dry_run_rename。\n".to_string()
     } else {
         String::new()
     }
@@ -582,7 +631,29 @@ fn many_hits_hint(total: usize) -> String {
 fn is_doc_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     let ext = p.rsplit_once('.').map_or("", |(_, e)| e);
-    matches!(ext, "md" | "mdx" | "rst" | "txt" | "adoc")
+    let stem = p
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.split('.').next())
+        .unwrap_or("");
+    // `.txt` is prose only for README-like names; CMakeLists.txt,
+    // requirements.txt etc. are build/config files.
+    let readme_like = matches!(
+        stem,
+        "readme"
+            | "notes"
+            | "changelog"
+            | "changes"
+            | "license"
+            | "authors"
+            | "todo"
+            | "contributing"
+            | "history"
+            | "news"
+            | "install"
+    );
+    matches!(ext, "md" | "mdx" | "rst" | "adoc")
+        || (ext == "txt" && readme_like)
         || p.starts_with("docs/")
         || p.starts_with("doc/")
         || p.contains("/docs/")
@@ -616,7 +687,7 @@ fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
         row.1.insert(path);
     }
     let mut out = format!(
-        "计数：总计 {total} 处命中 / {} 个文件 / {} 个目录 / {} 个顶层目录（完整计数）。\n",
+        "计数：总计 {total} 行命中 / {} 个文件 / {} 个目录 / {} 个顶层目录（完整计数；按行计，同一行出现多次只算 1 行，不是出现次数）。\n",
         all_files.len(),
         dirs.len(),
         tops.len()
@@ -632,20 +703,20 @@ fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
             Some("dir") => "每个目录",
             _ => "每个文件",
         };
-        out.push_str(&format!("{label}: N 处 / M 个文件\n"));
+        out.push_str(&format!("{label}: N 行 / M 个文件\n"));
         let suffix = if aggregate == Some("file") { "" } else { "/" };
         for (key, n, f) in rows.iter().take(MAX_ROWS) {
-            out.push_str(&format!("  {n:>5} 处 / {f:>4} 个文件  {key}{suffix}\n"));
+            out.push_str(&format!("  {n:>5} 行 / {f:>4} 个文件  {key}{suffix}\n"));
         }
         if rows.len() > MAX_ROWS {
             let rest: usize = rows[MAX_ROWS..].iter().map(|r| r.1).sum();
             out.push_str(&format!(
-                "  …其余 {} 项共 {rest} 处（已计入总计）\n",
+                "  …其余 {} 项共 {rest} 行（已计入总计）\n",
                 rows.len() - MAX_ROWS
             ));
         }
         out.push_str(&format!(
-            "  {total:>5} 处 / {:>4} 个文件  总计\n",
+            "  {total:>5} 行 / {:>4} 个文件  总计\n",
             all_files.len()
         ));
     }
@@ -702,10 +773,21 @@ fn search_digest(index: &RepoIndex, hits: &[SearchHit]) -> String {
         .map(|(f, n)| format!("{f}×{n}"))
         .collect();
     let mut out = format!(
-        "{} 处命中 / {n_files} 个文件；最多：{}",
+        "{} 行命中 / {n_files} 个文件；最多：{}",
         hits.len(),
         top.join("、")
     );
+    let samples: Vec<String> = hits
+        .iter()
+        .take(3)
+        .map(|h| {
+            let text: String = h.text.trim().chars().take(100).collect();
+            format!("@{}:{} {text}", h.path, h.line)
+        })
+        .collect();
+    if !samples.is_empty() {
+        out.push_str(&format!("；前几处：{}", samples.join(" | ")));
+    }
     if let Some(first) = hits.first() {
         out.push_str(&format!("；首处 {}:{}", first.path, first.line));
         if !first.text_only {
@@ -721,34 +803,98 @@ fn search_digest(index: &RepoIndex, hits: &[SearchHit]) -> String {
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskKind {
+    Rename,
+    Refs,
+    Count,
+    Other,
+}
+
+fn ascii_words(t: &str) -> Vec<String> {
+    t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `phrase` (space-separated lowercase words) occurs in `words` as whole words.
+fn has_phrase(words: &[String], phrase: &str) -> bool {
+    let p: Vec<&str> = phrase.split(' ').collect();
+    words
+        .windows(p.len())
+        .any(|w| w.iter().zip(&p).all(|(a, b)| a == b))
+}
+
+/// Classify the task wording. English keywords match whole words only
+/// (`account` is not `count`); callers/references win over counting because
+/// "how many callers of X" needs the call sites first.
+fn classify_task(task: &str) -> TaskKind {
+    let t = task.to_lowercase();
+    let words = ascii_words(&t);
+    let any_word = |keys: &[&str]| keys.iter().any(|k| words.iter().any(|w| w == k));
+    let zh = |keys: &[&str]| keys.iter().any(|k| t.contains(k));
+
+    let refs = any_word(&["caller", "callers", "usages", "usage", "references"])
+        || has_phrase(&words, "who calls")
+        || has_phrase(&words, "called by")
+        || zh(&["谁调用", "调用方", "引用"]);
+    // "count" is a counting task only in verb/noun-phrase use, not as a bare
+    // trailing word (`account balance count`).
+    let count_verb = words.iter().enumerate().any(|(i, w)| {
+        if w != "count" && w != "counts" && w != "counting" {
+            return false;
+        }
+        let prev = i.checked_sub(1).map(|j| words[j].as_str());
+        let next = words.get(i + 1).map(String::as_str);
+        let lead = [
+            "to", "and", "then", "please", "just", "also", "can", "you", "i", "we", "need", "want",
+            "should", "must",
+        ];
+        let tail = [
+            "of",
+            "the",
+            "all",
+            "how",
+            "each",
+            "every",
+            "occurrences",
+            "usages",
+            "calls",
+            "lines",
+            "files",
+            "matches",
+            "per",
+            "by",
+            "in",
+            "total",
+        ];
+        i == 0 || prev.is_some_and(|p| lead.contains(&p)) || next.is_some_and(|n| tail.contains(&n))
+    });
+    let count = count_verb
+        || has_phrase(&words, "how many")
+        || has_phrase(&words, "number of")
+        || zh(&["多少", "统计", "每个目录", "分布", "调用次数"]);
+
+    if refs {
+        TaskKind::Refs
+    } else if count {
+        TaskKind::Count
+    } else if any_word(&["rename", "renaming"]) || zh(&["重命名", "改名", "批量改", "替换"])
+    {
+        TaskKind::Rename
+    } else {
+        TaskKind::Other
+    }
+}
+
 /// One-line pointer to the follow-up tool that fits the task wording.
 fn next_step_hint(task: &str) -> &'static str {
-    let t = task.to_lowercase();
-    let has = |keys: &[&str]| keys.iter().any(|k| t.contains(k));
-    if has(&["rename", "重命名", "改名", "批量改", "替换"]) {
-        "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后 get_diagnostics 验证。\n"
-    } else if has(&[
-        "多少",
-        "统计",
-        "count",
-        "how many",
-        "每个目录",
-        "分布",
-        "调用次数",
-    ]) {
-        "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 处 / M 个文件计数；只要总数加 count_only=true。\n"
-    } else if has(&[
-        "谁调用",
-        "调用方",
-        "caller",
-        "callers",
-        "引用",
-        "usages",
-        "references",
-    ]) {
-        "下一步：find_references(symbol) 取精确调用点；定义用 goto_definition。\n"
-    } else {
-        "下一步：已知名字用 find_symbol（include_body=true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n"
+    match classify_task(task) {
+        TaskKind::Rename => "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后 get_diagnostics 验证。\n",
+        TaskKind::Count => "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 行 / M 个文件计数（按行计，同一行多次出现算 1）；只要总数加 count_only=true。\n",
+        TaskKind::Refs => "下一步：find_references(symbol) 取精确调用点；定义用 goto_definition。\n",
+        TaskKind::Other => "下一步：已知名字用 find_symbol（include_body=true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n",
     }
 }
 
@@ -1194,6 +1340,9 @@ fn structured_output_for(context: &ClientContext) -> bool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct BudgetOnly {
+    #[serde(default)]
+    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    pub root: Option<String>,
     #[serde(default = "default_budget")]
     #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
@@ -1201,15 +1350,24 @@ pub(crate) struct BudgetOnly {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ResolveContextParams {
+    #[serde(default)]
+    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    pub root: Option<String>,
     #[schemars(description = "Natural-language coding task description.")]
     pub task_description: String,
     #[serde(default = "default_budget")]
     #[schemars(description = "Maximum approximate token budget.")]
     pub budget_tokens: usize,
+    #[serde(default)]
+    #[schemars(description = "false: resend full result for a repeated identical call.")]
+    pub dedup: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct QueryParams {
+    #[serde(default)]
+    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    pub root: Option<String>,
     #[schemars(
         description = "Symbol name, substring, or hierarchical path ('Class/method', 'pkg.Func')."
     )]
@@ -1252,7 +1410,7 @@ pub(crate) struct QueryParams {
 
 /// Valid `kind` filter names for path queries (case-insensitive).
 const VALID_KIND_NAMES: &str =
-    "function, method, class, interface, struct, enum, trait, type, const, module, field";
+    "function, method, class, interface, struct, enum, trait, type, const, module, field, variable";
 
 /// SymbolKind 名字（schema 字符串）→ 枚举。未知名字返回 Err（列出有效值）。
 fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
@@ -1269,6 +1427,7 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
         "const" => K::Const,
         "module" => K::Module,
         "field" => K::Field,
+        "variable" => K::Variable,
         other => {
             return Err(format!("未知 kind `{other}`；有效值：{VALID_KIND_NAMES}"));
         }
@@ -1277,6 +1436,9 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
+    #[serde(default)]
+    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    pub root: Option<String>,
     #[schemars(
         description = "Search string (case-insensitive literal, or regex when regex=true)."
     )]
@@ -1336,6 +1498,84 @@ pub(crate) struct SearchParams {
     pub skip_comments: bool,
 }
 
+/// Max offloaded results kept for `resources/read`.
+const RESOURCE_MAX_ENTRIES: usize = 64;
+/// Max total bytes of offloaded results kept for `resources/read`.
+const RESOURCE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// LRU store for offloaded tool results. Bounded by entry count and bytes;
+/// the URI carries a per-process nonce so a counter restarted by a new server
+/// process never reuses an old client-cached URI.
+#[derive(Debug)]
+pub(crate) struct ResourceStore {
+    map: HashMap<String, String>,
+    /// Least recently used first.
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+    pub(crate) nonce: String,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl ResourceStore {
+    fn new() -> Self {
+        Self::with_limits(RESOURCE_MAX_ENTRIES, RESOURCE_MAX_BYTES)
+    }
+
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let mixed = (nanos as u64) ^ (u64::from(std::process::id()) << 32);
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            nonce: format!("{:08x}", (mixed ^ (mixed >> 32)) as u32),
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    fn insert(&mut self, uri: String, body: String) {
+        if let Some(old) = self.map.remove(&uri) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+            self.order.retain(|u| u != &uri);
+        }
+        self.bytes += body.len();
+        self.map.insert(uri.clone(), body);
+        self.order.push_back(uri);
+        while self.order.len() > 1
+            && (self.order.len() > self.max_entries || self.bytes > self.max_bytes)
+        {
+            if let Some(victim) = self.order.pop_front() {
+                if let Some(old) = self.map.remove(&victim) {
+                    self.bytes = self.bytes.saturating_sub(old.len());
+                }
+            }
+        }
+    }
+
+    /// Fetch and mark as most recently used.
+    fn get(&mut self, uri: &str) -> Option<String> {
+        let text = self.map.get(uri)?.clone();
+        self.order.retain(|u| u != uri);
+        self.order.push_back(uri.to_string());
+        Some(text)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &String> {
+        self.map.values()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
     /// Parent (multi) or the single index root. Memory tools use this;
@@ -1344,7 +1584,7 @@ pub struct AstrolabeServer {
     primary: Arc<RootSession>,
     dispatch: Option<Arc<DispatchState>>,
     ticker_stop: Arc<AtomicBool>,
-    resources: Arc<Mutex<BTreeMap<String, String>>>,
+    resources: Arc<Mutex<ResourceStore>>,
     next_resource: Arc<AtomicU64>,
     cache_budget_bytes: u64,
     context: ClientContext,
@@ -1468,7 +1708,7 @@ impl AstrolabeServer {
             primary,
             dispatch,
             ticker_stop: Arc::new(AtomicBool::new(false)),
-            resources: Arc::new(Mutex::new(BTreeMap::new())),
+            resources: Arc::new(Mutex::new(ResourceStore::new())),
             next_resource: Arc::new(AtomicU64::new(1)),
             context,
             structured_output,
@@ -1498,15 +1738,6 @@ impl AstrolabeServer {
         }
     }
 
-    fn join_hint(parts: &[&str]) -> String {
-        parts
-            .iter()
-            .copied()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
     fn session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
         match &self.dispatch {
             None => Ok(Arc::clone(&self.primary)),
@@ -1515,6 +1746,181 @@ impl AstrolabeServer {
                 Err(msg) => Err(self.finish(text_error(msg))),
             },
         }
+    }
+
+    /// Resolve which sub-repo a call targets. Priority: explicit `root` >
+    /// `path` (absolute under a child, or starting with the child's name,
+    /// rewritten to a child-relative path) > task-text mention (only when
+    /// `text` is given; noted in the result) > the only resident child.
+    /// Single-repo servers ignore all of it. The returned `hint` is the
+    /// child's absolute path, which downstream routing matches exactly.
+    fn resolve_route(
+        &self,
+        root: Option<&str>,
+        path: Option<&str>,
+        text: Option<&str>,
+    ) -> Result<RouteOutcome, CallToolResult> {
+        let keep_path = path.map(str::to_string);
+        let Some(dispatch) = &self.dispatch else {
+            return Ok(RouteOutcome {
+                hint: String::new(),
+                path: keep_path,
+                note: None,
+            });
+        };
+        let root = root.map(str::trim).filter(|r| !r.is_empty());
+        let disp = dispatch
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let outcome = if let Some(r) = root {
+            match disp.route_explicit(r) {
+                Some(child) => {
+                    let rel = path.map(|p| relativize_to_child(child, p));
+                    Some((child.to_path_buf(), rel.or(keep_path.clone()), None))
+                }
+                None => {
+                    drop(disp);
+                    return Err(self.finish(text_error(format!(
+                        "root `{r}` 不匹配任何子仓。\n{}",
+                        session::unroutable_message(&dispatch.children)
+                    ))));
+                }
+            }
+        } else if let Some((child, rest)) = path.and_then(|p| disp.route_path(p)) {
+            Some((child.to_path_buf(), Some(rest), None))
+        } else if let Some(child) = text.and_then(|t| disp.route(t)) {
+            let note = format!(
+                "路由说明：按任务文本中的名称猜测路由到子仓 {}；要指定子仓请传 root 参数。",
+                child.display()
+            );
+            Some((child.to_path_buf(), keep_path.clone(), Some(note)))
+        } else {
+            disp.sole_resident()
+                .map(|child| (child.to_path_buf(), keep_path.clone(), None))
+        };
+        drop(disp);
+        match outcome {
+            Some((child, path, note)) => Ok(RouteOutcome {
+                hint: child.to_string_lossy().into_owned(),
+                path: path.filter(|p| !p.is_empty()),
+                note,
+            }),
+            None => Err(self.finish(text_error(session::unroutable_message(&dispatch.children)))),
+        }
+    }
+
+    fn with_route_note(result: CallToolResult, note: &Option<String>) -> CallToolResult {
+        match note {
+            Some(note) => append_stale_note(result, note),
+            None => result,
+        }
+    }
+
+    /// The routed session, when its index is still in the cold build.
+    fn building_session(&self, hint: &str) -> Option<Arc<RootSession>> {
+        let session = self.session_for(hint).ok()?;
+        let building = matches!(
+            &*session.state.read().unwrap_or_else(|e| e.into_inner()),
+            IndexState::Building
+        );
+        building.then_some(session)
+    }
+
+    /// `search_code` while the index is still building: a plain literal scan
+    /// of the files on disk (`[text-only]`, no symbol context), so the first
+    /// calls after startup get an answer instead of "try again later".
+    fn search_while_building(
+        &self,
+        session: &RootSession,
+        params: &SearchParams,
+    ) -> CallToolResult {
+        const MAX_SHOWN: usize = 60;
+        const MAX_SECONDS: u64 = 20;
+        let matcher = match build_search_matcher(&params.query, params.regex, params.case_sensitive)
+        {
+            Ok(matcher) => matcher,
+            Err(error) => return text_error(format!("无效正则表达式：{error}")),
+        };
+        let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
+            Ok(set) => set,
+            Err(message) => return text_error(message),
+        };
+        let started = std::time::Instant::now();
+        let scanned = astrolabe_core::scan::scan(
+            &session.root,
+            &astrolabe_core::scan::ScanOptions::default(),
+        );
+        let mut total = 0usize;
+        let mut files_hit = 0usize;
+        let mut lines: Vec<String> = Vec::new();
+        let mut complete = true;
+        for rel in &scanned.files {
+            let path = rel.as_str();
+            if params
+                .path_filter
+                .as_deref()
+                .is_some_and(|f| !path.contains(f))
+                || exclude_set.as_ref().is_some_and(|set| set.is_match(path))
+            {
+                continue;
+            }
+            if cancel::is_cancelled() || started.elapsed().as_secs() >= MAX_SECONDS {
+                complete = false;
+                break;
+            }
+            let Ok(text) = std::fs::read_to_string(session.root.join(path)) else {
+                continue;
+            };
+            let mut file_hit = false;
+            for (idx, line) in text.lines().enumerate() {
+                if !matcher.is_match(line) {
+                    continue;
+                }
+                file_hit = true;
+                total += 1;
+                if total > params.offset && lines.len() < MAX_SHOWN && !params.count_only {
+                    lines.push(format!(
+                        "{path}:{}: {}",
+                        idx + 1,
+                        clip_match_line(line, &params.query, Some(&matcher))
+                    ));
+                }
+            }
+            if file_hit {
+                files_hit += 1;
+            }
+        }
+        let mut body = String::from(
+            "confidence: exact (磁盘源码字面扫描；索引仍在后台构建，本结果无符号/角色标注，[text-only])\n",
+        );
+        body.push_str(&render_search_mode_header(params.regex, &params.query));
+        if params.aggregate.is_some() {
+            body.push_str("aggregate 需索引就绪后才分组，此处只给总数。\n");
+        }
+        for line in &lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        let shown = lines.len();
+        if complete {
+            body.push_str(&format!(
+                "{total} 处 / {files_hit} 个文件（全部已扫描），显示 {shown} 条{}。索引就绪后同一查询会带符号标注。\n",
+                if total > params.offset + shown && !params.count_only {
+                    "；其余用 offset 翻页"
+                } else {
+                    ""
+                }
+            ));
+        } else {
+            body.push_str(&format!(
+                "已扫描部分文件即停止（超时或取消）：至少 {total} 处 / {files_hit} 个文件，结果不完整。索引就绪后重查。\n"
+            ));
+        }
+        self.finish_at(
+            &session.root,
+            CallToolResult::success(vec![ContentBlock::text(body)]),
+        )
     }
 
     fn with_index(
@@ -1539,6 +1945,9 @@ impl AstrolabeServer {
         barrier: bool,
         f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
     ) -> CallToolResult {
+        if cancel::is_cancelled() {
+            return text_error("请求已取消。confidence: unknown");
+        }
         let session = match self.session_for(hint) {
             Ok(s) => s,
             Err(err) => return err,
@@ -1598,6 +2007,13 @@ impl AstrolabeServer {
     fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| !self.context.excludes(tool.name.as_ref()));
+        for tool in &mut tools {
+            let mut schema = Value::Object((*tool.input_schema).clone());
+            slim_schema(&mut schema);
+            if let Value::Object(slim) = schema {
+                tool.input_schema = Arc::new(slim);
+            }
+        }
         if self.context.openai_tool_compatible() {
             for tool in &mut tools {
                 let schema = Value::Object((*tool.input_schema).clone());
@@ -1749,11 +2165,10 @@ impl AstrolabeServer {
         let threshold = self.resource_threshold_for(budget);
         if estimate_tokens(&body) > threshold.saturating_add(RESOURCE_SLACK_TOKENS) {
             let id = self.next_resource.fetch_add(1, Ordering::Relaxed);
-            let uri = format!("astrolabe://results/{id}");
-            self.resources
-                .lock()
-                .expect("resource lock poisoned")
-                .insert(uri.clone(), body.clone());
+            let mut store = self.resources.lock().unwrap_or_else(|e| e.into_inner());
+            let uri = format!("astrolabe://results/{}-{id}", store.nonce);
+            store.insert(uri.clone(), body.clone());
+            drop(store);
             let resource = Resource::new(&uri, title)
                 .with_description("Astrolabe 大型工具结果；通过 resources/read 获取完整文本")
                 .with_mime_type("text/plain")
@@ -1801,6 +2216,196 @@ impl AstrolabeServer {
         }
         text
     }
+}
+
+/// Drop schemars boilerplate that carries no information for a client:
+/// `$schema`, `"default": null` (the `["x","null"]` union already says it) and
+/// `format: uint*` + `minimum: 0` (the integer type is enough).
+fn slim_schema(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            if map.get("default").is_some_and(Value::is_null) {
+                map.remove("default");
+            }
+            let unsigned = map
+                .get("format")
+                .and_then(Value::as_str)
+                .is_some_and(|f| f.starts_with("uint"));
+            if unsigned {
+                map.remove("format");
+                if map.get("minimum").and_then(Value::as_u64) == Some(0) {
+                    map.remove("minimum");
+                }
+            }
+            for child in map.values_mut() {
+                slim_schema(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                slim_schema(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Cooperative cancellation for tool calls running on a blocking thread.
+///
+/// `call_tool` sets a per-thread flag; long loops may poll [`is_cancelled`]
+/// and bail out early. Tool bodies are synchronous and cannot be preempted.
+mod cancel {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        static FLAG: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn scope<T>(flag: Arc<AtomicBool>, f: impl FnOnce() -> T) -> T {
+        FLAG.with(|cell| *cell.borrow_mut() = Some(flag));
+        let out = f();
+        FLAG.with(|cell| *cell.borrow_mut() = None);
+        out
+    }
+
+    pub(super) fn is_cancelled() -> bool {
+        FLAG.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        })
+    }
+}
+
+/// Per-call wall-clock cap. `ASTROLABE_TOOL_TIMEOUT_SECS=0` disables it.
+const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
+
+fn tool_timeout_from_env() -> Option<std::time::Duration> {
+    let secs = std::env::var("ASTROLABE_TOOL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Stand-in server used when startup fails (bad root, oversized directory,
+/// bad flag): it still answers the MCP handshake and `tools/list`, and every
+/// `tools/call` returns the failure as an `isError` result, so the client UI
+/// shows the reason instead of a bare "connection closed".
+#[derive(Clone)]
+pub struct StartupFailedServer {
+    message: String,
+    inner: AstrolabeServer,
+}
+
+impl StartupFailedServer {
+    pub fn new(message: impl Into<String>, context: ClientContext) -> Self {
+        let message = message.into();
+        // Only supplies the catalog and protocol negotiation; never indexed.
+        let inner = AstrolabeServer::with_context(std::env::temp_dir(), context);
+        Self { message, inner }
+    }
+
+    fn failure_result(&self) -> CallToolResult {
+        text_error(format!(
+            "Astrolabe 启动失败，未建立索引：\n{}\nconfidence: unknown",
+            self.message
+        ))
+    }
+}
+
+impl ServerHandler for StartupFailedServer {
+    fn get_info(&self) -> ServerConfig {
+        self.inner.get_info()
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        self.inner.supported_protocol_versions()
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        self.inner.initialize(request, context).await
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        self.inner.list_tools(request, context).await
+    }
+
+    async fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        Ok(self.failure_result().into())
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        Err(custom_request_error(&request.method))
+    }
+}
+
+/// JSON-RPC error for a request that reached the custom-request fallback:
+/// a standard MCP method with malformed `params` is `-32602 Invalid params`;
+/// anything else is `-32601 Method not found`.
+fn custom_request_error(method: &str) -> ErrorData {
+    const STANDARD: &[&str] = &[
+        "initialize",
+        "tools/call",
+        "tools/list",
+        "resources/list",
+        "resources/read",
+        "resources/templates/list",
+        "prompts/list",
+        "prompts/get",
+        "completion/complete",
+        "logging/setLevel",
+    ];
+    if STANDARD.contains(&method) {
+        ErrorData::invalid_params(
+            format!("Invalid params for `{method}`: params do not match the method's schema (e.g. `arguments` must be an object)"),
+            None,
+        )
+    } else {
+        ErrorData::new(
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+            format!("Method not found: {method}"),
+            None,
+        )
+    }
+}
+
+/// Where a call goes after routing (see [`AstrolabeServer::resolve_route`]).
+struct RouteOutcome {
+    hint: String,
+    path: Option<String>,
+    note: Option<String>,
+}
+
+/// An absolute `path` under `child` becomes child-relative; anything else is
+/// returned unchanged.
+fn relativize_to_child(child: &Path, path: &str) -> String {
+    let p = Path::new(path.trim());
+    if p.is_absolute() {
+        if let Ok(rel) = p.strip_prefix(child) {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+    }
+    path.to_string()
 }
 
 fn top_unindexed_exts(
@@ -1871,10 +2476,81 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
     ) -> CallToolResult {
-        self.with_fresh_index(&params.task_description, |session, index| {
-            let base = compute_centrality(index.graph());
-            let ranked = rank_for_task(index.graph(), &params.task_description, &base);
-            let mut ids: Vec<_> = index.graph().files.iter().map(|file| file.id).collect();
+        let route = match self.resolve_route(
+            params.root.as_deref(),
+            None,
+            Some(&params.task_description),
+        ) {
+            Ok(route) => route,
+            Err(err) => return err,
+        };
+        let result = self.resolve_context_inner(params, &route.hint);
+        Self::with_route_note(result, &route.note)
+    }
+
+    fn resolve_context_inner(&self, params: ResolveContextParams, hint: &str) -> CallToolResult {
+        self.with_fresh_index(hint, |session, index| {
+            let graph = index.graph();
+            let kind = classify_task(&params.task_description);
+            let compact_task = matches!(kind, TaskKind::Count | TaskKind::Refs);
+            // Counting / caller tasks are answered by the follow-up tool, not
+            // by a file map: keep the reply under ~3 KB unless the caller set
+            // an explicit budget.
+            let budget = if compact_task && params.budget_tokens == DEFAULT_BUDGET {
+                COMPACT_CONTEXT_BUDGET
+            } else {
+                params.budget_tokens
+            };
+            let (file_cap, symbol_cap) = if compact_task { (6, 6) } else { (20, 24) };
+
+            // Repeat call with the same arguments on an unchanged index:
+            // short pointer instead of resending the whole map.
+            let dedup_on = session_dedup_enabled(params.dedup);
+            let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let key = format!(
+                "{}|resolve|{}|{}",
+                session.root.display(),
+                params.task_description,
+                params.budget_tokens
+            );
+            let generation = index.generation();
+            if dedup_on {
+                let earlier = {
+                    let mut map = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
+                    match map.get(&key) {
+                        Some((g, c)) if *g == generation => Some(*c),
+                        _ => {
+                            map.insert(key.clone(), (generation, call));
+                            None
+                        }
+                    }
+                };
+                if let Some(c) = earlier {
+                    let digest = self
+                        .search_digests
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let body = format!(
+                        "同一 resolve_context 已在本会话第 {c} 次工具调用返回（索引未变），不再重发全文。\n{digest}若你没看到那份结果（如子任务或上下文已压缩），传 dedup=false 重新取全文。\n{}",
+                        next_step_hint(&params.task_description)
+                    );
+                    return self.result_on(
+                        &session.root,
+                        "resolve_context",
+                        body,
+                        json!({"deduplicated":true,"earlier_call":c,"budget_tokens":params.budget_tokens}),
+                        Some(params.budget_tokens),
+                    );
+                }
+            }
+
+            let base = cached_centrality(graph);
+            let ranked = rank_for_task(graph, &params.task_description, &base);
+            let matched = match_task(graph, &params.task_description);
+            let mut ids: Vec<_> = graph.files.iter().map(|file| file.id).collect();
             ids.sort_by(|a, b| {
                 ranked
                     .by_file
@@ -1885,12 +2561,36 @@ impl AstrolabeServer {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.cmp(b))
             });
-            let mut body = self.ranked_files(
-                index,
-                ids.iter().copied(),
-                params.budget_tokens,
-                Confidence::Scoped,
-            );
+            // Symbols by file, in source order, built once.
+            let mut by_file: HashMap<FileId, Vec<usize>> = HashMap::new();
+            for (idx, symbol) in graph.symbols.iter().enumerate() {
+                by_file.entry(symbol.file).or_default().push(idx);
+            }
+            let relevant: BTreeSet<FileId> = matched
+                .files
+                .iter()
+                .copied()
+                .chain(matched.symbols.iter().map(|&i| graph.symbols[i].file))
+                .collect();
+
+            let mut body;
+            let mut omitted_symbols = 0;
+            let mut shown_symbols = 0;
+            if matched.is_empty() {
+                let top: Vec<FileId> = ids.iter().copied().take(5).collect();
+                body = self.ranked_files(index, top.iter().copied(), budget, Confidence::Unknown);
+                body.push_str(
+                    "未匹配到与任务相关的符号或文件：任务词没有命中任何文件名或符号名。上面 5 个只是仓库里依赖关系最中心的文件，与任务无关，不要据此判断相关性。\n建议：字面量/文案用 search_code，已知名字用 find_symbol。\n",
+                );
+            } else {
+                let shown: Vec<FileId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| relevant.contains(id))
+                    .take(file_cap)
+                    .collect();
+                body = self.ranked_files(index, shown.iter().copied(), budget, Confidence::Scoped);
+            }
             body.push_str(&format!(
                 "index: scanned={}, parsed={}, parse_failures={}, unresolved_imports={}\n",
                 index.report().files_scanned,
@@ -1898,21 +2598,30 @@ impl AstrolabeServer {
                 index.report().parse_failures.len(),
                 index.report().unresolved_imports.len()
             ));
-            let mut remaining =
-                TokenBudget::new(params.budget_tokens.saturating_sub(estimate_tokens(&body)));
-            let mut omitted_symbols = 0;
-            for id in ids.into_iter().take(12) {
-                if let Some(file) = index.file(id) {
-                    for symbol in index
-                        .graph()
-                        .symbols
+            let mut top_files: Vec<String> = Vec::new();
+            if !matched.is_empty() {
+                let mut remaining =
+                    TokenBudget::new(budget.saturating_sub(estimate_tokens(&body)));
+                for id in ids.iter().copied().filter(|id| relevant.contains(id)).take(12) {
+                    let Some(file) = index.file(id) else { continue };
+                    if top_files.len() < 5 {
+                        top_files.push(file.path.to_string());
+                    }
+                    let all = by_file.get(&id).map(Vec::as_slice).unwrap_or_default();
+                    let mut picked: Vec<usize> = all
                         .iter()
-                        .filter(|symbol| symbol.file == id)
-                        .take(4)
-                    {
-                        let line = format!("{}\n", symbol_line(symbol, &file.path));
-                        if remaining.try_add(&line) {
+                        .copied()
+                        .filter(|i| matched.symbols.contains(i))
+                        .collect();
+                    if picked.is_empty() {
+                        // Matched by file name only: a short skeleton.
+                        picked = all.iter().copied().take(2).collect();
+                    }
+                    for idx in picked.into_iter().take(4) {
+                        let line = format!("{}\n", symbol_line(&graph.symbols[idx], &file.path));
+                        if shown_symbols < symbol_cap && remaining.try_add(&line) {
                             body.push_str(&line);
+                            shown_symbols += 1;
                         } else {
                             omitted_symbols += 1;
                         }
@@ -1921,16 +2630,28 @@ impl AstrolabeServer {
             }
             if omitted_symbols > 0 {
                 body.push_str(&format!(
-                    "{omitted_symbols} 个符号因 budget_tokens 被省略。\n"
+                    "{omitted_symbols} 个符号因 budget_tokens 或数量上限被省略。\n"
                 ));
             }
             body.push_str(next_step_hint(&params.task_description));
+            if dedup_on {
+                let digest = if top_files.is_empty() {
+                    "首次结果摘要：未匹配到相关文件。\n".to_string()
+                } else {
+                    format!("首次结果摘要：最相关文件 {}\n", top_files.join("、"))
+                };
+                self.search_digests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, digest);
+            }
+            let conf_label = if matched.is_empty() { "unknown" } else { "scoped" };
             self.result_on(
                 &session.root,
                 "resolve_context",
                 body,
-                json!({"confidence":"scoped","budget_tokens":params.budget_tokens}),
-                Some(params.budget_tokens),
+                json!({"confidence":conf_label,"matched":!matched.is_empty(),"budget_tokens":budget}),
+                Some(budget),
             )
         })
     }
@@ -1947,10 +2668,14 @@ impl AstrolabeServer {
     )]
     pub(crate) fn find_references(
         &self,
-        Parameters(params): Parameters<crate::precise_tools::FindReferencesParams>,
+        Parameters(mut params): Parameters<crate::precise_tools::FindReferencesParams>,
     ) -> CallToolResult {
-        let hint = Self::join_hint(&[params.path.as_deref().unwrap_or(""), &params.symbol]);
-        self.with_precise(&hint, true, move |session| {
+        let route = match self.resolve_route(params.root.as_deref(), params.path.as_deref(), None) {
+            Ok(route) => route,
+            Err(err) => return err,
+        };
+        params.path = route.path;
+        self.with_precise(&route.hint, true, move |session| {
             crate::precise_tools::run_find_references(params, session.precise.as_ref())
         })
     }
@@ -1960,10 +2685,14 @@ impl AstrolabeServer {
     )]
     pub(crate) fn goto_definition(
         &self,
-        Parameters(params): Parameters<crate::precise_tools::GotoDefinitionParams>,
+        Parameters(mut params): Parameters<crate::precise_tools::GotoDefinitionParams>,
     ) -> CallToolResult {
-        let hint = params.path.clone();
-        self.with_precise(&hint, true, move |session| {
+        let route = match self.resolve_route(params.root.as_deref(), Some(&params.path), None) {
+            Ok(route) => route,
+            Err(err) => return err,
+        };
+        params.path = route.path.unwrap_or_default();
+        self.with_precise(&route.hint, true, move |session| {
             crate::precise_tools::run_goto_definition(params, session.precise.as_ref())
         })
     }
@@ -1973,10 +2702,14 @@ impl AstrolabeServer {
     )]
     pub(crate) fn get_diagnostics(
         &self,
-        Parameters(params): Parameters<crate::precise_tools::GetDiagnosticsParams>,
+        Parameters(mut params): Parameters<crate::precise_tools::GetDiagnosticsParams>,
     ) -> CallToolResult {
-        let hint = params.path.clone();
-        self.with_precise(&hint, false, move |session| {
+        let route = match self.resolve_route(params.root.as_deref(), Some(&params.path), None) {
+            Ok(route) => route,
+            Err(err) => return err,
+        };
+        params.path = route.path.unwrap_or_default();
+        self.with_precise(&route.hint, false, move |session| {
             crate::precise_tools::run_get_diagnostics(params, session.precise.as_ref())
         })
     }
@@ -1986,17 +2719,30 @@ impl AstrolabeServer {
     )]
     pub(crate) fn find_symbol(
         &self,
-        Parameters(params): Parameters<QueryParams>,
+        Parameters(mut params): Parameters<QueryParams>,
     ) -> CallToolResult {
         let signature = format!("{params:?}");
-        let hint = params.query.clone();
-        self.guarded("find_symbol", &hint, &signature, || {
+        // The query is a symbol name, never a routing hint.
+        let route =
+            match self.resolve_route(params.root.as_deref(), params.path_filter.as_deref(), None) {
+                Ok(route) => route,
+                Err(err) => return err,
+            };
+        params.path_filter = route.path.clone();
+        params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
+        let result = self.guarded("find_symbol", &route.hint, &signature, || {
             self.find_symbol_inner(params)
-        })
+        });
+        Self::with_route_note(result, &route.note)
     }
 
     fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
-        self.with_fresh_index(&params.query, |session, index| {
+        if params.query.trim().is_empty() {
+            return text_error(
+                "find_symbol 需要非空 query（符号名、子串或 'Class/method' 路径）；空白查询不返回全部符号。".to_string(),
+            );
+        }
+        self.with_fresh_index(params.root.as_deref().unwrap_or(""), |session, index| {
             if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
                 return self.finish_at(&session.root, text_error(message));
             }
@@ -2037,7 +2783,10 @@ impl AstrolabeServer {
             // 排序：精确名 > 前缀 > 子串，同档再按锚点行——避免真正的定义
             // 因按路径排序排在后面而被 budget 截掉。
             let exact_only = params.substring == Some(false);
-            let mut ranked: Vec<(u8, String, usize)> = Vec::new();
+            // 排序键：(档, 测试路径靠后, exported 优先, path, start_line)；
+            // 末位 idx 保证全序。不再按渲染后的签名文本排序。
+            type RankKey = (u8, bool, bool, String, u32);
+            let mut ranked: Vec<(RankKey, String, usize)> = Vec::new();
             for (idx, symbol) in index.graph().symbols.iter().enumerate() {
                 let Some(tier) = name_match_tier(&symbol.name, &needle) else {
                     continue;
@@ -2056,26 +2805,47 @@ impl AstrolabeServer {
                     {
                         continue;
                     }
-                    ranked.push((tier, symbol_line(symbol, &file.path), idx));
+                    let key = (
+                        tier,
+                        is_test_path(file.path.as_str()),
+                        !symbol.exported,
+                        file.path.as_str().to_owned(),
+                        symbol.start_line,
+                    );
+                    ranked.push((key, symbol_line(symbol, &file.path), idx));
                 }
             }
-            ranked.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            ranked.sort_by(|a, b| (&a.0, a.2).cmp(&(&b.0, b.2)));
             let hits: Vec<(String, usize)> = ranked
                 .into_iter()
                 .map(|(_, line, idx)| (line, idx))
                 .collect();
-            let lines: Vec<String> = hits.iter().map(|(line, _)| line.clone()).collect();
+            let lines = decorated_symbol_lines(index, &hits);
             let total = lines.len();
             let offset = params.offset.min(total);
-            let (kept, omitted) =
-                truncate_ranked(&lines[offset..], params.budget_tokens, |line| format!("{line}\n"));
-            let kept_count = kept.len();
-            let truncated = omitted > 0;
-            let next_offset = truncated.then_some(offset + kept_count);
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
             if let Some(ignored) = &normalized.ignored {
                 body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
             }
+            // 头部与状态行也计入预算：按"最长的截断态状态行"预留。
+            let reserve = estimate_tokens(&body)
+                + estimate_tokens(&render_search_page_status(
+                    total,
+                    offset,
+                    total - offset,
+                    1,
+                    params.budget_tokens,
+                    params.offset,
+                ));
+            let (kept, omitted) = truncate_ranked(
+                &lines[offset..],
+                params.budget_tokens.saturating_sub(reserve),
+                |line| format!("{line}\n"),
+            );
+            let kept_count = kept.len();
+            let truncated = omitted > 0;
+            // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
+            let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
             body.push_str(&render_search_page_status(total, offset, kept_count, omitted, params.budget_tokens, params.offset));
             for line in kept {
                 body.push_str(line);
@@ -2119,22 +2889,34 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Count hits (统计/计数每个目录有多少处调用): aggregate=top|dir|file gives N hits / M files per dir + total; combine with skip_comments, exclude=[\"_test.go\",\"vendor\"], count_only. Also exhaustive code & text search: literal case-insensitive (regex=true for regex), hits come with context; group=true groups per file; other text files tagged [text-only]; page with offset=next_offset."
+        description = "Count hits (统计/计数每个目录有多少处调用): aggregate=top|dir|file gives N matching lines / M files per dir + total (counts lines, not occurrences: a line matching twice counts once); combine with skip_comments, exclude=[\"_test.go\",\"vendor\"], count_only. Also exhaustive code & text search: literal case-insensitive (regex=true for regex), hits come with context; group=true groups per file; other text files tagged [text-only]; page with offset=next_offset."
     )]
     pub(crate) fn search_code(
         &self,
-        Parameters(params): Parameters<SearchParams>,
+        Parameters(mut params): Parameters<SearchParams>,
     ) -> CallToolResult {
         let signature = format!("{params:?}");
-        let hint = Self::join_hint(&[params.path_filter.as_deref().unwrap_or(""), &params.query]);
-        self.guarded("search_code", &hint, &signature, || {
+        // The query is a search string, never a routing hint.
+        let route =
+            match self.resolve_route(params.root.as_deref(), params.path_filter.as_deref(), None) {
+                Ok(route) => route,
+                Err(err) => return err,
+            };
+        params.path_filter = route.path.clone();
+        params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
+        if let Some(building) = self.building_session(&route.hint) {
+            let result = self.search_while_building(&building, &params);
+            return Self::with_route_note(result, &route.note);
+        }
+        let result = self.guarded("search_code", &route.hint, &signature, || {
             self.search_code_inner(params)
-        })
+        });
+        Self::with_route_note(result, &route.note)
     }
 
     fn search_code_inner(&self, params: SearchParams) -> CallToolResult {
         self.with_fresh_index(
-            &Self::join_hint(&[params.path_filter.as_deref().unwrap_or(""), &params.query]),
+            params.root.as_deref().unwrap_or(""),
             |session, index| {
                 // A filter that only hits non-code text files (docs/, *.toml …)
                 // is valid here: those files are searched as [text-only].
@@ -2161,19 +2943,45 @@ impl AstrolabeServer {
                         ));
                     }
                 }
+                if params.query.is_empty() {
+                    return text_error(
+                        "query 不能为空（空串会匹配每一行）。请给出要搜的字面量；要匹配任意内容请用 regex=true 并写明模式。",
+                    );
+                }
+                // The text-only path uses grep-regex, which rejects patterns
+                // that can match a line terminator. Surface that instead of
+                // silently reporting "no match".
+                let text_matcher = match astrolabe_core::text_search::build_matcher(
+                    &params.query,
+                    params.regex,
+                    params.case_sensitive.unwrap_or(params.regex),
+                ) {
+                    Ok(m) => m,
+                    Err(error) => {
+                        return text_error(format!(
+                            "查询无法按行匹配：{error}。search_code 逐行搜索，不支持含换行（\\n、字面换行）或跨行的模式；请拆成单行查询。"
+                        ))
+                    }
+                };
                 let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
                     Ok(set) => set,
                     Err(message) => return text_error(message),
                 };
                 let excluded = |path: &str| exclude_set.as_ref().is_some_and(|set| set.is_match(path));
                 let mut dedup_key: Option<String> = None;
-                if session_dedup_enabled(params.dedup) {
+                // Ordinal taken by this search call (set when session dedup is on).
+                let mut search_call: Option<u64> = None;
+                let counting = params.count_only || params.aggregate.is_some();
+                // count_only/aggregate replies are short tables: always resend
+                // them in full (a pointer would hide the table the model needs).
+                if session_dedup_enabled(params.dedup) && !counting {
                     let mut probe = params.clone();
                     probe.dedup = None;
                     let key = format!("{}|search|{probe:?}", session.root.display());
                     let generation = index.generation();
-                    // Same ordinal the body bookkeeping below takes.
-                    let call = self.call_seq.load(Ordering::Relaxed) + 1;
+                    // A real, monotonically increasing tool-call ordinal.
+                    let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                    search_call = Some(call);
                     dedup_key = Some(key.clone());
                     let earlier = {
                         let mut map = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
@@ -2195,7 +3003,7 @@ impl AstrolabeServer {
                             .map(|d| format!("首次结果摘要：{d}\n"))
                             .unwrap_or_default();
                         let body = format!(
-                            "confidence: exact (磁盘源码字面匹配)\n{}同一查询已在本会话第 {c} 次调用返回（文件未改动），不再重发全文；无需换词重查。\n{digest}要重新取全文传 dedup=false。\n",
+                            "confidence: exact (磁盘源码字面匹配)\n{}同一查询已在本会话第 {c} 次工具调用返回（文件未改动），不再重发全文。\n{digest}若你没看到那份结果（如子任务或上下文已压缩后丢失），传 dedup=false 重新取全文。\n",
                             render_search_mode_header(params.regex, &params.query)
                         );
                         return self.result_on(
@@ -2212,15 +3020,18 @@ impl AstrolabeServer {
                 let mut misses = 0u64;
                 let mut skipped = 0usize;
                 let strings_are_code = params.query.contains(['"', '\'', '`']);
+                // skip_comments on a type without a lexer cannot filter anything;
+                // collect those types so the summary says so.
+                let mut unlexed: BTreeSet<String> = BTreeSet::new();
                 let mut scan_file = |path: &str, matches: &mut Vec<SearchHit>| {
+                    if cancel::is_cancelled() {
+                        return;
+                    }
                     let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
                         return;
                     };
-                    let mask = if params.skip_comments {
-                        crate::code_mask::code_mask(path, &lines, strings_are_code)
-                    } else {
-                        None
-                    };
+                    // Lazy: the mask is only computed once a line matches.
+                    let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
                     if hit {
                         hits += 1;
                     } else {
@@ -2228,13 +3039,20 @@ impl AstrolabeServer {
                     }
                     for (line_no, line) in lines.iter().enumerate() {
                         if matcher.is_match(line) {
-                            if let Some(mask) = &mask {
-                                let real = matcher.find_iter(line).any(|m| {
-                                    mask[line_no].get(m.start()).copied().unwrap_or(true)
+                            if params.skip_comments {
+                                let mask = mask.get_or_insert_with(|| {
+                                    crate::code_mask::code_mask(path, &lines, strings_are_code)
                                 });
-                                if !real {
-                                    skipped += 1;
-                                    continue;
+                                if let Some(mask) = mask {
+                                    let real = matcher.find_iter(line).any(|m| {
+                                        mask[line_no].get(m.start()).copied().unwrap_or(true)
+                                    });
+                                    if !real {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                } else {
+                                    unlexed.insert(crate::code_mask::type_label(path));
                                 }
                             }
                             // P0：超长行先做单行安全切片（Unicode 边界安全），
@@ -2243,7 +3061,11 @@ impl AstrolabeServer {
                             matches.push(SearchHit {
                                 path: path.to_string(),
                                 line: line_no + 1,
-                                text: clip_match_line(line, &params.query, Some(&matcher)),
+                                text: if counting {
+                                    String::new()
+                                } else {
+                                    clip_match_line(line, &params.query, Some(&matcher))
+                                },
                                 text_only: false,
                             });
                         }
@@ -2272,11 +3094,7 @@ impl AstrolabeServer {
                     .filter(|p| !excluded(p.as_str()))
                     .collect();
                 let sensitive = params.case_sensitive.unwrap_or(params.regex);
-                if let Ok(text_matcher) = astrolabe_core::text_search::build_matcher(
-                    &params.query,
-                    params.regex,
-                    sensitive,
-                ) {
+                {
                     let rels: Vec<&str> = text_paths.iter().map(|p| p.as_str()).collect();
                     let found = astrolabe_core::text_search::search_files(
                         &session.root,
@@ -2285,15 +3103,50 @@ impl AstrolabeServer {
                         TEXT_SEARCH_MAX_FILE_BYTES,
                     );
                     for (idx, file_hits) in found {
-                        if params.skip_comments && is_doc_path(rels[idx]) {
-                            skipped += file_hits.len();
-                            continue;
+                        let mut file_hits = file_hits;
+                        if params.skip_comments {
+                            if is_doc_path(rels[idx]) {
+                                skipped += file_hits.len();
+                                continue;
+                            }
+                            if crate::code_mask::has_lexer(rels[idx]) {
+                                let text = std::fs::read(session.root.join(rels[idx]))
+                                    .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+                                    .unwrap_or_default();
+                                let lines: Vec<String> =
+                                    text.lines().map(str::to_string).collect();
+                                if let Some(mask) = crate::code_mask::code_mask(
+                                    rels[idx],
+                                    &lines,
+                                    strings_are_code,
+                                ) {
+                                    let before = file_hits.len();
+                                    file_hits.retain(|hit| {
+                                        let l = (hit.line as usize).saturating_sub(1);
+                                        match (lines.get(l), mask.get(l)) {
+                                            (Some(line), Some(m)) => {
+                                                matcher.find_iter(line).any(|f| {
+                                                    m.get(f.start()).copied().unwrap_or(true)
+                                                })
+                                            }
+                                            _ => true,
+                                        }
+                                    });
+                                    skipped += before - file_hits.len();
+                                }
+                            } else if !file_hits.is_empty() {
+                                unlexed.insert(crate::code_mask::type_label(rels[idx]));
+                            }
                         }
                         for hit in file_hits {
                             matches.push(SearchHit {
                                 path: rels[idx].to_string(),
                                 line: hit.line as usize,
-                                text: clip_match_line(&hit.text, &params.query, Some(&matcher)),
+                                text: if counting {
+                                    String::new()
+                                } else {
+                                    clip_match_line(&hit.text, &params.query, Some(&matcher))
+                                },
                                 text_only: true,
                             });
                         }
@@ -2301,7 +3154,15 @@ impl AstrolabeServer {
                 }
                 let text_matches = matches.len() - code_matches;
                 let skip_note = if params.skip_comments {
-                    format!("skip_comments：已跳过注释/字符串/文档中的 {skipped} 处命中，以下不含它们。\n")
+                    let mut note = format!("skip_comments：已跳过注释/字符串/文档中的 {skipped} 处命中，以下不含它们。\n");
+                    if !unlexed.is_empty() {
+                        let kinds: Vec<&str> = unlexed.iter().map(String::as_str).collect();
+                        note.push_str(&format!(
+                            "注意：{} 类型未跳过注释（没有词法器），其命中仍含注释/字符串里的出现。\n",
+                            kinds.join("、")
+                        ));
+                    }
+                    note
                 } else {
                     String::new()
                 };
@@ -2311,7 +3172,14 @@ impl AstrolabeServer {
                     params
                         .path_filter
                         .as_deref()
-                        .map(|filter| data_hits_outside(index, &session.root, filter, &params.query, sensitive))
+                        .map(|filter| data_hits_outside(
+                            index,
+                            &session.root,
+                            filter,
+                            &params.query,
+                            sensitive,
+                            &excluded,
+                        ))
                         .unwrap_or_default()
                 };
                 session.cache_hits.fetch_add(hits, Ordering::Relaxed);
@@ -2338,7 +3206,10 @@ impl AstrolabeServer {
                             .insert(key.clone(), digest);
                     }
                 }
-                if params.count_only || params.aggregate.is_some() {
+                if counting {
+                    if search_call.is_none() {
+                        self.call_seq.fetch_add(1, Ordering::Relaxed);
+                    }
                     let body = format!(
                         "confidence: exact (磁盘源码字面匹配)\n{}{}",
                         render_search_mode_header(params.regex, &params.query),
@@ -2371,7 +3242,10 @@ impl AstrolabeServer {
                         .collect::<BTreeSet<_>>()
                         .len()
                         > 3;
-                if (params.group == Some(true) || auto_group) && total > 0 {
+                // Grouped output is re-ordered per file, so it is not a prefix of
+                // the hit list and cannot be paged by `offset`; with offset > 0
+                // fall through to ordinary pagination.
+                if ((params.group == Some(true) && params.offset == 0) || auto_group) && total > 0 {
                     let (grouped, shown) = render_grouped_hits(
                         index,
                         &matches,
@@ -2385,7 +3259,7 @@ impl AstrolabeServer {
                         "grouped=true total={total} shown={shown}\n"
                     ));
                     body.push_str(&grouped);
-                    body.push_str(&closure_line(&matches, shown, 0, false));
+                    body.push_str(&grouped_closure_line(&matches, shown));
                     body.push_str(&many_hits_hint(total));
                     body.push_str(&skip_note);
                     body.push_str(&data_note);
@@ -2472,7 +3346,8 @@ impl AstrolabeServer {
                     && total <= smart_body_max_hits();
                 let dedup = session_dedup_enabled(params.dedup);
                 let generation = index.generation();
-                let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let call = search_call
+                    .unwrap_or_else(|| self.call_seq.fetch_add(1, Ordering::Relaxed) + 1);
                 let root_key = session.root.display().to_string();
                 let mut pending: Vec<(String, u32, u32)> = Vec::new();
                 let mut seen = |path: &str, start: u32, end: u32| -> Option<u64> {
@@ -2828,15 +3703,9 @@ impl AstrolabeServer {
                 }
             }
         }
-        let lines: Vec<String> = hits.iter().map(|(line, _)| line.clone()).collect();
+        let lines = decorated_symbol_lines(index, &hits);
         let total = lines.len();
         let offset = params.offset.min(total);
-        let (kept, omitted) = truncate_ranked(&lines[offset..], params.budget_tokens, |line| {
-            format!("{line}\n")
-        });
-        let kept_count = kept.len();
-        let truncated = omitted > 0;
-        let next_offset = truncated.then_some(offset + kept_count);
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
                 .to_string();
@@ -2846,6 +3715,24 @@ impl AstrolabeServer {
         if receiver_fallback {
             body.push_str("注意：层级由接收者类型/签名/路径段推断（非行范围嵌套）\n");
         }
+        let reserve = estimate_tokens(&body)
+            + estimate_tokens(&render_search_page_status(
+                total,
+                offset,
+                total - offset,
+                1,
+                params.budget_tokens,
+                params.offset,
+            ));
+        let (kept, omitted) = truncate_ranked(
+            &lines[offset..],
+            params.budget_tokens.saturating_sub(reserve),
+            |line| format!("{line}\n"),
+        );
+        let kept_count = kept.len();
+        let truncated = omitted > 0;
+        // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
+        let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
         body.push_str(&render_search_page_status(
             total,
             offset,
@@ -2907,7 +3794,16 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<BudgetOnly>,
     ) -> CallToolResult {
-        self.with_index("", |session, index| {
+        let route = match self.resolve_route(params.root.as_deref(), None, None) {
+            Ok(route) => route,
+            Err(err) => return err,
+        };
+        let result = self.get_languages_inner(params, &route.hint);
+        Self::with_route_note(result, &route.note)
+    }
+
+    fn get_languages_inner(&self, params: BudgetOnly, hint: &str) -> CallToolResult {
+        self.with_index(hint, |session, index| {
             let mut totals: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
             for file in &index.graph().files {
                 if let Some(language) = file.language {
@@ -3050,6 +3946,75 @@ impl ServerHandler for AstrolabeServer {
         Ok(result)
     }
 
+    /// Run the (synchronous) tool body on a blocking thread so a heavy query
+    /// never occupies an async worker: `ping`, `tools/list` and cancellation
+    /// stay responsive on 1-2 core hosts. A per-call timeout and the request's
+    /// cancellation token end the *wait*; the body observes the same flag via
+    /// [`cancel::is_cancelled`] at its checkpoints.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let ct = context.ct.clone();
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker_flag = Arc::clone(&flag);
+        let server = self.clone();
+        let tool_name = request.name.to_string();
+        let runtime = tokio::runtime::Handle::current();
+        let work = tokio::task::spawn_blocking(move || {
+            cancel::scope(worker_flag, || {
+                runtime.block_on(async {
+                    let tcc = ToolCallContext::new(&server, request, context);
+                    server.tool_router.call(tcc).await
+                })
+            })
+        });
+        let timeout = tool_timeout_from_env();
+        let deadline = async {
+            match timeout {
+                Some(limit) => tokio::time::sleep(limit).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            joined = work => match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(tool = %tool_name, %error, "tool body panicked");
+                    Ok(self
+                        .finish(text_error(format!("{tool_name} 内部错误（已记录日志）。confidence: unknown")))
+                        .into())
+                }
+            },
+            () = ct.cancelled() => {
+                flag.store(true, Ordering::Relaxed);
+                Err(ErrorData::internal_error("request cancelled", None))
+            }
+            () = deadline => {
+                flag.store(true, Ordering::Relaxed);
+                let secs = timeout.map(|d| d.as_secs()).unwrap_or_default();
+                Ok(self
+                    .finish(text_error(format!(
+                        "{tool_name} 超过 {secs} 秒未完成，已放弃等待。请缩小范围（path_filter / aggregate / count_only）后重试；\
+                         可用 ASTROLABE_TOOL_TIMEOUT_SECS 调整。confidence: unknown"
+                    )))
+                    .into())
+            }
+        }
+    }
+
+    /// rmcp routes a request whose `params` do not fit the typed schema to
+    /// this hook. For a standard method that is a client error (-32602), not
+    /// "method not found".
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        Err(custom_request_error(&request.method))
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -3066,14 +4031,17 @@ impl ServerHandler for AstrolabeServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        let resources = self.resources.lock().expect("resource lock poisoned");
+        let mut resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
         let Some(text) = resources.get(&request.uri) else {
             return Err(ErrorData::resource_not_found(
-                format!("resource not found: {}", request.uri),
+                format!(
+                    "resource not found: {} (expired, evicted, or from an earlier server process; re-run the query)",
+                    request.uri
+                ),
                 None,
             ));
         };
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(text.clone(), request.uri)]).into())
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(text, request.uri)]).into())
     }
 }
 
@@ -3251,6 +4219,59 @@ fn normalize_symbol_query(raw: &str) -> NormalizedQuery {
         query,
         ignored: (!ignored.is_empty()).then(|| format!("`{}`", ignored.join(" "))),
     }
+}
+
+/// SymbolKind 的展示名（与 `kind` 过滤参数同一套词）。
+fn kind_display_name(kind: astrolabe_core::SymbolKind) -> &'static str {
+    use astrolabe_core::SymbolKind as K;
+    match kind {
+        K::Function => "function",
+        K::Method => "method",
+        K::Class => "class",
+        K::Interface => "interface",
+        K::Struct => "struct",
+        K::Enum => "enum",
+        K::Trait => "trait",
+        K::Type => "type",
+        K::Const => "const",
+        K::Module => "module",
+        K::Field => "field",
+        K::Variable => "variable",
+    }
+}
+
+/// 给 find_symbol 的每个命中行补 `[kind in 容器]`，让重名符号（Rust 的
+/// 70 个 `new`）可分辨。控制体积：签名已以 kind 词开头（`struct Foo`）时省去
+/// kind；容器名最多 24 字符；无容器的顶层符号只标 kind。
+fn decorated_symbol_lines(index: &RepoIndex, hits: &[(String, usize)]) -> Vec<String> {
+    let symbols = &index.graph().symbols;
+    let targets: Vec<usize> = hits.iter().map(|(_, idx)| *idx).collect();
+    let containers = astrolabe_core::name_path::innermost_containers(symbols, &targets);
+    hits.iter()
+        .zip(containers)
+        .map(|((line, idx), container)| {
+            let symbol = &symbols[*idx];
+            let kind = kind_display_name(symbol.kind);
+            let sig = symbol.signature.trim_start().to_ascii_lowercase();
+            let kind_obvious = sig
+                .strip_prefix(kind)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+            let container = container.map(|c| {
+                let name = &symbols[c].name;
+                if name.chars().count() > 24 {
+                    format!("{}…", name.chars().take(23).collect::<String>())
+                } else {
+                    name.clone()
+                }
+            });
+            match (kind_obvious, container) {
+                (true, None) => line.clone(),
+                (true, Some(c)) => format!("{line}  [in {c}]"),
+                (false, None) => format!("{line}  [{kind}]"),
+                (false, Some(c)) => format!("{line}  [{kind} in {c}]"),
+            }
+        })
+        .collect()
 }
 
 /// 名称匹配档位：0 精确、1 前缀、2 子串（needle 已小写）。
@@ -3636,10 +4657,13 @@ mod tests {
     fn every_tool_returns_nonempty_first_text_block() {
         let server = ready_server();
         assert_first_text(server.resolve_context(Parameters(ResolveContextParams {
+            root: None,
             task_description: "alpha".into(),
             budget_tokens: 100,
+            dedup: None,
         })));
         assert_first_text(server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -3650,6 +4674,7 @@ mod tests {
             offset: 0,
         })));
         assert_first_text(server.search_code(Parameters(SearchParams {
+            root: None,
             query: "definitely absent".into(),
             regex: false,
             path_filter: None,
@@ -3665,13 +4690,17 @@ mod tests {
             count_only: false,
             skip_comments: false,
         })));
-        assert_first_text(server.get_languages(Parameters(BudgetOnly { budget_tokens: 100 })));
+        assert_first_text(server.get_languages(Parameters(BudgetOnly {
+            root: None,
+            budget_tokens: 100,
+        })));
     }
 
     #[test]
     fn budget_parameter_reaches_core_truncation() {
         let server = ready_server();
         let result = server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -3695,7 +4724,10 @@ mod tests {
     fn structured_output_opt_in_carries_root_and_full_text() {
         let mut server = ready_server();
         server.structured_output = true;
-        let result = server.get_languages(Parameters(BudgetOnly { budget_tokens: 100 }));
+        let result = server.get_languages(Parameters(BudgetOnly {
+            root: None,
+            budget_tokens: 100,
+        }));
         let text = result.content[0].as_text().unwrap().text.clone();
         let structured = result.structured_content.expect("opt-in structured");
         assert_eq!(structured["root"], json!(server.root.display().to_string()));
@@ -3905,6 +4937,7 @@ mod tests {
         server.structured_output = false;
 
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "marker".into(),
             regex: false,
             path_filter: None,
@@ -3950,6 +4983,7 @@ mod tests {
 
         // budget=1：扣掉头部 35 tokens 后剩余 0，首条匹配单项就超预算。
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "needle".into(),
             regex: false,
             path_filter: None,
@@ -4029,6 +5063,7 @@ mod tests {
 
     fn search(query: &str) -> SearchParams {
         SearchParams {
+            root: None,
             query: query.into(),
             regex: false,
             path_filter: None,
@@ -4108,8 +5143,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn search_code_group_true_truncated_does_not_suggest_unusable_offset_and_offset_pages() {
+        let a: String = (0..40).map(|i| format!("NEEDLE_a{i}\n")).collect();
+        let b: String = (0..40).map(|i| format!("NEEDLE_b{i}\n")).collect();
+        let (server, dir) = smart_server(&[("pkg/a.py", a), ("pkg/b.py", b)]);
+        let mut grouped = search("NEEDLE_");
+        grouped.group = Some(true);
+        grouped.budget_tokens = 300;
+        let text = text_of(&server.search_code(Parameters(grouped.clone())));
+        assert!(text.contains("有截断"), "{text}");
+        assert!(text.contains("不能用 offset 翻页"), "{text}");
+        assert!(
+            !text.contains("offset=") || text.contains("group=false 再 offset="),
+            "{text}"
+        );
+        // offset > 0 with group=true falls back to ordinary paging.
+        grouped.offset = 40;
+        grouped.budget_tokens = 2500;
+        let page = text_of(&server.search_code(Parameters(grouped)));
+        assert!(!page.contains("grouped=true"), "{page}");
+        assert!(page.contains("NEEDLE_b0"), "{page}");
+        assert!(!page.contains("NEEDLE_a0\n"), "{page}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_repeated_count_only_and_aggregate_resend_table_and_advance_call_seq() {
+        let (server, dir) = smart_server(&[("pkg/a.py", "x = foo()\nfoo(foo())\n".into())]);
+        let mut p = search("foo(");
+        p.aggregate = Some("file".into());
+        let first = text_of(&server.search_code(Parameters(p.clone())));
+        let second = text_of(&server.search_code(Parameters(p.clone())));
+        assert!(second.contains("pkg/a.py"), "{second}");
+        assert!(!second.contains("同一查询已在"), "{second}");
+        assert_eq!(first, second);
+        let mut c = search("foo(");
+        c.count_only = true;
+        let _ = server.search_code(Parameters(c.clone()));
+        let again = text_of(&server.search_code(Parameters(c)));
+        assert!(again.contains("总计 2 行命中"), "{again}");
+        // Wording is honest: lines, not occurrences (foo( occurs 3 times).
+        assert!(again.contains("不是出现次数"), "{again}");
+        assert_eq!(server.call_seq.load(Ordering::Relaxed), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_text_only_gbk_and_utf16_bom_files_are_searchable() {
+        let (server, dir) = smart_server(&[("src/a.py", "x = 1\n".into())]);
+        // GBK: "# 你好，这是一段中文说明" + newline + marker.
+        let mut gbk = b"# \xC4\xE3\xBA\xC3\xA3\xAC\xD5\xE2\xCA\xC7\xD2\xBB\xB6\xCE\xD6\xD0\xCE\xC4\xCB\xB5\xC3\xF7\n".to_vec();
+        gbk.extend_from_slice(b"SysLogGbk\n");
+        std::fs::write(dir.join("notes.txt"), gbk).unwrap();
+        let mut u16b = vec![0xFF, 0xFE];
+        for u in "line\nSysLogU16 here\n".encode_utf16() {
+            u16b.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(dir.join("res.sql"), u16b).unwrap();
+        let index = crate::index::build(&dir).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        let gbk_hit = text_of(&server.search_code(Parameters(search("你好"))));
+        assert!(gbk_hit.contains("notes.txt"), "{gbk_hit}");
+        let u16_hit = text_of(&server.search_code(Parameters(search("SysLogU16"))));
+        assert!(u16_hit.contains("res.sql"), "{u16_hit}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_newline_regex_and_empty_query_are_explicit_errors() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let mut multi = search("foo\\nbar");
+        multi.regex = true;
+        let r = server.search_code(Parameters(multi));
+        assert_eq!(r.is_error, Some(true));
+        assert!(text_of(&r).contains("逐行"), "{}", text_of(&r));
+        let empty = server.search_code(Parameters(search("")));
+        assert_eq!(empty.is_error, Some(true));
+        assert!(text_of(&empty).contains("不能为空"), "{}", text_of(&empty));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hit_role_matches_words_not_substrings() {
+        assert_eq!(hit_role(false, "return thread"), "使用");
+        assert_eq!(hit_role(false, "x = spread(a)"), "使用");
+        assert_eq!(hit_role(false, "download(url)"), "使用");
+        assert_eq!(hit_role(false, "x = read_file(p)"), "加载");
+        assert_eq!(hit_role(false, "cfg.loadConfig()"), "加载");
+        assert_eq!(hit_role(false, "os.Getenv(\"A\")"), "加载");
+        assert_eq!(hit_role(false, "budget(3)"), "使用");
+        assert_eq!(hit_role(true, "event.error(x)"), "引用");
+        assert_eq!(hit_role(true, "assert_eq!(a, b)"), "断言");
+    }
+
+    #[test]
+    fn search_code_data_hits_outside_respects_exclude() {
+        let (server, dir) = smart_server(&[
+            ("src/a.py", "x = MARKER_Q\n".into()),
+            ("testdata/d.json", "{\"k\": \"MARKER_Q\"}\n".into()),
+        ]);
+        let mut p = search("MARKER_Q");
+        p.path_filter = Some("src/".into());
+        let with = text_of(&server.search_code(Parameters(p.clone())));
+        assert!(with.contains("testdata/d.json"), "{with}");
+        let mut q = p.clone();
+        q.dedup = Some(false);
+        q.exclude = Some(vec!["testdata".into()]);
+        let without = text_of(&server.search_code(Parameters(q)));
+        assert!(!without.contains("testdata/d.json"), "{without}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn find(query: &str) -> QueryParams {
         QueryParams {
+            root: None,
             query: query.into(),
             include_body: true,
             substring: Some(false),
@@ -4305,7 +5453,7 @@ mod tests {
         assert_eq!(text.matches("  L").count(), 11, "{text}");
         assert!(!text.contains("未列出"), "{text}");
         assert!(
-            text.contains("汇总：11/11 处命中 / 2 个文件，无截断，已全部列出（结果完整"),
+            text.contains("汇总：11/11 行命中 / 2 个文件，无截断，已全部列出（结果完整"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4342,7 +5490,7 @@ mod tests {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
         let text = text_of(&server.search_code(Parameters(search("marker_x"))));
         assert!(
-            text.contains("汇总：2/2 处命中 / 1 个文件，无截断，已全部列出（结果完整"),
+            text.contains("汇总：2/2 行命中 / 1 个文件，无截断，已全部列出（结果完整"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4374,14 +5522,14 @@ mod tests {
         p.aggregate = Some("dir".into());
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(
-            text.contains("总计 6 处命中 / 5 个文件 / 3 个目录 / 3 个顶层目录"),
+            text.contains("总计 6 行命中 / 5 个文件 / 3 个目录 / 3 个顶层目录"),
             "{text}"
         );
-        assert!(text.contains("每个目录: N 处 / M 个文件"), "{text}");
-        assert!(text.contains("    4 处 /    3 个文件  svc/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  web/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  vendor/x/"), "{text}");
-        assert!(text.contains("    6 处 /    5 个文件  总计"), "{text}");
+        assert!(text.contains("每个目录: N 行 / M 个文件"), "{text}");
+        assert!(text.contains("    4 行 /    3 个文件  svc/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  web/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  vendor/x/"), "{text}");
+        assert!(text.contains("    6 行 /    5 个文件  总计"), "{text}");
         assert!(!text.contains("@svc/a.go"), "no hit lines: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4392,12 +5540,12 @@ mod tests {
         let mut p = search("SysLog(");
         p.aggregate = Some("file".into());
         let text = text_of(&server.search_code(Parameters(p)));
-        assert!(text.contains("    2 处 /    1 个文件  svc/a.go"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  web/c.go"), "{text}");
+        assert!(text.contains("    2 行 /    1 个文件  svc/a.go"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  web/c.go"), "{text}");
         let mut c = search("SysLog(");
         c.count_only = true;
         let text = text_of(&server.search_code(Parameters(c)));
-        assert!(text.contains("总计 6 处命中 / 5 个文件"), "{text}");
+        assert!(text.contains("总计 6 行命中 / 5 个文件"), "{text}");
         assert!(!text.contains("总计\n"), "count_only has no rows: {text}");
         let mut bad = search("SysLog(");
         bad.aggregate = Some("package".into());
@@ -4426,11 +5574,11 @@ mod tests {
         let mut p = search("SysLog(");
         p.aggregate = Some("top".into());
         let text = text_of(&server.search_code(Parameters(p)));
-        assert!(text.contains("每个顶层目录: N 处 / M 个文件"), "{text}");
-        assert!(text.contains("    7 处 /    3 个文件  svc/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  web/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  ./"), "{text}");
-        assert!(text.contains("   10 处 /    6 个文件  总计"), "{text}");
+        assert!(text.contains("每个顶层目录: N 行 / M 个文件"), "{text}");
+        assert!(text.contains("    7 行 /    3 个文件  svc/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  web/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  ./"), "{text}");
+        assert!(text.contains("   10 行 /    6 个文件  总计"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4443,8 +5591,8 @@ mod tests {
         p.exclude = Some(vec!["_test.go".into()]);
         let text = text_of(&server.search_code(Parameters(p)));
         // a.go keeps the SysLog(1) line and the `*/ SysLog(5)` line.
-        assert!(text.contains("    3 处 /    2 个文件  svc/"), "{text}");
-        assert!(text.contains("    5 处 /    4 个文件  总计"), "{text}");
+        assert!(text.contains("    3 行 /    2 个文件  svc/"), "{text}");
+        assert!(text.contains("    5 行 /    4 个文件  总计"), "{text}");
         assert!(!text.contains("docs/"), "{text}");
         assert!(
             text.contains("skip_comments：已跳过注释/字符串/文档中的 4 处命中"),
@@ -4454,8 +5602,74 @@ mod tests {
         let mut q = search("SysLog(");
         q.aggregate = Some("file".into());
         let text = text_of(&server.search_code(Parameters(q)));
-        assert!(text.contains("    5 处 /    1 个文件  svc/a.go"), "{text}");
+        assert!(text.contains("    5 行 /    1 个文件  svc/a.go"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skip_comments_applies_to_text_only_files_and_keeps_build_txt() {
+        let (server, dir) = smart_server(&[
+            (
+                "main.go",
+                "package main\nfunc main() { SysLog(1) }\n".into(),
+            ),
+            (
+                "cfg/app.yaml",
+                "# SysLog(yaml comment)\nk: SysLog(2)\n".into(),
+            ),
+            (
+                "cfg/q.sql",
+                "-- SysLog(sql comment)\nselect SysLog(3);\n".into(),
+            ),
+            (
+                "cfg/k.kt",
+                "// SysLog(kt comment)\nfun f() { SysLog(4) }\n".into(),
+            ),
+            (
+                "cfg/CMakeLists.txt",
+                "add_executable(SysLog( main.c)\n".into(),
+            ),
+            ("notes/README.txt", "call SysLog( here\n".into()),
+            ("cfg/a.hs", "-- SysLog(hs comment)\nx = SysLog(5)\n".into()),
+        ]);
+        let mut p = search("SysLog(");
+        p.skip_comments = true;
+        p.dedup = Some(false);
+        let text = text_of(&server.search_code(Parameters(p)));
+        for kept in [
+            "SysLog(1)",
+            "k: SysLog(2)",
+            "select SysLog(3)",
+            "SysLog(4)",
+            "add_executable(SysLog(",
+        ] {
+            assert!(text.contains(kept), "{kept} missing: {text}");
+        }
+        for dropped in [
+            "yaml comment",
+            "sql comment",
+            "kt comment",
+            "call SysLog( here",
+        ] {
+            assert!(!text.contains(dropped), "{dropped} kept: {text}");
+        }
+        // No lexer for .hs: hits stay, and the summary says so.
+        assert!(text.contains("hs comment"), "{text}");
+        assert!(
+            text.contains("未跳过注释") && text.contains(".hs"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_doc_path_txt_only_for_readme_like_names() {
+        assert!(is_doc_path("README.txt"));
+        assert!(is_doc_path("a/NOTES.txt"));
+        assert!(is_doc_path("docs/x.yaml"));
+        assert!(is_doc_path("a/b.md"));
+        assert!(!is_doc_path("cfg/CMakeLists.txt"));
+        assert!(!is_doc_path("requirements.txt"));
     }
 
     #[test]
@@ -4507,7 +5721,7 @@ mod tests {
         p.exclude = Some(vec!["vendor".into(), "*_test.go".into()]);
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(
-            text.contains("总计 4 处命中 / 3 个文件 / 2 个目录 / 2 个顶层目录"),
+            text.contains("总计 4 行命中 / 3 个文件 / 2 个目录 / 2 个顶层目录"),
             "{text}"
         );
         assert!(!text.contains("vendor"), "{text}");
@@ -4533,7 +5747,7 @@ mod tests {
         let again = text_of(&server.search_code(Parameters(p)));
         assert!(again.contains("不再重发全文"), "{again}");
         assert!(
-            again.contains("首次结果摘要：6 处命中 / 5 个文件"),
+            again.contains("首次结果摘要：6 行命中 / 5 个文件"),
             "{again}"
         );
         assert!(again.contains("svc/a.go×2"), "{again}");
@@ -4558,12 +5772,144 @@ mod tests {
     fn resolve_context_output_ends_with_next_step_line() {
         let server = ready_server();
         let result = server.resolve_context(Parameters(ResolveContextParams {
+            root: None,
             task_description: "rename alpha".into(),
             budget_tokens: 2000,
+            dedup: None,
         }));
         let text = text_of(&result);
         let last = text.trim_end().lines().last().unwrap_or_default();
         assert!(last.starts_with("下一步："), "{text}");
+    }
+
+    fn rc(task: &str, budget: usize, dedup: Option<bool>) -> ResolveContextParams {
+        ResolveContextParams {
+            root: None,
+            task_description: task.into(),
+            budget_tokens: budget,
+            dedup,
+        }
+    }
+
+    fn many_file_server() -> (AstrolabeServer, PathBuf) {
+        let mut files: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                (
+                    format!("pkg/mod{i}.py"),
+                    format!(
+                        "def filler_{i}():\n    return {i}\n\n\ndef other_{i}():\n    return 1\n"
+                    ),
+                )
+            })
+            .collect();
+        files.push((
+            "pkg/loop_guard.py".into(),
+            "def other_a():\n    return 1\n\n\ndef repeat_budget_check():\n    return 2\n".into(),
+        ));
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
+        smart_server(&refs)
+    }
+
+    #[test]
+    fn resolve_context_ranks_symbols_and_files_by_task_words() {
+        let (server, dir) = many_file_server();
+        let text = text_of(&server.resolve_context(Parameters(rc(
+            "where is repeat_budget_check in the loop guard",
+            2500,
+            None,
+        ))));
+        let first_file = text
+            .lines()
+            .find(|l| l.starts_with('@'))
+            .unwrap_or_default();
+        assert!(first_file.contains("loop_guard.py"), "{text}");
+        assert!(text.contains("repeat_budget_check"), "{text}");
+        // The unrelated first symbol of the file is not listed.
+        assert!(!text.contains("other_a"), "{text}");
+        assert!(!text.contains("filler_"), "{text}");
+        assert!(text.contains("confidence: Scoped"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_context_without_match_says_so_and_stays_small() {
+        let (server, dir) = many_file_server();
+        let text = text_of(&server.resolve_context(Parameters(rc(
+            "zzzz qqqq nonexistent thing",
+            2500,
+            None,
+        ))));
+        assert!(text.contains("未匹配到与任务相关"), "{text}");
+        assert!(!text.contains("confidence: Scoped"), "{text}");
+        assert!(
+            text.matches("\n@").count() + usize::from(text.starts_with('@')) <= 6,
+            "{text}"
+        );
+        assert!(text.len() < 3_000, "{} bytes", text.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_context_counting_task_is_short() {
+        let (server, dir) = many_file_server();
+        let text = text_of(&server.resolve_context(Parameters(rc(
+            "how many callers of filler_3 per directory",
+            2500,
+            None,
+        ))));
+        assert!(text.len() < 3_000, "{} bytes\n{text}", text.len());
+        assert!(text.contains("find_references"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_context_repeat_returns_pointer_with_top_files_and_dedup_hint() {
+        let (server, dir) = many_file_server();
+        let task = "where is repeat_budget_check in the loop guard";
+        let first = text_of(&server.resolve_context(Parameters(rc(task, 2500, None))));
+        let again = text_of(&server.resolve_context(Parameters(rc(task, 2500, None))));
+        assert!(again.contains("不再重发全文"), "{again}");
+        assert!(again.contains("pkg/loop_guard.py"), "{again}");
+        assert!(again.contains("dedup=false"), "{again}");
+        let full = text_of(&server.resolve_context(Parameters(rc(task, 2500, Some(false)))));
+        assert_eq!(
+            full.contains("repeat_budget_check"),
+            first.contains("repeat_budget_check")
+        );
+        assert!(!full.contains("不再重发全文"), "{full}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_step_hint_uses_word_boundaries_and_caller_priority() {
+        assert!(next_step_hint("account balance count").contains("find_symbol"));
+        assert!(next_step_hint("the country discount").contains("find_symbol"));
+        assert!(next_step_hint("how many callers of resolve_context").contains("find_references"));
+        assert!(next_step_hint("how many calls per directory").contains("aggregate"));
+        assert!(next_step_hint("count the usages of foo").contains("find_references"));
+        assert!(next_step_hint("count TODO comments").contains("aggregate"));
+        assert!(next_step_hint("rename account to user").contains("dry_run_rename"));
+        assert!(next_step_hint("统计 foo 的出现次数").contains("aggregate"));
+        assert!(next_step_hint("谁调用了 parse").contains("find_references"));
+    }
+
+    #[test]
+    fn search_dedup_pointer_has_real_call_number_and_sample_hits() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let first = server.call_seq.load(Ordering::Relaxed);
+        let _ = server.search_code(Parameters(search("marker_x")));
+        let second_seq_before = server.call_seq.load(Ordering::Relaxed);
+        assert_eq!(second_seq_before, first + 1, "search must take an ordinal");
+        let again = text_of(&server.search_code(Parameters(search("marker_x"))));
+        assert!(
+            again.contains(&format!("第 {} 次工具调用", first + 1)),
+            "{again}"
+        );
+        assert!(again.contains("前几处：@calc.py:"), "{again}");
+        assert!(again.contains("上下文已压缩"), "{again}");
+        assert!(again.contains("dedup=false"), "{again}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4675,7 +6021,10 @@ mod tests {
     #[test]
     fn get_languages_reports_file_cache_occupancy() {
         let server = ready_server();
-        let result = server.get_languages(Parameters(BudgetOnly { budget_tokens: 100 }));
+        let result = server.get_languages(Parameters(BudgetOnly {
+            root: None,
+            budget_tokens: 100,
+        }));
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(
             text.contains("file_cache:"),
@@ -4692,6 +6041,7 @@ mod tests {
     fn search_code_uses_file_cache_and_records_hits() {
         let (server, dir) = ready_server_with_disk();
         let params = SearchParams {
+            root: None,
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
@@ -4722,7 +6072,10 @@ mod tests {
             "second search of an unchanged file must hit"
         );
 
-        let languages = server.get_languages(Parameters(BudgetOnly { budget_tokens: 200 }));
+        let languages = server.get_languages(Parameters(BudgetOnly {
+            root: None,
+            budget_tokens: 200,
+        }));
         let languages_text = languages.content[0].as_text().unwrap().text.as_str();
         assert!(languages_text.contains("hits="), "{languages_text}");
         assert!(
@@ -4747,6 +6100,7 @@ mod tests {
         *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
 
         let _ = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "payload".into(),
             regex: false,
             path_filter: None,
@@ -4780,6 +6134,7 @@ mod tests {
     fn search_code_sees_edits_after_mtime_change() {
         let (server, dir) = ready_server_with_disk();
         let _ = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
@@ -4804,6 +6159,7 @@ mod tests {
         .unwrap();
 
         let after = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "fresh-content".into(),
             regex: false,
             path_filter: None,
@@ -4837,6 +6193,7 @@ mod tests {
 
     fn guarded_search(server: &AstrolabeServer, q: &str, budget: usize) -> String {
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: q.into(),
             regex: false,
             path_filter: None,
@@ -4873,6 +6230,7 @@ mod tests {
         server.structured_output = false;
         let page = |offset: usize, path: bool| {
             let r = server.find_symbol(Parameters(QueryParams {
+                root: None,
                 query: if path {
                     "/pager".into()
                 } else {
@@ -4951,6 +6309,7 @@ mod tests {
         server.structured_output = false;
         let page = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
+                root: None,
                 context_lines: Some(0),
                 page: false,
                 group: None,
@@ -5012,6 +6371,7 @@ mod tests {
         let (server, dir) = loop_guard_server(1);
         let at = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
+                root: None,
                 context_lines: Some(0),
                 page: false,
                 group: None,
@@ -5087,6 +6447,7 @@ mod tests {
         let (server, dir) = loop_guard_server(1);
         let bad = |s: &AstrolabeServer| {
             s.search_code(Parameters(SearchParams {
+                root: None,
                 query: "(".into(),
                 regex: true,
                 path_filter: None,
@@ -5215,6 +6576,7 @@ mod tests {
     fn search_code_shows_context_by_default_for_narrow_queries() {
         let (server, dir) = ready_server_with_disk();
         let params = |context_lines| SearchParams {
+            root: None,
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
@@ -5248,6 +6610,7 @@ mod tests {
     fn search_code_empty_result_states_no_match_explicitly() {
         let (server, dir) = ready_server_with_disk();
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "totally-absent-needle".into(),
             regex: false,
             path_filter: None,
@@ -5281,6 +6644,7 @@ mod tests {
     fn search_code_warns_when_regex_metacharacters_are_literal() {
         let (server, dir) = ready_server_with_disk();
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "scanForBrandHint|RewriteStreamingBody".into(),
             regex: false,
             path_filter: None,
@@ -5323,6 +6687,7 @@ mod tests {
         server.structured_output = true;
 
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "needle".into(),
             regex: false,
             path_filter: None,
@@ -5398,6 +6763,7 @@ mod tests {
 
     fn fs_query(query: &str) -> QueryParams {
         QueryParams {
+            root: None,
             query: query.into(),
             include_body: false,
             substring: None,
@@ -5441,6 +6807,66 @@ mod tests {
         params.substring = Some(false);
         let text = fs_text(&server.find_symbol(Parameters(params)));
         assert!(text.contains("aaa/exact.py"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_blank_query_errors_and_kind_variable_is_accepted() {
+        let (server, dir) = server_on_files(&[("a.py", "def f():\n    pass\n")]);
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("   "))));
+        assert!(text.contains("非空"), "{text}");
+        assert!(!text.contains("shown="), "{text}");
+        let mut params = fs_query("f");
+        params.kind = Some("variable".into());
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(!text.contains("未知 kind"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_orders_by_path_line_not_signature_and_tags_container() {
+        let (server, dir) = server_on_files(&[
+            (
+                "pkg/b.py",
+                "class Beta:\n    def run(self):\n        pass\n\ndef run():\n    pass\n",
+            ),
+            (
+                "pkg/a.py",
+                "class Alpha:\n    def run(self):\n        pass\n",
+            ),
+            ("tests/test_x.py", "def run():\n    pass\n"),
+        ]);
+        let mut params = fs_query("run");
+        params.substring = Some(false);
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        let anchors: Vec<&str> = text.lines().filter(|l| l.contains("@")).collect();
+        assert!(
+            anchors[0].contains("pkg/a.py") && anchors[0].contains("[method in Alpha]"),
+            "{text}"
+        );
+        assert!(
+            anchors[1].contains("pkg/b.py:2") && anchors[1].contains("[method in Beta]"),
+            "{text}"
+        );
+        assert!(
+            anchors[2].contains("pkg/b.py:5") && anchors[2].contains("[function]"),
+            "{text}"
+        );
+        assert!(anchors[3].contains("tests/test_x.py"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_zero_budget_has_no_stuck_next_offset() {
+        let (server, dir) = server_on_files(&[(
+            "a.py",
+            "def widget():\n    pass\ndef widget2():\n    pass\n",
+        )]);
+        let mut params = fs_query("widget");
+        params.budget_tokens = 0;
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(text.contains("shown=0"), "{text}");
+        assert!(!text.contains("next_offset="), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5524,6 +6950,7 @@ mod tests {
         assert!(text.contains("relay/channel"), "{text}");
 
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "send".into(),
             regex: false,
             path_filter: Some("./relay/channel".into()),
@@ -5565,6 +6992,7 @@ mod tests {
         // 名称匹配分支：include_body=true 时零命中也不得出现
         // 误导性的"无可提取的符号体"。
         let named = server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "NoSuchSymbolAnywhere".into(),
             include_body: true,
             substring: None,
@@ -5580,6 +7008,7 @@ mod tests {
 
         // 层级路径分支（query 含 '/'）同样需要显式零命中声明。
         let by_path = server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "NoSuch/Path".into(),
             include_body: false,
             substring: None,
@@ -5612,6 +7041,7 @@ mod tests {
         server.structured_output = false;
 
         let result = server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "spacious".into(),
             include_body: true,
             substring: None,
@@ -5756,6 +7186,7 @@ mod tests {
         let mut text = String::new();
         while std::time::Instant::now() < visible_deadline {
             text = first_text(server.find_symbol(Parameters(QueryParams {
+                root: None,
                 query: "during_build_xyz".into(),
                 include_body: false,
                 substring: None,
@@ -5788,6 +7219,7 @@ mod tests {
         server.start_indexing();
         wait_ready(&server, Duration::from_secs(20));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -5823,6 +7255,7 @@ mod tests {
         std::fs::write(dir.join("a.py"), "def alpha_v2():\n    return 2\n").unwrap();
         std::thread::sleep(Duration::from_millis(120));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "alpha_v2".into(),
             include_body: false,
             substring: None,
@@ -5854,6 +7287,7 @@ mod tests {
         std::fs::write(dir.join("a.py"), "def alpha_v3():\n    return 3\n").unwrap();
         std::thread::sleep(Duration::from_millis(120));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -5870,6 +7304,7 @@ mod tests {
         let start = std::time::Instant::now();
         loop {
             let probe = first_text(server.find_symbol(Parameters(QueryParams {
+                root: None,
                 query: "alpha_v3".into(),
                 include_body: false,
                 substring: None,
@@ -5925,6 +7360,7 @@ mod tests {
         }
         let before = log.watermark();
         let _ = server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -5975,6 +7411,7 @@ mod tests {
         // Child name is a word-boundary hint; "alpha" also substring-matches
         // the symbol `alpha_unique` without taking the path-query branch.
         let priming = server.find_symbol(Parameters(QueryParams {
+            root: Some("alpha".into()),
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -6002,6 +7439,7 @@ mod tests {
         };
         wait_session_ready(&session, Duration::from_secs(20));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
+            root: Some("alpha".into()),
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -6056,6 +7494,7 @@ mod tests {
         server.start_indexing();
 
         let _ = server.find_symbol(Parameters(QueryParams {
+            root: Some("alpha".into()),
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -6085,6 +7524,7 @@ mod tests {
         );
 
         let _ = server.find_symbol(Parameters(QueryParams {
+            root: Some("beta".into()),
             query: "beta".into(),
             include_body: false,
             substring: None,
@@ -6132,6 +7572,7 @@ mod tests {
         );
         server.structured_output = false;
         let text = first_text(server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "compare alpha and beta".into(),
             include_body: false,
             substring: None,
@@ -6175,6 +7616,7 @@ mod tests {
 
         // 1. search_code 零命中且无 path_filter，含 .scala×3 (N>=3) 时提示尚未支持语言且带计数
         let search_miss = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "nonexistent_code_pattern".into(),
             regex: false,
             path_filter: None,
@@ -6211,6 +7653,7 @@ mod tests {
 
         // 1b. 带 path_filter 的 search_code 零命中：filter 范围内 N>=3
         let search_filter_hit_hint = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "nonexistent".into(),
             regex: false,
             path_filter: Some(".scala".into()),
@@ -6243,6 +7686,7 @@ mod tests {
 
         // 1c. 带 path_filter 的 search_code 零命中：filter 范围内 N<3 (仅 A.scala 匹配，计 1)
         let search_filter_miss = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "nonexistent".into(),
             regex: false,
             path_filter: Some("A.scala".into()),
@@ -6276,6 +7720,7 @@ mod tests {
 
         // 2. find_symbol 零命中提示
         let symbol_miss = server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "NonExistentSymbol".into(),
             budget_tokens: 2500,
             offset: 0,
@@ -6294,6 +7739,7 @@ mod tests {
 
         // 4. get_languages 首行 supported、末尾 unindexed 行
         let langs_res = server.get_languages(Parameters(BudgetOnly {
+            root: None,
             budget_tokens: 2500,
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
@@ -6319,6 +7765,7 @@ mod tests {
         assert!(!langs_text.contains(".dart×"), "{langs_text}");
         // 5b. .dart 源码能被 search_code 命中
         let search_dart = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "dart service running".into(),
             regex: false,
             path_filter: None,
@@ -6350,6 +7797,7 @@ mod tests {
         cs: Option<bool>,
     ) -> (String, Value) {
         let result = server.search_code(Parameters(SearchParams {
+            root: None,
             query: query.into(),
             regex,
             path_filter: None,
@@ -6518,6 +7966,7 @@ mod tests {
 
         // search_code 零命中：N<3 不应触发提示
         let search_miss = server.search_code(Parameters(SearchParams {
+            root: None,
             query: "nonexistent".into(),
             regex: false,
             path_filter: None,
@@ -6542,6 +7991,7 @@ mod tests {
 
         // find_symbol 零命中：N<3 不应触发提示
         let symbol_miss = server.find_symbol(Parameters(QueryParams {
+            root: None,
             query: "NonExistent".into(),
             budget_tokens: 2500,
             offset: 0,
@@ -6557,6 +8007,7 @@ mod tests {
 
         // get_languages: >=1 就显示统计，这里有 2 个 .scala 仍会显示
         let langs_res = server.get_languages(Parameters(BudgetOnly {
+            root: None,
             budget_tokens: 2500,
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
@@ -6579,6 +8030,7 @@ mod tests {
         *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
 
         let langs_res = server.get_languages(Parameters(BudgetOnly {
+            root: None,
             budget_tokens: 2500,
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
@@ -6605,5 +8057,397 @@ mod tests {
         let desc = tool.description.as_deref().unwrap_or("");
         assert!(desc.contains("[text-only]"), "{desc}");
         assert!(desc.contains("case-insensitive"), "{desc}");
+    }
+}
+
+/// Multi-root routing, schema size, resource LRU and building-time search.
+#[cfg(test)]
+mod mcp_routing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn tmp(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "astrolabe-route-{tag}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn multi_server(names: &[&str]) -> (AstrolabeServer, PathBuf) {
+        let parent = tmp("multi");
+        let mut children = Vec::new();
+        for name in names {
+            let dir = parent.join(name);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(
+                dir.join("src").join("lib.rs"),
+                format!("pub fn handler_{name}() -> u8 {{\n    1 // shared\n}}\n"),
+            )
+            .unwrap();
+            children.push(dir);
+        }
+        let knobs = crate::knobs::McpKnobs {
+            watch_mode: None,
+            resident_roots: 3,
+            loop_guard: crate::loop_guard::LoopGuardConfig {
+                repeat_max: 0,
+                rate_max: 0,
+                ..Default::default()
+            },
+            ..crate::knobs::McpKnobs::default()
+        };
+        let mut server =
+            AstrolabeServer::with_multi_project_knobs(parent.clone(), children, knobs, 8 << 20);
+        server.structured_output = false;
+        server.start_indexing();
+        (server, parent)
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn sym(query: &str, root: Option<&str>, path_filter: Option<&str>) -> QueryParams {
+        QueryParams {
+            root: root.map(str::to_string),
+            query: query.into(),
+            include_body: false,
+            substring: None,
+            kind: None,
+            path_filter: path_filter.map(str::to_string),
+            depth: 0,
+            budget_tokens: 800,
+            offset: 0,
+        }
+    }
+
+    /// Retry while the routed child is still doing its cold build.
+    fn until_ready(mut call: impl FnMut() -> CallToolResult) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            let out = text(&call());
+            if !out.contains("索引正在后台构建") || start.elapsed() > Duration::from_secs(30)
+            {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn explicit_root_selects_sub_repo_for_every_tool() {
+        let (server, parent) = multi_server(&["api", "web", "docs", "core"]);
+        let found =
+            until_ready(|| server.find_symbol(Parameters(sym("handler_web", Some("web"), None))));
+        assert!(found.contains("handler_web"), "{found}");
+        assert!(
+            found.starts_with(&format!("index_root: {}", parent.join("web").display())),
+            "{found}"
+        );
+        // The query string is a symbol name: it is never reinterpreted as a
+        // routing hint, so naming another repo in it cannot misroute.
+        let miss = until_ready(|| {
+            server.find_symbol(Parameters(sym("api handler_api", Some("api"), None)))
+        });
+        assert!(
+            miss.contains("index_root:") && miss.contains("api"),
+            "{miss}"
+        );
+        assert!(!miss.contains("无法路由"), "{miss}");
+        // Case-insensitive name and absolute path both work.
+        let by_abs = until_ready(|| {
+            server.find_symbol(Parameters(sym(
+                "handler_core",
+                Some(parent.join("core").to_str().unwrap()),
+                None,
+            )))
+        });
+        assert!(by_abs.contains("handler_core"), "{by_abs}");
+        let langs = until_ready(|| {
+            server.get_languages(Parameters(BudgetOnly {
+                root: Some("DOCS".into()),
+                budget_tokens: 200,
+            }))
+        });
+        assert!(
+            langs.starts_with(&format!("index_root: {}", parent.join("docs").display())),
+            "{langs}"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn path_filter_routes_and_is_rewritten_relative_to_the_sub_repo() {
+        let (server, parent) = multi_server(&["api", "web"]);
+        let out = until_ready(|| {
+            server.search_code(Parameters(SearchParams {
+                root: None,
+                path_filter: Some("api/src".into()),
+                ..search_params("shared")
+            }))
+        });
+        assert!(
+            out.starts_with(&format!("index_root: {}", parent.join("api").display())),
+            "{out}"
+        );
+        assert!(!out.contains("不匹配"), "{out}");
+        assert!(out.contains("lib.rs"), "{out}");
+        // Bare sub-repo name routes and drops the (now empty) filter.
+        let bare = until_ready(|| {
+            server.search_code(Parameters(SearchParams {
+                root: None,
+                path_filter: Some("web/".into()),
+                ..search_params("shared")
+            }))
+        });
+        assert!(bare.contains("web") && bare.contains("lib.rs"), "{bare}");
+        assert!(!bare.contains("不匹配"), "{bare}");
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    fn search_params(query: &str) -> SearchParams {
+        SearchParams {
+            root: None,
+            query: query.into(),
+            regex: false,
+            path_filter: None,
+            case_sensitive: None,
+            budget_tokens: 1500,
+            offset: 0,
+            context_lines: None,
+            page: false,
+            group: None,
+            dedup: None,
+            aggregate: None,
+            exclude: None,
+            count_only: false,
+            skip_comments: false,
+        }
+    }
+
+    #[test]
+    fn unroutable_call_names_the_root_parameter_and_unknown_root_is_rejected() {
+        let (server, parent) = multi_server(&["api", "web"]);
+        let none = text(&server.find_symbol(Parameters(sym("handler_web", None, None))));
+        assert!(none.contains("无法路由") && none.contains("root"), "{none}");
+        assert!(none.contains("例如 root="), "{none}");
+        let bad = text(&server.find_symbol(Parameters(sym("x", Some("nope"), None))));
+        assert!(bad.contains("`nope` 不匹配"), "{bad}");
+        assert!(bad.contains("api") && bad.contains("web"), "{bad}");
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn sole_resident_sub_repo_serves_calls_without_root() {
+        let (server, parent) = multi_server(&["api", "web"]);
+        let first =
+            until_ready(|| server.find_symbol(Parameters(sym("handler_api", Some("api"), None))));
+        assert!(first.contains("handler_api"), "{first}");
+        let second = until_ready(|| server.find_symbol(Parameters(sym("handler_api", None, None))));
+        assert!(second.contains("handler_api"), "{second}");
+        assert!(!second.contains("无法路由"), "{second}");
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn task_text_routing_is_guessed_noted_and_ignores_generic_words() {
+        let (server, parent) = multi_server(&["api", "web", "billing"]);
+        // "web" is an everyday word: prose alone must not pick a repo.
+        let prose = text(&server.resolve_context(Parameters(ResolveContextParams {
+            root: None,
+            task_description: "set up a web server".into(),
+            budget_tokens: 400,
+            dedup: None,
+        })));
+        assert!(prose.contains("无法路由"), "{prose}");
+        // A distinctive name routes, and the result says it was a guess.
+        let guessed = until_ready(|| {
+            server.resolve_context(Parameters(ResolveContextParams {
+                root: None,
+                task_description: "fix the invoice rounding in billing".into(),
+                budget_tokens: 400,
+                dedup: None,
+            }))
+        });
+        assert!(
+            guessed.contains("路由说明：按任务文本中的名称猜测"),
+            "{guessed}"
+        );
+        assert!(guessed.contains("billing"), "{guessed}");
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn absolute_path_routes_precise_tools_to_the_owning_sub_repo() {
+        let (server, parent) = multi_server(&["api", "web"]);
+        let file = parent.join("web").join("src").join("lib.rs");
+        let out = text(&server.get_diagnostics(Parameters(
+            crate::precise_tools::GetDiagnosticsParams {
+                root: None,
+                path: file.to_string_lossy().into_owned(),
+                severity: None,
+                budget_tokens: 300,
+            },
+        )));
+        assert!(
+            out.starts_with(&format!("index_root: {}", parent.join("web").display())),
+            "{out}"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn schemas_are_slim_and_catalog_stays_small() {
+        let server = AstrolabeServer::new(tmp("schema"));
+        let tools = server.listed_tools();
+        assert_eq!(tools.len(), 7);
+        for tool in &tools {
+            let json = serde_json::to_string(&*tool.input_schema).unwrap();
+            assert!(!json.contains("$schema"), "{}: {json}", tool.name);
+            assert!(!json.contains("\"default\":null"), "{}: {json}", tool.name);
+            assert!(!json.contains("\"format\":\"uint"), "{}: {json}", tool.name);
+            assert!(!json.contains("\"minimum\":0"), "{}: {json}", tool.name);
+            // Every tool takes an optional `root` for multi-repo workspaces.
+            assert!(
+                tool.input_schema
+                    .get("properties")
+                    .and_then(|p| p.get("root"))
+                    .is_some(),
+                "{} lacks `root`",
+                tool.name
+            );
+            let required = tool
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(!required.iter().any(|r| r == "root"), "{}", tool.name);
+        }
+        // Compact JSON of the whole `tools` array. v0.13.0 shipped 7,535 B
+        // here without a `root` parameter; schema slimming pays for it.
+        let bytes = serde_json::to_vec(&tools).unwrap().len();
+        assert!(
+            bytes <= TOOLS_LIST_MAX_BYTES,
+            "tools/list is {bytes} B, limit {TOOLS_LIST_MAX_BYTES} B (v0.13.0: 7,535 B)"
+        );
+    }
+
+    /// Upper bound for the compact `tools` array. Raise only with a reason.
+    const TOOLS_LIST_MAX_BYTES: usize = 7_500;
+
+    #[test]
+    fn resource_store_is_lru_bounded_and_uris_carry_a_process_nonce() {
+        let mut store = ResourceStore::with_limits(3, 1_000);
+        for i in 0..5 {
+            store.insert(format!("u{i}"), "x".repeat(10));
+        }
+        assert_eq!(store.len(), 3, "entry cap");
+        assert!(store.get("u0").is_none() && store.get("u1").is_none());
+        assert!(store.get("u4").is_some());
+        // Touching u2 makes u3 the next victim.
+        assert!(store.get("u2").is_some());
+        store.insert("u5".into(), "y".into());
+        assert!(store.get("u3").is_none(), "LRU victim");
+        assert!(store.get("u2").is_some());
+        // Byte cap evicts old entries but always keeps the newest.
+        let mut bytes = ResourceStore::with_limits(100, 25);
+        bytes.insert("a".into(), "x".repeat(10));
+        bytes.insert("b".into(), "x".repeat(10));
+        bytes.insert("c".into(), "x".repeat(10));
+        assert!(bytes.get("a").is_none() && bytes.get("c").is_some());
+        bytes.insert("huge".into(), "x".repeat(100));
+        assert_eq!(bytes.len(), 1, "an oversized entry stays alone");
+        // A new process gets a different nonce window; same-process stores
+        // built at different instants differ too.
+        let a = ResourceStore::new();
+        std::thread::sleep(Duration::from_millis(2));
+        let b = ResourceStore::new();
+        assert_ne!(a.nonce, b.nonce);
+        let server = AstrolabeServer::new(tmp("res"));
+        let big = "z".repeat(40_000);
+        let result = server.result("t", big, json!({}), Some(100));
+        let link = text(&result);
+        assert!(link.contains("astrolabe://results/"), "{link}");
+        let uri_tail = link
+            .split("astrolabe://results/")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap();
+        assert!(
+            uri_tail.contains('-'),
+            "uri carries nonce-counter: {uri_tail}"
+        );
+    }
+
+    #[test]
+    fn search_code_answers_from_disk_while_the_index_is_building() {
+        let dir = tmp("building");
+        std::fs::write(dir.join("notes.md"), "needle_text appears here\nnothing\n").unwrap();
+        std::fs::write(dir.join("a.py"), "def f():\n    return 'needle_text'\n").unwrap();
+        // Never call start_indexing: the session stays in Building.
+        let mut server = AstrolabeServer::new(dir.clone());
+        server.structured_output = false;
+        let out = text(&server.search_code(Parameters(search_params("needle_text"))));
+        assert!(!out.contains("请稍后重试"), "{out}");
+        assert!(
+            out.contains("磁盘源码字面扫描") && out.contains("[text-only]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("notes.md:1:") && out.contains("a.py:2:"),
+            "{out}"
+        );
+        assert!(out.contains("2 处 / 2 个文件"), "{out}");
+        // path_filter and count_only apply.
+        let counted = text(&server.search_code(Parameters(SearchParams {
+            path_filter: Some("a.py".into()),
+            count_only: true,
+            ..search_params("needle_text")
+        })));
+        assert!(counted.contains("1 处 / 1 个文件"), "{counted}");
+        assert!(!counted.contains("a.py:2:"), "{counted}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_params_on_standard_methods_are_invalid_params() {
+        let bad = custom_request_error("tools/call");
+        assert_eq!(bad.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let unknown = custom_request_error("frobnicate/now");
+        assert_eq!(unknown.code, rmcp::model::ErrorCode::METHOD_NOT_FOUND);
+        assert!(unknown.message.contains("frobnicate/now"));
+    }
+
+    #[test]
+    fn cancel_flag_is_visible_only_inside_its_scope() {
+        assert!(!cancel::is_cancelled());
+        let flag = Arc::new(AtomicBool::new(false));
+        cancel::scope(Arc::clone(&flag), || {
+            assert!(!cancel::is_cancelled());
+            flag.store(true, Ordering::Relaxed);
+            assert!(cancel::is_cancelled());
+        });
+        assert!(!cancel::is_cancelled());
     }
 }

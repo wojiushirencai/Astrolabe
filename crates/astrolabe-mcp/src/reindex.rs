@@ -70,15 +70,48 @@ pub(crate) fn mcp_index_options(persist: bool, parse_cache_bytes: u64) -> IndexO
     IndexOptions {
         call_edges: true,
         persist,
+        // A follower never writes the store, but reading the leader's cache
+        // saves it a cold reparse of every file.
+        persist_read_only: !persist,
         parse_cache_bytes,
         ..IndexOptions::default()
     }
 }
 
-/// Keep `added`/`modified` only when [`Language::from_path`] recognizes the
+/// Max size of a text-only file admitted by the incremental path; mirrors the
+/// scanner's default `max_file_bytes` so a cold build and a live edit agree.
+const TEXT_ONLY_MAX_BYTES: u64 = 1_500_000;
+
+/// A non-language file (md, yaml, sql, `LICENSE` …) that the scanner would
+/// admit: it exists, is within the size cap, and is not binary (no NUL in the
+/// first 8 KiB). Such a change must still publish a new index so that
+/// `text_only_paths` and the index generation (dedup / loop-guard stamp) see
+/// it; a missing or oversized file is dropped as before.
+fn text_only_admissible(root: &Path, path: &RelPath) -> bool {
+    use std::io::Read;
+    let full = root.join(path.as_str());
+    let Ok(meta) = std::fs::metadata(&full) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > TEXT_ONLY_MAX_BYTES {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(&full) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(8192);
+    if file.take(8192).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    !head.contains(&0)
+}
+
+/// Keep `added`/`modified` when [`Language::from_path`] recognizes the
 /// file, or it has no real extension ([`Language::is_shebang_candidate`]) and is (or just stopped being) a shebang
-/// script. Editing `LICENSE` / `Makefile` therefore never triggers a rebuild;
-/// the `#!` probe is cached by mtime/size so it costs a stat. A script that
+/// script, or when it is an admissible text-only file
+/// ([`text_only_admissible`]); the latter produce no symbols but republish the
+/// index so text search and dedup stamps stay fresh. The `#!` probe is cached
+/// by mtime/size so it costs a stat. A script that
 /// lost its shebang is turned into a removal so its symbols are dropped.
 /// Every `removed` path is kept (dropping a node is cheap and must not miss a
 /// delete).
@@ -89,7 +122,7 @@ pub(crate) fn filter_changeset(root: &Path, changes: ChangeSet) -> ChangeSet {
             return true;
         }
         if !Language::is_shebang_candidate(path) {
-            return false;
+            return text_only_admissible(root, path);
         }
         let state = astrolabe_core::index::shebang_state(&root.join(path.as_str()));
         if state.script || state.missing {
@@ -98,7 +131,7 @@ pub(crate) fn filter_changeset(root: &Path, changes: ChangeSet) -> ChangeSet {
         if state.was_script {
             removed.push(path.clone());
         }
-        false
+        text_only_admissible(root, path)
     };
     let added: Vec<RelPath> = changes.added.into_iter().filter(|p| keep(p)).collect();
     let modified: Vec<RelPath> = changes.modified.into_iter().filter(|p| keep(p)).collect();
@@ -355,19 +388,22 @@ mod tests {
             removed: Vec::new(),
         };
         let filtered = filter_changeset(&dir, cs);
-        assert!(filtered.added.is_empty());
-        assert_eq!(filtered.modified, vec![RelPath::new("bin/tool")]);
-        assert!(filter_changeset(&dir, cs_modified(&["LICENSE"])).is_empty());
+        assert_eq!(filtered.added, vec![RelPath::new("Makefile")]);
+        assert_eq!(
+            filtered.modified,
+            vec![RelPath::new("LICENSE"), RelPath::new("bin/tool")]
+        );
+        // Existing text-only files now pass (fresh index / generation).
+        assert!(!filter_changeset(&dir, cs_modified(&["LICENSE"])).is_empty());
         // A script that loses its shebang becomes a removal.
         std::fs::write(dir.join("bin/tool"), "just text\n").unwrap();
         let lost = filter_changeset(&dir, cs_modified(&["bin/tool"]));
-        assert!(lost.modified.is_empty());
         assert_eq!(lost.removed, vec![RelPath::new("bin/tool")]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn md_touch_does_not_call_apply() {
+    fn md_touch_of_missing_file_does_not_call_apply() {
         let (tx, rx) = mpsc::channel();
         let applied = Arc::new(Mutex::new(0usize));
         let applied_thread = Arc::clone(&applied);
@@ -388,8 +424,57 @@ mod tests {
         assert_eq!(
             *applied.lock().unwrap(),
             0,
-            "non-language changesets must not trigger a rebuild"
+            "changes to missing non-language files must not trigger a rebuild"
         );
+    }
+
+    #[test]
+    fn text_only_filter_gates_size_and_binary() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("notes.md"), "needle\n").unwrap();
+        std::fs::write(dir.join("blob.dat"), b"ab\0cd").unwrap();
+        std::fs::write(dir.join("huge.txt"), vec![b'a'; 1_600_000]).unwrap();
+        let f = filter_changeset(
+            &dir,
+            cs_added(&["notes.md", "blob.dat", "huge.txt", "none.md"]),
+        );
+        assert_eq!(f.added, vec![RelPath::new("notes.md")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn text_only_add_and_edit_visible_in_index_and_generation() {
+        use crate::index::RepoIndex;
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "needle\n").unwrap();
+        let opts = mcp_index_options(false, DEFAULT_PARSE_CACHE_BYTES);
+        let inc = IncrementalIndex::build(&dir, &opts);
+        let before = RepoIndex::from_incremental(dir.clone(), inc);
+        let names = |i: &RepoIndex| -> Vec<String> {
+            i.text_only_paths(None)
+                .iter()
+                .map(|p| p.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(names(&before), vec!["notes.md".to_string()]);
+
+        // (b) a brand-new text-only file shows up after the watcher batch.
+        std::fs::write(dir.join("new.md"), "needle again\n").unwrap();
+        let cs = filter_changeset(&dir, cs_added(&["new.md"]));
+        assert!(!cs.is_empty(), "text-only add must publish a new index");
+        let inc = apply_reindex(&dir, before.incremental(), &cs, &opts).expect("add");
+        let after_add = RepoIndex::from_incremental(dir.clone(), inc);
+        assert!(names(&after_add).contains(&"new.md".to_string()));
+
+        // (a) an edit publishes a new index, hence a new generation stamp.
+        std::fs::write(dir.join("notes.md"), "needle\nsecond needle\n").unwrap();
+        let cs = filter_changeset(&dir, cs_modified(&["notes.md"]));
+        assert!(!cs.is_empty(), "text-only edit must publish a new index");
+        let inc = apply_reindex(&dir, after_add.incremental(), &cs, &opts).expect("mod");
+        let after_edit = RepoIndex::from_incremental(dir.clone(), inc);
+        assert_ne!(after_add.generation(), after_edit.generation());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -70,8 +70,9 @@ pub type ChurnTable = HashMap<String, ChurnStats>;
 /// * 两次子进程共享同一 10 秒 deadline（合计最坏 ≤10s）→ 超时 kill → 空表；
 /// * 同一提交内同名文件只计 1 次 commit（先按提交去重再累计）。
 ///
-/// 已知简化：git 对含特殊字符的路径会做 C 风格加引号转义（`core.quotePath`），
-/// 这里只剥掉首尾双引号、跳过内部仍含引号/反斜杠的行；非 UTF-8 字节经
+/// 已知简化：命令带 `-c core.quotePath=false`，非 ASCII 路径原样输出；含引号、
+/// 反斜杠、制表符等特殊字符的路径 git 仍会加引号转义，这里只剥掉首尾双引号、
+/// 跳过内部仍含引号/反斜杠的行；非 UTF-8 字节经
 /// `from_utf8_lossy` 有损转换。
 pub fn compute_churn(root: &Path) -> ChurnTable {
     // show-prefix 与 log 共用一个 deadline，最坏合计 ≤ GIT_TIMEOUT，而非各 10s。
@@ -81,7 +82,11 @@ pub fn compute_churn(root: &Path) -> ChurnTable {
     };
     let prefix = prefix_raw.trim();
 
+    // quotePath=false: otherwise non-ASCII paths come back as "\350\276..."
+    // and are skipped, so CJK file names always had churn 0.
     let args = [
+        "-c",
+        "core.quotePath=false",
         "log",
         "--since=90.days",
         "--name-only",
@@ -577,5 +582,39 @@ mod tests {
         let table = compute_churn(&dir);
         assert!(table.is_empty(), "non-git dir must yield an empty table");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compute_churn_counts_non_ascii_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "astrolabe-churn-cjk-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("辞.rs"), "fn a() {}").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "x"]);
+        let table = compute_churn(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            table.get("辞.rs").map(|s| s.commits_90d),
+            Some(1),
+            "{table:?}"
+        );
     }
 }

@@ -44,6 +44,8 @@
         (identifier) @name
         (dot_index_expression
           field: (identifier) @name)
+        (bracket_index_expression
+          field: (string content: (string_content) @name))
       ])) @definition.variable)
 
 ;; ---- nested function values ----------------------------------------------
@@ -66,6 +68,8 @@
         (identifier) @name
         (dot_index_expression
           field: (identifier) @name)
+        (bracket_index_expression
+          field: (string content: (string_content) @name))
       ])
     (expression_list
       .

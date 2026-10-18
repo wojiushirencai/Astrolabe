@@ -58,33 +58,77 @@ fn inside_type_body(node: tree_sitter::Node<'_>) -> bool {
 }
 
 /// Whether a definition is visible outside its file / type.
-pub(super) fn exported(_name: &str, node: tree_sitter::Node<'_>, source: &str) -> bool {
-    if node.kind() != "method" {
+pub(super) fn exported(name: &str, node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let kind = node.kind();
+    if !matches!(kind, "method" | "singleton_method" | "call") {
         return true;
     }
-    // `private def x` → method is an argument of a `private` call.
+    let src = source.as_bytes();
+    let text = |n: tree_sitter::Node<'_>| n.utf8_text(src).unwrap_or("");
+    // `private def x` / `private attr_reader :y` / `private_class_method def
+    // self.c` → the definition is an argument of a restrictive call.
     if let Some(args) = node.parent().filter(|p| p.kind() == "argument_list") {
         if let Some(call) = args.parent().filter(|p| p.kind() == "call") {
             if let Some(m) = call.child_by_field_name("method") {
-                if is_restrictive(m.utf8_text(source.as_bytes()).unwrap_or("")) {
+                if is_restrictive(text(m)) {
                     return false;
                 }
             }
         }
     }
-    // Bare `private` / `protected` / `public` statements before us.
-    let mut sib = node.prev_named_sibling();
-    while let Some(s) = sib {
-        if s.kind() == "identifier" {
-            match s.utf8_text(source.as_bytes()).unwrap_or("") {
-                "private" | "protected" => return false,
-                "public" => return true,
-                _ => {}
+    // Bare `private` / `protected` / `public` statements before us
+    // (instance methods and accessors; `def self.x` ignores them in Ruby).
+    let mut state = true;
+    if kind != "singleton_method" {
+        let mut sib = node.prev_named_sibling();
+        while let Some(s) = sib {
+            if s.kind() == "identifier" {
+                match text(s) {
+                    "private" | "protected" => {
+                        state = false;
+                        break;
+                    }
+                    "public" => break,
+                    _ => {}
+                }
+            }
+            sib = s.prev_named_sibling();
+        }
+    }
+    // Explicit symbol forms in the same body: `private :a, :b`,
+    // `private_class_method :c`, `public :a` (the last one in source order
+    // wins).
+    let want = clean_name(name);
+    if let Some(parent) = node.parent() {
+        let mut cur = parent.walk();
+        for sib in parent.named_children(&mut cur) {
+            if sib.kind() != "call"
+                || sib.id() == node.id()
+                || sib.child_by_field_name("receiver").is_some()
+            {
+                continue;
+            }
+            let Some(m) = sib.child_by_field_name("method").map(text) else {
+                continue;
+            };
+            let vis = match m {
+                "private" | "protected" | "private_class_method" => false,
+                "public" | "public_class_method" => true,
+                _ => continue,
+            };
+            let Some(args) = sib.child_by_field_name("arguments") else {
+                continue;
+            };
+            let mut ac = args.walk();
+            let named = args.named_children(&mut ac).any(|a| {
+                matches!(a.kind(), "simple_symbol" | "string") && clean_name(text(a)) == want
+            });
+            if named {
+                state = vis;
             }
         }
-        sib = s.prev_named_sibling();
     }
-    true
+    state
 }
 
 fn is_restrictive(m: &str) -> bool {
@@ -172,6 +216,27 @@ def top; end
         assert!(!find("k").1);
         assert!(find("m").1);
         assert!(!find("l").1);
+    }
+
+    #[test]
+    fn visibility_symbol_forms_and_attrs() {
+        let src = "class K\n  def a; end\n  def b; end\n  private :a\n  private_class_method def self.c; end\n  def self.d; end\n  private_class_method :d\n  attr_reader :pub1\n  private\n  attr_reader :x\n  private attr_reader :y\n  public\n  attr_reader :z\nend\n";
+        let p = parse_source(Language::Ruby, src).expect("parse");
+        let ex = |n: &str| {
+            p.symbols
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap_or_else(|| panic!("missing {n}: {:?}", p.symbols))
+                .exported
+        };
+        assert!(!ex("a"));
+        assert!(ex("b"));
+        assert!(!ex("c"));
+        assert!(!ex("d"));
+        assert!(ex("pub1"));
+        assert!(!ex("x"));
+        assert!(!ex("y"));
+        assert!(ex("z"));
     }
 
     #[test]

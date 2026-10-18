@@ -58,6 +58,12 @@
 //! (`a.b.Outer.Inner` → `a/b/Outer.java`) and static member imports
 //! (`import static a.b.C.method` → `a/b/C.java`) fall out of the same loop.
 //!
+//! **Kotlin targets.** In a mixed Java/Kotlin repo, `detect` also records the
+//! top-level declarations of `.kt` files in `ProjectMeta::type_decls` (same
+//! scanner as the Kotlin resolver), and `resolve` falls back to them when no
+//! `.java` file matches, so `import com.z.KtThing;` links to `KtThing.kt`.
+//! Nothing is read when the repo has no `.kt` file.
+//!
 //! Roots whose first-segment directory does not exist (`<root>/java` for
 //! `java.util.List`) are pruned before the loop, so JDK and third-party
 //! imports cost one directory lookup per root and return `None`, which is the
@@ -71,17 +77,25 @@
 //! The rule, applied uniformly:
 //!
 //! * if the name before `.*` denotes a **package** (a directory under some
-//!   source root), return `None`. A package is not a file; picking one member
-//!   (e.g. the lexicographically first) would fabricate an edge to a file the
-//!   importer may never touch, and the `Option<RelPath>` contract cannot
-//!   express "all files in the directory".
+//!   source root), [`JavaResolver::resolve`] still returns `None` (it cannot
+//!   express "all files"), but [`JavaResolver::resolve_import`] returns
+//!   [`ImportResolution::Files`]: every `.java` file directly in that package
+//!   directory (all source roots) plus Kotlin files declaring that package,
+//!   capped at [`WILDCARD_FILE_CAP`]. That is the honest, over-approximate
+//!   reading of "on demand": the importer may use any of them. The Java
+//!   parser reports `import com.y.*;` as plain `com.y`, so a spec whose last
+//!   segment is lowercase, that no type file matches and that names a package
+//!   directory is treated the same way. The importing
+//!   file itself is never a target.
 //! * otherwise resolve the name as a type exactly like a plain import, so
 //!   `import a.b.Outer.*` and `import static a.b.C.*` land on `Outer.java` /
 //!   `C.java`.
 
 use std::collections::BTreeSet;
 
-use crate::types::{join_rel, FileIndex, Language, ModuleResolver, ProjectMeta, RelPath};
+use crate::types::{
+    join_rel, FileIndex, ImportResolution, Language, ModuleResolver, ProjectMeta, RelPath, TypeDecl,
+};
 
 pub struct JavaResolver;
 
@@ -89,6 +103,12 @@ pub struct JavaResolver;
 /// fallback. One file per directory is enough — every file in a directory
 /// shares a package — so this caps I/O on huge, oddly laid-out repos.
 const FALLBACK_DIR_LIMIT: usize = 512;
+
+/// Most files one `import pkg.*` may link to.
+const WILDCARD_FILE_CAP: usize = 300;
+
+/// Upper bound on `.kt` files read for Java→Kotlin resolution.
+const KOTLIN_FILE_LIMIT: usize = 50_000;
 
 impl ModuleResolver for JavaResolver {
     fn language(&self) -> Language {
@@ -152,13 +172,93 @@ impl ModuleResolver for JavaResolver {
             }
         }
 
+        // 5. Kotlin declarations, so Java can import Kotlin classes.
+        let mut decls: BTreeSet<TypeDecl> = BTreeSet::new();
+        for p in files
+            .iter()
+            .filter(|p| p.extension() == Some("kt"))
+            .take(KOTLIN_FILE_LIMIT)
+        {
+            let Some(src) = files.read(p.as_str()) else {
+                continue;
+            };
+            let pkg = crate::resolvers::kotlin::package_decl(&src).unwrap_or_default();
+            for name in crate::resolvers::kotlin::top_level_names(&src) {
+                decls.insert(TypeDecl {
+                    namespace: pkg.clone(),
+                    name,
+                    file: p.as_str().to_owned(),
+                });
+            }
+        }
+
         ProjectMeta {
             source_roots: roots.into_iter().collect(),
+            type_decls: decls.into_iter().collect(),
             ..Default::default()
         }
     }
 
+    fn resolve_import(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> ImportResolution {
+        let explicit = normalize_spec(spec).is_some_and(|(_, on_demand)| on_demand);
+        let as_files = |targets: Vec<RelPath>| {
+            if targets.is_empty() {
+                ImportResolution::Unresolved
+            } else {
+                ImportResolution::Files(targets)
+            }
+        };
+        if explicit {
+            if let Some(targets) = wildcard_package_files(from, spec, files, meta, true) {
+                return as_files(targets);
+            }
+        }
+        if let Some(p) = self.resolve(from, spec, files, meta) {
+            return ImportResolution::File(p);
+        }
+        // The Java parser reports `import com.y.*;` as plain `com.y` (the star
+        // is only a capture flag). A lowercase last segment that is a package
+        // directory and no type is read as the wildcard it came from.
+        if !explicit {
+            if let Some(targets) = wildcard_package_files(from, spec, files, meta, false) {
+                return as_files(targets);
+            }
+        }
+        ImportResolution::Unresolved
+    }
+
     fn resolve(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> Option<RelPath> {
+        let found = self.resolve_inner(from, spec, files, meta)?;
+        // `import static a.B.CONST` inside `a/B.java` names the file itself.
+        (found != *from).then_some(found)
+    }
+}
+
+impl JavaResolver {
+    fn resolve_inner(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> Option<RelPath> {
+        self.resolve_java(from, spec, files, meta)
+            .or_else(|| resolve_kotlin(from, spec, meta))
+    }
+
+    fn resolve_java(
         &self,
         from: &RelPath,
         spec: &str,
@@ -219,6 +319,81 @@ impl ModuleResolver for JavaResolver {
 }
 
 // ----------------------------------------------------------------- helpers
+
+/// Fallback: the import names a Kotlin top-level declaration. Backs off
+/// trailing segments like the Kotlin resolver does (`a.b.Outer.Inner`).
+fn resolve_kotlin(from: &RelPath, spec: &str, meta: &ProjectMeta) -> Option<RelPath> {
+    if meta.type_decls.is_empty() {
+        return None;
+    }
+    let (name, on_demand) = normalize_spec(spec)?;
+    let segs: Vec<&str> = name.split('.').collect();
+    if segs.len() < 2 || !segs.iter().all(|s| is_identifier(s)) {
+        return None;
+    }
+    if on_demand && meta.type_decls.iter().any(|d| d.namespace == name) {
+        return None;
+    }
+    for n in (1..segs.len()).rev() {
+        let pkg = segs[..n].join(".");
+        if let Some(file) =
+            crate::resolvers::kotlin::lookup(&meta.type_decls, &pkg, segs[n], from.as_str())
+        {
+            return Some(RelPath::new(file));
+        }
+    }
+    None
+}
+
+/// `import a.b.*` naming a package: every `.java` file directly in that
+/// package directory (all roots) plus Kotlin files declaring the package.
+/// `None` when the import is not a package wildcard.
+fn wildcard_package_files(
+    from: &RelPath,
+    spec: &str,
+    files: &FileIndex,
+    meta: &ProjectMeta,
+    explicit: bool,
+) -> Option<Vec<RelPath>> {
+    let (name, _) = normalize_spec(spec)?;
+    let segs: Vec<&str> = name.split('.').collect();
+    if segs.len() < 2 || segs.iter().any(|s| !is_identifier(s)) {
+        return None;
+    }
+    if !explicit
+        && !segs
+            .last()
+            .is_some_and(|l| l.starts_with(|c: char| c.is_lowercase()))
+    {
+        return None;
+    }
+    let pkg_dir = segs.join("/");
+    let mut out: BTreeSet<RelPath> = BTreeSet::new();
+    let mut is_package = false;
+    for root in &meta.source_roots {
+        let dir = join(root, &pkg_dir);
+        if !files.has_dir(&dir) || dir.is_empty() {
+            continue;
+        }
+        is_package = true;
+        for p in files.entries(&dir) {
+            if p.extension() == Some("java") && p != from {
+                out.insert(p.clone());
+            }
+        }
+    }
+    for d in meta.type_decls.iter().filter(|d| d.namespace == name) {
+        is_package = true;
+        let p = RelPath::new(&d.file);
+        if p != *from {
+            out.insert(p);
+        }
+    }
+    if !is_package {
+        return None;
+    }
+    Some(out.into_iter().take(WILDCARD_FILE_CAP).collect())
+}
 
 /// `"root/rest"`, or just `rest` for the repo-root source root.
 fn join(root: &str, rest: &str) -> String {

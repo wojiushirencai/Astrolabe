@@ -285,16 +285,46 @@ impl FreshnessLog {
     }
 
     /// A completed full check: push watermark, clear distrust and suspects.
-    pub(crate) fn note_verified(&self) {
+    ///
+    /// `changes` is the delta this check just produced. It has been sent (or
+    /// is about to be) to the reindex consumer but is not applied to the
+    /// index yet, so its paths stay suspects *after* the new watermark until
+    /// the query barrier repairs them or a rebuild covers them
+    /// ([`Self::clear_suspects_through`]). Advancing the watermark alone would
+    /// make the barrier report "fresh" for an index that does not yet contain
+    /// the change.
+    pub(crate) fn note_verified(&self, changes: &ChangeSet) {
         let mut g = self.lock();
         g.watermark = Instant::now();
         g.distrusted = false;
         g.suspects.clear();
+        Self::push_unapplied(&mut g, changes);
         self.seeded.store(true, Ordering::SeqCst);
     }
 
-    fn bump_watermark(&self) {
-        self.lock().watermark = Instant::now();
+    /// A completed directed check; same contract as [`Self::note_verified`]
+    /// but without clearing distrust or earlier suspects.
+    fn bump_watermark(&self, changes: &ChangeSet) {
+        let mut g = self.lock();
+        g.watermark = Instant::now();
+        Self::push_unapplied(&mut g, changes);
+    }
+
+    fn push_unapplied(g: &mut FreshnessInner, changes: &ChangeSet) {
+        if changes.is_empty() {
+            return;
+        }
+        // Strictly after the watermark so `suspect_paths(watermark)` sees them.
+        let t = Instant::now().max(g.watermark + Duration::from_nanos(1));
+        for (_, p) in changes.iter() {
+            g.suspects.push((t, p.clone()));
+        }
+    }
+
+    /// Drop suspects noted at or before `through`: the caller has repaired
+    /// (or rebuilt past) them. Later suspects are kept.
+    pub fn clear_suspects_through(&self, through: Instant) {
+        self.lock().suspects.retain(|(t, _)| *t > through);
     }
 }
 
@@ -398,8 +428,12 @@ fn apply_coalesce(map: &mut BTreeMap<RelPath, ChangeKind>, path: RelPath, next: 
         }
         (Some(ChangeKind::Added), ChangeKind::Added) => {}
         (Some(ChangeKind::Added), ChangeKind::Modified) => {}
+        // Keep the removal: the add may already have been applied to the
+        // index out of band (barrier inline repair), and dropping a path that
+        // is not indexed is a cheap idempotent no-op. Cancelling both would
+        // leave a ghost file behind.
         (Some(ChangeKind::Added), ChangeKind::Removed) => {
-            map.remove(&path);
+            map.insert(path, ChangeKind::Removed);
         }
         (Some(ChangeKind::Modified), ChangeKind::Added) => {}
         (Some(ChangeKind::Modified), ChangeKind::Modified) => {}
@@ -528,7 +562,7 @@ impl Watcher {
         if !self.seeded {
             self.snapshot = stamps_from_observed(&self.root, &observed, now);
             self.seeded = true;
-            self.freshness.note_verified();
+            self.freshness.note_verified(&ChangeSet::default());
             return ChangeSet::default();
         }
 
@@ -575,7 +609,7 @@ impl Watcher {
                 "watch changeset"
             );
         }
-        self.freshness.note_verified();
+        self.freshness.note_verified(&changes);
         changes
     }
 
@@ -682,15 +716,22 @@ impl Watcher {
 
         for rel in work {
             match self.snapshot.get(&rel).cloned() {
-                Some(old) => match observe_one(&self.root, &rel) {
-                    Some(meta) => {
+                Some(old) => match (
+                    admit_new(&self.root, &rel, &self.scan),
+                    observe_one(&self.root, &rel),
+                ) {
+                    // Still admitted: same stat + confirm as before.
+                    (Admit::Indexed, Some(meta)) => {
                         let (stamp, changed) = confirm(&self.root, &rel, &old, &meta, now);
                         if changed {
                             modified.push(rel.clone());
                         }
                         self.snapshot.insert(rel, stamp);
                     }
-                    None => {
+                    // Gone, or no longer passes the scan gates (gitignored,
+                    // grew past the size cap, turned binary): a full scan
+                    // would drop it, so the directed path must too.
+                    _ => {
                         self.snapshot.remove(&rel);
                         removed.push(rel);
                     }
@@ -724,7 +765,7 @@ impl Watcher {
                 "watch directed changeset"
             );
         }
-        self.freshness.bump_watermark();
+        self.freshness.bump_watermark(&changes);
         changes
     }
 
@@ -989,6 +1030,22 @@ fn safety_wait(configured: Duration, distrusted: bool) -> Duration {
     }
 }
 
+/// Upper bound on how long a continuously-busy burst may defer delivery.
+fn max_debounce_for(debounce: Duration) -> Duration {
+    debounce
+        .saturating_mul(6)
+        .max(Duration::from_secs(3))
+        .max(debounce)
+}
+
+/// `.gitignore` / `.ignore` edits re-define which other paths are admitted.
+fn is_ignore_rule_file(rel: &RelPath) -> bool {
+    matches!(
+        rel.as_str().rsplit('/').next(),
+        Some(".gitignore") | Some(".ignore")
+    ) || rel.as_str() == ".git/info/exclude"
+}
+
 fn event_loop<F: EventFeed, G>(
     mut watcher: Watcher,
     mut feed: F,
@@ -1000,6 +1057,10 @@ fn event_loop<F: EventFeed, G>(
     let storm_paths = watcher.config.storm_paths;
     let safety_interval = watcher.config.safety_interval;
     let mut last_event: Option<Instant> = None;
+    // First event of the current debounce burst; bounds the total wait so a
+    // path that keeps changing (a log file) cannot starve delivery.
+    let mut first_event: Option<Instant> = None;
+    let max_debounce = max_debounce_for(debounce);
     let mut last_safety = initial_last_safety(&watcher.config);
     let mut pending: HashSet<PathBuf> = HashSet::new();
     let mut all_dirty = false;
@@ -1061,10 +1122,17 @@ fn event_loop<F: EventFeed, G>(
                     watcher.freshness.note_distrust();
                 }
                 if !noted.is_empty() {
+                    // Ignore-rule files change the admitted set of other
+                    // paths; only a full scan can re-evaluate those.
+                    if noted.iter().any(is_ignore_rule_file) {
+                        all_dirty = true;
+                    }
                     watcher.freshness.note_paths(&noted);
                 }
                 if kept > 0 || overflow || all_dirty {
-                    last_event = Some(Instant::now());
+                    let now = Instant::now();
+                    last_event = Some(now);
+                    first_event.get_or_insert(now);
                 }
             }
             Ok(FeedWake::Error) => {
@@ -1084,6 +1152,7 @@ fn event_loop<F: EventFeed, G>(
             all_dirty = false;
             pending.clear();
             last_event = None;
+            first_event = None;
             last_safety = Instant::now();
             let batch = watcher.check();
             if !batch.is_empty() && tx.send(batch).is_err() {
@@ -1091,12 +1160,16 @@ fn event_loop<F: EventFeed, G>(
             }
         }
 
-        let quiet = last_event.map(|t| t.elapsed() >= debounce).unwrap_or(false);
+        let quiet = last_event.map(|t| t.elapsed() >= debounce).unwrap_or(false)
+            || first_event
+                .map(|t| t.elapsed() >= max_debounce)
+                .unwrap_or(false);
         let wait = safety_wait(safety_interval, watcher.freshness.distrusted());
         let safety_due = !wait.is_zero() && last_safety.elapsed() >= wait;
 
         if quiet || safety_due {
             last_event = None;
+            first_event = None;
             // Safety scans and storm/overflow always take the full-tree path.
             // Directed `check_paths` does not reset the safety clock, so a
             // distrusted log still gets a full scan within the 60 s cap.
@@ -1420,6 +1493,10 @@ fn keep_event_path(root: &Path, scan: &ScanOptions, path: &Path) -> Option<(Path
         root.join(path)
     };
     let rel = relativize(root, &abs)?;
+    if rel.as_str() == ".git/info/exclude" {
+        // Not content, but it changes the admitted set like a `.gitignore`.
+        return Some((abs, rel));
+    }
     if is_excluded_rel(root, &rel, &scan.extra_excludes) {
         return None;
     }
@@ -1709,9 +1786,172 @@ mod tests {
         });
         assert!(pending.added.is_empty(), "{pending:?}");
         assert_eq!(pending.modified, vec![RelPath::new("gone.rs")]);
-        assert_eq!(pending.removed, vec![RelPath::new("old.rs")]);
+        // `new.rs` was added then removed: the removal must survive (it may
+        // have been applied to the index out of band), so no ghost remains.
+        assert_eq!(
+            pending.removed,
+            vec![RelPath::new("new.rs"), RelPath::new("old.rs")]
+        );
     }
 
+    #[test]
+    fn added_then_removed_keeps_removal() {
+        let mut cs = ChangeSet {
+            added: vec![RelPath::new("x.rs")],
+            ..ChangeSet::default()
+        };
+        cs.merge(ChangeSet {
+            removed: vec![RelPath::new("x.rs")],
+            ..ChangeSet::default()
+        });
+        assert_eq!(cs.removed, vec![RelPath::new("x.rs")]);
+        assert!(cs.added.is_empty() && cs.modified.is_empty());
+    }
+
+    #[test]
+    fn directed_check_keeps_changed_paths_as_suspects_after_watermark() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        let log = Arc::clone(&w.freshness);
+        w.check();
+        rewrite_and_bump(&dir, "a.rs", "fn a() { 1 }");
+        let ch = w.check_paths(&[dir.abs("a.rs")]);
+        assert_eq!(ch.modified, vec![RelPath::new("a.rs")]);
+        // Delta is produced but not applied: it must still be a suspect.
+        assert_eq!(
+            log.suspect_paths(log.watermark()),
+            vec![RelPath::new("a.rs")]
+        );
+        log.clear_suspects_through(Instant::now());
+        assert!(log.suspect_paths(log.watermark()).is_empty());
+        // A no-change directed check leaves no suspects.
+        w.check_paths(&[dir.abs("a.rs")]);
+        assert!(log.suspect_paths(log.watermark()).is_empty());
+    }
+
+    #[test]
+    fn full_check_keeps_changes_as_suspects() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        let log = Arc::clone(&w.freshness);
+        w.check();
+        dir.write("b.rs", "fn b() {}");
+        let ch = w.check();
+        assert_eq!(ch.added, vec![RelPath::new("b.rs")]);
+        assert_eq!(
+            log.suspect_paths(log.watermark()),
+            vec![RelPath::new("b.rs")]
+        );
+    }
+
+    fn default_scan_watcher(dir: &TestDir) -> Watcher {
+        Watcher::new(dir.path())
+            .scan_options(ScanOptions::default())
+            .safety_jitter(false)
+    }
+
+    #[test]
+    fn directed_check_drops_newly_gitignored_tracked_file() {
+        let dir = TestDir::new();
+        dir.write("keep.rs", "fn k() {}");
+        dir.write("gen.rs", "fn g() {}");
+        let mut w = default_scan_watcher(&dir);
+        w.check();
+        dir.write(".gitignore", "gen.rs\n");
+        let ch = w.check_paths(&[dir.abs("gen.rs")]);
+        assert_eq!(ch.removed, vec![RelPath::new("gen.rs")], "{ch:?}");
+    }
+
+    #[test]
+    fn directed_check_drops_file_grown_past_size_cap() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = default_scan_watcher(&dir);
+        w.check();
+        dir.write("a.rs", vec![b'x'; 1_600_000]);
+        let ch = w.check_paths(&[dir.abs("a.rs")]);
+        assert_eq!(ch.removed, vec![RelPath::new("a.rs")], "{ch:?}");
+        assert!(w.check().is_empty(), "full scan agrees");
+    }
+
+    #[test]
+    fn directed_admission_honors_dot_ignore_and_git_exclude() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        dir.write(".git/info/.keep", "");
+        dir.write(".ignore", "skipme.rs\n");
+        dir.write(".git/info/exclude", "hidden.rs\n");
+        let mut w = default_scan_watcher(&dir);
+        w.check();
+        dir.write("skipme.rs", "fn s() {}");
+        dir.write("hidden.rs", "fn h() {}");
+        dir.write("shown.rs", "fn v() {}");
+        let ch = w.check_paths(&[
+            dir.abs("skipme.rs"),
+            dir.abs("hidden.rs"),
+            dir.abs("shown.rs"),
+        ]);
+        assert_eq!(ch.added, vec![RelPath::new("shown.rs")], "{ch:?}");
+        assert!(w.check().is_empty(), "directed and full agree: no flapping");
+    }
+
+    #[test]
+    fn ignore_rule_file_events_are_recognised() {
+        assert!(is_ignore_rule_file(&RelPath::new(".gitignore")));
+        assert!(is_ignore_rule_file(&RelPath::new("sub/.ignore")));
+        assert!(is_ignore_rule_file(&RelPath::new(".git/info/exclude")));
+        assert!(!is_ignore_rule_file(&RelPath::new("a.rs")));
+        assert!(!is_ignore_rule_file(&RelPath::new("x.gitignore")));
+    }
+
+    struct BusyFeed {
+        paths: Vec<PathBuf>,
+    }
+
+    impl EventFeed for BusyFeed {
+        fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
+            // The paths change on every wake, so the debounce never goes quiet.
+            if timeout.is_zero() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            thread::sleep(Duration::from_millis(20));
+            Ok(FeedWake::Events {
+                paths: self.paths.clone(),
+                overflow: false,
+            })
+        }
+    }
+
+    #[test]
+    fn continuous_events_cannot_starve_delivery() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        dir.write("busy.log", "0");
+        let mut w = watcher(&dir).debounce(Duration::from_millis(300));
+        w.check();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let feed = BusyFeed {
+            paths: vec![dir.abs("busy.log"), dir.abs("a.rs")],
+        };
+        let stop2 = Arc::clone(&stop);
+        let h = thread::spawn(move || {
+            event_loop(w, feed, (), tx, stop2);
+        });
+        // After the loop's catch-up check, edit a file while events never stop.
+        thread::sleep(Duration::from_millis(150));
+        rewrite_and_bump(&dir, "a.rs", "fn a() { 2 }");
+        let started = Instant::now();
+        let got = rx.recv_timeout(Duration::from_secs(8));
+        let waited = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let got = got.expect("batch delivered despite constant events");
+        assert!(got.modified.contains(&RelPath::new("a.rs")), "{got:?}");
+        assert!(waited < Duration::from_secs(6), "waited {waited:?}");
+    }
     #[test]
     fn debounce_collapses_rapid_events() {
         let dir = TestDir::new();
@@ -2503,7 +2743,7 @@ mod tests {
         );
 
         thread::sleep(Duration::from_millis(2));
-        log.note_verified();
+        log.note_verified(&ChangeSet::default());
         assert!(log.is_seeded());
         assert!(!log.distrusted());
         assert!(log.watermark() > t0);

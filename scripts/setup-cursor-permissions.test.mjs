@@ -42,10 +42,10 @@ test('catalog names are the seven reserved tools', () => {
   assert.equal(new Set(CATALOG_TOOL_NAMES).size, 7);
 });
 
-test('creates permissions.json when missing', () => {
+test('creates permissions.json when missing and --yes is given', () => {
   const home = tmpHome();
   try {
-    const result = run(home);
+    const result = run(home, ['--yes']);
     assert.equal(result.status, 0, result.stderr);
     const filePath = path.join(home, '.cursor', 'permissions.json');
     assert.equal(fs.existsSync(filePath), true);
@@ -127,7 +127,7 @@ test('invalid JSON exits 1 and leaves the file unchanged', () => {
 test('--cli skips missing cli-config.json and does not create it', () => {
   const home = tmpHome();
   try {
-    const result = run(home, ['--cli']);
+    const result = run(home, ['--cli', '--yes']);
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.existsSync(path.join(home, '.cursor', 'permissions.json')), true);
     assert.equal(fs.existsSync(path.join(home, '.cursor', 'cli-config.json')), false);
@@ -153,7 +153,7 @@ test('--cli merges Mcp(astrolabe:<tool>) without changing approvalMode', () => {
     };
     fs.writeFileSync(cliPath, `${JSON.stringify(original, null, 2)}\n`);
 
-    const result = run(home, ['--cli']);
+    const result = run(home, ['--cli', '--yes']);
     assert.equal(result.status, 0, result.stderr);
     const doc = readJson(cliPath);
     assert.equal(doc.approvalMode, 'allowlist');
@@ -164,6 +164,62 @@ test('--cli merges Mcp(astrolabe:<tool>) without changing approvalMode', () => {
     for (const entry of CLI_ALLOW_ENTRIES) {
       assert.equal(doc.permissions.allow.includes(entry), true, `missing ${entry}`);
     }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('missing permissions.json is not created without --yes (non-interactive)', () => {
+  const home = tmpHome();
+  try {
+    const result = run(home);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /整表覆盖/);
+    assert.match(result.stderr, /--yes/);
+    assert.equal(fs.existsSync(path.join(home, '.cursor', 'permissions.json')), false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('existing file is backed up, keeps mode, and warning is printed before the write', () => {
+  const home = tmpHome();
+  try {
+    const filePath = path.join(home, '.cursor', 'permissions.json');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const original = `${JSON.stringify({ mcpAllowlist: ['other:foo'] }, null, 2)}\n`;
+    fs.writeFileSync(filePath, original);
+    fs.chmodSync(filePath, 0o640);
+    const result = run(home);
+    assert.equal(result.status, 0, result.stderr);
+    const baks = fs.readdirSync(path.dirname(filePath)).filter((n) => n.includes('.bak-'));
+    assert.equal(baks.length, 1);
+    assert.equal(fs.readFileSync(path.join(path.dirname(filePath), baks[0]), 'utf8'), original);
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(filePath).mode & 0o777, 0o640);
+    }
+    assert.ok(result.stdout.indexOf('整表覆盖') < result.stdout.indexOf('已合并'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('symlinked permissions.json stays a symlink and the target is updated', { skip: process.platform === 'win32' }, () => {
+  const home = tmpHome();
+  try {
+    const dotfiles = path.join(home, 'dotfiles');
+    fs.mkdirSync(dotfiles, { recursive: true });
+    const target = path.join(dotfiles, 'permissions.json');
+    fs.writeFileSync(target, `${JSON.stringify({ mcpAllowlist: ['other:foo'] })}\n`);
+    const linkPath = path.join(home, '.cursor', 'permissions.json');
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+    fs.symlinkSync(target, linkPath);
+    const result = run(home);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.lstatSync(linkPath).isSymbolicLink(), true);
+    const doc = readJson(target);
+    assert.equal(doc.mcpAllowlist[0], 'other:foo');
+    assert.equal(doc.mcpAllowlist.includes('astrolabe:search_code'), true);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

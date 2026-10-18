@@ -5,8 +5,10 @@
 //!
 //! # How `detect` builds [`ProjectMeta`]
 //!
-//! * Every `pubspec.yaml` in the index (excluding those in `.dart_tool` or `build/`
-//!   directories) is parsed for its `name:` declaration at column 0.
+//! * Every `pubspec.yaml` in the index (excluding those in `.dart_tool`, or in
+//!   a `build/` directory whose parent has its own `pubspec.yaml` — that is
+//!   package build output; `tool/build/tools/pubspec.yaml` with no package
+//!   directly above `build/` is a normal package) is parsed for its `name:` declaration at column 0.
 //! * Each valid pubspec produces a [`ModuleUnit`] mapping `<name>` to
 //!   `<pubspec_dir>/lib`. Same-name packages are all kept — see the note in
 //!   `detect`.
@@ -39,7 +41,7 @@ impl ModuleResolver for DartResolver {
     fn detect(&self, files: &FileIndex) -> ProjectMeta {
         let mut candidates: Vec<String> = Vec::new();
         for p in files.iter() {
-            if p.file_name() == "pubspec.yaml" && !is_ignored_dart_path(p.as_str()) {
+            if p.file_name() == "pubspec.yaml" && !is_ignored_dart_path(p.as_str(), files) {
                 candidates.push(p.as_str().to_string());
             }
         }
@@ -203,9 +205,32 @@ fn package_target(unit: &ModuleUnit, pkg_spec: &str, files: &FileIndex) -> Optio
     None
 }
 
-fn is_ignored_dart_path(path: &str) -> bool {
-    path.split('/')
-        .any(|seg| seg == ".dart_tool" || seg == "build")
+/// `.dart_tool` anywhere, or a `build` directory that is a package's build
+/// output, i.e. its parent directory holds a `pubspec.yaml` of its own. A
+/// `build` segment elsewhere (`build/tools/pubspec.yaml`, `tool/build/...`)
+/// is an ordinary directory name.
+fn is_ignored_dart_path(path: &str, files: &FileIndex) -> bool {
+    let mut parent = String::new();
+    for seg in path.split('/') {
+        if seg == ".dart_tool" {
+            return true;
+        }
+        if seg == "build" {
+            let manifest = if parent.is_empty() {
+                "pubspec.yaml".to_string()
+            } else {
+                format!("{parent}/pubspec.yaml")
+            };
+            if files.contains(&manifest) {
+                return true;
+            }
+        }
+        if !parent.is_empty() {
+            parent.push('/');
+        }
+        parent.push_str(seg);
+    }
+    false
 }
 
 /// Parses the package `name:` from a `pubspec.yaml` content.
@@ -480,7 +505,7 @@ dependencies:
 
         let normal = root.join("app");
         let tool = root.join(".dart_tool/sub");
-        let build = root.join("build/sub");
+        let build = root.join("app/build/sub");
         fs::create_dir_all(&normal).unwrap();
         fs::create_dir_all(&tool).unwrap();
         fs::create_dir_all(&build).unwrap();
@@ -495,7 +520,7 @@ dependencies:
                 RelPath::new("app/pubspec.yaml"),
                 RelPath::new(".dart_tool/sub/pubspec.yaml"),
                 RelPath::new(".dart_tool/hack.d"),
-                RelPath::new("build/sub/pubspec.yaml"),
+                RelPath::new("app/build/sub/pubspec.yaml"),
             ],
         );
 
@@ -509,5 +534,32 @@ dependencies:
             &RelPath::new(".dart_tool/hack.d"),
             &[".dart_tool".to_string()]
         ));
+    }
+
+    #[test]
+    fn pubspec_under_plain_build_directory_is_kept() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("build/tools/lib")).unwrap();
+        fs::write(root.join("build/tools/pubspec.yaml"), "name: tools\n").unwrap();
+        let files = FileIndex::new(
+            root,
+            [
+                RelPath::new("build/tools/pubspec.yaml"),
+                RelPath::new("build/tools/lib/t.dart"),
+                RelPath::new("app/lib/a.dart"),
+            ],
+        );
+        let meta = DartResolver.detect(&files);
+        assert_eq!(meta.modules.len(), 1);
+        assert_eq!(meta.modules[0].name, "tools");
+        let from = RelPath::new("app/lib/a.dart");
+        assert_eq!(
+            DartResolver
+                .resolve(&from, "package:tools/t.dart", &files, &meta)
+                .map(|p| p.as_str().to_string())
+                .as_deref(),
+            Some("build/tools/lib/t.dart")
+        );
     }
 }

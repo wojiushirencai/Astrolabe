@@ -39,6 +39,8 @@ pub(crate) fn parse_sfc(
         exported: true,
     });
 
+    // Template usages (`@click="go()"`, `{{ fmt(x) }}`, `<MyComp/>`).
+    calls.extend(template_calls(source));
     let blocks = extract_script_blocks(source);
     if blocks.is_empty() {
         // Template-only SFCs still get the module symbol so the file is indexed.
@@ -46,9 +48,11 @@ pub(crate) fn parse_sfc(
             symbols,
             imports,
             calls,
+            partial: false,
         });
     }
 
+    let mut partial = false;
     for block in blocks {
         let parsed = pool.parse(block.lang, path, &block.body)?;
         let line_offset = block.body_start_line.saturating_sub(1);
@@ -84,6 +88,7 @@ pub(crate) fn parse_sfc(
                 symbols.push(sym);
             }
         }
+        partial |= parsed.partial;
         imports.extend(parsed.imports);
         for (name, line) in parsed.calls {
             calls.push((name, line.saturating_add(line_offset)));
@@ -94,6 +99,7 @@ pub(crate) fn parse_sfc(
         symbols,
         imports,
         calls,
+        partial,
     })
 }
 
@@ -123,34 +129,91 @@ fn line_number(zero_based_row: usize) -> u32 {
         .saturating_add(1)
 }
 
+/// Copy of `lower` with `<!-- ... -->` comments blanked (newlines and length
+/// preserved), so tag scanning ignores commented-out markup.
+fn mask_html_comments(lower: &str) -> String {
+    let mut out = String::with_capacity(lower.len());
+    let mut rest = lower;
+    while let Some(i) = rest.find("<!--") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail.find("-->").map(|e| e + 3).unwrap_or(tail.len());
+        // One byte out per byte in: offsets into the masked text must stay
+        // valid for the original source (comments may hold multi-byte text).
+        for b in tail[..end].bytes() {
+            out.push(if b == b'\n' || b == b'\r' {
+                b as char
+            } else {
+                ' '
+            });
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Index of the `>` that ends the start tag whose attributes begin at
+/// `from`, skipping `>` inside quoted attribute values (`generic="T extends
+/// Record<string, any>"`).
+fn find_tag_end(masked: &str, from: usize) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (k, &b) in bytes.iter().enumerate().skip(from) {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'>' => return Some(k),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Byte ranges (start of `<script`, end after `</script>`) of script blocks.
+fn script_ranges(masked: &str) -> Vec<(usize, usize, usize, usize)> {
+    // (tag_start, tag_end_idx_of_'>', body_end, block_end)
+    let bytes = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = masked[search_from..].find("<script") {
+        let start = search_from + rel;
+        let after = start + "<script".len();
+        // `<scripty>` and friends are different elements.
+        match bytes.get(after) {
+            Some(b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/') => {}
+            _ => {
+                search_from = after;
+                continue;
+            }
+        }
+        let Some(tag_end) = find_tag_end(masked, after) else {
+            break;
+        };
+        let close_pat = "</script>";
+        let Some(close_rel) = masked[tag_end + 1..].find(close_pat) else {
+            break;
+        };
+        let body_end = tag_end + 1 + close_rel;
+        out.push((start, tag_end, body_end, body_end + close_pat.len()));
+        search_from = body_end + close_pat.len();
+    }
+    out
+}
+
 fn extract_script_blocks(source: &str) -> Vec<ScriptBlock> {
-    let lower = source.to_ascii_lowercase();
+    let masked = mask_html_comments(&source.to_ascii_lowercase());
     let bytes = source.as_bytes();
     let mut blocks = Vec::new();
-    let mut search_from = 0;
-
-    while let Some(rel) = lower[search_from..].find("<script") {
-        let start = search_from + rel;
-        // Avoid matching "</script" or partial tags inside strings poorly —
-        // require tag open at `<script` and a following `>` for attributes.
-        let after = start + "<script".len();
-        let Some(tag_end_rel) = lower[after..].find('>') else {
-            break;
-        };
-        let tag_end = after + tag_end_rel; // index of '>'
+    for (start, tag_end, body_end, _) in script_ranges(&masked) {
         let open_tag = &source[start..=tag_end];
-        // Skip the closing tag form if somehow matched.
-        if open_tag.as_bytes().get(1) == Some(&b'/') {
-            search_from = tag_end + 1;
-            continue;
-        }
-
-        let close_pat = "</script>";
-        let Some(close_rel) = lower[tag_end + 1..].find(close_pat) else {
-            break;
-        };
         let body_start = tag_end + 1;
-        let body_end = tag_end + 1 + close_rel;
         let body = &source[body_start..body_end];
         // Drop a single leading newline so line 1 of the script aligns with
         // the first content line after `<script...>`.
@@ -169,9 +232,204 @@ fn extract_script_blocks(source: &str) -> Vec<ScriptBlock> {
             body: body.to_string(),
             body_start_line,
         });
-        search_from = body_end + close_pat.len();
     }
     blocks
+}
+
+const TEMPLATE_NOT_CALLS: &[&str] = &[
+    "if", "for", "while", "switch", "function", "return", "typeof", "catch", "new", "void",
+];
+
+fn is_ident_byte(b: u8) -> bool {
+    b == b'_' || b == b'$' || b.is_ascii_alphanumeric()
+}
+
+/// `ident(` call names inside a template expression (member calls give the
+/// tail name). `line` is the 1-based SFC line of `expr`'s first byte.
+fn push_expr_calls(expr: &str, mut line: u32, calls: &mut Vec<(String, u32)>) {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            line = line.saturating_add(1);
+        }
+        if is_ident_byte(b) && !b.is_ascii_digit() && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+            let mut j = i;
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            let mut k = j;
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            let name = &expr[i..j];
+            if bytes.get(k) == Some(&b'(') && !TEMPLATE_NOT_CALLS.contains(&name) {
+                calls.push((name.to_string(), line));
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn kebab_to_pascal(tag: &str) -> String {
+    tag.split('-')
+        .map(|p| {
+            let mut c = p.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// Calls and component usages in the template markup (everything outside
+/// `<script>`, `<style>` and comments): `{{ fmt(x) }}`, `@click="go(1)"`,
+/// `:prop="f(x)"`, `v-*="..."`, a bare `@click="handler"`, and
+/// `<MyComp/>` / `<my-comp>` tags (as the PascalCase component name).
+fn template_calls(source: &str) -> Vec<(String, u32)> {
+    let lower = source.to_ascii_lowercase();
+    let masked = mask_html_comments(&lower);
+    // Blank script and style blocks in a source copy of identical length.
+    let mut blank: Vec<(usize, usize)> = script_ranges(&masked)
+        .into_iter()
+        .map(|(s, _, _, e)| (s, e))
+        .collect();
+    let mut from = 0;
+    while let Some(rel) = masked[from..].find("<style") {
+        let s = from + rel;
+        let e = masked[s..]
+            .find("</style>")
+            .map(|x| s + x + "</style>".len())
+            .unwrap_or(masked.len());
+        blank.push((s, e));
+        from = e;
+    }
+    // Keep original case; blank comments + blocks.
+    let mut text = String::with_capacity(source.len());
+    let mut byte = 0;
+    for c in source.chars() {
+        let len = c.len_utf8();
+        let hide = blank.iter().any(|&(s, e)| byte >= s && byte < e)
+            || masked.as_bytes().get(byte) == Some(&b' ') && c != ' ';
+        if hide && c != '\n' && c != '\r' {
+            for _ in 0..len {
+                text.push(' ');
+            }
+        } else {
+            text.push(c);
+        }
+        byte += len;
+    }
+    let bytes = text.as_bytes();
+    let mut calls = Vec::new();
+    let mut line = 1u32;
+    let mut p = 0;
+    while p < bytes.len() {
+        match bytes[p] {
+            b'\n' => {
+                line = line.saturating_add(1);
+                p += 1;
+            }
+            b'{' if bytes.get(p + 1) == Some(&b'{') => {
+                let end = text[p + 2..]
+                    .find("}}")
+                    .map(|e| p + 2 + e)
+                    .unwrap_or(bytes.len());
+                push_expr_calls(&text[p + 2..end], line, &mut calls);
+                line = line.saturating_add(text[p..end].matches('\n').count() as u32);
+                p = (end + 2).min(bytes.len());
+            }
+            b'<' => {
+                let name_start = p + 1;
+                let mut q = name_start;
+                while q < bytes.len()
+                    && (is_ident_byte(bytes[q]) || bytes[q] == b'-' || bytes[q] == b'.')
+                {
+                    q += 1;
+                }
+                let tag = &text[name_start..q];
+                if !tag.is_empty() && tag.as_bytes()[0].is_ascii_alphabetic() {
+                    if tag.as_bytes()[0].is_ascii_uppercase() {
+                        calls.push((tag.to_string(), line));
+                    } else if tag.contains('-') && !tag.starts_with("script") {
+                        calls.push((kebab_to_pascal(tag), line));
+                    }
+                    // Attributes up to the tag end.
+                    let end = find_tag_end(&text, q).unwrap_or(bytes.len());
+                    scan_attributes(&text[q..end], line, &mut calls);
+                    line = line.saturating_add(text[p..end].matches('\n').count() as u32);
+                    p = (end + 1).min(bytes.len());
+                } else {
+                    p += 1;
+                }
+            }
+            _ => p += 1,
+        }
+    }
+    calls
+}
+
+fn scan_attributes(attrs: &str, mut line: u32, calls: &mut Vec<(String, u32)>) {
+    let bytes = attrs.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            line = line.saturating_add(1);
+            i += 1;
+            continue;
+        }
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let name = &attrs[name_start..i];
+        if bytes.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        let (val_start, val_end) = match bytes.get(i) {
+            Some(&q @ (b'"' | b'\'')) => {
+                let s = i + 1;
+                let e = attrs[s..]
+                    .find(q as char)
+                    .map(|e| s + e)
+                    .unwrap_or(bytes.len());
+                i = (e + 1).min(bytes.len());
+                (s, e)
+            }
+            _ => {
+                let s = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                (s, i)
+            }
+        };
+        let val = &attrs[val_start..val_end];
+        let dynamic = name.starts_with('@') || name.starts_with(':') || name.starts_with("v-");
+        if dynamic {
+            push_expr_calls(val, line, calls);
+            let is_event = name.starts_with('@') || name.starts_with("v-on:");
+            let t = val.trim();
+            if is_event
+                && !t.is_empty()
+                && t.bytes().all(|b| is_ident_byte(b) || b == b'.')
+                && !t.as_bytes()[0].is_ascii_digit()
+            {
+                calls.push((t.rsplit('.').next().unwrap_or(t).to_string(), line));
+            }
+        }
+        line =
+            line.saturating_add(attrs[name_start..i.min(bytes.len())].matches('\n').count() as u32);
+    }
 }
 
 fn line_of_offset(bytes: &[u8], offset: usize) -> usize {
@@ -592,5 +850,67 @@ const e = defineEmits({ close: () => true })
         for n in ["cell", "Cell", "value", "Render"] {
             assert!(names.contains(&n), "missing {n}: {names:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_fix_tests {
+    use super::*;
+
+    fn parse(path: &str, src: &str) -> ParsedFile {
+        ParserPool::new()
+            .parse(Language::Vue, &RelPath::new(path), src)
+            .unwrap()
+    }
+
+    #[test]
+    fn template_calls_and_components() {
+        let src = "<template>\n  <button @click=\"hello(1)\" @input=\"onInput\">{{ fmt(x) }}</button>\n  <MyComp :v=\"f(2)\"/>\n  <my-card/>\n  <!-- <Ghost @click=\"gone()\"/> -->\n</template>\n<script>\nfunction hello() {}\n</script>\n";
+        let p = parse("G.vue", src);
+        let has = |n: &str, l: u32| p.calls.iter().any(|(c, ln)| c == n && *ln == l);
+        assert!(has("hello", 2), "{:?}", p.calls);
+        assert!(has("fmt", 2), "{:?}", p.calls);
+        assert!(has("onInput", 2), "{:?}", p.calls);
+        assert!(has("MyComp", 3) && has("f", 3), "{:?}", p.calls);
+        assert!(has("MyCard", 4), "{:?}", p.calls);
+        assert!(!p.calls.iter().any(|(c, _)| c == "gone" || c == "Ghost"));
+    }
+
+    #[test]
+    fn generic_gt_in_script_tag() {
+        let src = "<script setup generic=\"T extends Record<string, any>\" lang=\"ts\">\nconst x: T = 1 as any\nfunction foo() {}\n</script>\n";
+        let blocks = extract_script_blocks(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].lang, Language::TypeScript);
+        assert!(
+            blocks[0].body.starts_with("const x"),
+            "{:?}",
+            blocks[0].body
+        );
+        let p = parse("H.vue", src);
+        assert!(p.symbols.iter().any(|s| s.name == "x"), "{:?}", p.symbols);
+    }
+
+    #[test]
+    fn scripty_and_commented_script_ignored() {
+        let src = "<scripty>hi</scripty>\n<!-- <script>var a=1</script> -->\n<script>\nfunction real2() {}\n</script>\n";
+        let blocks = extract_script_blocks(src);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let p = parse("D.vue", src);
+        assert!(p.symbols.iter().any(|s| s.name == "real2"));
+        assert!(!p.symbols.iter().any(|s| s.name == "a"));
+    }
+
+    #[test]
+    fn multibyte_html_comment_does_not_shift_offsets() {
+        let src = "<!-- 的的的 说明 -->\n<script>\nfunction real3() {}\n</script>\n";
+        let blocks = extract_script_blocks(src);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let p = parse("M.vue", src);
+        assert!(
+            p.symbols.iter().any(|s| s.name == "real3"),
+            "{:?}",
+            p.symbols
+        );
     }
 }

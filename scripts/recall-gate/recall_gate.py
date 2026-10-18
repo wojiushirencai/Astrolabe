@@ -88,7 +88,7 @@ class MCP:
             self.p.kill()
 
 
-ANCHOR = re.compile(r"(.+):(\d+)\s*")
+ANCHOR = re.compile(r"(.+):(\d+)(?:\s+\[[^\]]*\])?\s*")
 
 
 def anchors(text):

@@ -87,8 +87,12 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
       comes with surrounding lines (context_lines, adaptive by default); answer from
       that context instead of Reading the file. Read only for a range the context
       does not cover, and then with offset/limit around the reported line.
-- search_code and find_symbol results are exhaustive: total= is the full count of
-  literal matches (truncation is always declared), so never re-grep the same literal.
+- search_code results are exhaustive over the files Astrolabe has indexed: total= is the
+  full count of literal matches there and truncation is always declared, so one query
+  is enough per literal. Files in unsupported languages and files created very recently
+  may be missing or tagged [text-only]; if a result looks stale or incomplete, re-check
+  with dedup=false (or a narrow Grep) instead of trusting it. find_symbol matches
+  declared names only (syntax-level), not every textual mention.
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.
@@ -199,8 +203,12 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
       comes with surrounding lines (context_lines, adaptive by default); answer from
       that context instead of Reading the file. Read only for a range the context
       does not cover, and then with offset/limit around the reported line.
-- search_code and find_symbol results are exhaustive: total= is the full count of
-  literal matches (truncation is always declared), so never re-grep the same literal.
+- search_code results are exhaustive over the files Astrolabe has indexed: total= is the
+  full count of literal matches there and truncation is always declared, so one query
+  is enough per literal. Files in unsupported languages and files created very recently
+  may be missing or tagged [text-only]; if a result looks stale or incomplete, re-check
+  with dedup=false (or a narrow Grep) instead of trusting it. find_symbol matches
+  declared names only (syntax-level), not every textual mention.
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
   tests, tagged assert/load, so you see every loader and assertion in one call.

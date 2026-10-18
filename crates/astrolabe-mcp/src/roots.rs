@@ -117,6 +117,84 @@ impl RootDispatcher {
         }
     }
 
+    /// Explicit `root` argument: an absolute path at or under a child, a child
+    /// directory name (exact, then case-insensitive when unique), or a
+    /// relative path whose first component is a child name.
+    pub fn route_explicit(&self, root: &str) -> Option<&Path> {
+        let root = root.trim();
+        if root.is_empty() {
+            return None;
+        }
+        if let Some((child, _)) = self.route_path(root) {
+            return Some(child);
+        }
+        let name = root.trim_matches(|c| c == '/' || c == '\\');
+        let exact: Vec<&PathBuf> = self
+            .children
+            .iter()
+            .filter(|c| c.file_name().and_then(|s| s.to_str()) == Some(name))
+            .collect();
+        if exact.len() == 1 {
+            return Some(exact[0].as_path());
+        }
+        let lower = name.to_lowercase();
+        let loose: Vec<&PathBuf> = self
+            .children
+            .iter()
+            .filter(|c| {
+                c.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.to_lowercase() == lower)
+            })
+            .collect();
+        if loose.len() == 1 {
+            Some(loose[0].as_path())
+        } else {
+            None
+        }
+    }
+
+    /// Route a file path: an absolute path under a child, or a relative path
+    /// whose first component is a child's directory name. Returns the child
+    /// and the path relative to it (empty for the child itself).
+    pub fn route_path(&self, path: &str) -> Option<(&Path, String)> {
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let p = Path::new(path);
+        if p.is_absolute() {
+            let hits: Vec<&PathBuf> = self.children.iter().filter(|c| p.starts_with(c)).collect();
+            let child = pick_unique_or_nested(&hits)?;
+            let rel = p.strip_prefix(child).ok()?;
+            return Some((child, rel.to_string_lossy().replace('\\', "/")));
+        }
+        let norm = path.replace('\\', "/");
+        let norm = norm.trim_start_matches("./");
+        let (first, rest) = match norm.split_once('/') {
+            Some((a, b)) => (a, b),
+            None => (norm, ""),
+        };
+        let hits: Vec<&PathBuf> = self
+            .children
+            .iter()
+            .filter(|c| c.file_name().and_then(|s| s.to_str()) == Some(first))
+            .collect();
+        if hits.len() == 1 {
+            Some((hits[0].as_path(), rest.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// The only resident root, when exactly one is resident.
+    pub fn sole_resident(&self) -> Option<&Path> {
+        match self.resident.as_slice() {
+            [only] => Some(only.as_path()),
+            _ => None,
+        }
+    }
+
     /// Touch `root`: insert it into the resident set and refresh `last_used`.
     ///
     /// If the set would exceed [`DispatcherConfig::resident_roots`], the
@@ -227,7 +305,30 @@ fn child_name_matches(child: &Path, hint: &str) -> bool {
     let Some(name) = child.file_name().and_then(|s| s.to_str()) else {
         return false;
     };
+    if is_generic_dir_name(name) {
+        // Common words ("api", "web", "docs") appear in ordinary prose; only
+        // trust them when written like a path or code token.
+        return mentions_as_token(hint, name);
+    }
     contains_word(hint, name)
+}
+
+/// Directory names that are ordinary English/engineering words.
+fn is_generic_dir_name(name: &str) -> bool {
+    const GENERIC: &[&str] = &[
+        "api", "web", "app", "apps", "core", "docs", "doc", "server", "client", "lib", "libs",
+        "src", "test", "tests", "common", "utils", "util", "shared", "ui", "cli", "tools", "tool",
+        "build", "data", "main", "base", "service", "services", "backend", "frontend", "site",
+        "admin", "sdk", "examples", "example", "scripts", "infra", "config", "model", "models",
+    ];
+    GENERIC.contains(&name.to_lowercase().as_str())
+}
+
+/// `name/`, `` `name` ``, or `./name` in the hint (case-sensitive).
+fn mentions_as_token(hint: &str, name: &str) -> bool {
+    hint.contains(&format!("{name}/"))
+        || hint.contains(&format!("`{name}`"))
+        || hint.contains(&format!("./{name}"))
 }
 
 /// Case-insensitive word-boundary search.
@@ -503,5 +604,61 @@ mod tests {
         let evicted = d.activate(Path::new("/a"), now);
         assert_eq!(evicted, vec![PathBuf::from("/a")]);
         assert!(d.resident().is_empty());
+    }
+
+    #[test]
+    fn explicit_root_matches_name_path_and_case() {
+        let d = disp(&["/ws/api", "/ws/Web", "/ws/billing"], 300, 3);
+        assert_eq!(d.route_explicit("api"), Some(Path::new("/ws/api")));
+        assert_eq!(d.route_explicit("web"), Some(Path::new("/ws/Web")));
+        assert_eq!(
+            d.route_explicit("/ws/billing/src/x.rs"),
+            Some(Path::new("/ws/billing"))
+        );
+        assert_eq!(d.route_explicit("billing/"), Some(Path::new("/ws/billing")));
+        assert_eq!(d.route_explicit("nope"), None);
+        assert_eq!(d.route_explicit(""), None);
+    }
+
+    #[test]
+    fn route_path_rewrites_to_child_relative() {
+        let d = disp(&["/ws/api", "/ws/web"], 300, 3);
+        assert_eq!(
+            d.route_path("/ws/web/src/lib.rs"),
+            Some((Path::new("/ws/web"), "src/lib.rs".to_string()))
+        );
+        assert_eq!(
+            d.route_path("api/src"),
+            Some((Path::new("/ws/api"), "src".to_string()))
+        );
+        assert_eq!(
+            d.route_path("api"),
+            Some((Path::new("/ws/api"), String::new()))
+        );
+        assert_eq!(d.route_path("src/lib.rs"), None);
+        assert_eq!(d.route_path("/elsewhere/x"), None);
+    }
+
+    #[test]
+    fn sole_resident_only_when_exactly_one() {
+        let mut d = disp(&["/ws/a", "/ws/b"], 300, 3);
+        assert_eq!(d.sole_resident(), None);
+        let _ = d.activate(Path::new("/ws/a"), Instant::now());
+        assert_eq!(d.sole_resident(), Some(Path::new("/ws/a")));
+        let _ = d.activate(Path::new("/ws/b"), Instant::now());
+        assert_eq!(d.sole_resident(), None);
+    }
+
+    #[test]
+    fn generic_directory_names_need_a_path_like_mention() {
+        let d = disp(&["/ws/api", "/ws/billing"], 300, 3);
+        assert_eq!(d.route("add an api endpoint"), None, "prose word");
+        assert_eq!(d.route("look in api/ for it"), Some(Path::new("/ws/api")));
+        assert_eq!(d.route("the `api` crate"), Some(Path::new("/ws/api")));
+        assert_eq!(
+            d.route("fix billing totals"),
+            Some(Path::new("/ws/billing")),
+            "distinctive names still match by word"
+        );
     }
 }

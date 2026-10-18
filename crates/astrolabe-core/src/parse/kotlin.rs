@@ -99,8 +99,18 @@ pub(super) fn exported(_name: &str, node: tree_sitter::Node<'_>, source: &str) -
 }
 
 fn in_class_body(node: tree_sitter::Node<'_>) -> bool {
-    node.parent()
-        .is_some_and(|p| matches!(p.kind(), "class_body" | "enum_class_body"))
+    // Tolerate grammar error recovery: `class A(val x: Int) { fun m() {} }`
+    // can leave the member under an ERROR node or directly under the class.
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        match p.kind() {
+            "class_body" | "enum_class_body" | "class_declaration" | "object_declaration"
+            | "companion_object" => return true,
+            "ERROR" => cur = p.parent(),
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Anonymous keyword child (`interface`, `class`, ...).

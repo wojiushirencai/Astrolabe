@@ -75,6 +75,7 @@ pub struct LspTransport {
     shared: Arc<Shared>,
     reader: Mutex<Option<JoinHandle<()>>>,
     stderr: Mutex<Option<JoinHandle<()>>>,
+    writer: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct Shared {
@@ -82,11 +83,19 @@ struct Shared {
     pid: u32,
     timeout: Duration,
     child: Mutex<Child>,
-    stdin: Mutex<Option<std::process::ChildStdin>>,
+    /// Frames queued for the stdin writer thread. A bounded channel keeps a
+    /// wedged server from making callers block inside `write(2)`: requests
+    /// time out on their own clock instead.
+    stdin: Mutex<Option<mpsc::SyncSender<Vec<u8>>>>,
+    /// Milliseconds since `started` (+1) at which the writer thread began its
+    /// current `write_all`; 0 while idle. A write that outlives the request
+    /// timeout means the server stopped reading its stdin.
+    write_started: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::Sender<Result<Value, LspError>>>>,
     next_id: AtomicU64,
     life: AtomicU8,
     diagnostics: Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>,
+    diag_versions: Mutex<HashMap<String, i64>>,
     notifications: Mutex<Vec<(String, Value)>>,
     initialize_result: Mutex<Option<Value>>,
     workspace_folders: Mutex<Option<Value>>,
@@ -178,6 +187,15 @@ impl LspTransport {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Own process group: wrappers (typescript-language-server -> tsserver,
+        // JVM launchers, dotnet) spawn grandchildren that inherit our pipes.
+        // Killing only the direct child leaves them alive and keeps the
+        // stdout reader from ever seeing EOF.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -207,16 +225,19 @@ impl LspTransport {
             .ok_or_else(|| LspError::Startup(spec.language, "child stderr was not piped".into()))?;
         let pid = child.id();
 
+        let (stdin_tx, stdin_rx) = mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_FRAMES);
         let shared = Arc::new(Shared {
             spec: spec.clone(),
             pid,
             timeout,
             child: Mutex::new(child),
-            stdin: Mutex::new(Some(stdin)),
+            stdin: Mutex::new(Some(stdin_tx)),
+            write_started: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             life: AtomicU8::new(LIFE_RUNNING),
             diagnostics: Mutex::new(HashMap::new()),
+            diag_versions: Mutex::new(HashMap::new()),
             notifications: Mutex::new(Vec::new()),
             saw_progress: AtomicBool::new(false),
             active_progress: Mutex::new(HashSet::new()),
@@ -236,6 +257,12 @@ impl LspTransport {
             .spawn(move || read_stdout(stdout, reader_shared))
             .map_err(|err| LspError::Startup(spec.language, err.to_string()))?;
 
+        let writer_shared = Arc::clone(&shared);
+        let writer = thread::Builder::new()
+            .name("astrolabe-lsp-stdin".into())
+            .spawn(move || write_stdin(stdin, stdin_rx, writer_shared))
+            .map_err(|err| LspError::Startup(spec.language, err.to_string()))?;
+
         let stderr_shared = Arc::clone(&shared);
         let stderr_thread = match thread::Builder::new()
             .name("astrolabe-lsp-stderr".into())
@@ -247,6 +274,7 @@ impl LspTransport {
                     shared,
                     reader: Mutex::new(Some(reader)),
                     stderr: Mutex::new(None),
+                    writer: Mutex::new(Some(writer)),
                 };
                 transport.force_stop();
                 return Err(LspError::Startup(spec.language, err.to_string()));
@@ -257,6 +285,7 @@ impl LspTransport {
             shared,
             reader: Mutex::new(Some(reader)),
             stderr: Mutex::new(Some(stderr_thread)),
+            writer: Mutex::new(Some(writer)),
         })
     }
 
@@ -337,6 +366,11 @@ impl LspTransport {
     }
 
     /// Latest `textDocument/publishDiagnostics` per document URI.
+    /// `version` the server attached to its last publish for `uri`, if any.
+    pub fn published_diagnostic_version(&self, uri: &str) -> Option<i64> {
+        lock(&self.shared.diag_versions).get(uri).copied()
+    }
+
     pub fn published_diagnostics(&self) -> HashMap<String, Vec<lsp_types::Diagnostic>> {
         lock(&self.shared.diagnostics).clone()
     }
@@ -555,9 +589,22 @@ impl LspTransport {
         timeout: Duration,
     ) -> Result<Value, LspError> {
         let mut attempt = 0;
+        let started = Instant::now();
         loop {
-            match self.request_once(method, params.clone(), timeout) {
-                Err(LspError::ContentModified) if attempt + 1 < CONTENT_MODIFIED_ATTEMPTS => {
+            // One deadline for the request and its retries, not one timeout each.
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if attempt > 0 && remaining.is_zero() {
+                return Err(LspError::Timeout(timeout));
+            }
+            match self.request_once(
+                method,
+                params.clone(),
+                remaining.max(Duration::from_millis(1)),
+            ) {
+                Err(LspError::ContentModified)
+                    if attempt + 1 < CONTENT_MODIFIED_ATTEMPTS
+                        && started.elapsed() + CONTENT_MODIFIED_BACKOFF < timeout =>
+                {
                     attempt += 1;
                     tracing::debug!(
                         method,
@@ -611,6 +658,11 @@ impl LspTransport {
                 if let Ok(late) = rx.try_recv() {
                     return late;
                 }
+                if stdin_write_stuck(&self.shared, timeout.min(Duration::from_secs(1))) {
+                    // The request never even left: the server is not reading.
+                    kill_stuck_server(&self.shared);
+                    return Err(LspError::Crashed);
+                }
                 let _ = self.notify("$/cancelRequest", json!({ "id": id }));
                 Err(LspError::Timeout(timeout))
             }
@@ -642,11 +694,10 @@ impl LspTransport {
         }
         self.shared.life.store(LIFE_DEAD, Ordering::SeqCst);
         fail_pending(&self.shared);
-        if let Some(handle) = lock(&self.reader).take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = lock(&self.stderr).take() {
-            let _ = handle.join();
+        for slot in [&self.reader, &self.stderr, &self.writer] {
+            if let Some(handle) = lock(slot).take() {
+                join_with_timeout(handle, THREAD_JOIN_TIMEOUT);
+            }
         }
     }
 }
@@ -857,10 +908,23 @@ impl LspSession {
     pub(crate) fn ensure_open(&self, path: &RelPath) -> Result<(), LspError> {
         let key = path.as_str().to_string();
         let abs = self.root.join(path.as_str());
-        let text = match std::fs::read_to_string(&abs) {
-            Ok(text) => text,
+        // Read the file *inside* the lock. Reading first let a slow caller
+        // that had read older text send it after a fresher didChange.
+        let mut opened = lock(&self.opened);
+        let text = match std::fs::read(&abs) {
+            // Non-UTF-8 sources (GBK, Latin-1) are still synced, lossily: the
+            // server only ever sees UTF-8 text anyway.
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+            },
             Err(err) => {
-                self.close_if_open(path);
+                if opened.remove(&key).is_some() {
+                    let _ = self.transport.notify(
+                        "textDocument/didClose",
+                        json!({ "textDocument": { "uri": self.file_uri(path) } }),
+                    );
+                }
                 return Err(LspError::Protocol(format!(
                     "could not read {} ({err})",
                     path.as_str()
@@ -868,9 +932,6 @@ impl LspSession {
             }
         };
         let hash = content_hash(&text);
-        // Hold the lock across the notification so two callers cannot send
-        // the same version twice or interleave open/change.
-        let mut opened = lock(&self.opened);
         match opened.get_mut(&key) {
             Some(doc) if doc.hash == hash => Ok(()),
             Some(doc) => {
@@ -1057,11 +1118,30 @@ impl LanguageServer for LspSession {
 impl LspSession {
     fn push_diagnostics(&self, path: &RelPath, uri: &str) -> Vec<Diagnostic> {
         let snap = self.transport.published_diagnostics();
-        let Some(items) = snap.get(uri).or_else(|| {
-            snap.iter()
-                .find(|(k, _)| k.ends_with(path.as_str()))
-                .map(|(_, v)| v)
-        }) else {
+        // Exact URI first, then any key that names the very same file once
+        // decoded (case/percent-encoding differences). Never a suffix match:
+        // `lib.rs` must not pick up `mylib.rs`.
+        let key = if snap.contains_key(uri) {
+            Some(uri.to_string())
+        } else {
+            snap.keys()
+                .find(|k| uri_to_rel(k, &self.root).as_ref() == Some(path))
+                .cloned()
+        };
+        let Some(key) = key else {
+            return Vec::new();
+        };
+        // A publish for an older document version describes text we have
+        // since replaced.
+        if let (Some(published), Some(current)) = (
+            self.transport.published_diagnostic_version(&key),
+            lock(&self.opened).get(path.as_str()).map(|d| d.version),
+        ) {
+            if published < current {
+                return Vec::new();
+            }
+        }
+        let Some(items) = snap.get(&key) else {
             return Vec::new();
         };
         items
@@ -1248,8 +1328,16 @@ fn location_from_value(value: &Value, root: &Path) -> Option<Location> {
     let range = value
         .get("range")
         .or_else(|| value.get("targetSelectionRange"))?;
+    let path = match uri_to_rel(uri, root) {
+        Some(path) => path,
+        // Outside the workspace (stdlib, node_modules, registry): keep the
+        // raw `file://` URI so the query layer can classify it and say
+        // "N results are outside the repository" instead of seeing nothing.
+        None if uri.len() >= 5 && uri[..5].eq_ignore_ascii_case("file:") => RelPath::new(uri),
+        None => return None,
+    };
     Some(Location {
-        path: uri_to_rel(uri, root)?,
+        path,
         range: range_from_value(range)?,
     })
 }
@@ -1473,21 +1561,29 @@ fn rpc_notification(method: &str, params: Value) -> Value {
 
 fn write_rpc(shared: &Shared, payload: &Value) -> Result<(), LspError> {
     let body = serde_json::to_vec(payload).map_err(|err| LspError::Protocol(err.to_string()))?;
-    let mut stdin = lock(&shared.stdin);
-    let stdin = stdin.as_mut().ok_or(LspError::Crashed)?;
-    write_frame(stdin, &body).map_err(|_| {
-        shared.life.store(LIFE_DEAD, Ordering::SeqCst);
-        fail_pending(shared);
-        LspError::Crashed
-    })
-}
-
-fn write_frame(writer: &mut impl Write, body: &[u8]) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(32 + body.len());
-    write!(buf, "Content-Length: {}\r\n\r\n", body.len())?;
-    buf.extend_from_slice(body);
-    writer.write_all(&buf)?;
-    writer.flush()
+    if shared.life.load(Ordering::SeqCst) == LIFE_DEAD {
+        return Err(LspError::Crashed);
+    }
+    let mut frame = Vec::with_capacity(32 + body.len());
+    write!(frame, "Content-Length: {}\r\n\r\n", body.len())
+        .map_err(|err| LspError::Protocol(err.to_string()))?;
+    frame.extend_from_slice(&body);
+    let guard = lock(&shared.stdin);
+    let tx = guard.as_ref().ok_or(LspError::Crashed)?;
+    match tx.try_send(frame) {
+        Ok(()) => Ok(()),
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            shared.life.store(LIFE_DEAD, Ordering::SeqCst);
+            fail_pending(shared);
+            Err(LspError::Crashed)
+        }
+        // The writer is wedged behind a server that does not read.
+        Err(mpsc::TrySendError::Full(_)) => {
+            drop(guard);
+            kill_stuck_server(shared);
+            Err(LspError::Crashed)
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1512,19 +1608,105 @@ fn child_exited(shared: &Shared) -> bool {
 }
 
 fn reap_child(child: &mut Child, timeout: Duration) {
+    let pid = child.id();
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => {
+                // The wrapper exited; whatever it spawned may still be alive.
+                kill_process_group(pid);
+                return;
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
+                kill_process_group(pid);
                 let _ = child.kill();
                 let _ = child.wait();
                 return;
             }
-            Err(_) => return,
+            Err(_) => {
+                kill_process_group(pid);
+                return;
+            }
         }
     }
+}
+
+/// SIGKILL the whole process group the server was started in (it is its own
+/// group leader, see `start`). No-op off Unix, where `Child::kill` is all
+/// there is.
+fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        // Never signal pgid 0/1 or something that does not fit pid_t.
+        if pid > 1 && pid <= i32::MAX as u32 {
+            // SAFETY: plain syscall with integer arguments.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// How long a stopping transport waits for its helper threads. They end once
+/// the pipes close; if a stray descendant still holds one open we detach the
+/// thread rather than hang `drop`/`shutdown` (and the pool monitor with it).
+const THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Frames the stdin writer may have queued before the server is declared stuck.
+const STDIN_QUEUE_FRAMES: usize = 4096;
+
+fn join_with_timeout(handle: JoinHandle<()>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::debug!("lsp helper thread did not stop in time; detaching");
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = handle.join();
+}
+
+fn write_stdin(
+    mut stdin: std::process::ChildStdin,
+    rx: mpsc::Receiver<Vec<u8>>,
+    shared: Arc<Shared>,
+) {
+    while let Ok(frame) = rx.recv() {
+        let stamp = shared.started.elapsed().as_millis() as u64 + 1;
+        shared.write_started.store(stamp, Ordering::SeqCst);
+        let result = stdin.write_all(&frame).and_then(|_| stdin.flush());
+        shared.write_started.store(0, Ordering::SeqCst);
+        if result.is_err() {
+            shared.life.store(LIFE_DEAD, Ordering::SeqCst);
+            fail_pending(&shared);
+            return;
+        }
+    }
+}
+
+/// The server stopped draining its stdin: kill it (and its group) without
+/// touching the child lock, which `stop_with_grace` may be holding.
+fn kill_stuck_server(shared: &Shared) {
+    shared.life.store(LIFE_DEAD, Ordering::SeqCst);
+    *lock(&shared.stdin) = None;
+    kill_process_group(shared.pid);
+    fail_pending(shared);
+}
+
+/// True when the writer thread has been inside one `write_all` for at least `min`.
+fn stdin_write_stuck(shared: &Shared, min: Duration) -> bool {
+    let stamp = shared.write_started.load(Ordering::SeqCst);
+    if stamp == 0 {
+        return false;
+    }
+    let now = shared.started.elapsed().as_millis() as u64 + 1;
+    now.saturating_sub(stamp) >= min.as_millis() as u64
 }
 
 fn read_stdout(stdout: std::process::ChildStdout, shared: Arc<Shared>) {
@@ -1685,6 +1867,13 @@ fn handle_notification(shared: &Shared, method: &str, params: Option<&Value>) {
     }
     if method == "textDocument/publishDiagnostics" {
         if let Ok(parsed) = serde_json::from_value::<PublishDiagnosticsLoose>(params.clone()) {
+            {
+                let mut versions = lock(&shared.diag_versions);
+                match parsed.version {
+                    Some(v) => versions.insert(parsed.uri.clone(), v),
+                    None => versions.remove(&parsed.uri),
+                };
+            }
             lock(&shared.diagnostics).insert(parsed.uri, parsed.diagnostics);
         }
     }
@@ -1912,6 +2101,8 @@ fn rpc_id_u64(id: &Value) -> Option<u64> {
 struct PublishDiagnosticsLoose {
     uri: String,
     #[serde(default)]
+    version: Option<i64>,
+    #[serde(default)]
     diagnostics: Vec<lsp_types::Diagnostic>,
 }
 
@@ -2011,39 +2202,108 @@ pub(crate) fn path_to_file_uri(path: &Path) -> String {
     uri
 }
 
+/// One process as seen by the OS: `(pid, ppid, pgid, rss_bytes)`.
+type ProcRow = (u32, u32, u32, u64);
+
+/// Sum RSS over `root` and everything below it: members of its process group
+/// plus any descendant reached through parent links (a child that called
+/// `setsid` leaves the group but not the tree).
+fn tree_rss(rows: &[ProcRow], root: u32) -> Option<u64> {
+    let mut members: HashSet<u32> = HashSet::new();
+    members.insert(root);
+    loop {
+        let before = members.len();
+        for &(pid, ppid, pgid, _) in rows {
+            if pgid == root || members.contains(&ppid) {
+                members.insert(pid);
+            }
+        }
+        if members.len() == before {
+            break;
+        }
+    }
+    let mut total = 0u64;
+    let mut seen_root = false;
+    for &(pid, _, _, rss) in rows {
+        if members.contains(&pid) {
+            seen_root |= pid == root;
+            total = total.saturating_add(rss);
+        }
+    }
+    seen_root.then_some(total)
+}
+
+/// Resident-set size of the server's whole process tree, not just the wrapper.
 fn rss_bytes(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        for line in status.lines() {
-            let Some(rest) = line.strip_prefix("VmRSS:") else {
-                continue;
-            };
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb.saturating_mul(1024));
+    tree_rss(&process_table()?, pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_table() -> Option<Vec<ProcRow>> {
+    // SAFETY: plain syscall.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let mut rows = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `comm` may contain spaces and parens: split after the last ')'.
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // fields[0] is field 3 (state); ppid=4, pgrp=5, rss=24.
+        let (Some(ppid), Some(pgid), Some(rss)) = (fields.get(1), fields.get(2), fields.get(21))
+        else {
+            continue;
+        };
+        let (Ok(ppid), Ok(pgid), Ok(rss)) =
+            (ppid.parse::<u32>(), pgid.parse::<u32>(), rss.parse::<i64>())
+        else {
+            continue;
+        };
+        rows.push((pid, ppid, pgid, (rss.max(0) as u64).saturating_mul(page)));
+    }
+    Some(rows)
+}
+
+#[cfg(target_os = "macos")]
+fn process_table() -> Option<Vec<ProcRow>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,rss="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let nums: Vec<u64> = line
+            .split_whitespace()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        if let [pid, ppid, pgid, kb] = nums[..] {
+            rows.push((
+                pid as u32,
+                ppid as u32,
+                pgid as u32,
+                kb.saturating_mul(1024),
+            ));
         }
-        None
     }
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let kb: u64 = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .ok()?;
-        Some(kb.saturating_mul(1024))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
+    Some(rows)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_table() -> Option<Vec<ProcRow>> {
+    None
 }
 
 #[cfg(test)]
@@ -2940,6 +3200,8 @@ while True:
             if res.is_err() {
                 break;
             }
+            // The writer thread notices the broken pipe asynchronously.
+            thread::sleep(Duration::from_millis(5));
         }
         assert!(matches!(res, Err(LspError::Crashed)));
         assert_eq!(t.shared.life.load(Ordering::SeqCst), LIFE_DEAD);
@@ -3278,5 +3540,288 @@ while True:
         let hits = ref_paths_and_lines(&r.value);
         assert!(hits.contains(&("m.py".into(), 1)), "{hits:?}");
         assert!(hits.contains(&("other.py".into(), 1)), "{hits:?}");
+    }
+
+    // ---- audit fixes (lsp.md H1/H2/M3/M5/M6/M7/L1) ----
+
+    fn process_gone(pid: i32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                .unwrap_or(true),
+        }
+    }
+
+    fn wait_gone(pid: i32, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        while Instant::now() < until {
+            if process_gone(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        process_gone(pid)
+    }
+
+    /// H1: a wrapper that leaves a grandchild holding our pipes used to make
+    /// `drop` hang forever and leak the grandchild.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_kills_grandchildren_and_does_not_hang() {
+        let tmp = unique_temp();
+        let script = tmp.0.join("fake_lsp.py");
+        fs::write(&script, FAKE_SERVER).unwrap();
+        let pidfile = tmp.0.join("grandchild.pid");
+        let spec = ServerSpec {
+            language: Language::Python,
+            command: PathBuf::from("sh"),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "sleep 123 & echo $! > {}; exec {} -u {}",
+                    pidfile.display(),
+                    python3().display(),
+                    script.display()
+                ),
+            ],
+            install_hint: String::new(),
+        };
+        let transport = LspTransport::spawn_in(&spec, &tmp.0, Duration::from_secs(5)).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let grandchild: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!process_gone(grandchild));
+
+        let started = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(transport);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(8))
+            .expect("drop must return even with a grandchild holding the pipes");
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert!(
+            wait_gone(grandchild, Duration::from_secs(3)),
+            "grandchild leaked"
+        );
+    }
+
+    /// H2: a server that never reads stdin must not make a request outlive
+    /// its timeout, nor make `drop` block.
+    #[cfg(unix)]
+    #[test]
+    fn blocked_stdin_write_times_out_and_server_is_killed() {
+        let tmp = unique_temp();
+        let spec = ServerSpec {
+            language: Language::Python,
+            command: PathBuf::from("sleep"),
+            args: vec!["60".into()],
+            install_hint: String::new(),
+        };
+        let transport = LspTransport::spawn_in(&spec, &tmp.0, Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let big = "x".repeat(2 * 1024 * 1024);
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res =
+                transport.request_timeout("noop", json!({ "blob": big }), Duration::from_secs(2));
+            let _ = tx.send(res.is_err());
+            drop(transport);
+        });
+        let failed = rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("request must return after its timeout, not block in write(2)");
+        assert!(failed);
+        assert!(started.elapsed() < Duration::from_secs(6));
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("drop of a stuck server must not hang");
+    }
+
+    /// M7: memory accounting covers the whole tree, not only the wrapper.
+    #[test]
+    fn tree_rss_sums_group_and_descendants() {
+        let rows: Vec<ProcRow> = vec![
+            (100, 1, 100, 10),   // wrapper, group leader
+            (101, 100, 100, 50), // child in the group
+            (102, 101, 102, 70), // grandchild that left the group via setsid
+            (200, 1, 200, 999),  // unrelated
+        ];
+        assert_eq!(tree_rss(&rows, 100), Some(130));
+        assert_eq!(tree_rss(&rows, 999), None);
+    }
+
+    /// M7 (live): a real wrapper's child shows up in the total.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memory_bytes_includes_child_processes() {
+        let tmp = unique_temp();
+        let spec = ServerSpec {
+            language: Language::Python,
+            command: PathBuf::from("sh"),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "{} -c 'import time; x = bytearray(80*1024*1024); time.sleep(30)' & wait",
+                    python3().display()
+                ),
+            ],
+            install_hint: String::new(),
+        };
+        let transport = LspTransport::spawn_in(&spec, &tmp.0, Duration::from_secs(5)).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut seen = 0;
+        while Instant::now() < until {
+            seen = transport.memory_bytes().unwrap_or(0);
+            if seen > 60 * 1024 * 1024 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(seen > 60 * 1024 * 1024, "tree rss was {seen}");
+    }
+
+    /// M3: results outside the workspace keep their file: URI instead of
+    /// vanishing.
+    #[test]
+    fn locations_outside_root_are_kept_as_file_uris() {
+        let tmp = unique_temp();
+        let value = json!([
+            { "uri": format!("file://{}/a.py", tmp.0.display()),
+              "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}} },
+            { "uri": "file:///usr/lib/python3/os.py",
+              "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}} },
+        ]);
+        let locs = locations_from_value(&value, &tmp.0);
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0].path.as_str(), "a.py");
+        assert!(locs[1].path.as_str().starts_with("file:///usr/lib"));
+    }
+
+    /// M5: a non-UTF-8 source file is still synced.
+    #[test]
+    fn non_utf8_file_is_synced_lossily() {
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        fs::write(tmp.0.join("gbk.py"), b"# \xc4\xe3\xba\xc3\nx = 1\n").unwrap();
+        let path = RelPath::new("gbk.py");
+        session
+            .ensure_open(&path)
+            .expect("non-UTF-8 file must open");
+        assert_eq!(session.open_version(&path), Some(1));
+    }
+
+    /// M6: the push-diagnostics fallback must not match a different file
+    /// whose path merely ends the same way.
+    #[test]
+    fn push_diagnostics_does_not_match_by_suffix() {
+        let (session, tmp) = spawn_session(&[], Duration::from_secs(10));
+        let other = format!("file://{}/src/mylib.rs", tmp.0.display());
+        lock(&session.transport.shared.diagnostics).insert(
+            other,
+            vec![lsp_types::Diagnostic {
+                message: "belongs to mylib.rs".into(),
+                ..Default::default()
+            }],
+        );
+        let path = RelPath::new("lib.rs");
+        let uri = session.file_uri(&path);
+        assert!(session.push_diagnostics(&path, &uri).is_empty());
+
+        let own = format!("file://{}/lib.rs", tmp.0.display());
+        lock(&session.transport.shared.diagnostics).insert(
+            own,
+            vec![lsp_types::Diagnostic {
+                message: "mine".into(),
+                ..Default::default()
+            }],
+        );
+        let got = session.push_diagnostics(&path, &uri);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].message, "mine");
+    }
+
+    /// M6: a publish for an older document version is not current.
+    #[test]
+    fn push_diagnostics_ignores_stale_versions() {
+        let (session, tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
+        let path = RelPath::new("v.py");
+        fs::write(tmp.0.join("v.py"), "x = 1\n").unwrap();
+        session.ensure_open(&path).unwrap();
+        fs::write(tmp.0.join("v.py"), "x = 2\n").unwrap();
+        session.ensure_open(&path).unwrap();
+        assert_eq!(session.open_version(&path), Some(2));
+        let uri = session.file_uri(&path);
+        lock(&session.transport.shared.diagnostics).insert(
+            uri.clone(),
+            vec![lsp_types::Diagnostic {
+                message: "old".into(),
+                ..Default::default()
+            }],
+        );
+        lock(&session.transport.shared.diag_versions).insert(uri.clone(), 1);
+        assert!(session.push_diagnostics(&path, &uri).is_empty());
+        lock(&session.transport.shared.diag_versions).insert(uri.clone(), 2);
+        assert_eq!(session.push_diagnostics(&path, &uri).len(), 1);
+    }
+
+    /// L1: ContentModified retries share one deadline.
+    #[cfg(unix)]
+    #[test]
+    fn content_modified_retries_share_one_deadline() {
+        let tmp = unique_temp();
+        let script = tmp.0.join("cm.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys, time
+def read_msg():
+    h = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: return None
+        if line in (b"\r\n", b"\n"): break
+        k, v = line.decode().split(":", 1); h[k.strip().lower()] = v.strip()
+    return json.loads(sys.stdin.buffer.read(int(h["content-length"])))
+while True:
+    m = read_msg()
+    if m is None: break
+    if "id" in m and m.get("method"):
+        time.sleep(0.4)
+        d = json.dumps({"jsonrpc":"2.0","id":m["id"],"error":{"code":-32801,"message":"content modified"}}).encode()
+        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(d) + d); sys.stdout.buffer.flush()
+"#,
+        )
+        .unwrap();
+        let spec = ServerSpec {
+            language: Language::Python,
+            command: python3(),
+            args: vec!["-u".into(), script.to_string_lossy().into_owned()],
+            install_hint: String::new(),
+        };
+        let transport = LspTransport::spawn_in(&spec, &tmp.0, Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        let res =
+            transport.request_timeout("textDocument/definition", json!({}), Duration::from_secs(1));
+        assert!(res.is_err());
+        // 4 attempts x (0.4s + 0.25s backoff) would be ~2.6s.
+        assert!(
+            started.elapsed() < Duration::from_millis(1900),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

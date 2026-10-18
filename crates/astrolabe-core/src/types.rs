@@ -100,25 +100,147 @@ pub enum Language {
     Lua,
 }
 
-/// Cheap textual check for C++-only constructs in a header.
-fn header_looks_cpp(source: &str) -> bool {
-    const LEADING: &[&str] = &[
-        "class ",
-        "namespace ",
-        "template",
-        "using namespace",
-        "public:",
-        "private:",
-        "protected:",
-    ];
-    const ANYWHERE: &[&str] = &["::", "nullptr", "constexpr ", "extern \"C++\""];
-    source.lines().any(|line| {
-        let line = line.trim_start();
-        if line.starts_with("//") || line.starts_with('*') || line.starts_with("/*") {
-            return false;
+/// Remove `/* */` (tracking state across lines) and `//` comments from one
+/// line, leaving string literals intact.
+fn strip_comments(line: &str, in_block: &mut bool) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        if *in_block {
+            if b[i..].starts_with(b"*/") {
+                *in_block = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
         }
-        LEADING.iter().any(|m| line.starts_with(m)) || ANYWHERE.iter().any(|m| line.contains(m))
+        if let Some(q) = quote {
+            if b[i] == b'\\' && i + 1 < b.len() {
+                out.push_str(&line[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            if b[i] == q {
+                quote = None;
+            }
+        } else if b[i..].starts_with(b"//") {
+            break;
+        } else if b[i..].starts_with(b"/*") {
+            *in_block = true;
+            i += 2;
+            continue;
+        } else if b[i] == b'"' || b[i] == b'\'' {
+            quote = Some(b[i]);
+        }
+        let ch = line[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Replace the contents of string / char literals with nothing.
+fn strip_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for c in line.chars() {
+        match quote {
+            Some(q) => {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == q {
+                    quote = None;
+                    out.push(c);
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+fn has_word(line: &str, word: &str) -> bool {
+    let b = line.as_bytes();
+    line.match_indices(word).any(|(i, _)| {
+        let before = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        let end = i + word.len();
+        let after = end >= b.len() || !(b[end].is_ascii_alphanumeric() || b[end] == b'_');
+        before && after
     })
+}
+
+/// `kw` + whitespace + identifier at the start of `line`; returns the rest.
+fn keyword_ident<'a>(line: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(kw)?;
+    let trimmed = rest.trim_start();
+    if trimmed.len() == rest.len() {
+        return None;
+    }
+    let end = trimmed
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(trimmed.len());
+    if end == 0 {
+        return None;
+    }
+    Some(trimmed[end..].trim_start())
+}
+
+/// Cheap textual check for C++-only constructs in a header. Comments and
+/// string literals are ignored; `template` needs `<`, `class` / `namespace`
+/// need an identifier and a C++-looking continuation.
+fn header_looks_cpp(source: &str) -> bool {
+    let mut in_block = false;
+    for raw in source.lines() {
+        let nocomment = strip_comments(raw, &mut in_block);
+        let line = nocomment.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.contains("extern \"C++\"") {
+            return true;
+        }
+        let code = strip_literals(line);
+        let line = code.as_str();
+        if let Some(rest) = line.strip_prefix("template") {
+            if rest.trim_start().starts_with('<') {
+                return true;
+            }
+        }
+        if let Some(rest) = keyword_ident(line, "class") {
+            if rest.is_empty()
+                || rest.starts_with('{')
+                || rest.starts_with(';')
+                || (rest.starts_with(':') && !rest.starts_with("::"))
+                || rest.starts_with("final")
+            {
+                return true;
+            }
+        }
+        if keyword_ident(line, "namespace").is_some_and(|r| r.is_empty() || r.starts_with('{'))
+            || line.starts_with("namespace {")
+            || line.starts_with("using namespace ")
+        {
+            return true;
+        }
+        if matches!(line, "public:" | "private:" | "protected:") {
+            return true;
+        }
+        if line.contains("::") || has_word(line, "nullptr") || has_word(line, "constexpr") {
+            return true;
+        }
+    }
+    false
 }
 
 impl Language {
@@ -129,7 +251,7 @@ impl Language {
         }
         let ext = p.extension()?.to_ascii_lowercase();
         Some(match ext.as_str() {
-            "py" | "pyi" => Language::Python,
+            "py" | "pyi" | "pyw" => Language::Python,
             "go" => Language::Go,
             "java" => Language::Java,
             "rs" => Language::Rust,
@@ -142,7 +264,7 @@ impl Language {
             "m" => Language::ObjC,
             "mm" => Language::ObjCpp,
             "swift" => Language::Swift,
-            "php" => Language::Php,
+            "php" | "phtml" | "php5" => Language::Php,
             "vue" => Language::Vue,
             "dart" => Language::Dart,
             // `.razor` / `.cshtml` are not a language tag. C# is extracted
@@ -150,8 +272,8 @@ impl Language {
             "cs" | "csx" | "razor" | "cshtml" => Language::CSharp,
             "vb" => Language::VisualBasic,
             "kt" | "kts" => Language::Kotlin,
-            "sh" | "bash" | "zsh" | "zsh-theme" | "bats" => Language::Shell,
-            "rb" | "rake" | "gemspec" => Language::Ruby,
+            "sh" | "bash" | "zsh" | "zsh-theme" | "bats" | "ksh" => Language::Shell,
+            "rb" | "rake" | "gemspec" | "ru" | "rbw" => Language::Ruby,
             "lua" => Language::Lua,
             _ => return None,
         })
@@ -164,6 +286,12 @@ impl Language {
             "Rakefile" | "Gemfile" | "Guardfile" | "Podfile" | "Fastfile" | "Brewfile" => {
                 Some(Language::Ruby)
             }
+            // Dotfiles have no extension: `.zshrc` would otherwise read as
+            // extension `zshrc`.
+            ".bashrc" | ".bash_profile" | ".bash_login" | ".bash_logout" | ".bash_aliases"
+            | ".profile" | ".zshrc" | ".zprofile" | ".zshenv" | ".zlogin" | ".zlogout" => {
+                Some(Language::Shell)
+            }
             _ => None,
         }
     }
@@ -175,6 +303,15 @@ impl Language {
             "sh" | "bash" | "dash" | "ksh" | "zsh" | "bats" => Some(Language::Shell),
             "ruby" => Some(Language::Ruby),
             "lua" | "luajit" => Some(Language::Lua),
+            "python" | "pypy" | "pypy3" => Some(Language::Python),
+            "node" | "nodejs" | "deno" | "bun" => Some(Language::JavaScript),
+            "php" => Some(Language::Php),
+            i if i.len() > 6
+                && i.starts_with("python")
+                && i[6..].bytes().all(|b| b.is_ascii_digit() || b == b'.') =>
+            {
+                Some(Language::Python)
+            }
             _ => None,
         }
     }
@@ -425,7 +562,15 @@ pub struct ProjectMeta {
     /// aliases collapse to one file only when exactly one `file` declares the
     /// type.
     pub type_decls: Vec<TypeDecl>,
+    /// Lookup acceleration filled by the TypeScript resolver: alias scope →
+    /// indexes into `modules`, in declaration order. Empty means "not built";
+    /// consumers then scan `modules`.
+    pub scope_index: ScopeIndex,
 }
+
+/// `scope → indexes into ProjectMeta::modules`. See [`ProjectMeta::scope_index`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeIndex(pub std::collections::HashMap<String, Vec<usize>>);
 
 /// Build facts for one project file. C# fills this from the `csproj` and the
 /// nearest `Directory.Build.props`. Unused by other languages.
@@ -450,9 +595,10 @@ pub struct ProjectFacts {
     pub default_compile_items: bool,
 }
 
-/// File-level project reference. Stored as [`EdgeKind::Import`] when both
-/// manifests are graph nodes. PageRank may see this edge; it is one file to
-/// one file.
+/// Project-to-project reference (manifest paths). Recorded in
+/// [`ProjectMeta::project_refs`] only: `.csproj` files are not parsed source
+/// files, so there is no graph node and no edge for it. It becomes an
+/// [`EdgeKind::Import`] only if both manifests are ever indexed as files.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProjectRef {
     pub from: String,
@@ -541,7 +687,13 @@ pub trait ModuleResolver: Send + Sync {
 pub enum ImportResolution {
     Unresolved,
     File(RelPath),
-    Namespace { name: String, files: Vec<RelPath> },
+    /// One import statement that names several repo files (Rust
+    /// `use crate::{a::X, b::Y}`). Each is a real import edge, like `File`.
+    Files(Vec<RelPath>),
+    Namespace {
+        name: String,
+        files: Vec<RelPath>,
+    },
 }
 
 // ------------------------------------------------------------------- graph
@@ -620,6 +772,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audit_header_cpp_detection_ignores_comments_and_c_names() {
+        let h = RelPath::new("a.h");
+        for c in [
+            "template_t foo(void);\n",
+            "/*\n class of devices handled here */\nint f(void);\n",
+            "int f(const char *s); /* see \"a::b\" */\n",
+            "const char *s = \"a::b\";\n",
+            "// namespace foo { }\nint x;\n",
+        ] {
+            assert_eq!(
+                Language::from_path_and_source(&h, c),
+                Some(Language::C),
+                "{c:?}"
+            );
+        }
+        for c in [
+            "template <typename T>\nstruct S {};\n",
+            "class Foo {\n};\n",
+            "namespace a {\n}\n",
+            "int x = std::max(1, 2);\n",
+            "void* p = nullptr;\n",
+            "extern \"C++\" void f();\n",
+        ] {
+            assert_eq!(
+                Language::from_path_and_source(&h, c),
+                Some(Language::Cpp),
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_dotfiles_and_shebangs() {
+        for n in [".bashrc", "home/.zshrc", ".bash_profile", ".zprofile"] {
+            assert_eq!(
+                Language::from_path_and_source(&RelPath::new(n), ""),
+                Some(Language::Shell),
+                "{n}"
+            );
+        }
+        for (src, lang) in [
+            ("#!/usr/bin/env python3\nprint(1)\n", Language::Python),
+            ("#!/usr/bin/python3.11\n", Language::Python),
+            ("#!/usr/bin/env node\n", Language::JavaScript),
+            ("#!/usr/bin/env -S deno run\n", Language::JavaScript),
+        ] {
+            assert_eq!(
+                Language::from_path_and_source(&RelPath::new("bin/tool"), src),
+                Some(lang),
+                "{src:?}"
+            );
+        }
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.pyw")),
+            Some(Language::Python)
+        );
+    }
+
+    #[test]
     fn lang_batch_8_paths_and_shebangs() {
         for (path, lang) in [
             ("a.kt", Language::Kotlin),
@@ -654,7 +865,7 @@ mod tests {
             Some(Language::Ruby)
         );
         assert_eq!(
-            Language::from_path_and_source(&bin, "#!/usr/bin/env python3\n"),
+            Language::from_path_and_source(&bin, "#!/usr/bin/env perl\n"),
             None
         );
         assert_eq!(

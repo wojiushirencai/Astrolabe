@@ -96,41 +96,43 @@ pub fn rank_for_task(g: &CodeGraph, task: &str, base: &Centrality) -> Centrality
         let Some(&i) = positions.get(&symbol.file) else {
             continue;
         };
-        let words = split_words(&symbol.name);
-        let meaningful: Vec<&String> = words.iter().filter(|word| word.len() >= 3).collect();
-        let split_match = !meaningful.is_empty()
-            && meaningful
-                .iter()
-                .filter(|word| task_words.contains((*word).as_str()))
-                .count()
-                >= meaningful.len().min(2);
-        let compact: String = symbol
-            .name
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect();
-        let explicit_match = compact.len() >= 3 && task_compact.contains(&compact);
+        let compact = compact_lower(&symbol.name);
+        let (explicit_match, split_match) =
+            symbol_matches(symbol, &compact, &task_words, &task_compact, 3);
 
         if explicit_match || split_match {
             boosts[i] *= 10.0;
             // Specific names encode more relationship information than generic
             // names such as `run` or `helper`.
-            if compact.len() >= 12 || meaningful.len() >= 3 {
+            if compact.len() >= 12
+                || split_words(&symbol.name)
+                    .iter()
+                    .filter(|word| word.len() >= 3)
+                    .count()
+                    >= 3
+            {
                 boosts[i] *= 10.0;
             }
         }
     }
 
+    let task_lower = task.to_lowercase();
     let context_files: BTreeSet<FileId> = files
         .iter()
-        .filter(|file| {
-            let path = file.path.as_str().to_lowercase();
-            let name = file.path.file_name().to_lowercase();
-            task.to_lowercase().contains(&path) || task.to_lowercase().contains(&name)
-        })
+        .filter(|file| file_mentioned(&task_lower, file))
         .map(|file| file.id)
         .collect();
+    // A file whose name words all appear in the task (`loop_guard.rs` for
+    // "loop guard") is task-relevant even when the task never types the
+    // extension. Weaker than an explicit path (10x, not 50x).
+    for file in &files {
+        if context_files.contains(&file.id) || !stem_matches(file, &task_words, &task_compact) {
+            continue;
+        }
+        if let Some(&i) = positions.get(&file.id) {
+            boosts[i] *= 10.0;
+        }
+    }
     for file in &context_files {
         if let Some(&i) = positions.get(file) {
             // Giving the source more restart mass makes its 50x outgoing
@@ -260,6 +262,121 @@ fn normalize(values: &mut [f64]) {
     }
 }
 
+fn compact_lower(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// `(explicit, split)` name-vs-task matches for one symbol. `explicit` means
+/// the whole compacted name (>= `min_explicit_len` chars) occurs in the task;
+/// `split` means the name's words occur among the task's words.
+fn symbol_matches(
+    symbol: &CodeSymbol,
+    compact: &str,
+    task_words: &BTreeSet<String>,
+    task_compact: &str,
+    min_explicit_len: usize,
+) -> (bool, bool) {
+    let words = split_words(&symbol.name);
+    let meaningful: Vec<&String> = words.iter().filter(|word| word.len() >= 3).collect();
+    let split_match = !meaningful.is_empty()
+        && meaningful
+            .iter()
+            .filter(|word| task_words.contains((*word).as_str()))
+            .count()
+            >= meaningful.len().min(2);
+    let explicit_match = compact.len() >= min_explicit_len && task_compact.contains(compact);
+    (explicit_match, split_match)
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// `needle` occurs in `haystack` delimited by non-path characters on both
+/// sides (so `a.rs` is not "mentioned" by `data.rs`). Both lowercase.
+pub fn mentions_path(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_path_char(c));
+        let after_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_path_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn file_mentioned(task_lower: &str, file: &CodeFile) -> bool {
+    let path = file.path.as_str().to_lowercase();
+    let name = file.path.file_name().to_lowercase();
+    mentions_path(task_lower, &path) || mentions_path(task_lower, &name)
+}
+
+fn stem_matches(file: &CodeFile, task_words: &BTreeSet<String>, task_compact: &str) -> bool {
+    let name = file.path.file_name();
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let compact = compact_lower(stem);
+    if compact.len() < 4 {
+        return false;
+    }
+    let words = split_words(stem);
+    let meaningful: Vec<&String> = words.iter().filter(|w| w.len() >= 3).collect();
+    let words_hit =
+        !meaningful.is_empty() && meaningful.iter().all(|w| task_words.contains(w.as_str()));
+    words_hit || (compact.len() >= 6 && task_compact.contains(&compact))
+}
+
+/// Files and symbols that the task text actually names (strict predicates:
+/// path/name boundary match, file-stem words, whole-name symbol hits). Empty
+/// result means the task matched nothing and any ranking is pure centrality.
+#[derive(Clone, Debug, Default)]
+pub struct TaskMatch {
+    pub files: BTreeSet<FileId>,
+    /// Indexes into `CodeGraph::symbols`.
+    pub symbols: BTreeSet<usize>,
+}
+
+impl TaskMatch {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.symbols.is_empty()
+    }
+}
+
+pub fn match_task(g: &CodeGraph, task: &str) -> TaskMatch {
+    let task_words = split_words(task);
+    let task_compact = compact_lower(task);
+    let task_lower = task.to_lowercase();
+    let mut out = TaskMatch::default();
+    for file in &g.files {
+        if file_mentioned(&task_lower, file) || stem_matches(file, &task_words, &task_compact) {
+            out.files.insert(file.id);
+        }
+    }
+    for (idx, symbol) in g.symbols.iter().enumerate() {
+        let compact = compact_lower(&symbol.name);
+        let (explicit, split) = symbol_matches(symbol, &compact, &task_words, &task_compact, 4);
+        if explicit || split {
+            out.symbols.insert(idx);
+        }
+    }
+    out
+}
+
 fn split_words(text: &str) -> BTreeSet<String> {
     let mut words = BTreeSet::new();
     let mut current = String::new();
@@ -289,6 +406,43 @@ fn split_words(text: &str) -> BTreeSet<String> {
         words.insert(current.to_lowercase());
     }
     words
+}
+
+/// Fingerprint of everything `compute_centrality` reads.
+fn centrality_fingerprint(g: &CodeGraph) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    g.files.len().hash(&mut h);
+    for f in &g.files {
+        f.id.hash(&mut h);
+        f.path.as_str().hash(&mut h);
+    }
+    for e in g.edges.iter().filter(|e| e.kind == EdgeKind::Import) {
+        (e.from, e.to, e.weight).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// PageRank is the expensive part of `dependents`/`dependencies`; the answer
+/// only changes when files or import edges do, so keep the last few results
+/// keyed by a fingerprint of those inputs instead of recomputing per call.
+pub fn cached_centrality(g: &CodeGraph) -> std::sync::Arc<Centrality> {
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Vec<(u64, Arc<Centrality>)>> = Mutex::new(Vec::new());
+    let key = centrality_fingerprint(g);
+    {
+        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, c)) = cache.iter().find(|(k, _)| *k == key) {
+            return Arc::clone(c);
+        }
+    }
+    let computed = Arc::new(compute_centrality(g));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 4 {
+        cache.remove(0);
+    }
+    cache.push((key, Arc::clone(&computed)));
+    computed
 }
 
 fn reachable_imports(g: &CodeGraph, target: FileId, reverse: bool) -> Vec<FileId> {
@@ -322,7 +476,7 @@ fn reachable_imports(g: &CodeGraph, target: FileId, reverse: bool) -> Vec<FileId
         }
     }
 
-    let centrality = compute_centrality(g);
+    let centrality = cached_centrality(g);
     let files_by_id: BTreeMap<FileId, &CodeFile> =
         g.files.iter().map(|file| (file.id, file)).collect();
     let first_line: BTreeMap<FileId, u32> =
@@ -532,5 +686,62 @@ mod tests {
         assert_eq!(ranked(&first)[0], FileId(2));
         assert_eq!(first, second);
         assert_eq!(base, snapshot);
+    }
+
+    #[test]
+    fn mentions_path_requires_boundaries() {
+        assert!(mentions_path("edit a.rs now", "a.rs"));
+        assert!(mentions_path("see src/a.rs.", "src/a.rs"));
+        assert!(mentions_path("see x/src/a.rs", "src/a.rs"));
+        assert!(!mentions_path("edit data.rs now", "a.rs"));
+        assert!(!mentions_path("edit a.rs2", "a.rs"));
+        assert!(!mentions_path("edit my-a.rs", "a.rs"));
+        assert!(mentions_path("data.rs then a.rs", "a.rs"));
+    }
+
+    #[test]
+    fn substring_file_name_is_not_in_context() {
+        // `data.rs` contains `a.rs`; a task naming only data.rs must not pull
+        // a.rs into the 50x context set.
+        let g = CodeGraph {
+            files: vec![file(0, "a.rs"), file(1, "data.rs"), file(2, "z.rs")],
+            symbols: Vec::new(),
+            edges: vec![import(0, 2), import(1, 2)],
+        };
+        let m = match_task(&g, "please edit data.rs");
+        assert_eq!(m.files, BTreeSet::from([FileId(1)]));
+        let m = match_task(&g, "please edit a.rs");
+        assert_eq!(m.files, BTreeSet::from([FileId(0)]));
+    }
+
+    #[test]
+    fn file_stem_words_match_task_without_extension() {
+        let g = CodeGraph {
+            files: vec![file(0, "src/loop_guard.rs"), file(1, "src/server.rs")],
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        };
+        let m = match_task(&g, "where does the loop guard block repeats");
+        assert!(m.files.contains(&FileId(0)));
+        assert!(!m.files.contains(&FileId(1)));
+        let base = compute_centrality(&g);
+        let r = rank_for_task(&g, "where does the loop guard block repeats", &base);
+        assert_eq!(ranked(&r)[0], FileId(0));
+    }
+
+    #[test]
+    fn gibberish_task_matches_nothing() {
+        let g = graph(vec![import(0, 1)]);
+        assert!(match_task(&g, "zzzz qqqq nonexistent thing").is_empty());
+    }
+
+    #[test]
+    fn cached_dependents_equal_fresh_and_track_graph_changes() {
+        let g1 = graph(vec![import(0, 1), import(2, 1)]);
+        let first = dependents(&g1, FileId(1));
+        assert_eq!(first, dependents(&g1, FileId(1)));
+        let g2 = graph(vec![import(0, 1)]);
+        assert_eq!(dependents(&g2, FileId(1)), vec![FileId(0)]);
+        assert_eq!(first.len(), 2);
     }
 }

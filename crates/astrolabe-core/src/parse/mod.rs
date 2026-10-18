@@ -19,17 +19,20 @@
 //! language. Prefer the upstream grammar's `tags.scm` conventions
 //! (`@definition.*` / `@reference.*`) over inventing capture names.
 
+use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::types::{CodeSymbol, FileId, Language, RelPath, SymbolId, SymbolKind};
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Parser, Query, QueryCursor, QueryCursorOptions, StreamingIterator};
 
 pub mod queries;
 mod razor;
 mod vue;
 // lang-batch-8 per-language hooks (one file per worker).
+mod dart;
+mod decor;
 mod kotlin;
 mod lua;
 mod objc;
@@ -86,25 +89,82 @@ pub struct ParsedFile {
     /// `(callee_name, line)`; name-based, so downstream confidence is
     /// `Syntactic`.
     pub calls: Vec<(String, u32)>,
+    /// The syntax tree contained ERROR / MISSING nodes, so `symbols`,
+    /// `imports` and `calls` may be incomplete. The result is still usable;
+    /// the indexer reports it in `parse_failures` and does not cache it.
+    pub partial: bool,
 }
 
-/// Parser pool. Holds one reusable `Parser` per language.
+/// Parser pool. Holds reusable `Parser`s per language.
 pub struct ParserPool {
-    // A fixed mutex per language keeps Parser (which is not Sync) reusable and
-    // makes the pool Sync. Same-language parses serialize; different languages
-    // proceed concurrently. Unlike a checkout Vec, the pool cannot grow with
-    // file count or accidentally retain a Tree.
-    parsers: [Mutex<Option<Parser>>; LANGUAGES.len()],
+    // `Parser` is not Sync and a parse needs `&mut Parser`. Each language has a
+    // small idle stack: a parse pops one (or builds one when the stack is
+    // empty) and pushes it back afterwards, so same-language parses run in
+    // parallel instead of serializing on one mutex. The lock is held only for
+    // the pop/push, never during a parse. The stack can never hold more
+    // parsers than the peak number of concurrent parses of that language
+    // (bounded by the thread count), and no Tree is ever retained.
+    parsers: [Mutex<Vec<Parser>>; LANGUAGES.len()],
+}
+
+/// A parser checked out of the pool; returns itself on drop.
+struct PooledParser<'a> {
+    pool: &'a Mutex<Vec<Parser>>,
+    parser: Option<Parser>,
+}
+
+impl std::ops::Deref for PooledParser<'_> {
+    type Target = Parser;
+    fn deref(&self) -> &Parser {
+        self.parser.as_ref().expect("parser present until drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledParser<'_> {
+    fn deref_mut(&mut self) -> &mut Parser {
+        self.parser.as_mut().expect("parser present until drop")
+    }
+}
+
+impl Drop for PooledParser<'_> {
+    fn drop(&mut self) {
+        if let Some(mut parser) = self.parser.take() {
+            // A cancelled parse is resumable; always start the next file clean.
+            parser.reset();
+            if let Ok(mut idle) = self.pool.lock() {
+                idle.push(parser);
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Deadline shared by the parse and the three query passes of the file
+    /// currently being processed on this thread.
+    static QUERY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    static QUERY_TIMED_OUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Progress callback for `QueryCursor`: breaks once the per-file deadline set
+/// by `parse_raw` has passed and records that it did (an interrupted cursor
+/// otherwise just looks like "no more matches").
+fn query_progress() -> impl FnMut(&tree_sitter::QueryCursorState) -> ControlFlow<()> {
+    let deadline = QUERY_DEADLINE.with(Cell::get);
+    move |_| match deadline {
+        Some(deadline) if Instant::now() >= deadline => {
+            QUERY_TIMED_OUT.with(|flag| flag.set(true));
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    }
 }
 
 impl ParserPool {
     pub fn new() -> Self {
         ParserPool {
-            // `new` cannot report grammar ABI failures, so retain them as
-            // `None`; `parse` turns that state into an explicit NoGrammar.
-            parsers: std::array::from_fn(|index| {
-                Mutex::new(configured_parser(LANGUAGES[index]).ok())
-            }),
+            // Parsers are created lazily; a grammar ABI failure surfaces as an
+            // explicit `NoGrammar` from `parse`.
+            parsers: std::array::from_fn(|_| Mutex::new(Vec::new())),
         }
     }
 
@@ -158,14 +218,22 @@ impl ParserPool {
         source: &str,
     ) -> Result<ParsedFile, ParseError> {
         let index = language_index(lang).ok_or(ParseError::NoGrammar(lang))?;
-        let mut slot = self.parsers[index]
+        let idle = self.parsers[index]
             .lock()
-            .map_err(|_| ParseError::Query("parser pool mutex poisoned".into()))?;
-        let parser = slot.as_mut().ok_or(ParseError::NoGrammar(lang))?;
+            .map_err(|_| ParseError::Query("parser pool mutex poisoned".into()))?
+            .pop();
+        let parser = match idle {
+            Some(parser) => parser,
+            None => configured_parser(lang)?,
+        };
+        let mut parser = PooledParser {
+            pool: &self.parsers[index],
+            parser: Some(parser),
+        };
 
-        // Tree-sitter invokes this callback from inside the synchronous parse,
-        // so expiration really interrupts parser work. There is no racing
-        // timer thread that can fire after a successful parse.
+        // One budget covers the parse and the query passes. Tree-sitter calls
+        // these callbacks from inside the synchronous work, so expiration
+        // really interrupts it. There is no racing timer thread.
         let deadline = Instant::now() + PARSE_BUDGET;
         let mut timed_out = false;
         let tree = {
@@ -181,13 +249,12 @@ impl ParserPool {
             let bytes = source.as_bytes();
             parser.parse_with_options(&mut |offset, _| &bytes[offset..], None, Some(options))
         };
+        // Return the parser (reset on drop) before the query phase.
+        drop(parser);
 
         let tree = match tree {
             Some(tree) => tree,
             None => {
-                // A cancelled parse is resumable by default. Resetting ensures
-                // the pooled parser starts the next file from a clean state.
-                parser.reset();
                 return Err(if timed_out {
                     ParseError::Timeout
                 } else {
@@ -195,12 +262,19 @@ impl ParserPool {
                 });
             }
         };
-        drop(slot);
 
         let compiled = compiled_queries(lang)?;
+        QUERY_DEADLINE.with(|d| d.set(Some(deadline)));
+        QUERY_TIMED_OUT.with(|f| f.set(false));
         let symbols = extract_symbols(lang, &compiled.symbols, tree.root_node(), source);
         let imports = extract_imports(lang, &compiled.imports, tree.root_node(), source);
         let calls = extract_calls_for(lang, &compiled.calls, tree.root_node(), source);
+        let query_timed_out = QUERY_TIMED_OUT.with(|f| f.replace(false));
+        QUERY_DEADLINE.with(|d| d.set(None));
+        if query_timed_out {
+            return Err(ParseError::Timeout);
+        }
+        let partial = tree.root_node().has_error();
 
         // `tree`, all Nodes, queries, and cursors are local and drop here.
         // ParsedFile contains only owned strings and scalar line numbers.
@@ -208,6 +282,7 @@ impl ParserPool {
             symbols,
             imports,
             calls,
+            partial,
         })
     }
 }
@@ -334,7 +409,13 @@ fn extract_symbols(
 ) -> Vec<CodeSymbol> {
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, root, source.as_bytes());
+    let mut progress = query_progress();
+    let mut matches = cursor.matches_with_options(
+        query,
+        root,
+        source.as_bytes(),
+        QueryCursorOptions::new().progress_callback(&mut progress),
+    );
     let mut symbols = Vec::new();
 
     while let Some(query_match) = matches.next() {
@@ -377,7 +458,8 @@ fn extract_symbols(
                 Language::Kotlin => kotlin::symbol_name(definition_node, name, kind, source),
                 Language::Shell => shell::symbol_name(definition_node, name, kind, source),
                 Language::Ruby => ruby::symbol_name(definition_node, name, kind, source),
-                Language::Lua => lua::symbol_name(definition_node, name, kind, source),
+                Language::Lua => lua::symbol_name(definition_node, name_node, name, kind, source),
+                Language::Dart => (name.to_owned(), dart::refine_kind(definition_node, kind)),
                 _ => (name.to_owned(), kind),
             }
         };
@@ -394,7 +476,10 @@ fn extract_symbols(
         let (sig, start_row) = if anchor_on_name {
             (signature_from_row(source, name_row), name_row)
         } else {
-            (signature(definition_node, source), def_row)
+            (
+                signature(definition_node, source),
+                decor::start_row(definition_node).map_or(def_row, |r| r.min(def_row)),
+            )
         };
         let exported = is_exported(lang, &name, definition_node, source);
         symbols.push(CodeSymbol {
@@ -436,7 +521,13 @@ fn extract_imports(
 
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, root, source.as_bytes());
+    let mut progress = query_progress();
+    let mut matches = cursor.matches_with_options(
+        query,
+        root,
+        source.as_bytes(),
+        QueryCursorOptions::new().progress_callback(&mut progress),
+    );
     let mut output = Vec::new();
     while let Some(query_match) = matches.next() {
         let mut import_text: Option<String> = None;
@@ -476,7 +567,13 @@ fn extract_imports(
 fn extract_ruby_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, root, source.as_bytes());
+    let mut progress = query_progress();
+    let mut matches = cursor.matches_with_options(
+        query,
+        root,
+        source.as_bytes(),
+        QueryCursorOptions::new().progress_callback(&mut progress),
+    );
     let mut output = Vec::new();
     while let Some(query_match) = matches.next() {
         let mut import_text: Option<&str> = None;
@@ -518,7 +615,13 @@ fn extract_calls_for(
     // names line up with method symbols.
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, root, source.as_bytes());
+    let mut progress = query_progress();
+    let mut matches = cursor.matches_with_options(
+        query,
+        root,
+        source.as_bytes(),
+        QueryCursorOptions::new().progress_callback(&mut progress),
+    );
     let mut output = Vec::new();
     while let Some(query_match) = matches.next() {
         let call_node = query_match
@@ -554,11 +657,32 @@ fn extract_named_captures(
 ) -> Vec<(String, u32)> {
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut captures = cursor.captures(query, root, source.as_bytes());
+    let mut progress = query_progress();
+    let mut matches = cursor.matches_with_options(
+        query,
+        root,
+        source.as_bytes(),
+        QueryCursorOptions::new().progress_callback(&mut progress),
+    );
     let mut output = Vec::new();
-    while let Some((query_match, capture_index)) = captures.next() {
-        let capture = query_match.captures()[*capture_index];
-        if wanted(capture_names[capture.index as usize]) {
+    // Complete matches (not `captures()`, which may yield a match before its
+    // later captures are known) so the whole-call capture can be recognised.
+    while let Some(query_match) = matches.next() {
+        // `@call` / `@reference.call` capture the whole call expression
+        // (`h(a, b)`), the callee name is `@name` in the same match. Storing
+        // both doubles the table and keeps argument text; skip the whole-call
+        // capture whenever the match also names the callee.
+        let names_callee = query_match
+            .captures()
+            .iter()
+            .any(|c| capture_names[c.index as usize] == queries::NAME);
+        for capture in query_match.captures() {
+            let capture_name = capture_names[capture.index as usize];
+            if !wanted(capture_name)
+                || (names_callee && matches!(capture_name, "call" | "reference.call"))
+            {
+                continue;
+            }
             if let Ok(text) = capture.node.utf8_text(source.as_bytes()) {
                 output.push((
                     text.to_owned(),
@@ -1183,13 +1307,9 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
 
     #[test]
     fn all_languages_have_compatible_parsers() {
-        let pool = ParserPool::new();
         for language in LANGUAGES {
             assert!(
-                pool.parsers[language_index(language).expect("wired language")]
-                    .lock()
-                    .unwrap()
-                    .is_some(),
+                configured_parser(language).is_ok(),
                 "failed to configure the {} parser",
                 language.name()
             );
@@ -1200,28 +1320,156 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
     fn parser_pool_size_does_not_grow_with_file_count() {
         let pool = ParserPool::new();
         for _ in 0..100 {
-            let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")]
-                .lock()
+            pool.parse(Language::Rust, &RelPath::new("a.rs"), "fn f() {}")
                 .unwrap();
-            assert!(parser.as_mut().unwrap().parse("fn f() {}", None).is_some());
         }
+        // Sequential parses reuse one parser: the idle stack stays at 1.
+        let idle = pool.parsers[language_index(Language::Rust).unwrap()]
+            .lock()
+            .unwrap()
+            .len();
+        assert_eq!(idle, 1);
         assert_eq!(pool.parsers.len(), LANGUAGES.len());
-        assert_eq!(
-            pool.parsers
-                .iter()
-                .filter(|parser| parser.lock().unwrap().is_some())
-                .count(),
-            LANGUAGES.len()
+    }
+
+    #[test]
+    fn same_language_parses_run_concurrently_and_pool_stays_bounded() {
+        let pool = ParserPool::new();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        let parsed = pool
+                            .parse(Language::Rust, &RelPath::new("a.rs"), "fn f() { g(1); }")
+                            .unwrap();
+                        assert_eq!(parsed.symbols.len(), 1);
+                    }
+                });
+            }
+        });
+        let idle = pool.parsers[language_index(Language::Rust).unwrap()]
+            .lock()
+            .unwrap()
+            .len();
+        assert!((1..=4).contains(&idle), "idle parsers: {idle}");
+    }
+
+    #[test]
+    fn malformed_source_sets_partial_and_clean_source_does_not() {
+        let pool = ParserPool::new();
+        let bad = pool
+            .parse(Language::Rust, &RelPath::new("b.rs"), "fn broken( {")
+            .unwrap();
+        assert!(bad.partial);
+        let ok = pool
+            .parse(Language::Rust, &RelPath::new("ok.rs"), "fn fine() {}\n")
+            .unwrap();
+        assert!(!ok.partial);
+        assert!(pool
+            .parse(Language::Rust, &RelPath::new("empty.rs"), "")
+            .is_ok());
+    }
+
+    #[test]
+    fn calls_do_not_store_whole_call_text_next_to_callee_name() {
+        let pool = ParserPool::new();
+        for (lang, path, src, callee) in [
+            (Language::JavaScript, "a.js", "function f(){ h(a); }\n", "h"),
+            (
+                Language::Python,
+                "a.py",
+                "def f():\n    os.path.join(1)\n",
+                "join",
+            ),
+        ] {
+            let parsed = pool.parse(lang, &RelPath::new(path), src).unwrap();
+            assert!(
+                parsed.calls.iter().any(|(n, _)| n == callee),
+                "{lang:?}: {:?}",
+                parsed.calls
+            );
+            assert!(
+                parsed.calls.iter().all(|(n, _)| !n.contains('(')),
+                "{lang:?} stored call text: {:?}",
+                parsed.calls
+            );
+        }
+    }
+
+    #[test]
+    fn query_phase_honours_the_deadline() {
+        // An already-expired deadline must interrupt the query cursor and be
+        // visible through the flag (not look like "no matches").
+        let source = format!("fn f() {{ {} }}\n", "g(1); ".repeat(20_000));
+        let source = source.as_str();
+        let grammar = grammar(Language::Rust).unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let compiled = compiled_queries(Language::Rust).unwrap();
+        QUERY_DEADLINE.with(|d| d.set(Some(Instant::now() - Duration::from_secs(1))));
+        QUERY_TIMED_OUT.with(|f| f.set(false));
+        let _ = extract_calls_for(Language::Rust, &compiled.calls, tree.root_node(), source);
+        let flagged = QUERY_TIMED_OUT.with(|f| f.replace(false));
+        QUERY_DEADLINE.with(|d| d.set(None));
+        assert!(flagged);
+    }
+
+    /// `cargo test -p astrolabe-core --release --lib pool_parallel_bench -- --ignored --nocapture`
+    /// Parses every `.rs` file under this crate from 8 threads, once with a
+    /// global lock around each parse (the old one-parser-per-language
+    /// behaviour: same-language parses serialize) and once without.
+    #[test]
+    #[ignore = "benchmark"]
+    fn pool_parallel_bench() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(std::fs::read_to_string(&p).unwrap());
+                }
+            }
+        }
+        let run = |serialize: bool| {
+            let pool = ParserPool::new();
+            let gate = Mutex::new(());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= files.len() * 3 {
+                            break;
+                        }
+                        let _g = serialize.then(|| gate.lock().unwrap());
+                        pool.parse(
+                            Language::Rust,
+                            &RelPath::new("x.rs"),
+                            &files[i % files.len()],
+                        )
+                        .unwrap();
+                    });
+                }
+            });
+            start.elapsed()
+        };
+        let serial = run(true);
+        let parallel = run(false);
+        println!(
+            "files={} serialized={serial:?} parallel={parallel:?}",
+            files.len()
         );
     }
 
     #[test]
     fn malformed_source_and_empty_source_are_recoverable() {
-        let pool = ParserPool::new();
-        let mut parser = pool.parsers[language_index(Language::Rust).expect("rust wired")]
-            .lock()
-            .unwrap();
-        let parser = parser.as_mut().unwrap();
+        let mut parser = configured_parser(Language::Rust).unwrap();
         let malformed = parser.parse("fn broken( {", None).unwrap();
         assert!(malformed.root_node().has_error());
         assert!(parser.parse("", None).is_some());

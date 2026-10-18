@@ -59,7 +59,9 @@ impl ModuleResolver for SwiftResolver {
                 let Some(dir) = crate::types::join_rel(base, &rel) else {
                     continue;
                 };
-                if !files.has_dir(&dir) || meta.modules.iter().any(|m| m.name == name) {
+                if !files.has_dir(&dir)
+                    || meta.modules.iter().any(|m| m.name == name && m.dir == dir)
+                {
                     continue;
                 }
                 meta.modules.push(ModuleUnit { name, dir });
@@ -73,7 +75,7 @@ impl ModuleResolver for SwiftResolver {
 
     fn resolve(
         &self,
-        _from: &RelPath,
+        from: &RelPath,
         spec: &str,
         files: &FileIndex,
         meta: &ProjectMeta,
@@ -82,10 +84,7 @@ impl ModuleResolver for SwiftResolver {
         if module.is_empty() {
             return None;
         }
-        let dir = meta
-            .modules
-            .iter()
-            .find(|m| m.name == module)
+        let dir = pick_module(meta, module, from.as_str())
             .map(|m| m.dir.clone())
             .or_else(|| {
                 [format!("Sources/{module}"), module.to_owned()]
@@ -94,6 +93,33 @@ impl ModuleResolver for SwiftResolver {
             })?;
         representative(&dir, module, files)
     }
+}
+
+/// The package (manifest directory) a path belongs to: the longest source
+/// root that is an ancestor of it.
+fn package_of<'m>(meta: &'m ProjectMeta, path: &str) -> Option<&'m str> {
+    meta.source_roots
+        .iter()
+        .map(String::as_str)
+        .filter(|r| {
+            r.is_empty() || (path.starts_with(r) && path.as_bytes().get(r.len()) == Some(&b'/'))
+        })
+        .max_by_key(|r| r.len())
+}
+
+/// Several packages may declare a target with the same name (`Core`,
+/// `Utils`). Prefer the one in the importer's own package; otherwise the
+/// first declared (shallowest manifest).
+fn pick_module<'m>(meta: &'m ProjectMeta, module: &str, from: &str) -> Option<&'m ModuleUnit> {
+    let mut candidates = meta.modules.iter().filter(|m| m.name == module);
+    let first = candidates.next()?;
+    let Some(own) = package_of(meta, from) else {
+        return Some(first);
+    };
+    std::iter::once(first)
+        .chain(candidates)
+        .find(|m| package_of(meta, &m.dir) == Some(own))
+        .or(Some(first))
 }
 
 fn is_manifest(name: &str) -> bool {
@@ -286,5 +312,44 @@ mod tests {
         assert!(got.contains(&("A".into(), Some("Src/A".into()), false)));
         assert!(got.contains(&("ATests".into(), None, true)));
         assert!(!got.iter().any(|g| g.0 == "Commented" || g.0 == "X"));
+    }
+
+    #[test]
+    fn same_named_targets_in_two_packages_stay_separate() {
+        let root = std::env::temp_dir().join(format!("astrolabe-swift-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manifest = "// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: \"P\", targets: [.target(name: \"Core\")])\n";
+        let mut paths = Vec::new();
+        for (pkg, file) in [
+            ("pkgA", "Sources/Core/Core.swift"),
+            ("pkgB", "Sources/Core/Core.swift"),
+            ("pkgB", "Sources/App/main.swift"),
+        ] {
+            let rel = format!("{pkg}/{file}");
+            std::fs::create_dir_all(root.join(&rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(&rel), "").unwrap();
+            paths.push(RelPath::new(&rel));
+        }
+        for pkg in ["pkgA", "pkgB"] {
+            let rel = format!("{pkg}/Package.swift");
+            std::fs::write(root.join(&rel), manifest).unwrap();
+            paths.push(RelPath::new(&rel));
+        }
+        let files = FileIndex::new(root.clone(), paths);
+        let meta = SwiftResolver.detect(&files);
+        let r = |from: &str| {
+            SwiftResolver
+                .resolve(&RelPath::new(from), "Core", &files, &meta)
+                .map(|p| p.as_str().to_owned())
+        };
+        assert_eq!(
+            r("pkgB/Sources/App/main.swift"),
+            Some("pkgB/Sources/Core/Core.swift".into())
+        );
+        assert_eq!(
+            r("pkgA/Sources/Core/Core.swift"),
+            Some("pkgA/Sources/Core/Core.swift".into())
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

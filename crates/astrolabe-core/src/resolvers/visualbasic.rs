@@ -245,6 +245,7 @@ impl ModuleResolver for VisualBasicResolver {
             project_refs,
             namespaces,
             type_decls: type_decls.into_iter().collect(),
+            scope_index: Default::default(),
         }
     }
 
@@ -257,7 +258,9 @@ impl ModuleResolver for VisualBasicResolver {
     ) -> Option<RelPath> {
         match self.resolve_import(from, spec, files, meta) {
             ImportResolution::File(path) => Some(path),
-            ImportResolution::Namespace { .. } | ImportResolution::Unresolved => None,
+            ImportResolution::Files(_)
+            | ImportResolution::Namespace { .. }
+            | ImportResolution::Unresolved => None,
         }
     }
 

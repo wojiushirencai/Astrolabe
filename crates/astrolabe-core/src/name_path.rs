@@ -10,7 +10,8 @@
 //! 行范围嵌套不如 LSP documentSymbol 层级精确：
 //! - 语法符号（如 Rust 的 `impl` 块）会形成中间层，因此祖先链验证
 //!   允许**跳过中间层**（`"Class/method"` 不要求直接父子）；
-//! - 范围相等视为兄弟；范围交叉（而非嵌套）的符号互不包含；
+//! - 范围相等（同一行的多个符号）没有列号可比：容器种类（Class/Struct/…）
+//!   包含非容器种类，其余视为兄弟；范围交叉（而非嵌套）的符号互不包含；
 //! - 跨文件不构成层级：祖先链只在同文件内计算。
 //!
 //! 与 Serena 的差异（有意为之）：
@@ -19,8 +20,8 @@
 //! - 尾斜杠 `"Foo/"` 只命中容器本身，子树一律由 `depth` 参数展开
 //!   （当前 Serena 只是把尾斜杠剥掉）。
 //!
-//! 复杂度：祖先链与直接子符号均为朴素扫描，最坏 O(n²)；匹配器面向
-//! 一次性查询，不建缓存。
+//! 复杂度：按文件分桶，祖先链与直接子符号只在同文件内扫描
+//!（O(Σ n_file²)）；查询串只小写一次，符号名比较走 ASCII 零分配快路。
 
 use std::collections::HashMap;
 
@@ -70,11 +71,55 @@ pub fn match_name_path(
     kind: KindFilter,
     depth: u8,
 ) -> Vec<NamePathMatch> {
-    let Some(query) = parse_query(query) else {
+    let Some(mut query) = parse_query(query) else {
         return Vec::new();
     };
-    let by_id = index_by_id(symbols);
-    let last = query.segments.last().expect("解析结果至少一段");
+    // 名字本身含 `/`（`operator /`、TS 的 "a/b" 方法名）：先整串匹配，
+    // 命中就当单段查询；否则尝试"祖先路径 + 含 `/` 的尾段"（最长尾段优先）；
+    // 都没有符号名匹配时才回落到按 `/` 分段。
+    if query.whole.contains('/') {
+        let any_named = |text: &str| {
+            let lowered = lower_once(text);
+            symbols
+                .iter()
+                .any(|s| name_matches(&s.name, &lowered, substring))
+        };
+        if any_named(&query.whole) {
+            query = Query {
+                segments: vec![query.whole.clone()],
+                absolute: false,
+                trailing_slash: false,
+                whole: query.whole,
+            };
+        } else {
+            let whole = query.whole.clone();
+            for (pos, _) in whole.match_indices('/') {
+                let tail = whole[pos + 1..].trim();
+                if tail.is_empty() || !tail.contains('/') || !any_named(tail) {
+                    continue;
+                }
+                let mut segments: Vec<String> = whole[..pos]
+                    .split('/')
+                    .map(str::trim)
+                    .filter(|seg| !seg.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                segments.push(tail.to_owned());
+                query = Query {
+                    segments,
+                    absolute: query.absolute,
+                    trailing_slash: false,
+                    whole: whole.clone(),
+                };
+                break;
+            }
+        }
+    }
+    let ctx = Ctx::new(symbols);
+    let by_id = &ctx.by_id;
+    // 查询段只小写一次；符号名比较走 ASCII 快路，不再逐符号分配。
+    let lowered: Vec<String> = query.segments.iter().map(|s| lower_once(s)).collect();
+    let last = lowered.last().expect("解析结果至少一段");
 
     // 1) 候选 = 最后一段的名字匹配者；2) 向上验证祖先链与绝对路径约束。
     let mut matched: Vec<SymbolId> = Vec::new();
@@ -82,22 +127,16 @@ pub fn match_name_path(
         if !name_matches(&sym.name, last, substring) {
             continue;
         }
-        if query.segments.len() == 1 {
+        if lowered.len() == 1 {
             // 绝对路径的单段查询：命中者必须是文件顶层。
-            if query.absolute && !ancestors_within_file(symbols, sym).is_empty() {
+            if query.absolute && !ctx.ancestors_within_file(sym).is_empty() {
                 continue;
             }
-        } else if !chain_matches(
-            symbols,
-            &by_id,
-            sym,
-            &query.segments[..query.segments.len() - 1],
-            query.absolute,
-        ) {
+        } else if !chain_matches(&ctx, sym, &lowered[..lowered.len() - 1], query.absolute) {
             continue;
         }
         // 尾斜杠：只命中容器本身（叶子不算容器）。
-        if query.trailing_slash && !is_container(symbols, sym) {
+        if query.trailing_slash && !ctx.is_container(sym) {
             continue;
         }
         matched.push(sym.id);
@@ -115,7 +154,7 @@ pub fn match_name_path(
         for d in 1..=depth {
             let mut next = Vec::new();
             for cur in &layer {
-                next.extend(direct_children(symbols, &symbols[by_id[cur]]));
+                next.extend(ctx.direct_children(&symbols[by_id[cur]]));
             }
             for child in &next {
                 match depth_by_id.entry(*child) {
@@ -156,6 +195,20 @@ pub fn match_name_path(
     out
 }
 
+/// 每个目标（`symbols` 下标）在同文件内的最内层包含者（`symbols` 下标）。
+/// 供 find_symbol 在每行标注"所属容器"；按文件分桶，不做全库扫描。
+pub fn innermost_containers(symbols: &[CodeSymbol], targets: &[usize]) -> Vec<Option<usize>> {
+    let ctx = Ctx::new(symbols);
+    targets
+        .iter()
+        .map(|&t| {
+            ctx.ancestors_within_file(&symbols[t])
+                .first()
+                .map(|id| ctx.by_id[id])
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------------ 解析
 
 /// 解析后的查询。段保留原始大小写（匹配时统一小写比较）。
@@ -165,6 +218,8 @@ struct Query {
     absolute: bool,
     /// 尾部 `/`：只匹配容器本身。
     trailing_slash: bool,
+    /// 去空白后的整串（用于名字里带 `/` 的符号先整串匹配）。
+    whole: String,
 }
 
 /// 去空白、按 `/` 分段、空段丢弃；记录绝对/尾斜杠标志（单段也合法）。
@@ -186,64 +241,131 @@ fn parse_query(query: &str) -> Option<Query> {
             segments,
             absolute,
             trailing_slash,
+            whole: trimmed.to_owned(),
         })
     }
 }
 
 // ------------------------------------------------------------名字与层级判定
 
-/// 大小写不敏感的名字匹配；`substring` 为真时按子串（用于最后一段）。
-fn name_matches(sym_name: &str, seg: &str, substring: bool) -> bool {
-    let (n, s) = (sym_name.to_lowercase(), seg.to_lowercase());
+/// 查询段小写化（只做一次）。
+fn lower_once(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// 大小写不敏感的名字匹配；`seg_lower` 必须已小写；`substring` 为真时按子串
+///（用于最后一段）。ASCII 对 ASCII 走零分配快路。
+fn name_matches(sym_name: &str, seg_lower: &str, substring: bool) -> bool {
+    if sym_name.is_ascii() && seg_lower.is_ascii() {
+        let (n, s) = (sym_name.as_bytes(), seg_lower.as_bytes());
+        return if substring {
+            s.is_empty() || n.windows(s.len()).any(|w| w.eq_ignore_ascii_case(s))
+        } else {
+            n.eq_ignore_ascii_case(s)
+        };
+    }
+    let n = sym_name.to_lowercase();
     if substring {
-        n.contains(&s)
+        n.contains(seg_lower)
     } else {
-        n == s
+        n == seg_lower
     }
 }
 
-/// `outer` 的行范围是否**严格包含** `inner`（须同文件）。
-/// 范围完全相等的两个符号互不包含，视为兄弟。
+/// 能容纳其它符号的种类。
+fn is_container_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Module
+    )
+}
+
+/// `outer` 是否**严格包含** `inner`（须同文件）。行范围真包含即成立；
+/// 范围完全相等（一行类、压缩/生成代码）时没有列号可比，改用种类兜底：
+/// 容器种类（Class/Struct/…）包含非容器种类，其余视为兄弟。
 fn strictly_contains(outer: &CodeSymbol, inner: &CodeSymbol) -> bool {
-    outer.file == inner.file
-        && outer.start_line <= inner.start_line
-        && outer.end_line >= inner.end_line
-        && (outer.start_line, outer.end_line) != (inner.start_line, inner.end_line)
+    if outer.file != inner.file
+        || outer.start_line > inner.start_line
+        || outer.end_line < inner.end_line
+    {
+        return false;
+    }
+    if (outer.start_line, outer.end_line) != (inner.start_line, inner.end_line) {
+        return true;
+    }
+    is_container_kind(outer.kind) && !is_container_kind(inner.kind)
 }
 
-/// `target` 在同文件内的包含者，按范围**从内到外**排序
-///（start_line 降序、end_line 升序；范围交叉的包含者也由此排定确定顺序）。
-fn ancestors_within_file(symbols: &[CodeSymbol], target: &CodeSymbol) -> Vec<SymbolId> {
-    let mut ancestors: Vec<&CodeSymbol> = symbols
-        .iter()
-        .filter(|s| strictly_contains(s, target))
-        .collect();
-    ancestors.sort_by(|a, b| {
-        b.start_line
-            .cmp(&a.start_line)
-            .then(a.end_line.cmp(&b.end_line))
-    });
-    ancestors.into_iter().map(|s| s.id).collect()
+/// 查询期上下文：按文件分桶，层级判定只在同文件符号里扫描
+///（O(Σ n_file²) 而非 O(N²)），id→下标映射一次建好。
+struct Ctx<'a> {
+    symbols: &'a [CodeSymbol],
+    by_id: HashMap<SymbolId, usize>,
+    buckets: HashMap<crate::types::FileId, Vec<usize>>,
 }
 
-/// `parent` 的直接子符号：严格被 `parent` 包含、且二者之间没有中间符号。
-/// 范围相等的兄弟互为直接子；孙辈被中间符号挡住。
-fn direct_children(symbols: &[CodeSymbol], parent: &CodeSymbol) -> Vec<SymbolId> {
-    symbols
-        .iter()
-        .filter(|s| strictly_contains(parent, s))
-        .filter(|s| {
-            !symbols
-                .iter()
-                .any(|mid| strictly_contains(parent, mid) && strictly_contains(mid, s))
-        })
-        .map(|s| s.id)
-        .collect()
-}
+impl<'a> Ctx<'a> {
+    fn new(symbols: &'a [CodeSymbol]) -> Self {
+        let mut buckets: HashMap<crate::types::FileId, Vec<usize>> = HashMap::new();
+        for (i, s) in symbols.iter().enumerate() {
+            buckets.entry(s.file).or_default().push(i);
+        }
+        Ctx {
+            symbols,
+            by_id: index_by_id(symbols),
+            buckets,
+        }
+    }
 
-/// `target` 是否容器：同文件内至少严格包含一个其它符号。
-fn is_container(symbols: &[CodeSymbol], target: &CodeSymbol) -> bool {
-    symbols.iter().any(|s| strictly_contains(target, s))
+    fn bucket(&self, file: crate::types::FileId) -> &[usize] {
+        self.buckets.get(&file).map_or(&[], Vec::as_slice)
+    }
+
+    /// `target` 在同文件内的包含者，按范围**从内到外**排序
+    ///（start_line 降序、end_line 升序；范围交叉的包含者也由此排定确定顺序）。
+    fn ancestors_within_file(&self, target: &CodeSymbol) -> Vec<SymbolId> {
+        let mut ancestors: Vec<&CodeSymbol> = self
+            .bucket(target.file)
+            .iter()
+            .map(|&i| &self.symbols[i])
+            .filter(|s| strictly_contains(s, target))
+            .collect();
+        ancestors.sort_by(|a, b| {
+            b.start_line
+                .cmp(&a.start_line)
+                .then(a.end_line.cmp(&b.end_line))
+                // 范围相等时容器（外层）排在后面
+                .then(is_container_kind(a.kind).cmp(&is_container_kind(b.kind)))
+        });
+        ancestors.into_iter().map(|s| s.id).collect()
+    }
+
+    /// `parent` 的直接子符号：严格被 `parent` 包含、且二者之间没有中间符号。
+    fn direct_children(&self, parent: &CodeSymbol) -> Vec<SymbolId> {
+        let inside: Vec<&CodeSymbol> = self
+            .bucket(parent.file)
+            .iter()
+            .map(|&i| &self.symbols[i])
+            .filter(|s| strictly_contains(parent, s))
+            .collect();
+        inside
+            .iter()
+            .filter(|s| !inside.iter().any(|mid| strictly_contains(mid, s)))
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// `target` 是否容器：同文件内至少严格包含一个其它符号。
+    fn is_container(&self, target: &CodeSymbol) -> bool {
+        self.bucket(target.file)
+            .iter()
+            .any(|&i| strictly_contains(target, &self.symbols[i]))
+    }
 }
 
 /// `SymbolId` → 下标。`match_name_path` 假定 id 在 `symbols` 内唯一。
@@ -251,19 +373,15 @@ fn index_by_id(symbols: &[CodeSymbol]) -> HashMap<SymbolId, usize> {
     symbols.iter().enumerate().map(|(i, s)| (s.id, i)).collect()
 }
 
-/// 多段查询的祖先链验证。`ancestor_segs` 是除最后一段外的段（书写顺序，
-/// 外→内）；从最内段开始在链（内→外）中**贪心**寻找最近的匹配者，允许
-/// 跳过中间层（后缀匹配语义：`Class/method` 允许 Class→impl→method）。
+/// 多段查询的祖先链验证。`ancestor_segs` 是除最后一段外的段（已小写，
+/// 书写顺序，外→内）；从最内段开始在链（内→外）中**贪心**寻找最近的匹配
+/// 者，允许跳过中间层（后缀匹配语义：`Class/method` 允许 Class→impl→method）。
 /// `absolute` 为真时还要求链首（最外层匹配段）之上没有更外层的包含者。
 /// 祖先段一律精确匹配（子串只作用于最后一段）。
-fn chain_matches(
-    symbols: &[CodeSymbol],
-    by_id: &HashMap<SymbolId, usize>,
-    target: &CodeSymbol,
-    ancestor_segs: &[String],
-    absolute: bool,
-) -> bool {
-    let chain = ancestors_within_file(symbols, target);
+fn chain_matches(ctx: &Ctx, target: &CodeSymbol, ancestor_segs: &[String], absolute: bool) -> bool {
+    let symbols = ctx.symbols;
+    let by_id = &ctx.by_id;
+    let chain = ctx.ancestors_within_file(target);
     let mut idx = 0;
     let mut outermost: Option<usize> = None;
     let last_seg_i = ancestor_segs.len().saturating_sub(1);
@@ -629,6 +747,64 @@ mod tests {
         assert_eq!(
             ids(&match_name_path(&s, "/Dup/leaf", false, all(), 0)),
             vec![(72, 0)]
+        );
+    }
+
+    // 同一行的类与方法：行范围相等，靠种类兜底（审计 parse-front #6）
+    #[test]
+    fn same_line_container_contains_member() {
+        let s = vec![
+            sym(80, 1, "A", SymbolKind::Class, (1, 1)),
+            sym(81, 1, "m", SymbolKind::Method, (1, 1)),
+            sym(82, 1, "B", SymbolKind::Class, (1, 1)), // 容器之间仍是兄弟
+        ];
+        assert_eq!(
+            ids(&match_name_path(&s, "A/m", false, all(), 0)),
+            vec![(81, 0)]
+        );
+        assert!(match_name_path(&s, "A/B", false, all(), 0).is_empty());
+        assert_eq!(
+            ids(&match_name_path(&s, "A/", false, all(), 1)),
+            vec![(81, 1)]
+        );
+    }
+
+    // 名字含 `/`：先整串精确匹配，再回落分段（审计 parse-front #7）
+    #[test]
+    fn slash_in_symbol_name_matches_whole_string_first() {
+        let s = vec![
+            sym(90, 1, "Vec2", SymbolKind::Struct, (1, 20)),
+            sym(91, 1, "operator /", SymbolKind::Method, (5, 8)),
+        ];
+        assert_eq!(
+            ids(&match_name_path(&s, "operator /", false, all(), 0)),
+            vec![(91, 0)]
+        );
+        assert_eq!(
+            ids(&match_name_path(&s, "Vec2/operator /", false, all(), 0)),
+            vec![(91, 0)]
+        );
+        // 没有符号名匹配整串时仍按分段
+        assert_eq!(
+            ids(&match_name_path(&s, "Vec2/", false, all(), 0)),
+            vec![(90, 0)]
+        );
+    }
+
+    // 大小写不敏感 + 非 ASCII 名字仍可匹配
+    #[test]
+    fn case_insensitive_ascii_and_unicode() {
+        let s = vec![
+            sym(95, 1, "HandleÉvent", SymbolKind::Function, (1, 2)),
+            sym(96, 1, "FooBar", SymbolKind::Function, (3, 4)),
+        ];
+        assert_eq!(
+            ids(&match_name_path(&s, "handleévent", false, all(), 0)),
+            vec![(95, 0)]
+        );
+        assert_eq!(
+            ids(&match_name_path(&s, "OOB", true, all(), 0)),
+            vec![(96, 0)]
         );
     }
 }

@@ -11,6 +11,13 @@ use std::path::Path;
 
 /// Decode raw file bytes to text. Never fails.
 pub fn decode_source(bytes: Vec<u8>) -> String {
+    // UTF-16 text is often valid UTF-8 too (ASCII + NUL), so check its BOM first.
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(&bytes) {
+            let (text, _) = encoding.decode_without_bom_handling(&bytes[bom_len..]);
+            return text.into_owned();
+        }
+    }
     let bytes = match String::from_utf8(bytes) {
         Ok(mut text) => {
             if text.starts_with('\u{feff}') {
@@ -54,6 +61,15 @@ mod tests {
         let text = decode_source(bytes.into_owned());
         assert!(text.contains("main_func"));
         assert!(text.contains("中文注释"));
+    }
+
+    #[test]
+    fn utf16_bom_is_decoded_even_when_ascii_only() {
+        let mut le = vec![0xFF, 0xFE];
+        for u in "a\nb\n".encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_source(le), "a\nb\n");
     }
 
     #[test]
