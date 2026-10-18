@@ -582,7 +582,20 @@ fn many_hits_hint(total: usize) -> String {
 fn is_doc_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     let ext = p.rsplit_once('.').map_or("", |(_, e)| e);
-    matches!(ext, "md" | "mdx" | "rst" | "txt" | "adoc")
+    let stem = p
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.split('.').next())
+        .unwrap_or("");
+    // `.txt` is prose only for README-like names; CMakeLists.txt,
+    // requirements.txt etc. are build/config files.
+    let readme_like = matches!(
+        stem,
+        "readme" | "notes" | "changelog" | "changes" | "license" | "authors" | "todo"
+            | "contributing" | "history" | "news" | "install"
+    );
+    matches!(ext, "md" | "mdx" | "rst" | "adoc")
+        || (ext == "txt" && readme_like)
         || p.starts_with("docs/")
         || p.starts_with("doc/")
         || p.contains("/docs/")
@@ -2212,15 +2225,15 @@ impl AstrolabeServer {
                 let mut misses = 0u64;
                 let mut skipped = 0usize;
                 let strings_are_code = params.query.contains(['"', '\'', '`']);
+                // skip_comments on a type without a lexer cannot filter anything;
+                // collect those types so the summary says so.
+                let mut unlexed: BTreeSet<String> = BTreeSet::new();
                 let mut scan_file = |path: &str, matches: &mut Vec<SearchHit>| {
                     let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
                         return;
                     };
-                    let mask = if params.skip_comments {
-                        crate::code_mask::code_mask(path, &lines, strings_are_code)
-                    } else {
-                        None
-                    };
+                    // Lazy: the mask is only computed once a line matches.
+                    let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
                     if hit {
                         hits += 1;
                     } else {
@@ -2228,13 +2241,20 @@ impl AstrolabeServer {
                     }
                     for (line_no, line) in lines.iter().enumerate() {
                         if matcher.is_match(line) {
-                            if let Some(mask) = &mask {
-                                let real = matcher.find_iter(line).any(|m| {
-                                    mask[line_no].get(m.start()).copied().unwrap_or(true)
+                            if params.skip_comments {
+                                let mask = mask.get_or_insert_with(|| {
+                                    crate::code_mask::code_mask(path, &lines, strings_are_code)
                                 });
-                                if !real {
-                                    skipped += 1;
-                                    continue;
+                                if let Some(mask) = mask {
+                                    let real = matcher.find_iter(line).any(|m| {
+                                        mask[line_no].get(m.start()).copied().unwrap_or(true)
+                                    });
+                                    if !real {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                } else {
+                                    unlexed.insert(crate::code_mask::type_label(path));
                                 }
                             }
                             // P0：超长行先做单行安全切片（Unicode 边界安全），
@@ -2285,9 +2305,40 @@ impl AstrolabeServer {
                         TEXT_SEARCH_MAX_FILE_BYTES,
                     );
                     for (idx, file_hits) in found {
-                        if params.skip_comments && is_doc_path(rels[idx]) {
-                            skipped += file_hits.len();
-                            continue;
+                        let mut file_hits = file_hits;
+                        if params.skip_comments {
+                            if is_doc_path(rels[idx]) {
+                                skipped += file_hits.len();
+                                continue;
+                            }
+                            if crate::code_mask::has_lexer(rels[idx]) {
+                                let text = std::fs::read(session.root.join(rels[idx]))
+                                    .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+                                    .unwrap_or_default();
+                                let lines: Vec<String> =
+                                    text.lines().map(str::to_string).collect();
+                                if let Some(mask) = crate::code_mask::code_mask(
+                                    rels[idx],
+                                    &lines,
+                                    strings_are_code,
+                                ) {
+                                    let before = file_hits.len();
+                                    file_hits.retain(|hit| {
+                                        let l = (hit.line as usize).saturating_sub(1);
+                                        match (lines.get(l), mask.get(l)) {
+                                            (Some(line), Some(m)) => {
+                                                matcher.find_iter(line).any(|f| {
+                                                    m.get(f.start()).copied().unwrap_or(true)
+                                                })
+                                            }
+                                            _ => true,
+                                        }
+                                    });
+                                    skipped += before - file_hits.len();
+                                }
+                            } else if !file_hits.is_empty() {
+                                unlexed.insert(crate::code_mask::type_label(rels[idx]));
+                            }
                         }
                         for hit in file_hits {
                             matches.push(SearchHit {
@@ -2301,7 +2352,15 @@ impl AstrolabeServer {
                 }
                 let text_matches = matches.len() - code_matches;
                 let skip_note = if params.skip_comments {
-                    format!("skip_comments：已跳过注释/字符串/文档中的 {skipped} 处命中，以下不含它们。\n")
+                    let mut note = format!("skip_comments：已跳过注释/字符串/文档中的 {skipped} 处命中，以下不含它们。\n");
+                    if !unlexed.is_empty() {
+                        let kinds: Vec<&str> = unlexed.iter().map(String::as_str).collect();
+                        note.push_str(&format!(
+                            "注意：{} 类型未跳过注释（没有词法器），其命中仍含注释/字符串里的出现。\n",
+                            kinds.join("、")
+                        ));
+                    }
+                    note
                 } else {
                     String::new()
                 };
@@ -4456,6 +4515,43 @@ mod tests {
         let text = text_of(&server.search_code(Parameters(q)));
         assert!(text.contains("    5 处 /    1 个文件  svc/a.go"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skip_comments_applies_to_text_only_files_and_keeps_build_txt() {
+        let (server, dir) = smart_server(&[
+            ("main.go", "package main\nfunc main() { SysLog(1) }\n".into()),
+            ("cfg/app.yaml", "# SysLog(yaml comment)\nk: SysLog(2)\n".into()),
+            ("cfg/q.sql", "-- SysLog(sql comment)\nselect SysLog(3);\n".into()),
+            ("cfg/k.kt", "// SysLog(kt comment)\nfun f() { SysLog(4) }\n".into()),
+            ("cfg/CMakeLists.txt", "add_executable(SysLog( main.c)\n".into()),
+            ("notes/README.txt", "call SysLog( here\n".into()),
+            ("cfg/a.hs", "-- SysLog(hs comment)\nx = SysLog(5)\n".into()),
+        ]);
+        let mut p = search("SysLog(");
+        p.skip_comments = true;
+        p.dedup = Some(false);
+        let text = text_of(&server.search_code(Parameters(p)));
+        for kept in ["SysLog(1)", "k: SysLog(2)", "select SysLog(3)", "SysLog(4)", "add_executable(SysLog("] {
+            assert!(text.contains(kept), "{kept} missing: {text}");
+        }
+        for dropped in ["yaml comment", "sql comment", "kt comment", "call SysLog( here"] {
+            assert!(!text.contains(dropped), "{dropped} kept: {text}");
+        }
+        // No lexer for .hs: hits stay, and the summary says so.
+        assert!(text.contains("hs comment"), "{text}");
+        assert!(text.contains("未跳过注释") && text.contains(".hs"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_doc_path_txt_only_for_readme_like_names() {
+        assert!(is_doc_path("README.txt"));
+        assert!(is_doc_path("a/NOTES.txt"));
+        assert!(is_doc_path("docs/x.yaml"));
+        assert!(is_doc_path("a/b.md"));
+        assert!(!is_doc_path("cfg/CMakeLists.txt"));
+        assert!(!is_doc_path("requirements.txt"));
     }
 
     #[test]
