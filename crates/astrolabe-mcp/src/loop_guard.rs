@@ -25,10 +25,12 @@ pub(crate) const DEFAULT_RATE_WINDOW_SECS: u64 = 600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LoopGuardConfig {
-    /// Allowed runs of one signature per window; `0` disables.
+    /// Allowed runs of one signature per window; `0` disables (as does a
+    /// `0` repeat window).
     pub repeat_max: usize,
     pub repeat_window: Duration,
-    /// Search calls per window before warning; `0` disables.
+    /// Search calls per window before warning; `0` disables (as does a `0`
+    /// rate window).
     pub rate_max: usize,
     pub rate_window: Duration,
 }
@@ -61,21 +63,24 @@ impl LoopGuardConfig {
 
     pub(crate) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         let n = |k: &str, d: usize| parse_num(get(k).as_deref(), d, k);
-        let s = |k: &str, d: u64| {
-            let v = parse_num(get(k).as_deref(), d, k);
-            Duration::from_secs(if v == 0 { d } else { v })
-        };
+        // A window of 0 means "disable the corresponding check" (the same as
+        // `*_MAX=0`), not "silently use the default".
+        let secs = |k: &str, d: u64| parse_num(get(k).as_deref(), d, k);
+        let repeat_secs = secs(
+            "ASTROLABE_SEARCH_REPEAT_WINDOW_SECS",
+            DEFAULT_REPEAT_WINDOW_SECS,
+        );
+        let rate_secs = secs(
+            "ASTROLABE_SEARCH_RATE_WINDOW_SECS",
+            DEFAULT_RATE_WINDOW_SECS,
+        );
+        let repeat_max = n("ASTROLABE_SEARCH_REPEAT_MAX", DEFAULT_REPEAT_MAX);
+        let rate_max = n("ASTROLABE_SEARCH_RATE_MAX", DEFAULT_RATE_MAX);
         Self {
-            repeat_max: n("ASTROLABE_SEARCH_REPEAT_MAX", DEFAULT_REPEAT_MAX),
-            repeat_window: s(
-                "ASTROLABE_SEARCH_REPEAT_WINDOW_SECS",
-                DEFAULT_REPEAT_WINDOW_SECS,
-            ),
-            rate_max: n("ASTROLABE_SEARCH_RATE_MAX", DEFAULT_RATE_MAX),
-            rate_window: s(
-                "ASTROLABE_SEARCH_RATE_WINDOW_SECS",
-                DEFAULT_RATE_WINDOW_SECS,
-            ),
+            repeat_max: if repeat_secs == 0 { 0 } else { repeat_max },
+            repeat_window: Duration::from_secs(repeat_secs),
+            rate_max: if rate_secs == 0 { 0 } else { rate_max },
+            rate_window: Duration::from_secs(rate_secs),
         }
     }
 }
@@ -183,8 +188,9 @@ impl<R: Clone> LoopGuard<R> {
                     let mut note = format!(
                         "blocked: true\nloop guard: 这条 {tool} 查询（参数完全相同、索引自上次执行后未变化）\
                          在最近 {} 秒内已执行 {prior} 次（上限 {}），本次未重新执行，下面附上上一次的执行结果。\
+                         下面的结果就是该查询的完整结果（即使这条查询最初来自其他子任务或你已压缩的上下文，也请直接使用）。\
                          若需要不同信息，请修改查询/path_filter/budget_tokens，或换一种方法\
-                         （find_references、goto_definition、Read 指定行段）；不要在同一组查询之间反复轮换。",
+                         （find_references、goto_definition、Read 指定行段）。",
                         cfg.repeat_window.as_secs(),
                         cfg.repeat_max
                     );
@@ -366,14 +372,35 @@ mod tests {
         let c = LoopGuardConfig::from_lookup(|k| match k {
             "ASTROLABE_SEARCH_REPEAT_MAX" => Some("5".into()),
             "ASTROLABE_SEARCH_RATE_MAX" => Some("bogus".into()),
-            "ASTROLABE_SEARCH_REPEAT_WINDOW_SECS" => Some("0".into()),
             _ => None,
         });
         assert_eq!(c.repeat_max, 5);
         assert_eq!(c.rate_max, DEFAULT_RATE_MAX);
-        assert_eq!(
-            c.repeat_window,
-            Duration::from_secs(DEFAULT_REPEAT_WINDOW_SECS)
-        );
+        // A zero window disables the check; it is not the default window.
+        let c = LoopGuardConfig::from_lookup(|k| match k {
+            "ASTROLABE_SEARCH_REPEAT_WINDOW_SECS" => Some("0".into()),
+            _ => None,
+        });
+        assert_eq!(c.repeat_window, Duration::ZERO);
+        assert_eq!(c.repeat_max, 0);
+        let c = LoopGuardConfig::from_lookup(|k| match k {
+            "ASTROLABE_SEARCH_RATE_WINDOW_SECS" => Some("0".into()),
+            _ => None,
+        });
+        assert_eq!(c.rate_max, 0);
+        assert_eq!(c.repeat_max, DEFAULT_REPEAT_MAX);
+    }
+
+    #[test]
+    fn zero_window_env_never_blocks() {
+        let c = LoopGuardConfig::from_lookup(|k| match k {
+            "ASTROLABE_SEARCH_REPEAT_WINDOW_SECS" => Some("0".into()),
+            _ => None,
+        });
+        let mut g: LoopGuard = LoopGuard::new(c);
+        let t = Instant::now();
+        for _ in 0..20 {
+            assert!(!call(&mut g, "q", 1, t));
+        }
     }
 }
