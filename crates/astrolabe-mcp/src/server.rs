@@ -11,7 +11,7 @@ use std::{
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
     cache::{FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
-    graph::{cached_centrality, match_task, rank_for_task},
+    graph::{cached_centrality, rank_and_match},
     render::{confidence_note, symbol_line},
     types::RelPath,
     CodeSymbol, Confidence, FileId,
@@ -2664,8 +2664,7 @@ impl AstrolabeServer {
             }
 
             let base = cached_centrality(graph);
-            let ranked = rank_for_task(graph, &params.task_description, &base);
-            let matched = match_task(graph, &params.task_description);
+            let (ranked, matched) = rank_and_match(graph, &params.task_description, &base);
             let mut ids: Vec<_> = graph.files.iter().map(|file| file.id).collect();
             ids.sort_by(|a, b| {
                 ranked
