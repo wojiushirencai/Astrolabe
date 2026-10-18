@@ -67,12 +67,38 @@ pub fn search_files<P: AsRef<str> + Sync>(
         .collect()
 }
 
+/// Longest line kept whole; longer lines (minified bundles, base64, lockfiles)
+/// are cut to a window around the first match before being copied.
+const MAX_HIT_LINE_BYTES: usize = 4096;
+
+fn clip_long_line<'a>(matcher: &RegexMatcher, line: &'a str) -> &'a str {
+    use grep_matcher::Matcher;
+    if line.len() <= MAX_HIT_LINE_BYTES {
+        return line;
+    }
+    let at = matcher
+        .find(line.as_bytes())
+        .ok()
+        .flatten()
+        .map_or(0, |m| m.start());
+    let mut start = at.saturating_sub(MAX_HIT_LINE_BYTES / 2);
+    let mut end = (start + MAX_HIT_LINE_BYTES).min(line.len());
+    start = end.saturating_sub(MAX_HIT_LINE_BYTES).min(start);
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[start..end]
+}
+
 fn search_one(path: &Path, matcher: &RegexMatcher, max_file_bytes: u64) -> Vec<TextHit> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() <= max_file_bytes => {}
         _ => return Vec::new(),
     }
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(mut bytes) = std::fs::read(path) else {
         return Vec::new();
     };
     // UTF-16 BOM files contain NULs by design; everything else with a NUL is
@@ -83,7 +109,7 @@ fn search_one(path: &Path, matcher: &RegexMatcher, max_file_bytes: u64) -> Vec<T
         if !utf16_bom && bytes.contains(&0) {
             return Vec::new();
         }
-        Some(crate::text::decode_source(bytes.clone()))
+        Some(crate::text::decode_source(std::mem::take(&mut bytes)))
     } else {
         None
     };
@@ -101,9 +127,10 @@ fn search_one(path: &Path, matcher: &RegexMatcher, max_file_bytes: u64) -> Vec<T
         matcher,
         haystack,
         sinks::Lossy(|line, text| {
+            let line_text = text.trim_end_matches(['\n', '\r']);
             hits.push(TextHit {
                 line,
-                text: text.trim_end_matches(['\n', '\r']).to_string(),
+                text: clip_long_line(matcher, line_text).to_string(),
             });
             Ok(true)
         }),
@@ -190,6 +217,25 @@ mod tests {
         let got = search_files(&d, &["gbk.txt"], &m, 100);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].1[0].text.contains("你好"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn overlong_lines_are_clipped_around_the_match() {
+        let d = tmp();
+        let long = format!("{}NEEDLE{}", "中".repeat(20_000), "x".repeat(20_000));
+        std::fs::write(d.join("min.js"), format!("{long}\nshort NEEDLE\n")).unwrap();
+        let m = build_matcher("NEEDLE", false, true).unwrap();
+        let got = search_files(&d, &["min.js"], &m, 10_000_000);
+        let hits = &got[0].1;
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits[0].text.len() <= MAX_HIT_LINE_BYTES,
+            "{}",
+            hits[0].text.len()
+        );
+        assert!(hits[0].text.contains("NEEDLE"));
+        assert_eq!(hits[1].text, "short NEEDLE");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -785,8 +785,12 @@ fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
     out
 }
 
-/// Glob list -> matcher. A bare name (`vendor`) also excludes everything
-/// below a directory of that name; `*` crosses `/`.
+/// Glob list -> matcher. One rule for every consumer (search_code main path,
+/// aggregate/count, text-only scan, `data_hits_outside`): a bare name
+/// (`test`, `vendor`) matches a whole path segment, so a directory or a file
+/// of exactly that name (and everything under such a directory); it never
+/// matches part of a name (`test` skips neither `contest/` nor `test.rs`).
+/// `*` crosses `/`.
 fn build_exclude_set(globs: Option<&[String]>) -> Result<Option<globset::GlobSet>, String> {
     let Some(globs) = globs.filter(|g| !g.is_empty()) else {
         return Ok(None);
@@ -1563,7 +1567,7 @@ pub(crate) struct SearchParams {
     )]
     pub aggregate: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Skip paths: [\"vendor\",\"_test.go\",\"*_test.go\"].")]
+    #[schemars(description = "Skip paths; bare name=segment: [\"vendor\",\"_test.go\"]")]
     pub exclude: Option<Vec<String>>,
     #[serde(default)]
     #[schemars(description = "Only totals (hits, files).")]
@@ -5787,6 +5791,17 @@ mod tests {
         assert!(is_doc_path("a/b.md"));
         assert!(!is_doc_path("cfg/CMakeLists.txt"));
         assert!(!is_doc_path("requirements.txt"));
+    }
+
+    #[test]
+    fn bare_exclude_name_is_whole_path_segment_for_dirs_and_files_alike() {
+        let set = build_exclude_set(Some(&["test".into()])).unwrap().unwrap();
+        assert!(set.is_match("test/a.rs"));
+        assert!(set.is_match("src/test/a.rs"));
+        assert!(set.is_match("src/test"));
+        assert!(!set.is_match("src/contest/a.rs"));
+        assert!(!set.is_match("src/test.rs"));
+        assert!(!set.is_match("src/tests/a.rs"));
     }
 
     #[test]
