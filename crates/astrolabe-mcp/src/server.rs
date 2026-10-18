@@ -1688,6 +1688,9 @@ impl AstrolabeServer {
     }
 
     pub fn with_context(root: PathBuf, context: ClientContext) -> Self {
+    /// Index generation each `find_symbol` query (offset and budget aside) was
+    /// last served at, so a later page can say the index changed in between.
+    symbol_page_generations: Arc<Mutex<HashMap<String, u64>>>,
         Self::new_with_cache_budget_and_context(root, cache_budget_from_env(), context)
     }
 
@@ -1806,6 +1809,7 @@ impl AstrolabeServer {
             start_idle_ticker(Arc::clone(dispatch), Arc::clone(&self.ticker_stop));
             return;
         }
+            symbol_page_generations: Arc::new(Mutex::new(HashMap::new())),
         start_root_indexing(Arc::clone(&self.primary));
     }
 
@@ -2848,6 +2852,31 @@ impl AstrolabeServer {
                 Some(name) => match kind_from_name(name) {
                     Ok(kind) => Some(kind),
                     Err(message) => return self.finish_at(&session.root, text_error(message)),
+    /// Pages of one `find_symbol` query are cut from a ranking recomputed on
+    /// every call, so an index replacement between two pages shifts the page
+    /// boundaries (items skipped or repeated). Remember the generation each
+    /// query was last served at; on `offset > 0` with a different generation,
+    /// return a note telling the caller to restart from `offset=0`.
+    fn symbol_page_drift_note(&self, params: &QueryParams, generation: u64) -> Option<String> {
+        let key = format!(
+            "{}|{}|{:?}|{:?}|{:?}|{}",
+            params.root.as_deref().unwrap_or(""),
+            params.query,
+            params.kind,
+            params.substring,
+            params.path_filter,
+            params.depth
+        );
+        let mut map = self.symbol_page_generations.lock().ok()?;
+        if map.len() > 256 {
+            map.clear();
+        }
+        let previous = map.insert(key, generation);
+        (params.offset > 0 && previous.is_some_and(|g| g != generation)).then(|| {
+            "注意：索引在翻页期间已更新（文件有改动并重新索引），本页边界可能与上一页错位（漏项或重复）；需要完整结果请用 offset=0 重新查询。\n".to_string()
+        })
+    }
+
                 },
             };
             let normalized = normalize_symbol_query(&params.query);
@@ -2858,7 +2887,7 @@ impl AstrolabeServer {
             let literal = params.query.trim();
             let literal_hit = normalized.query != literal
                 && !literal.contains('/')
-                && index.graph().symbols.iter().any(|s| s.name == literal);
+                && index.names().exact.contains(literal);
             if normalized.query.contains('/') && !literal_hit {
                 let mut params = params.clone();
                 params.query = normalized.query;
@@ -2882,17 +2911,15 @@ impl AstrolabeServer {
             let exact_only = params.substring == Some(false);
             // 排序键：(档, 测试路径靠后, exported 优先, path, start_line)；
             // 末位 idx 保证全序。不再按渲染后的签名文本排序。
-            type RankKey = (u8, bool, bool, String, u32);
-            let mut ranked: Vec<(RankKey, String, usize)> = Vec::new();
-            for (idx, symbol) in index.graph().symbols.iter().enumerate() {
-                let Some(tier) = name_match_tier(&symbol.name, &needle) else {
-                    continue;
-                };
-                if exact_only && tier > 0 {
-                    continue;
-                }
+            type RankKey<'a> = (u8, bool, bool, &'a str, u32);
+            let names = index.names();
+            let symbols = &index.graph().symbols;
+            let mut ranked: Vec<(RankKey, usize)> = Vec::new();
+            let mut test_path_cache: HashMap<FileId, bool> = HashMap::new();
+            let mut consider = |idx: usize, tier: u8| {
+                let symbol = &symbols[idx];
                 if kind.is_some_and(|k| symbol.kind != k) {
-                    continue;
+                    return;
                 }
                 if let Some(file) = index.file(symbol.file) {
                     if params
@@ -2900,25 +2927,43 @@ impl AstrolabeServer {
                         .as_deref()
                         .is_some_and(|f| !file.path.as_str().contains(f))
                     {
-                        continue;
+                        return;
                     }
                     let key = (
                         tier,
-                        is_test_path(file.path.as_str()),
+                        is_test,
                         !symbol.exported,
-                        file.path.as_str().to_owned(),
+                        file.path.as_str(),
                         symbol.start_line,
                     );
-                    ranked.push((key, symbol_line(symbol, &file.path), idx));
+                    ranked.push((key, idx));
+                }
+            };
+            if exact_only {
+                // Exact names only: O(1) map lookup instead of a full scan.
+                for &idx in names.by_lower.get(&needle).map(Vec::as_slice).unwrap_or(&[]) {
+                    consider(idx as usize, 0);
+                }
+            } else {
+                for (idx, lower) in names.lower.iter().enumerate() {
+                    if let Some(tier) = name_match_tier(lower, &needle) {
+                        consider(idx, tier);
+                    }
                 }
             }
-            ranked.sort_by(|a, b| (&a.0, a.2).cmp(&(&b.0, b.2)));
+            ranked.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
             let hits: Vec<(String, usize)> = ranked
                 .into_iter()
-                .map(|(_, line, idx)| (line, idx))
+                .map(|(_, idx)| {
+                    let symbol = &symbols[idx];
+                    let path = &index.file(symbol.file).expect("ranked symbol has a file").path;
+                    (symbol_line(symbol, path), idx)
+                })
                 .collect();
-            let lines = decorated_symbol_lines(index, &hits);
-            let total = lines.len();
+                    let is_test = *test_path_cache
+                        .entry(symbol.file)
+                        .or_insert_with(|| is_test_path(file.path.as_str()));
+            let total = hits.len();
             let offset = params.offset.min(total);
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
             if let Some(ignored) = &normalized.ignored {
@@ -2934,17 +2979,22 @@ impl AstrolabeServer {
                     params.budget_tokens,
                     params.offset,
                 ));
-            let (kept, omitted) = truncate_ranked(
-                &lines[offset..],
+            let (kept, omitted) = paged_symbol_lines(
+                index,
+                &hits,
+                offset,
+            let generation = index.generation();
+            if let Some(note) = self.symbol_page_drift_note(&params, generation) {
+                body.push_str(&note);
+            }
                 params.budget_tokens.saturating_sub(reserve),
-                |line| format!("{line}\n"),
             );
             let kept_count = kept.len();
             let truncated = omitted > 0;
             // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
             let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
             body.push_str(&render_search_page_status(total, offset, kept_count, omitted, params.budget_tokens, params.offset));
-            for line in kept {
+            for line in &kept {
                 body.push_str(line);
                 body.push('\n');
             }
@@ -2974,7 +3024,8 @@ impl AstrolabeServer {
                 body,
                 json!({
                     "confidence": "syntactic",
-                    "matches": lines.len(), "total": total, "offset": offset, "next_offset": next_offset,
+                    "generation": generation,
+                    "matches": total, "total": total, "offset": offset, "next_offset": next_offset,
                     "shown": kept_count,
                     "omitted": omitted,
                     "truncated": truncated,
@@ -3730,7 +3781,7 @@ impl AstrolabeServer {
             },
         };
         let symbols = &index.graph().symbols;
-        let mut matches = astrolabe_core::name_path::match_name_path(
+        let mut matches = astrolabe_core::name_path::match_name_path_with(
             symbols,
             &params.query,
             params.substring.unwrap_or(false),
@@ -3779,7 +3830,11 @@ impl AstrolabeServer {
         // 命中对先收集 (锚点行, symbol 下标)，与名称分支同一 include_body 排序源。
         let mut hits: Vec<(String, usize)> = Vec::new();
         for m in &matches {
-            if let Some((idx, symbol)) = symbols.iter().enumerate().find(|(_, s)| s.id == m.symbol)
+            if let Some((idx, symbol)) = index
+                .names()
+                .by_id
+                .get(&m.symbol)
+                .map(|&idx| (idx, &symbols[idx]))
             {
                 if let Some(file) = index.file(symbol.file) {
                     if params
@@ -3787,6 +3842,7 @@ impl AstrolabeServer {
                         .as_deref()
                         .is_some_and(|f| !file.path.as_str().contains(f))
                     {
+            &index.names().name_path,
                         continue;
                     }
                     let depth_note = if m.depth > 0 {
@@ -3801,8 +3857,7 @@ impl AstrolabeServer {
                 }
             }
         }
-        let lines = decorated_symbol_lines(index, &hits);
-        let total = lines.len();
+        let total = hits.len();
         let offset = params.offset.min(total);
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
@@ -3822,10 +3877,11 @@ impl AstrolabeServer {
                 params.budget_tokens,
                 params.offset,
             ));
-        let (kept, omitted) = truncate_ranked(
-            &lines[offset..],
+        let (kept, omitted) = paged_symbol_lines(
+            index,
+            &hits,
+            offset,
             params.budget_tokens.saturating_sub(reserve),
-            |line| format!("{line}\n"),
         );
         let kept_count = kept.len();
         let truncated = omitted > 0;
@@ -3839,7 +3895,7 @@ impl AstrolabeServer {
             params.budget_tokens,
             params.offset,
         ));
-        for line in kept {
+        for line in &kept {
             body.push_str(line);
             body.push('\n');
         }
@@ -3862,6 +3918,10 @@ impl AstrolabeServer {
             self.attach_include_bodies(
                 root,
                 index,
+        let generation = index.generation();
+        if let Some(note) = self.symbol_page_drift_note(params, generation) {
+            body.push_str(&note);
+        }
                 &mut body,
                 &hits[offset..],
                 kept_count,
@@ -3874,7 +3934,8 @@ impl AstrolabeServer {
             body,
             json!({
                 "confidence": "syntactic",
-                "matches": lines.len(), "total": total, "offset": offset, "next_offset": next_offset,
+                "generation": generation,
+                "matches": total, "total": total, "offset": offset, "next_offset": next_offset,
                 "shown": kept_count,
                 "omitted": omitted,
                 "truncated": truncated,
@@ -4344,7 +4405,11 @@ fn kind_display_name(kind: astrolabe_core::SymbolKind) -> &'static str {
 fn decorated_symbol_lines(index: &RepoIndex, hits: &[(String, usize)]) -> Vec<String> {
     let symbols = &index.graph().symbols;
     let targets: Vec<usize> = hits.iter().map(|(_, idx)| *idx).collect();
-    let containers = astrolabe_core::name_path::innermost_containers(symbols, &targets);
+    let containers = astrolabe_core::name_path::innermost_containers_with(
+        symbols,
+        &index.names().name_path,
+        &targets,
+    );
     hits.iter()
         .zip(containers)
         .map(|((line, idx), container)| {
@@ -4372,9 +4437,33 @@ fn decorated_symbol_lines(index: &RepoIndex, hits: &[(String, usize)]) -> Vec<St
         .collect()
 }
 
-/// 名称匹配档位：0 精确、1 前缀、2 子串（needle 已小写）。
-fn name_match_tier(name: &str, needle: &str) -> Option<u8> {
-    let lower = name.to_lowercase();
+/// The page of decorated lines starting at `offset` that fits `limit` tokens,
+/// and how many hits remain after it. Decoration (container lookup, kind tag)
+/// is the costly part and only the shown page needs it, so hits are decorated
+/// in growing windows until the budget cuts the list or the hits run out.
+fn paged_symbol_lines(
+    index: &RepoIndex,
+    hits: &[(String, usize)],
+    offset: usize,
+    limit: usize,
+) -> (Vec<String>, usize) {
+    let rest = &hits[offset.min(hits.len())..];
+    let mut window = 256usize;
+    loop {
+        let end = window.min(rest.len());
+        let lines = decorated_symbol_lines(index, &rest[..end]);
+        let (kept, omitted_in_window) = truncate_ranked(&lines, limit, |line| format!("{line}\n"));
+        let kept_len = kept.len();
+        if omitted_in_window > 0 || end == rest.len() {
+            let kept: Vec<String> = lines.into_iter().take(kept_len).collect();
+            return (kept, rest.len() - kept_len);
+        }
+        window = window.saturating_mul(4);
+    }
+}
+
+/// 名称匹配档位：0 精确、1 前缀、2 子串（`lower`、`needle` 均已小写）。
+fn name_match_tier(lower: &str, needle: &str) -> Option<u8> {
     if lower == needle {
         Some(0)
     } else if lower.starts_with(needle) {
@@ -6503,6 +6592,103 @@ mod tests {
             }));
             r.content[0].as_text().unwrap().text.clone()
         };
+    /// Timing probe (run with --ignored --nocapture): 3000 files, ~150k symbols.
+    #[test]
+    #[ignore]
+    fn bench_find_symbol_large_graph() {
+        let mut files = Vec::new();
+        let mut symbols = Vec::new();
+        for f in 0..3000u32 {
+            files.push(CodeFile {
+                id: FileId(f),
+                path: RelPath::new(format!("pkg{}/mod{}.rs", f % 50, f)),
+                language: Some(Language::Rust),
+                loc: 1000,
+                sha: String::new(),
+            });
+            let base = symbols.len() as u32;
+            symbols.push(CodeSymbol {
+                id: SymbolId(base),
+                file: FileId(f),
+                name: format!("Service{f}"),
+                kind: SymbolKind::Class,
+                signature: format!("pub struct Service{f}"),
+                start_line: 1,
+                end_line: 400,
+                exported: true,
+            });
+            for m in 0..49u32 {
+                symbols.push(CodeSymbol {
+                    id: SymbolId(base + 1 + m),
+                    file: FileId(f),
+                    name: if m % 7 == 0 {
+                        "handle".into()
+                    } else {
+                        format!("method_{m}_Helper")
+                    },
+                    kind: SymbolKind::Method,
+                    signature: format!("fn method_{m}()"),
+                    start_line: 2 + m * 8,
+                    end_line: 8 + m * 8,
+                    exported: m % 2 == 0,
+                });
+            }
+        }
+        let n = symbols.len();
+        let graph = CodeGraph {
+            files,
+            symbols,
+            edges: vec![],
+        };
+        let mut server =
+            AstrolabeServer::new_with_cache_budget(PathBuf::from("."), DEFAULT_MEMORY_BUDGET_BYTES);
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(
+            RepoIndex::from_graph(PathBuf::from("."), graph, Default::default()),
+        ));
+        server.structured_output = false;
+        let run = |q: &str, substring: Option<bool>| {
+            // Warm-up call: builds the per-snapshot lookup tables (once per index).
+            let t0 = std::time::Instant::now();
+            let _ = server.find_symbol(Parameters(QueryParams {
+                root: None,
+                query: q.into(),
+                include_body: false,
+                substring,
+                path_filter: None,
+                kind: None,
+                depth: 0,
+                budget_tokens: 2000,
+                offset: 0,
+            }));
+            eprintln!("BENCH first call {q:?}: {:?}", t0.elapsed());
+            let t = std::time::Instant::now();
+            let mut last = 0;
+            for _ in 0..5 {
+                let r = server.find_symbol(Parameters(QueryParams {
+                    root: None,
+                    query: q.into(),
+                    include_body: false,
+                    substring,
+                    path_filter: None,
+                    kind: None,
+                    depth: 0,
+                    budget_tokens: 2000,
+                    offset: 0,
+                }));
+                last = r.content[0].as_text().unwrap().text.len();
+            }
+            eprintln!(
+                "BENCH {n} symbols query={q:?} substring={substring:?}: {:?}/call (out {last}B)",
+                t.elapsed() / 5
+            );
+        };
+        run("handle", Some(false));
+        run("helper", Some(true));
+        run("Service1500", None);
+        run("Service1500/handle", None);
+        run("Service/handle", Some(true));
+    }
+
         let mut got = Vec::new();
         let mut offset = 0;
         let mut pages = 0;
@@ -7161,6 +7347,33 @@ mod tests {
         assert!(n.ignored.is_some());
         assert_eq!(normalize_symbol_query("struct").query, "struct");
     }
+    #[test]
+    fn find_symbol_later_page_warns_when_index_generation_changed() {
+        let src: String = (0..30)
+            .map(|i| format!("def drift_{i}():\n    pass\n"))
+            .collect();
+        let (server, dir) = server_on_files(&[("a.py", src.as_str())]);
+        let page = |offset: usize| {
+            let mut params = fs_query("drift");
+            params.budget_tokens = 120;
+            params.offset = offset;
+            fs_text(&server.find_symbol(Parameters(params)))
+        };
+        let first = page(0);
+        assert!(first.contains("truncated=true"), "{first}");
+        assert!(!first.contains("翻页期间"), "{first}");
+        // Same generation: no warning on the next page.
+        assert!(!page(5).contains("翻页期间"));
+        // Replace the index (what an edit + reindex does): a later page warns.
+        *server.primary.state.write().unwrap() =
+            IndexState::Ready(Arc::new(crate::index::build(&dir).expect("index")));
+        let drifted = page(10);
+        assert!(drifted.contains("翻页期间"), "{drifted}");
+        // The warning is stated once; the generation is now the current one.
+        assert!(!page(15).contains("翻页期间"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn find_symbol_empty_result_states_no_match_explicitly() {

@@ -21,32 +21,40 @@ pub fn estimate_tokens(s: &str) -> usize {
     s.chars().count().div_ceil(4)
 }
 
+/// Spend is tracked in characters and rounded up to tokens once, over the
+/// running total. Rounding every item up on its own over-charges lists of
+/// short lines: ten 5-character lines (50 chars, 13 tokens) would cost 20.
 pub struct TokenBudget {
     limit: usize,
-    used: usize,
+    used_chars: usize,
 }
 
 impl TokenBudget {
     pub fn new(limit: usize) -> Self {
-        TokenBudget { limit, used: 0 }
+        TokenBudget {
+            limit,
+            used_chars: 0,
+        }
     }
 
     pub fn remaining(&self) -> usize {
-        self.limit.saturating_sub(self.used)
+        self.limit.saturating_sub(self.used_chars.div_ceil(4))
     }
 
     pub fn would_exceed(&self, s: &str) -> bool {
-        estimate_tokens(s) > self.remaining()
+        self.used_chars
+            .saturating_add(s.chars().count())
+            .div_ceil(4)
+            > self.limit
     }
 
     /// Charge `s` to the budget if it fits. Returns false when it does not,
     /// leaving the budget untouched.
     pub fn try_add(&mut self, s: &str) -> bool {
-        let cost = estimate_tokens(s);
-        if cost > self.remaining() {
+        if self.would_exceed(s) {
             return false;
         }
-        self.used += cost;
+        self.used_chars += s.chars().count();
         true
     }
 }
@@ -107,6 +115,17 @@ mod tests {
 
         assert!(kept.is_empty());
         assert_eq!(omitted, items.len());
+    }
+
+    #[test]
+    fn short_items_are_not_rounded_up_one_by_one() {
+        // Ten 5-char lines (incl. newline) = 50 chars = 13 tokens in total;
+        // per-item rounding would charge 20 and cut the list at 10 tokens.
+        let items: Vec<String> = (0..10).map(|i| format!("Li{i:02}\n")).collect();
+        let (kept, omitted) = truncate_ranked(&items, 13, |item| item.clone());
+        assert_eq!((kept.len(), omitted), (10, 0));
+        let (kept, omitted) = truncate_ranked(&items, 12, |item| item.clone());
+        assert_eq!((kept.len(), omitted), (9, 1));
     }
 
     #[test]

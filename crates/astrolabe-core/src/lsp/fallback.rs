@@ -153,6 +153,25 @@ fn collect(
         let f = files.remove(pos);
         files.insert(0, f);
     }
+    // Only files that can contain the name need the sequential decode and
+    // line scan; the byte-level rejection runs on all cores. `collect`
+    // keeps the original order, so the origin-first guarantee holds.
+    let files: Vec<RelPath> = {
+        use rayon::prelude::*;
+        let window = files.len().min(MAX_FILES + 1);
+        let (head, tail) = files.split_at(window);
+        let mut kept: Vec<RelPath> = head
+            .par_iter()
+            .filter(|f| {
+                std::fs::read(repo_root.join(f.as_str()))
+                    .map(|bytes| !cannot_contain_name(&bytes, name))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        kept.extend(tail.iter().cloned());
+        kept
+    };
     let mut hits = Vec::new();
     let mut truncated = false;
     for (n, file) in files.iter().enumerate() {
@@ -163,6 +182,11 @@ fn collect(
         let Ok(source) = crate::text::read_source(&repo_root.join(file.as_str())) else {
             continue;
         };
+        // One substring search over the whole file rules out almost every
+        // file before any per-line work (a whole-word hit is also a substring).
+        if !source.contains(name) {
+            continue;
+        }
         let mut file_hits = Vec::new();
         for (line_idx, line) in source.split('\n').enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
@@ -204,6 +228,23 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
+/// Cheap byte-level rejection before decoding. Only sound for an ASCII name
+/// and a file in an ASCII-compatible encoding (UTF-8, GBK, Shift-JIS …): then
+/// any decoded occurrence of the name is also a byte occurrence. UTF-16 (BOM
+/// or NUL bytes up front) is never rejected here.
+fn cannot_contain_name(bytes: &[u8], name: &str) -> bool {
+    if !name.is_ascii() || name.is_empty() {
+        return false;
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return false;
+    }
+    if memchr::memchr(0, &bytes[..bytes.len().min(512)]).is_some() {
+        return false;
+    }
+    memchr::memmem::find(bytes, name.as_bytes()).is_none()
+}
+
 fn word_columns(line: &str, name: &str) -> Vec<u32> {
     let mut out = Vec::new();
     if name.is_empty() {
@@ -227,6 +268,50 @@ fn word_columns(line: &str, name: &str) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// Timing probe: `cargo test -p astrolabe-core --lib bench_text_references -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_text_references_many_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in 0..50 {
+            let sub = dir.path().join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..100 {
+                let mut src = String::new();
+                for l in 0..300 {
+                    src.push_str(&format!(
+                        "fn item_{d}_{f}_{l}(x: i32) -> i32 {{ x + {l} }}\n"
+                    ));
+                }
+                if f % 50 == 0 {
+                    src.push_str("fn caller() { needle_fn(); }\n");
+                }
+                std::fs::write(sub.join(format!("m{f}.rs")), src).unwrap();
+            }
+        }
+        let t = Instant::now();
+        let mut n = 0;
+        for _ in 0..5 {
+            n = text_references(dir.path(), &RelPath::new("d0/m0.rs"), "needle_fn", "x")
+                .value
+                .len();
+        }
+        let ts = Instant::now();
+        let nfiles = scan(dir.path(), &ScanOptions::default()).files.len();
+        let tr = Instant::now();
+        let files = scan(dir.path(), &ScanOptions::default()).files;
+        let total: usize = files
+            .iter()
+            .map(|f| std::fs::read(dir.path().join(f.as_str())).unwrap().len())
+            .sum();
+        eprintln!(
+            "BENCH5 scan+raw read of {total} bytes (floor): {:?}",
+            tr.elapsed()
+        );
+        eprintln!("BENCH5 scan alone {nfiles} files: {:?}", ts.elapsed());
+        eprintln!("BENCH5 5000 files, {n} hits: {:?}/call", t.elapsed() / 5);
+    }
+
     #[test]
     fn text_references_unknown_language_searches_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -239,6 +324,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn byte_prefilter_never_hides_utf16_or_gbk_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut le = vec![0xFF, 0xFE];
+        for u in "fn x() { needle_fn(); }\n".encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(dir.path().join("a.rs"), le).unwrap();
+        let (gbk, _, _) =
+            encoding_rs::GBK.encode("// 中文注释，这是一个测试\nfn y() { needle_fn(); }\n");
+        std::fs::write(dir.path().join("b.rs"), gbk.into_owned()).unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn z() {}\n").unwrap();
+        let r = text_references(dir.path(), &RelPath::new("a.rs"), "needle_fn", "x");
+        let mut paths: Vec<_> = r
+            .value
+            .iter()
+            .map(|l| l.path.as_str().to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["a.rs", "b.rs"]);
+        assert!(cannot_contain_name(b"fn z() {}", "needle_fn"));
+        assert!(!cannot_contain_name(b"a needle_fn b", "needle_fn"));
+    }
 
     #[test]
     fn finds_whole_words_across_same_language_files() {
