@@ -113,6 +113,10 @@ fn search_one(path: &Path, matcher: &RegexMatcher, max_file_bytes: u64) -> Vec<T
     } else {
         None
     };
+    if decoded.is_none() {
+        // Classic-Mac `\r`-only files: same normalization as `decode_source`.
+        crate::text::normalize_lone_cr_bytes(&mut bytes);
+    }
     let haystack: &[u8] = match &decoded {
         Some(text) => text.as_bytes(),
         None => &bytes,
@@ -156,6 +160,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn lone_cr_file_has_real_line_numbers() {
+        let d = tmp();
+        std::fs::write(d.join("old.txt"), "one\rhello two\rthree\rhello four\r").unwrap();
+        let m = build_matcher("hello", false, false).unwrap();
+        let got = search_files(&d, &["old.txt"], &m, 100);
+        let lines: Vec<(usize, &str)> = got[0]
+            .1
+            .iter()
+            .map(|h| (h.line as usize, h.text.as_str()))
+            .collect();
+        assert_eq!(lines, vec![(2, "hello two"), (4, "hello four")]);
     }
 
     #[test]

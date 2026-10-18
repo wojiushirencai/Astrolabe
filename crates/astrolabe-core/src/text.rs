@@ -9,8 +9,35 @@
 use std::io;
 use std::path::Path;
 
-/// Decode raw file bytes to text. Never fails.
+/// Legacy classic-Mac files use a lone `\r` as the line terminator. Rust,
+/// tree-sitter and ripgrep only split on `\n`, so such a file collapses into a
+/// single line. When the text has `\r` but no `\n` at all, rewrite every `\r`
+/// to `\n` (same byte length, so offsets are unchanged). `\r\n` and mixed
+/// files are left untouched.
+pub fn normalize_lone_cr(text: String) -> String {
+    if text.contains('\r') && !text.contains('\n') {
+        text.replace('\r', "\n")
+    } else {
+        text
+    }
+}
+
+/// Byte-level twin of [`normalize_lone_cr`], in place.
+pub fn normalize_lone_cr_bytes(bytes: &mut [u8]) {
+    if bytes.contains(&b'\r') && !bytes.contains(&b'\n') {
+        for b in bytes.iter_mut().filter(|b| **b == b'\r') {
+            *b = b'\n';
+        }
+    }
+}
+
+/// Decode raw file bytes to text. Never fails. Lone-`\r` line endings are
+/// normalized to `\n` (see [`normalize_lone_cr`]).
 pub fn decode_source(bytes: Vec<u8>) -> String {
+    normalize_lone_cr(decode_source_raw(bytes))
+}
+
+fn decode_source_raw(bytes: Vec<u8>) -> String {
     // UTF-16 text is often valid UTF-8 too (ASCII + NUL), so check its BOM first.
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(&bytes) {
@@ -112,6 +139,45 @@ mod tests {
     fn valid_utf8_never_transcoded() {
         let s = "// 你好 SysLog\n";
         assert_eq!(decode_source(s.as_bytes().to_vec()), s);
+    }
+
+    #[test]
+    fn lone_cr_is_normalized_but_crlf_and_mixed_are_not() {
+        assert_eq!(decode_source(b"a\rb\rc\r".to_vec()), "a\nb\nc\n");
+        assert_eq!(decode_source(b"a\r\nb\r\n".to_vec()), "a\r\nb\r\n");
+        assert_eq!(decode_source(b"a\rb\nc".to_vec()), "a\rb\nc");
+        let mut le = vec![0xFF, 0xFE];
+        for u in "a\rb\r".encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_source(le), "a\nb\n");
+    }
+
+    #[test]
+    fn lone_cr_python_symbols_get_real_lines() {
+        let dir = std::env::temp_dir().join(format!("astrolabe-lonecr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("old.py");
+        std::fs::write(
+            &f,
+            "def alpha():\r    return 1\r\rdef beta():\r    return 2\r",
+        )
+        .unwrap();
+        let src = read_source(&f).unwrap();
+        let pool = crate::parse::ParserPool::new();
+        let p = pool
+            .parse(
+                crate::types::Language::Python,
+                &crate::types::RelPath::new("old.py"),
+                &src,
+            )
+            .unwrap();
+        let lines: Vec<(String, u32)> = p
+            .symbols
+            .iter()
+            .map(|s| (s.name.clone(), s.start_line))
+            .collect();
+        assert_eq!(lines, vec![("alpha".into(), 1), ("beta".into(), 4)]);
     }
 
     #[test]

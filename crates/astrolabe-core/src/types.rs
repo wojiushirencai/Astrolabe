@@ -533,7 +533,7 @@ impl FileIndex {
         if escapes_root(p) {
             return None;
         }
-        std::fs::read_to_string(self.root.join(p)).ok()
+        crate::text::read_source(&self.root.join(p)).ok()
     }
 
     /// Start recording every path given to [`Self::read`] (clears any
