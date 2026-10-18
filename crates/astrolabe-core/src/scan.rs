@@ -621,6 +621,25 @@ fn path_is_excluded(root: &Path, rel: &RelPath, abs: &Path, excludes: &ExcludeMa
 fn gitignore_ignores(root: &Path, rel: &RelPath) -> bool {
     let mut dir = root.to_path_buf();
     let mut chain: Vec<Gitignore> = Vec::new();
+    // Same sources as the `ignore` walker in `scan` (lowest precedence
+    // first, last match wins): global ignore file, `.gitignore`/`.ignore`
+    // in directories above the root, `.git/info/exclude`, then the root.
+    let (global, _) = Gitignore::global();
+    if !global.is_empty() {
+        chain.push(global);
+    }
+    let ancestors: Vec<&Path> = root.ancestors().skip(1).collect();
+    for ancestor in ancestors.into_iter().rev() {
+        push_gitignore(&mut chain, ancestor);
+    }
+    let exclude = root.join(".git").join("info").join("exclude");
+    if exclude.is_file() {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        let _ = builder.add(&exclude);
+        if let Ok(gi) = builder.build() {
+            chain.push(gi);
+        }
+    }
     push_gitignore(&mut chain, &dir);
 
     let parts: Vec<&str> = rel
@@ -646,10 +665,13 @@ fn gitignore_ignores(root: &Path, rel: &RelPath) -> bool {
 }
 
 fn push_gitignore(chain: &mut Vec<Gitignore>, dir: &Path) {
-    let path = dir.join(".gitignore");
-    if path.is_file() {
-        let (gi, _) = Gitignore::new(path);
-        chain.push(gi);
+    // `.ignore` outranks `.gitignore` in the same directory.
+    for name in [".gitignore", ".ignore"] {
+        let path = dir.join(name);
+        if path.is_file() {
+            let (gi, _) = Gitignore::new(path);
+            chain.push(gi);
+        }
     }
 }
 
@@ -1237,6 +1259,31 @@ mod tests {
         assert_eq!(
             path_admission(dir.path(), &RelPath::new("no/such/file.rs"), &opts),
             PathAdmission::Missing
+        );
+    }
+
+    #[test]
+    fn path_admission_honors_dot_ignore_and_git_info_exclude_like_scan() {
+        let dir = TestDir::new();
+        dir.write(".ignore", "dot_ignored.rs\n");
+        dir.write(".git/info/exclude", "excluded.rs\n");
+        dir.write("dot_ignored.rs", "fn a() {}");
+        dir.write("excluded.rs", "fn b() {}");
+        dir.write("kept.rs", "fn c() {}");
+        let opts = ScanOptions::default();
+        let scanned = scan(dir.path(), &opts);
+        for name in ["dot_ignored.rs", "excluded.rs", "kept.rs"] {
+            let rel = RelPath::new(name);
+            let admitted = path_admission(dir.path(), &rel, &opts) == PathAdmission::Indexed;
+            assert_eq!(
+                admitted,
+                scanned.files.contains(&rel),
+                "{name}: path_admission and scan must agree"
+            );
+        }
+        assert_eq!(
+            path_admission(dir.path(), &RelPath::new("kept.rs"), &opts),
+            PathAdmission::Indexed
         );
     }
 
