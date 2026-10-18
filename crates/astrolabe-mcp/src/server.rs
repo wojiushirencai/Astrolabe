@@ -13,6 +13,7 @@ use astrolabe_core::{
     cache::{FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
     graph::{cached_centrality, match_task, rank_for_task},
     render::{confidence_note, symbol_line},
+    types::RelPath,
     CodeSymbol, Confidence, FileId,
 };
 use rmcp::{
@@ -216,16 +217,15 @@ fn is_data_fixture(path: &str) -> bool {
 
 /// Compact list of literal hits in data/fixture files outside `filter`.
 fn data_hits_outside(
-    index: &RepoIndex,
+    all_text_paths: &[&RelPath],
     root: &Path,
     filter: &str,
     query: &str,
     sensitive: bool,
     excluded: &dyn Fn(&str) -> bool,
 ) -> String {
-    let rels: Vec<&str> = index
-        .text_only_paths(None)
-        .into_iter()
+    let rels: Vec<&str> = all_text_paths
+        .iter()
         .map(|p| p.as_str())
         .filter(|p| !p.contains(filter) && is_data_fixture(p) && !excluded(p))
         .collect();
@@ -723,7 +723,7 @@ fn is_doc_path(path: &str) -> bool {
 }
 
 /// `aggregate=top|dir|file` / `count_only`: counts and a total, no hit lines.
-fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
+fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>, offset: usize) -> String {
     const MAX_ROWS: usize = 80;
     let total = hits.len();
     let mut all_files: BTreeSet<&str> = BTreeSet::new();
@@ -767,14 +767,23 @@ fn render_search_counts(hits: &[SearchHit], aggregate: Option<&str>) -> String {
         };
         out.push_str(&format!("{label}: N 行 / M 个文件\n"));
         let suffix = if aggregate == Some("file") { "" } else { "/" };
-        for (key, n, f) in rows.iter().take(MAX_ROWS) {
+        let start = offset.min(rows.len());
+        let end = (start + MAX_ROWS).min(rows.len());
+        if start > 0 {
+            out.push_str(&format!(
+                "  （从第 {} 项开始，共 {} 项）\n",
+                start + 1,
+                rows.len()
+            ));
+        }
+        for (key, n, f) in &rows[start..end] {
             out.push_str(&format!("  {n:>5} 行 / {f:>4} 个文件  {key}{suffix}\n"));
         }
-        if rows.len() > MAX_ROWS {
-            let rest: usize = rows[MAX_ROWS..].iter().map(|r| r.1).sum();
+        if end < rows.len() {
+            let rest: usize = rows[end..].iter().map(|r| r.1).sum();
             out.push_str(&format!(
-                "  …其余 {} 项共 {rest} 行（已计入总计）\n",
-                rows.len() - MAX_ROWS
+                "  …还有 {} 项共 {rest} 行未列出（已计入总计）；传 offset={end} 看后续各项，或用 path_filter 缩小范围。\n",
+                rows.len() - end
             ));
         }
         out.push_str(&format!(
@@ -1679,6 +1688,9 @@ pub struct AstrolabeServer {
     /// One-line digest of each whole `search_code` result, keyed like the
     /// query entries of `sent_ranges`, so a repeat query gets the gist back.
     search_digests: Arc<Mutex<HashMap<String, String>>>,
+    /// Index generation each `find_symbol` query (offset and budget aside) was
+    /// last served at, so a later page can say the index changed in between.
+    symbol_page_generations: Arc<Mutex<HashMap<String, u64>>>,
     call_seq: Arc<AtomicU64>,
 }
 
@@ -1688,9 +1700,6 @@ impl AstrolabeServer {
     }
 
     pub fn with_context(root: PathBuf, context: ClientContext) -> Self {
-    /// Index generation each `find_symbol` query (offset and budget aside) was
-    /// last served at, so a later page can say the index changed in between.
-    symbol_page_generations: Arc<Mutex<HashMap<String, u64>>>,
         Self::new_with_cache_budget_and_context(root, cache_budget_from_env(), context)
     }
 
@@ -1800,6 +1809,7 @@ impl AstrolabeServer {
             tool_router: Self::tool_router(),
             sent_ranges: Arc::new(Mutex::new(HashMap::new())),
             search_digests: Arc::new(Mutex::new(HashMap::new())),
+            symbol_page_generations: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1809,7 +1819,6 @@ impl AstrolabeServer {
             start_idle_ticker(Arc::clone(dispatch), Arc::clone(&self.ticker_stop));
             return;
         }
-            symbol_page_generations: Arc::new(Mutex::new(HashMap::new())),
         start_root_indexing(Arc::clone(&self.primary));
     }
 
@@ -2372,6 +2381,12 @@ mod cancel {
         out
     }
 
+    /// The current thread's flag, for worker threads that cannot see the
+    /// thread-local.
+    pub(super) fn current() -> Option<Arc<AtomicBool>> {
+        FLAG.with(|cell| cell.borrow().clone())
+    }
+
     pub(super) fn is_cancelled() -> bool {
         FLAG.with(|cell| {
             cell.borrow()
@@ -2837,21 +2852,6 @@ impl AstrolabeServer {
         Self::with_route_note(result, &route.note)
     }
 
-    fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
-        if params.query.trim().is_empty() {
-            return text_error(
-                "find_symbol 需要非空 query（符号名、子串或 'Class/method' 路径）；空白查询不返回全部符号。".to_string(),
-            );
-        }
-        self.with_fresh_index(params.root.as_deref().unwrap_or(""), |session, index| {
-            if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
-                return self.finish_at(&session.root, text_error(message));
-            }
-            let kind = match params.kind.as_deref() {
-                None => None,
-                Some(name) => match kind_from_name(name) {
-                    Ok(kind) => Some(kind),
-                    Err(message) => return self.finish_at(&session.root, text_error(message)),
     /// Pages of one `find_symbol` query are cut from a ranking recomputed on
     /// every call, so an index replacement between two pages shifts the page
     /// boundaries (items skipped or repeated). Remember the generation each
@@ -2877,6 +2877,21 @@ impl AstrolabeServer {
         })
     }
 
+    fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
+        if params.query.trim().is_empty() {
+            return text_error(
+                "find_symbol 需要非空 query（符号名、子串或 'Class/method' 路径）；空白查询不返回全部符号。".to_string(),
+            );
+        }
+        self.with_fresh_index(params.root.as_deref().unwrap_or(""), |session, index| {
+            if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
+                return self.finish_at(&session.root, text_error(message));
+            }
+            let kind = match params.kind.as_deref() {
+                None => None,
+                Some(name) => match kind_from_name(name) {
+                    Ok(kind) => Some(kind),
+                    Err(message) => return self.finish_at(&session.root, text_error(message)),
                 },
             };
             let normalized = normalize_symbol_query(&params.query);
@@ -2929,6 +2944,9 @@ impl AstrolabeServer {
                     {
                         return;
                     }
+                    let is_test = *test_path_cache
+                        .entry(symbol.file)
+                        .or_insert_with(|| is_test_path(file.path.as_str()));
                     let key = (
                         tier,
                         is_test,
@@ -2960,12 +2978,13 @@ impl AstrolabeServer {
                     (symbol_line(symbol, path), idx)
                 })
                 .collect();
-                    let is_test = *test_path_cache
-                        .entry(symbol.file)
-                        .or_insert_with(|| is_test_path(file.path.as_str()));
             let total = hits.len();
             let offset = params.offset.min(total);
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
+            let generation = index.generation();
+            if let Some(note) = self.symbol_page_drift_note(&params, generation) {
+                body.push_str(&note);
+            }
             if let Some(ignored) = &normalized.ignored {
                 body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
             }
@@ -2983,10 +3002,6 @@ impl AstrolabeServer {
                 index,
                 &hits,
                 offset,
-            let generation = index.generation();
-            if let Some(note) = self.symbol_page_drift_note(&params, generation) {
-                body.push_str(&note);
-            }
                 params.budget_tokens.saturating_sub(reserve),
             );
             let kept_count = kept.len();
@@ -3068,10 +3083,20 @@ impl AstrolabeServer {
             |session, index| {
                 // A filter that only hits non-code text files (docs/, *.toml …)
                 // is valid here: those files are searched as [text-only].
-                if index
-                    .text_only_paths(params.path_filter.as_deref())
-                    .is_empty()
-                {
+                // Computed once per call; the path_filter view, the text-only
+                // scan and `data_hits_outside` all derive from it.
+                let all_text_paths = index.text_only_paths(None);
+                let filter_text_paths: Vec<&RelPath> = all_text_paths
+                    .iter()
+                    .copied()
+                    .filter(|p| {
+                        params
+                            .path_filter
+                            .as_deref()
+                            .is_none_or(|f| p.as_str().contains(f))
+                    })
+                    .collect();
+                if filter_text_paths.is_empty() {
                     if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
                         return text_error(message);
                     }
@@ -3171,84 +3196,114 @@ impl AstrolabeServer {
                 // skip_comments on a type without a lexer cannot filter anything;
                 // collect those types so the summary says so.
                 let mut unlexed: BTreeSet<String> = BTreeSet::new();
-                let mut scan_file = |path: &str, matches: &mut Vec<SearchHit>| {
-                    if cancel::is_cancelled() {
-                        return;
+                struct FileScan {
+                    hits: Vec<SearchHit>,
+                    cache_hit: bool,
+                    skipped: usize,
+                    unlexed: Option<String>,
+                }
+                // Per-file scan: pure (no shared mutable state), so files are
+                // scanned in parallel; results come back in graph order, which
+                // keeps the output identical to a sequential scan.
+                let cancel_flag = cancel::current();
+                let scan_file = |path: &str| -> Option<FileScan> {
+                    if cancel_flag
+                        .as_ref()
+                        .is_some_and(|f| f.load(Ordering::Relaxed))
+                    {
+                        return None;
                     }
-                    let Some((lines, hit)) = index.cached_lines(&session.file_cache, path) else {
-                        return;
+                    let (lines, cache_hit) = index.cached_lines(&session.file_cache, path)?;
+                    let mut out = FileScan {
+                        hits: Vec::new(),
+                        cache_hit,
+                        skipped: 0,
+                        unlexed: None,
                     };
                     // Lazy: the mask is only computed once a line matches.
                     let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
-                    if hit {
-                        hits += 1;
-                    } else {
-                        misses += 1;
-                    }
                     for (line_no, line) in lines.iter().enumerate() {
-                        if matcher.is_match(line) {
-                            if params.skip_comments {
-                                let mask = mask.get_or_insert_with(|| {
-                                    crate::code_mask::code_mask(path, &lines, strings_are_code)
-                                });
-                                if let Some(mask) = mask {
-                                    let real = matcher.find_iter(line).any(|m| {
-                                        mask[line_no].get(m.start()).copied().unwrap_or(true)
-                                    });
-                                    if !real {
-                                        skipped += 1;
-                                        continue;
-                                    }
-                                } else {
-                                    unlexed.insert(crate::code_mask::type_label(path));
-                                }
-                            }
-                            // P0：超长行先做单行安全切片（Unicode 边界安全），
-                            // 单条 match 不会把 budget 一口气吃光，也不会在
-                            // 大小写折叠差异上 panic。
-                            matches.push(SearchHit {
-                                path: path.to_string(),
-                                line: line_no + 1,
-                                text: if counting {
-                                    String::new()
-                                } else {
-                                    clip_match_line(line, &params.query, Some(&matcher))
-                                },
-                                text_only: false,
-                            });
+                        if !matcher.is_match(line) {
+                            continue;
                         }
+                        if params.skip_comments {
+                            let mask = mask.get_or_insert_with(|| {
+                                crate::code_mask::code_mask(path, &lines, strings_are_code)
+                            });
+                            if let Some(mask) = mask {
+                                let real = matcher
+                                    .find_iter(line)
+                                    .any(|m| mask[line_no].get(m.start()).copied().unwrap_or(true));
+                                if !real {
+                                    out.skipped += 1;
+                                    continue;
+                                }
+                            } else {
+                                out.unlexed = Some(crate::code_mask::type_label(path));
+                            }
+                        }
+                        // P0：超长行先做单行安全切片（Unicode 边界安全），
+                        // 单条 match 不会把 budget 一口气吃光，也不会在
+                        // 大小写折叠差异上 panic。
+                        out.hits.push(SearchHit {
+                            path: path.to_string(),
+                            line: line_no + 1,
+                            text: if counting {
+                                String::new()
+                            } else {
+                                clip_match_line(line, &params.query, Some(&matcher))
+                            },
+                            text_only: false,
+                        });
                     }
+                    Some(out)
                 };
-                for file in &index.graph().files {
-                    if params
-                        .path_filter
-                        .as_ref()
-                        .is_some_and(|filter| !file.path.as_str().contains(filter))
-                    {
-                        continue;
+                let candidates: Vec<&str> = index
+                    .graph()
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .filter(|path| {
+                        params
+                            .path_filter
+                            .as_ref()
+                            .is_none_or(|filter| path.contains(filter.as_str()))
+                            && !excluded(path)
+                    })
+                    .collect();
+                {
+                    use rayon::prelude::*;
+                    let scanned: Vec<Option<FileScan>> =
+                        candidates.par_iter().map(|path| scan_file(path)).collect();
+                    for scan in scanned.into_iter().flatten() {
+                        if scan.cache_hit {
+                            hits += 1;
+                        } else {
+                            misses += 1;
+                        }
+                        skipped += scan.skipped;
+                        unlexed.extend(scan.unlexed);
+                        matches.extend(scan.hits);
                     }
-                    if excluded(file.path.as_str()) {
-                        continue;
-                    }
-                    scan_file(file.path.as_str(), &mut matches);
                 }
                 // 非索引文本文件（md/sql/yaml/json/xml/gradle/kt/模板…）也搜，
                 // 排在代码命中之后并标注 [text-only]：它们没有符号/引用信息。
                 // ripgrep 引擎（grep-searcher）并行搜索，按输入顺序回收结果。
                 let code_matches = matches.len();
-                let text_paths: Vec<_> = index
-                    .text_only_paths(params.path_filter.as_deref())
-                    .into_iter()
+                let text_paths: Vec<&RelPath> = filter_text_paths
+                    .iter()
+                    .copied()
                     .filter(|p| !excluded(p.as_str()))
                     .collect();
                 let sensitive = params.case_sensitive.unwrap_or(params.regex);
                 {
                     let rels: Vec<&str> = text_paths.iter().map(|p| p.as_str()).collect();
-                    let found = astrolabe_core::text_search::search_files(
+                    let found = astrolabe_core::text_search::search_files_opts(
                         &session.root,
                         &rels,
                         &text_matcher,
                         TEXT_SEARCH_MAX_FILE_BYTES,
+                        !counting,
                     );
                     for (idx, file_hits) in found {
                         let mut file_hits = file_hits;
@@ -3321,7 +3376,7 @@ impl AstrolabeServer {
                         .path_filter
                         .as_deref()
                         .map(|filter| data_hits_outside(
-                            index,
+                            &all_text_paths,
                             &session.root,
                             filter,
                             &params.query,
@@ -3361,7 +3416,7 @@ impl AstrolabeServer {
                     let body = format!(
                         "confidence: exact (磁盘源码字面匹配)\n{}{}",
                         render_search_mode_header(params.regex, &params.query),
-                        render_search_counts(&matches, params.aggregate.as_deref()),
+                        render_search_counts(&matches, params.aggregate.as_deref(), params.offset),
                     ) + &skip_note;
                     return self.result_on(
                         &session.root,
@@ -3783,6 +3838,7 @@ impl AstrolabeServer {
         let symbols = &index.graph().symbols;
         let mut matches = astrolabe_core::name_path::match_name_path_with(
             symbols,
+            &index.names().name_path,
             &params.query,
             params.substring.unwrap_or(false),
             astrolabe_core::name_path::KindFilter(kind),
@@ -3842,7 +3898,6 @@ impl AstrolabeServer {
                         .as_deref()
                         .is_some_and(|f| !file.path.as_str().contains(f))
                     {
-            &index.names().name_path,
                         continue;
                     }
                     let depth_note = if m.depth > 0 {
@@ -3862,6 +3917,10 @@ impl AstrolabeServer {
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
                 .to_string();
+        let generation = index.generation();
+        if let Some(note) = self.symbol_page_drift_note(params, generation) {
+            body.push_str(&note);
+        }
         if let Some(ignored) = ignored {
             body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
         }
@@ -3918,10 +3977,6 @@ impl AstrolabeServer {
             self.attach_include_bodies(
                 root,
                 index,
-        let generation = index.generation();
-        if let Some(note) = self.symbol_page_drift_note(params, generation) {
-            body.push_str(&note);
-        }
                 &mut body,
                 &hits[offset..],
                 kept_count,
@@ -5808,6 +5863,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn aggregate_file_over_row_cap_pages_with_offset_and_says_so() {
+        let files: Vec<(String, String)> = (0..95)
+            .map(|i| {
+                (
+                    format!("pkg/f{i:03}.go"),
+                    format!("package pkg\nfunc F{i}() {{ SysLog({i}) }}\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let mut p = search("SysLog(");
+        p.aggregate = Some("file".into());
+        let first = text_of(&server.search_code(Parameters(p.clone())));
+        assert!(first.contains("总计 95 行命中 / 95 个文件"), "{first}");
+        assert!(first.contains("还有 15 项"), "{first}");
+        assert!(first.contains("offset=80"), "{first}");
+        assert!(first.contains("pkg/f000.go"), "{first}");
+        assert!(!first.contains("pkg/f094.go"), "{first}");
+        p.offset = 80;
+        let second = text_of(&server.search_code(Parameters(p)));
+        assert!(second.contains("pkg/f094.go"), "{second}");
+        assert!(!second.contains("pkg/f000.go"), "{second}");
+        assert!(second.contains("从第 81 项开始"), "{second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_code_scan_keeps_graph_order_and_is_repeatable() {
+        let files: Vec<(String, String)> = (0..60)
+            .map(|i| {
+                (
+                    format!("d{}/f{i:02}.go", i % 7),
+                    format!("package p\nfunc F{i}() {{ SysLog({i}) }}\n// SysLog(c{i})\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let mut p = search("SysLog(");
+        p.dedup = Some(false);
+        p.budget_tokens = 20000;
+        let first = text_of(&server.search_code(Parameters(p.clone())));
+        // The loop guard blocks the 4th identical call, so stop at 3.
+        for _ in 0..2 {
+            assert_eq!(text_of(&server.search_code(Parameters(p.clone()))), first);
+        }
+        let mut c = p.clone();
+        c.skip_comments = true;
+        let skipped = text_of(&server.search_code(Parameters(c)));
+        assert!(
+            skipped.contains("已跳过注释/字符串/文档中的 60 处"),
+            "{skipped}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn nested_fixture() -> (AstrolabeServer, PathBuf) {
         smart_server(&[
             (
@@ -6477,6 +6592,103 @@ mod tests {
         result.content[0].as_text().unwrap().text.clone()
     }
 
+    /// Timing probe (run with --ignored --nocapture): 3000 files, ~150k symbols.
+    #[test]
+    #[ignore]
+    fn bench_find_symbol_large_graph() {
+        let mut files = Vec::new();
+        let mut symbols = Vec::new();
+        for f in 0..3000u32 {
+            files.push(CodeFile {
+                id: FileId(f),
+                path: RelPath::new(format!("pkg{}/mod{}.rs", f % 50, f)),
+                language: Some(Language::Rust),
+                loc: 1000,
+                sha: String::new(),
+            });
+            let base = symbols.len() as u32;
+            symbols.push(CodeSymbol {
+                id: SymbolId(base),
+                file: FileId(f),
+                name: format!("Service{f}"),
+                kind: SymbolKind::Class,
+                signature: format!("pub struct Service{f}"),
+                start_line: 1,
+                end_line: 400,
+                exported: true,
+            });
+            for m in 0..49u32 {
+                symbols.push(CodeSymbol {
+                    id: SymbolId(base + 1 + m),
+                    file: FileId(f),
+                    name: if m % 7 == 0 {
+                        "handle".into()
+                    } else {
+                        format!("method_{m}_Helper")
+                    },
+                    kind: SymbolKind::Method,
+                    signature: format!("fn method_{m}()"),
+                    start_line: 2 + m * 8,
+                    end_line: 8 + m * 8,
+                    exported: m % 2 == 0,
+                });
+            }
+        }
+        let n = symbols.len();
+        let graph = CodeGraph {
+            files,
+            symbols,
+            edges: vec![],
+        };
+        let mut server =
+            AstrolabeServer::new_with_cache_budget(PathBuf::from("."), DEFAULT_MEMORY_BUDGET_BYTES);
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(
+            RepoIndex::from_graph(PathBuf::from("."), graph, Default::default()),
+        ));
+        server.structured_output = false;
+        let run = |q: &str, substring: Option<bool>| {
+            // Warm-up call: builds the per-snapshot lookup tables (once per index).
+            let t0 = std::time::Instant::now();
+            let _ = server.find_symbol(Parameters(QueryParams {
+                root: None,
+                query: q.into(),
+                include_body: false,
+                substring,
+                path_filter: None,
+                kind: None,
+                depth: 0,
+                budget_tokens: 2000,
+                offset: 0,
+            }));
+            eprintln!("BENCH first call {q:?}: {:?}", t0.elapsed());
+            let t = std::time::Instant::now();
+            let mut last = 0;
+            for _ in 0..5 {
+                let r = server.find_symbol(Parameters(QueryParams {
+                    root: None,
+                    query: q.into(),
+                    include_body: false,
+                    substring,
+                    path_filter: None,
+                    kind: None,
+                    depth: 0,
+                    budget_tokens: 2000,
+                    offset: 0,
+                }));
+                last = r.content[0].as_text().unwrap().text.len();
+            }
+            eprintln!(
+                "BENCH {n} symbols query={q:?} substring={substring:?}: {:?}/call (out {last}B)",
+                t.elapsed() / 5
+            );
+        };
+        run("handle", Some(false));
+        run("helper", Some(true));
+        run("Service1500", None);
+        run("Service1500/handle", None);
+        run("Service/handle", Some(true));
+    }
+
     #[test]
     fn find_symbol_pages_concatenate_to_full_match_set() {
         let dir = unique_temp_dir();
@@ -6592,103 +6804,6 @@ mod tests {
             }));
             r.content[0].as_text().unwrap().text.clone()
         };
-    /// Timing probe (run with --ignored --nocapture): 3000 files, ~150k symbols.
-    #[test]
-    #[ignore]
-    fn bench_find_symbol_large_graph() {
-        let mut files = Vec::new();
-        let mut symbols = Vec::new();
-        for f in 0..3000u32 {
-            files.push(CodeFile {
-                id: FileId(f),
-                path: RelPath::new(format!("pkg{}/mod{}.rs", f % 50, f)),
-                language: Some(Language::Rust),
-                loc: 1000,
-                sha: String::new(),
-            });
-            let base = symbols.len() as u32;
-            symbols.push(CodeSymbol {
-                id: SymbolId(base),
-                file: FileId(f),
-                name: format!("Service{f}"),
-                kind: SymbolKind::Class,
-                signature: format!("pub struct Service{f}"),
-                start_line: 1,
-                end_line: 400,
-                exported: true,
-            });
-            for m in 0..49u32 {
-                symbols.push(CodeSymbol {
-                    id: SymbolId(base + 1 + m),
-                    file: FileId(f),
-                    name: if m % 7 == 0 {
-                        "handle".into()
-                    } else {
-                        format!("method_{m}_Helper")
-                    },
-                    kind: SymbolKind::Method,
-                    signature: format!("fn method_{m}()"),
-                    start_line: 2 + m * 8,
-                    end_line: 8 + m * 8,
-                    exported: m % 2 == 0,
-                });
-            }
-        }
-        let n = symbols.len();
-        let graph = CodeGraph {
-            files,
-            symbols,
-            edges: vec![],
-        };
-        let mut server =
-            AstrolabeServer::new_with_cache_budget(PathBuf::from("."), DEFAULT_MEMORY_BUDGET_BYTES);
-        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(
-            RepoIndex::from_graph(PathBuf::from("."), graph, Default::default()),
-        ));
-        server.structured_output = false;
-        let run = |q: &str, substring: Option<bool>| {
-            // Warm-up call: builds the per-snapshot lookup tables (once per index).
-            let t0 = std::time::Instant::now();
-            let _ = server.find_symbol(Parameters(QueryParams {
-                root: None,
-                query: q.into(),
-                include_body: false,
-                substring,
-                path_filter: None,
-                kind: None,
-                depth: 0,
-                budget_tokens: 2000,
-                offset: 0,
-            }));
-            eprintln!("BENCH first call {q:?}: {:?}", t0.elapsed());
-            let t = std::time::Instant::now();
-            let mut last = 0;
-            for _ in 0..5 {
-                let r = server.find_symbol(Parameters(QueryParams {
-                    root: None,
-                    query: q.into(),
-                    include_body: false,
-                    substring,
-                    path_filter: None,
-                    kind: None,
-                    depth: 0,
-                    budget_tokens: 2000,
-                    offset: 0,
-                }));
-                last = r.content[0].as_text().unwrap().text.len();
-            }
-            eprintln!(
-                "BENCH {n} symbols query={q:?} substring={substring:?}: {:?}/call (out {last}B)",
-                t.elapsed() / 5
-            );
-        };
-        run("handle", Some(false));
-        run("helper", Some(true));
-        run("Service1500", None);
-        run("Service1500/handle", None);
-        run("Service/handle", Some(true));
-    }
-
         let mut got = Vec::new();
         let mut offset = 0;
         let mut pages = 0;
@@ -7233,6 +7348,33 @@ mod tests {
     }
 
     #[test]
+    fn find_symbol_later_page_warns_when_index_generation_changed() {
+        let src: String = (0..30)
+            .map(|i| format!("def drift_{i}():\n    pass\n"))
+            .collect();
+        let (server, dir) = server_on_files(&[("a.py", src.as_str())]);
+        let page = |offset: usize| {
+            let mut params = fs_query("drift");
+            params.budget_tokens = 120;
+            params.offset = offset;
+            fs_text(&server.find_symbol(Parameters(params)))
+        };
+        let first = page(0);
+        assert!(first.contains("truncated=true"), "{first}");
+        assert!(!first.contains("翻页期间"), "{first}");
+        // Same generation: no warning on the next page.
+        assert!(!page(5).contains("翻页期间"));
+        // Replace the index (what an edit + reindex does): a later page warns.
+        *server.primary.state.write().unwrap() =
+            IndexState::Ready(Arc::new(crate::index::build(&dir).expect("index")));
+        let drifted = page(10);
+        assert!(drifted.contains("翻页期间"), "{drifted}");
+        // The warning is stated once; the generation is now the current one.
+        assert!(!page(15).contains("翻页期间"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn find_symbol_exact_only_kind_and_path_filter_apply_to_name_queries() {
         let (server, dir) = server_on_files(&[
             (
@@ -7347,33 +7489,6 @@ mod tests {
         assert!(n.ignored.is_some());
         assert_eq!(normalize_symbol_query("struct").query, "struct");
     }
-    #[test]
-    fn find_symbol_later_page_warns_when_index_generation_changed() {
-        let src: String = (0..30)
-            .map(|i| format!("def drift_{i}():\n    pass\n"))
-            .collect();
-        let (server, dir) = server_on_files(&[("a.py", src.as_str())]);
-        let page = |offset: usize| {
-            let mut params = fs_query("drift");
-            params.budget_tokens = 120;
-            params.offset = offset;
-            fs_text(&server.find_symbol(Parameters(params)))
-        };
-        let first = page(0);
-        assert!(first.contains("truncated=true"), "{first}");
-        assert!(!first.contains("翻页期间"), "{first}");
-        // Same generation: no warning on the next page.
-        assert!(!page(5).contains("翻页期间"));
-        // Replace the index (what an edit + reindex does): a later page warns.
-        *server.primary.state.write().unwrap() =
-            IndexState::Ready(Arc::new(crate::index::build(&dir).expect("index")));
-        let drifted = page(10);
-        assert!(drifted.contains("翻页期间"), "{drifted}");
-        // The warning is stated once; the generation is now the current one.
-        assert!(!page(15).contains("翻页期间"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
 
     #[test]
     fn find_symbol_empty_result_states_no_match_explicitly() {

@@ -118,6 +118,7 @@ dependencies = [
  "anyhow",
  "astrolabe-core",
  "globset",
+ "rayon",
  "regex",
  "rmcp",
  "schemars",

@@ -57,11 +57,23 @@ pub fn search_files<P: AsRef<str> + Sync>(
     matcher: &RegexMatcher,
     max_file_bytes: u64,
 ) -> Vec<(usize, Vec<TextHit>)> {
+    search_files_opts(root, paths, matcher, max_file_bytes, true)
+}
+
+/// Like [`search_files`]; with `keep_text == false` hits carry only the line
+/// number (`text` is empty), so count-only callers never copy matched lines.
+pub fn search_files_opts<P: AsRef<str> + Sync>(
+    root: &Path,
+    paths: &[P],
+    matcher: &RegexMatcher,
+    max_file_bytes: u64,
+    keep_text: bool,
+) -> Vec<(usize, Vec<TextHit>)> {
     paths
         .par_iter()
         .enumerate()
         .filter_map(|(idx, rel)| {
-            let hits = search_one(&root.join(rel.as_ref()), matcher, max_file_bytes);
+            let hits = search_one(&root.join(rel.as_ref()), matcher, max_file_bytes, keep_text);
             (!hits.is_empty()).then_some((idx, hits))
         })
         .collect()
@@ -93,7 +105,12 @@ fn clip_long_line<'a>(matcher: &RegexMatcher, line: &'a str) -> &'a str {
     &line[start..end]
 }
 
-fn search_one(path: &Path, matcher: &RegexMatcher, max_file_bytes: u64) -> Vec<TextHit> {
+fn search_one(
+    path: &Path,
+    matcher: &RegexMatcher,
+    max_file_bytes: u64,
+    keep_text: bool,
+) -> Vec<TextHit> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() <= max_file_bytes => {}
         _ => return Vec::new(),
@@ -131,11 +148,12 @@ fn search_one(path: &Path, matcher: &RegexMatcher, max_file_bytes: u64) -> Vec<T
         matcher,
         haystack,
         sinks::Lossy(|line, text| {
-            let line_text = text.trim_end_matches(['\n', '\r']);
-            hits.push(TextHit {
-                line,
-                text: clip_long_line(matcher, line_text).to_string(),
-            });
+            let text = if keep_text {
+                clip_long_line(matcher, text.trim_end_matches(['\n', '\r'])).to_string()
+            } else {
+                String::new()
+            };
+            hits.push(TextHit { line, text });
             Ok(true)
         }),
     );
@@ -235,6 +253,18 @@ mod tests {
         let got = search_files(&d, &["gbk.txt"], &m, 100);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].1[0].text.contains("你好"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn count_mode_keeps_lines_but_not_text() {
+        let d = tmp();
+        std::fs::write(d.join("a.md"), "x\nhello\n".repeat(3)).unwrap();
+        let m = build_matcher("hello", false, true).unwrap();
+        let got = search_files_opts(&d, &["a.md"], &m, 1000, false);
+        let lines: Vec<u64> = got[0].1.iter().map(|h| h.line).collect();
+        assert_eq!(lines, vec![2, 4, 6]);
+        assert!(got[0].1.iter().all(|h| h.text.is_empty()));
         let _ = std::fs::remove_dir_all(&d);
     }
 
