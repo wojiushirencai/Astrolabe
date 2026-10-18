@@ -712,6 +712,20 @@ mod tests {
     }
 
     #[test]
+    fn vue_top_level_for_counter_and_export_type_star() {
+        let src = "<script lang=\"ts\" setup>\nexport type * from './t';\nconst columns = [1];\nfor (let i = 0; i < 3; i++) columns[i] = 2\n</script>\n";
+        let p = pool()
+            .parse(Language::Vue, &RelPath::new("a/B.vue"), src)
+            .unwrap();
+        assert!(!p.partial);
+        assert!(
+            p.symbols.iter().any(|s| s.name == "i" && s.start_line == 4),
+            "{:?}",
+            p.symbols
+        );
+    }
+
+    #[test]
     fn extracts_script_setup_ts_symbols_and_imports() {
         let src = r#"
 <template>

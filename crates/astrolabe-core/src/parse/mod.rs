@@ -207,6 +207,15 @@ impl ParserPool {
                 },
             );
         }
+        // TypeScript 5.0 `export type * from './x'` is unknown to
+        // tree-sitter-typescript 0.23 (ERROR node, whole file flagged partial).
+        // Blank the `type` keyword (same byte length) so it parses as the
+        // equivalent `export * from`, which keeps the re-export import edge.
+        if matches!(lang, Language::TypeScript | Language::Tsx) {
+            if let Some(fixed) = normalize_export_type_star(source) {
+                return self.parse_raw(lang, path, &fixed);
+            }
+        }
         self.parse_raw(lang, path, source)
     }
 
@@ -285,6 +294,37 @@ impl ParserPool {
             partial,
         })
     }
+}
+
+/// Replace `type` with spaces in statement-leading `export type * [as ns] from`
+/// (TS 5.0 syntax). Byte offsets, lines and columns are unchanged. Returns
+/// `None` when nothing matches.
+fn normalize_export_type_star(source: &str) -> Option<String> {
+    if !source.contains("export type") {
+        return None;
+    }
+    let mut out: Option<String> = None;
+    let mut pos = 0usize;
+    for line in source.split_inclusive('\n') {
+        let lead = line.len() - line.trim_start().len();
+        let rest = &line[lead..];
+        if let Some(after) = rest.strip_prefix("export") {
+            let after_ws = after.trim_start();
+            let ws = after.len() - after_ws.len();
+            if ws > 0 {
+                if let Some(tail) = after_ws.strip_prefix("type") {
+                    let t = tail.trim_start();
+                    if t.starts_with('*') {
+                        let at = pos + lead + "export".len() + ws;
+                        let buf = out.get_or_insert_with(|| source.to_owned());
+                        buf.replace_range(at..at + 4, "    ");
+                    }
+                }
+            }
+        }
+        pos += line.len();
+    }
+    out
 }
 
 impl Default for ParserPool {
@@ -632,8 +672,10 @@ fn collect_php_uses(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Str
                     let pre = prefix.unwrap_or("").trim_matches('\\');
                     let mut g = ch.walk();
                     for cl in ch.children(&mut g) {
-                        if matches!(cl.kind(), "namespace_use_clause" | "namespace_use_group_clause")
-                        {
+                        if matches!(
+                            cl.kind(),
+                            "namespace_use_clause" | "namespace_use_group_clause"
+                        ) {
                             if let Some(n) = php_clause_name(cl, source) {
                                 let n = n.trim_start_matches('\\');
                                 out.push(if pre.is_empty() {
@@ -1444,6 +1486,39 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             .unwrap()
             .len();
         assert!((1..=4).contains(&idle), "idle parsers: {idle}");
+    }
+
+    #[test]
+    fn ts_export_type_star_parses_cleanly_and_keeps_import_edges() {
+        let src = "export type * from './user';\nexport type * as ns from '@v/typings';\nexport type Foo = 1;\nexport function f() {}\n";
+        let pool = ParserPool::new();
+        for lang in [Language::TypeScript, Language::Tsx] {
+            let p = pool.parse(lang, &RelPath::new("index.ts"), src).unwrap();
+            assert!(!p.partial, "{lang:?} flagged partial");
+            assert!(
+                p.imports.iter().any(|i| i.contains("./user")),
+                "{:?}",
+                p.imports
+            );
+            assert!(p.symbols.iter().any(|s| s.name == "f" && s.start_line == 4));
+            assert!(p.symbols.iter().any(|s| s.name == "Foo"));
+        }
+        // String contents are untouched.
+        assert!(normalize_export_type_star("const s = \"export type * x\";\n").is_none());
+    }
+
+    #[test]
+    fn top_level_for_loop_counter_is_indexed_but_nested_is_not() {
+        let src = "const n = 3;\nfor (let i = 0; i < n; i++) {}\nfunction f() {\n  for (let j = 0; j < 2; j++) {}\n}\n";
+        let pool = ParserPool::new();
+        for lang in [Language::TypeScript, Language::JavaScript] {
+            let p = pool.parse(lang, &RelPath::new("a.ts"), src).unwrap();
+            assert!(
+                p.symbols.iter().any(|s| s.name == "i" && s.start_line == 2),
+                "{lang:?}"
+            );
+            assert!(!p.symbols.iter().any(|s| s.name == "j"), "{lang:?}");
+        }
     }
 
     #[test]

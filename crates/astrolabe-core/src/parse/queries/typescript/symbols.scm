@@ -335,3 +335,19 @@
         pattern: (identifier) @name)
     ] @definition.field)
   (#eq? @_ctor "constructor"))
+
+;; Top-level `for (let i = 0; ...)` loop counters (typical in Vue
+;; `<script setup>` and plain scripts). Only direct children of the program;
+;; loops nested in functions stay local and are not indexed.
+(program
+  (for_statement
+    initializer: (lexical_declaration
+      kind: "let"
+      (variable_declarator
+        name: (identifier) @name) @definition.variable)))
+
+(program
+  (for_statement
+    initializer: (variable_declaration
+      (variable_declarator
+        name: (identifier) @name) @definition.variable)))
