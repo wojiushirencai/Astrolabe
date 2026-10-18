@@ -1,5 +1,5 @@
 //! Real backend for the precise tools: a pooled language server plus the
-//! scope-aware rewrite planner.
+//! scope-aware precise queries.
 //!
 //! Everything here is on-demand. No server starts until a precise tool is
 //! actually called, and the pool reclaims it once idle or over its memory
