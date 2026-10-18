@@ -3,7 +3,11 @@
 Rules (same as our reports): for answer_only tasks only the text after the LAST 'ANSWER:' is matched; every regex in `must`
 has to match, none in `must_not` may match; edit tasks additionally need check.json ok. Timeouts are NOT counted as wrong
 by themselves: a timed-out run is scored on whatever answer/repo state it left.
-Tasks with must_with_comments / must_skip_comments (N5, N8) are scored under both conventions, reported separately."""
+Tasks with must_with_comments / must_skip_comments (N5, N8) are scored under both conventions, reported separately:
+  ok_strict = reference convention (comment call sites counted); ok_either = either convention accepted (lenient).
+  `ok` is the PRIMARY verdict: lenient (either) for tasks with "primary": "lenient" (N5), strict otherwise.
+  Why N5 is lenient-primary: the reference count includes 2 call sites inside comments, but a model that excludes comments
+  (search_code skip_comments=true) gets 15/43 and 319, a defensible reading of "calls to X(", so we accept both and still report strict."""
 import json, pathlib, re, os, collections
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -62,9 +66,11 @@ def score_run(d, task_id):
     if 'must_with_comments' in t:
         r['ok_with_comments'] = match(t, r['text'], 'must_with_comments') and chk_ok
         r['ok_skip_comments'] = match(t, r['text'], 'must_skip_comments') and chk_ok
-        r['ok'] = r['ok_with_comments']          # strict: the reference convention
+        r['ok_strict'] = r['ok_with_comments']   # the reference convention
         r['ok_either'] = r['ok_with_comments'] or r['ok_skip_comments']
+        r['ok'] = r['ok_either'] if t.get('primary') == 'lenient' else r['ok_strict']
     else:
         r['ok'] = match(t, r['text']) and chk_ok
+        r['ok_strict'] = r['ok']
         r['ok_either'] = r['ok']
     return r
