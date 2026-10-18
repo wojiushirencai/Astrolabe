@@ -335,7 +335,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), le).unwrap();
         let (gbk, _, _) =
             encoding_rs::GBK.encode("// 中文注释，这是一个测试\nfn y() { needle_fn(); }\n");
-        std::fs::write(dir.path().join("b.rs"), gbk.to_vec()).unwrap();
+        std::fs::write(dir.path().join("b.rs"), &gbk).unwrap();
         std::fs::write(dir.path().join("c.rs"), "fn z() {}\n").unwrap();
         let r = text_references(dir.path(), &RelPath::new("a.rs"), "needle_fn", "x");
         let mut paths: Vec<_> = r

@@ -5989,11 +5989,13 @@ mod tests {
         // resolve_context 是入口导航工具：它的回答取代了之前 grep/read 的探索，
         // 因此与 find_symbol 等一样清零全部 burst 计数。
         let cfg = HooksConfig::default();
-        let mut c = CounterState::default();
-        c.n_grep = 2;
-        c.n_read = 2;
-        c.n_slice = 1;
-        c.n_non_symbolic = 3;
+        let mut c = CounterState {
+            n_grep: 2,
+            n_read: 2,
+            n_slice: 1,
+            n_non_symbolic: 3,
+            ..Default::default()
+        };
         let kind = classify_tool(
             "mcp__astrolabe__resolve_context",
             Client::ClaudeCode,

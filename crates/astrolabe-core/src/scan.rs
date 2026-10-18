@@ -701,7 +701,8 @@ type MatcherStamp = Option<(SystemTime, u64)>;
 /// file's (mtime, len) is unchanged and the mtime is older than
 /// [`MTIME_UNTRUSTED_WINDOW`], so a rewrite inside one mtime tick is re-read.
 /// `None` stamp = the file did not exist.
-static MATCHER_CACHE: LazyLock<Mutex<HashMap<PathBuf, (MatcherStamp, Option<Gitignore>)>>> =
+type MatcherEntry = (MatcherStamp, Option<Gitignore>);
+static MATCHER_CACHE: LazyLock<Mutex<HashMap<PathBuf, MatcherEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 const MATCHER_CACHE_CAP: usize = 4096;
 

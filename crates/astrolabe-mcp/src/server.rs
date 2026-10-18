@@ -2959,7 +2959,12 @@ impl AstrolabeServer {
             };
             if exact_only {
                 // Exact names only: O(1) map lookup instead of a full scan.
-                for &idx in names.by_lower.get(&needle).map(Vec::as_slice).unwrap_or(&[]) {
+                for &idx in names
+                    .by_lower
+                    .get(&needle)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                {
                     consider(idx as usize, 0);
                 }
             } else {
@@ -2974,7 +2979,10 @@ impl AstrolabeServer {
                 .into_iter()
                 .map(|(_, idx)| {
                     let symbol = &symbols[idx];
-                    let path = &index.file(symbol.file).expect("ranked symbol has a file").path;
+                    let path = &index
+                        .file(symbol.file)
+                        .expect("ranked symbol has a file")
+                        .path;
                     (symbol_line(symbol, path), idx)
                 })
                 .collect();
@@ -3008,7 +3016,14 @@ impl AstrolabeServer {
             let truncated = omitted > 0;
             // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
             let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
-            body.push_str(&render_search_page_status(total, offset, kept_count, omitted, params.budget_tokens, params.offset));
+            body.push_str(&render_search_page_status(
+                total,
+                offset,
+                kept_count,
+                omitted,
+                params.budget_tokens,
+                params.offset,
+            ));
             for line in &kept {
                 body.push_str(line);
                 body.push('\n');
