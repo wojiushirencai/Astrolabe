@@ -1265,7 +1265,7 @@ pub(crate) struct QueryParams {
 
 /// Valid `kind` filter names for path queries (case-insensitive).
 const VALID_KIND_NAMES: &str =
-    "function, method, class, interface, struct, enum, trait, type, const, module, field";
+    "function, method, class, interface, struct, enum, trait, type, const, module, field, variable";
 
 /// SymbolKind 名字（schema 字符串）→ 枚举。未知名字返回 Err（列出有效值）。
 fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
@@ -1282,6 +1282,7 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
         "const" => K::Const,
         "module" => K::Module,
         "field" => K::Field,
+        "variable" => K::Variable,
         other => {
             return Err(format!("未知 kind `{other}`；有效值：{VALID_KIND_NAMES}"));
         }
@@ -2009,6 +2010,11 @@ impl AstrolabeServer {
     }
 
     fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
+        if params.query.trim().is_empty() {
+            return text_error(
+                "find_symbol 需要非空 query（符号名、子串或 'Class/method' 路径）；空白查询不返回全部符号。".to_string(),
+            );
+        }
         self.with_fresh_index(&params.query, |session, index| {
             if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
                 return self.finish_at(&session.root, text_error(message));
@@ -2050,7 +2056,10 @@ impl AstrolabeServer {
             // 排序：精确名 > 前缀 > 子串，同档再按锚点行——避免真正的定义
             // 因按路径排序排在后面而被 budget 截掉。
             let exact_only = params.substring == Some(false);
-            let mut ranked: Vec<(u8, String, usize)> = Vec::new();
+            // 排序键：(档, 测试路径靠后, exported 优先, path, start_line)；
+            // 末位 idx 保证全序。不再按渲染后的签名文本排序。
+            type RankKey = (u8, bool, bool, String, u32);
+            let mut ranked: Vec<(RankKey, String, usize)> = Vec::new();
             for (idx, symbol) in index.graph().symbols.iter().enumerate() {
                 let Some(tier) = name_match_tier(&symbol.name, &needle) else {
                     continue;
@@ -2077,18 +2086,32 @@ impl AstrolabeServer {
                 .into_iter()
                 .map(|(_, line, idx)| (line, idx))
                 .collect();
-            let lines: Vec<String> = hits.iter().map(|(line, _)| line.clone()).collect();
+            let lines = decorated_symbol_lines(index, &hits);
             let total = lines.len();
             let offset = params.offset.min(total);
-            let (kept, omitted) =
-                truncate_ranked(&lines[offset..], params.budget_tokens, |line| format!("{line}\n"));
-            let kept_count = kept.len();
-            let truncated = omitted > 0;
-            let next_offset = truncated.then_some(offset + kept_count);
             let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
             if let Some(ignored) = &normalized.ignored {
                 body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
             }
+            // 头部与状态行也计入预算：按"最长的截断态状态行"预留。
+            let reserve = estimate_tokens(&body)
+                + estimate_tokens(&render_search_page_status(
+                    total,
+                    offset,
+                    total - offset,
+                    1,
+                    params.budget_tokens,
+                    params.offset,
+                ));
+            let (kept, omitted) = truncate_ranked(
+                &lines[offset..],
+                params.budget_tokens.saturating_sub(reserve),
+                |line| format!("{line}\n"),
+            );
+            let kept_count = kept.len();
+            let truncated = omitted > 0;
+            // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
+            let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
             body.push_str(&render_search_page_status(total, offset, kept_count, omitted, params.budget_tokens, params.offset));
             for line in kept {
                 body.push_str(line);
@@ -2887,15 +2910,9 @@ impl AstrolabeServer {
                 }
             }
         }
-        let lines: Vec<String> = hits.iter().map(|(line, _)| line.clone()).collect();
+        let lines = decorated_symbol_lines(index, &hits);
         let total = lines.len();
         let offset = params.offset.min(total);
-        let (kept, omitted) = truncate_ranked(&lines[offset..], params.budget_tokens, |line| {
-            format!("{line}\n")
-        });
-        let kept_count = kept.len();
-        let truncated = omitted > 0;
-        let next_offset = truncated.then_some(offset + kept_count);
         let mut body =
             "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
                 .to_string();
@@ -2905,6 +2922,24 @@ impl AstrolabeServer {
         if receiver_fallback {
             body.push_str("注意：层级由接收者类型/签名/路径段推断（非行范围嵌套）\n");
         }
+        let reserve = estimate_tokens(&body)
+            + estimate_tokens(&render_search_page_status(
+                total,
+                offset,
+                total - offset,
+                1,
+                params.budget_tokens,
+                params.offset,
+            ));
+        let (kept, omitted) = truncate_ranked(
+            &lines[offset..],
+            params.budget_tokens.saturating_sub(reserve),
+            |line| format!("{line}\n"),
+        );
+        let kept_count = kept.len();
+        let truncated = omitted > 0;
+        // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
+        let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
         body.push_str(&render_search_page_status(
             total,
             offset,
@@ -3310,6 +3345,59 @@ fn normalize_symbol_query(raw: &str) -> NormalizedQuery {
         query,
         ignored: (!ignored.is_empty()).then(|| format!("`{}`", ignored.join(" "))),
     }
+}
+
+/// SymbolKind 的展示名（与 `kind` 过滤参数同一套词）。
+fn kind_display_name(kind: astrolabe_core::SymbolKind) -> &'static str {
+    use astrolabe_core::SymbolKind as K;
+    match kind {
+        K::Function => "function",
+        K::Method => "method",
+        K::Class => "class",
+        K::Interface => "interface",
+        K::Struct => "struct",
+        K::Enum => "enum",
+        K::Trait => "trait",
+        K::Type => "type",
+        K::Const => "const",
+        K::Module => "module",
+        K::Field => "field",
+        K::Variable => "variable",
+    }
+}
+
+/// 给 find_symbol 的每个命中行补 `[kind in 容器]`，让重名符号（Rust 的
+/// 70 个 `new`）可分辨。控制体积：签名已以 kind 词开头（`struct Foo`）时省去
+/// kind；容器名最多 24 字符；无容器的顶层符号只标 kind。
+fn decorated_symbol_lines(index: &RepoIndex, hits: &[(String, usize)]) -> Vec<String> {
+    let symbols = &index.graph().symbols;
+    let targets: Vec<usize> = hits.iter().map(|(_, idx)| *idx).collect();
+    let containers = astrolabe_core::name_path::innermost_containers(symbols, &targets);
+    hits.iter()
+        .zip(containers)
+        .map(|((line, idx), container)| {
+            let symbol = &symbols[*idx];
+            let kind = kind_display_name(symbol.kind);
+            let sig = symbol.signature.trim_start().to_ascii_lowercase();
+            let kind_obvious = sig
+                .strip_prefix(kind)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+            let container = container.map(|c| {
+                let name = &symbols[c].name;
+                if name.chars().count() > 24 {
+                    format!("{}…", name.chars().take(23).collect::<String>())
+                } else {
+                    name.clone()
+                }
+            });
+            match (kind_obvious, container) {
+                (true, None) => line.clone(),
+                (true, Some(c)) => format!("{line}  [in {c}]"),
+                (false, None) => format!("{line}  [{kind}]"),
+                (false, Some(c)) => format!("{line}  [{kind} in {c}]"),
+            }
+        })
+        .collect()
 }
 
 /// 名称匹配档位：0 精确、1 前缀、2 子串（needle 已小写）。
@@ -6564,6 +6652,51 @@ mod tests {
             !text.contains("Cargo.lock"),
             "Cargo.lock must be skipped: {text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_blank_query_errors_and_kind_variable_is_accepted() {
+        let (server, dir) = server_on_files(&[("a.py", "def f():\n    pass\n")]);
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("   "))));
+        assert!(text.contains("非空"), "{text}");
+        assert!(!text.contains("shown="), "{text}");
+        let mut params = fs_query("f");
+        params.kind = Some("variable".into());
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(!text.contains("未知 kind"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_orders_by_path_line_not_signature_and_tags_container() {
+        let (server, dir) = server_on_files(&[
+            (
+                "pkg/b.py",
+                "class Beta:\n    def run(self):\n        pass\n\ndef run():\n    pass\n",
+            ),
+            ("pkg/a.py", "class Alpha:\n    def run(self):\n        pass\n"),
+            ("tests/test_x.py", "def run():\n    pass\n"),
+        ]);
+        let mut params = fs_query("run");
+        params.substring = Some(false);
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        let anchors: Vec<&str> = text.lines().filter(|l| l.contains("@")).collect();
+        assert!(anchors[0].contains("pkg/a.py") && anchors[0].contains("[method in Alpha]"), "{text}");
+        assert!(anchors[1].contains("pkg/b.py:2") && anchors[1].contains("[method in Beta]"), "{text}");
+        assert!(anchors[2].contains("pkg/b.py:5") && anchors[2].contains("[function]"), "{text}");
+        assert!(anchors[3].contains("tests/test_x.py"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_zero_budget_has_no_stuck_next_offset() {
+        let (server, dir) = server_on_files(&[("a.py", "def widget():\n    pass\ndef widget2():\n    pass\n")]);
+        let mut params = fs_query("widget");
+        params.budget_tokens = 0;
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(text.contains("shown=0"), "{text}");
+        assert!(!text.contains("next_offset="), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
