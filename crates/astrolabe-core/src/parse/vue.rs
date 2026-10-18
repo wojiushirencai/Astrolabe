@@ -138,8 +138,14 @@ fn mask_html_comments(lower: &str) -> String {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
         let end = tail.find("-->").map(|e| e + 3).unwrap_or(tail.len());
-        for c in tail[..end].chars() {
-            out.push(if c == '\n' || c == '\r' { c } else { ' ' });
+        // One byte out per byte in: offsets into the masked text must stay
+        // valid for the original source (comments may hold multi-byte text).
+        for b in tail[..end].bytes() {
+            out.push(if b == b'\n' || b == b'\r' {
+                b as char
+            } else {
+                ' '
+            });
         }
         rest = &tail[end..];
     }
@@ -893,5 +899,18 @@ mod audit_fix_tests {
         let p = parse("D.vue", src);
         assert!(p.symbols.iter().any(|s| s.name == "real2"));
         assert!(!p.symbols.iter().any(|s| s.name == "a"));
+    }
+
+    #[test]
+    fn multibyte_html_comment_does_not_shift_offsets() {
+        let src = "<!-- 的的的 说明 -->\n<script>\nfunction real3() {}\n</script>\n";
+        let blocks = extract_script_blocks(src);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let p = parse("M.vue", src);
+        assert!(
+            p.symbols.iter().any(|s| s.name == "real3"),
+            "{:?}",
+            p.symbols
+        );
     }
 }
