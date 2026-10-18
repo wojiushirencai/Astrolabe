@@ -1,0 +1,27 @@
+# Astrolabe AI
+
+> Astrolabe AI is a local MCP server that gives Claude Code, Cursor and Codex fast code search, symbol lookup and reference navigation, with directory-level counts for questions like "how many call sites per module". Single Rust binary named `astrolabe`; indexes with tree-sitter and starts language servers on demand. Not related to the npm packages `astrolabe` or `astrolabe-ai`.
+
+Facts (as of 2026-10-18, version 0.13.0):
+- Repository: https://github.com/wojiushirencai/Astrolabe
+- License: MIT OR Apache-2.0
+- Tools (7): resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages
+- Platforms: macOS arm64/x64, Linux x64 (glibc/musl), Linux arm64, Windows x64
+- Install: curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
+- Claude Code: claude mcp add --scope user astrolabe -- astrolabe . --context=claude-code
+- No API key needed; indexing and search do not call an LLM.
+- npm package @astrolabe-ai/astrolabe is prepared but not published yet.
+- Evidence (own measurements, one model): 40 simultaneous A/B pairs on 4 counting/locating/editing tasks, cost -$0.65 per run [-0.98, -0.31], time -108 s [-178, -37]; on the older 75-cell v0.12.0 matrix Astrolabe was not cheaper (cost +$0.244 [+0.035, +0.467]). No benefit is claimed outside the measured tasks.
+
+## Docs
+- [README](https://github.com/wojiushirencai/Astrolabe/blob/main/README.md): overview, fact card, evidence with limits
+- [Install guide](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/INSTALL_GUIDE.md): all install paths and client configs
+- [FAQ](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/FAQ.md)
+- [Benchmark harness](https://github.com/wojiushirencai/Astrolabe/blob/main/bench/README.md): paired A/B method, scoring, reproduction, limits
+- [Changelog](https://github.com/wojiushirencai/Astrolabe/blob/main/CHANGELOG.md)
+- [简体中文 README](https://github.com/wojiushirencai/Astrolabe/blob/main/README.zh-CN.md)
+
+## Optional
+- [Architecture](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/ARCHITECTURE.md)
+- [Reference (Chinese)](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/REFERENCE.zh-CN.md): env vars, language matrix, quality gates
+- [Anti-drift hooks (effect not benchmarked)](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/HOOKS.md)

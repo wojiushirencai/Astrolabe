@@ -1,3 +1,5 @@
+> **存档提示（2026-10-18）**：这是早期发帖草稿，其中的数字和安装方式已过期（含对 Serena/OpenVisio 的对比、npx 安装、`dist/release-binaries` 路径等），请勿引用。当前口径见 [README.md](../README.md) 与 [bench/README.md](../bench/README.md)。
+
 # 【开源/硬核实测】别再让 Claude Code 盲目 Read 烧光 Token 了：我们用 Rust 重构了代码图谱引擎 Astrolabe（1.0s / 84MB，零 LLM 消耗，机械级防漂移）
 
 **标签**：`#开发调优` `#AI编程` `#Rust` `#ClaudeCode` `#Cursor` `#开源项目`

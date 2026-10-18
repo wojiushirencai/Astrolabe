@@ -49,7 +49,7 @@ partial failure). Platform packages MUST succeed before the main package
 is published — npm will otherwise fail to install optionalDependencies.
 
 Order:
-  1. @astrolabe/<platform>  (all six)
+  1. @astrolabe-ai/<platform>  (all six)
   2. the main package (name taken from packages/astrolabe/package.json)
 `);
 }

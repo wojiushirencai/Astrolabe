@@ -1,0 +1,8 @@
+{
+  "note": "Reference snapshots used in our runs. The snapshots were local single-commit copies, so upstream commit ids are NOT known; compare `git rev-parse HEAD^{tree}` of your checkout with reference_tree_sha. If it differs, expected counts in tasks.json may not match and answer-correctness is not comparable with our reports.",
+  "corpora": {
+    "cobra":   {"url": "https://github.com/spf13/cobra",           "reference_tree_sha": "5a3b2c8e9af4c74e607a0a55e7910c1edb5d266f"},
+    "express": {"url": "https://github.com/expressjs/express",      "reference_tree_sha": "5f7326c98990506a948080ff68d593ef9969d028", "note": "package.json version 5.3.0"},
+    "new-api": {"url": "https://github.com/QuantumNous/new-api",    "reference_tree_sha": "296be412894aa9179d4bfdf6cbb4cfde45ce39cd", "note": "our local copy had 1 uncommitted file change"}
+  }
+}

@@ -8,9 +8,9 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
-description = "MCP server for Astrolabe, a deterministic code-graph engine that answers file-level repository questions for coding agents and surfaces parse gaps instead of empty results."
+description = "MCP server for code search and navigation (search_code, find_symbol, find_references, goto_definition) for AI coding agents."
 documentation = "https://docs.rs/astrolabe-mcp"
-keywords = ["mcp-server", "code-graph", "tree-sitter", "code-intelligence", "coding-agents"]
+keywords = ["mcp", "code-search", "tree-sitter", "lsp", "ai-agent"]
 categories = ["development-tools", "command-line-utilities", "parsing"]
 
 [[bin]]

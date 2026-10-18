@@ -1,0 +1,80 @@
+# NOT ACTIVE: copy to .github/workflows/npm-publish.yml to enable. (Kept here because the token used to prepare this PR has no `workflow` scope.)
+# Manual npm publish for @astrolabe-ai/astrolabe and @astrolabe-ai/<platform>.
+#
+# Never runs automatically. Requirements before first use:
+#   1. The npm org/scope `astrolabe-ai` exists and the publishing account is a member.
+#   2. Repository secret NPM_TOKEN (automation token with publish rights on that scope).
+#   3. The GitHub Release for the tag already exists (release.yml builds it).
+# Without NPM_TOKEN the job fails fast with a clear message and publishes nothing.
+
+name: npm-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose binaries are published to npm, e.g. v0.13.0"
+        required: true
+      source_ref:
+        description: "Git ref providing the npm package sources (its npm/ version must equal the tag's version)"
+        default: "main"
+      dry_run:
+        description: "Run `npm publish --dry-run` only"
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout package sources
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - name: Require NPM_TOKEN
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [[ -z "${NPM_TOKEN}" && "${DRY_RUN}" != "true" ]]; then
+            echo "NPM_TOKEN secret is not configured; refusing to publish." >&2
+            exit 1
+          fi
+
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir artifacts \
+            --pattern 'astrolabe-*.tar.gz' --pattern 'astrolabe-*.zip' --pattern SHA256SUMS
+
+      - name: Fill platform packages (verifies SHA256SUMS)
+        working-directory: npm
+        run: node scripts/fill-binaries.js --artifacts-dir ../artifacts --require-all
+
+      - name: Publish
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" > "$HOME/.npmrc"
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            node scripts/publish.js --dry-run
+          else
+            node scripts/publish.js
+          fi

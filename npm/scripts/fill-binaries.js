@@ -47,7 +47,7 @@ Usage:
   node scripts/fill-binaries.js            # default: repo target/release/astrolabe
 
 Artifact layout (any of these, mixed):
-  <dir>/astrolabe-<rustTarget>.tar.gz|.zip
+  <dir>/astrolabe-<version>-<rustTarget>.tar.gz|.zip
   <dir>/<rustTarget>/astrolabe[.exe]
   <dir>/<rustTarget>/release/astrolabe[.exe]
   <dir>/astrolabe-<rustTarget>/astrolabe[.exe]
@@ -136,6 +136,7 @@ function candidateUnpacked(artifactsDir, platform) {
 }
 
 function fillFromArtifacts(artifactsDir, requireAll) {
+  const version = require('../packages/astrolabe/package.json').version;
   let filled = 0;
   const tmpRoot = fs.mkdtempSync(path.join(require('os').tmpdir(), 'astrolabe-fill-'));
   try {
@@ -146,7 +147,7 @@ function fillFromArtifacts(artifactsDir, requireAll) {
         filled += 1;
         continue;
       }
-      const archivePath = path.join(artifactsDir, archiveName(platform));
+      const archivePath = path.join(artifactsDir, archiveName(platform, version));
       if (!fs.existsSync(archivePath)) {
         if (requireAll) {
           throw new Error(`missing artifact for ${platform.key}: ${archivePath}`);

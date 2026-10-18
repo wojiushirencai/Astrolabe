@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.wojiushirencai/astrolabe",
+  "title": "Astrolabe AI",
+  "description": "Local MCP server for code search and navigation: search_code, find_symbol, find_references.",
+  "repository": {
+    "url": "https://github.com/wojiushirencai/Astrolabe",
+    "source": "github"
+  },
+  "version": "0.13.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@astrolabe-ai/astrolabe",
+      "version": "0.13.0",
+      "transport": { "type": "stdio" },
+      "packageArguments": [
+        { "type": "positional", "value": "." },
+        { "type": "named", "name": "--context", "value": "claude-code" }
+      ]
+    }
+  ]
+}

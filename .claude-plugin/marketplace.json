@@ -1,0 +1,12 @@
+{
+  "name": "astrolabe-ai",
+  "description": "Astrolabe AI: local MCP server for code search and navigation",
+  "owner": { "name": "wojiushirencai" },
+  "plugins": [
+    {
+      "name": "astrolabe",
+      "source": "./claude-plugin",
+      "description": "Registers the Astrolabe MCP server (7 tools). Install the `astrolabe` binary first: see README."
+    }
+  ]
+}

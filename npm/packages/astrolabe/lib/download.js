@@ -10,8 +10,8 @@ const { spawnSync } = require('child_process');
 
 const { archiveName } = require('./platforms');
 
-const DEFAULT_HOST = 'https://gitee.com';
-const DEFAULT_REPO = 'adam_1986/astrolabe';
+const DEFAULT_HOST = 'https://github.com';
+const DEFAULT_REPO = 'wojiushirencai/Astrolabe';
 const MAX_REDIRECTS = 10;
 const REQUEST_TIMEOUT_MS = 60_000;
 
@@ -310,7 +310,7 @@ async function downloadRelease(platform, version) {
     }
 
     const base = releasesBaseUrl(version);
-    const archive = archiveName(platform);
+    const archive = archiveName(platform, version);
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'astrolabe-dl-'));
     const sumsPath = path.join(tmpDir, 'SHA256SUMS');
     const archivePath = path.join(tmpDir, archive);

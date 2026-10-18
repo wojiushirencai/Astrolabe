@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "astrolabe": {
+      "command": "astrolabe",
+      "args": [".", "--context=claude-code"]
+    }
+  }
+}

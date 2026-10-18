@@ -1,603 +1,103 @@
-# Astrolabe (星盘)
+# Astrolabe AI
 
-> **让 AI 编码助手秒懂你的超大代码库 —— 告别疯狂 Grep 烧 Token 与幻觉，快如闪电的确定性代码图谱 MCP 服务。**
+**Astrolabe AI is a local MCP server that gives Claude Code, Cursor and Codex fast code search, symbol lookup and reference navigation, with directory-level counts for questions like "how many call sites per module".**
+It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter and starts language servers on demand.
 
-Astrolabe
-- **名字寓意**：星盘（古代天文学家和航海家在茫茫大海中观测天体、精准定位方位的精密仪器）。
-- **技术双关**：**AST**rolabe 前缀融合了 **AST（抽象语法树）** —— 既象征拥有宏观俯瞰全库的天文级拓扑视野，又具备深入语法树叶子节点的微观精确度。
-- **运行形态**：以 MCP (Model Context Protocol) 服务运行，原生适配 Claude Code、Cursor、Windsurf、Codex 等主流 AI 编程工具。
+[简体中文](README.zh-CN.md) · [Install guide](docs/INSTALL_GUIDE.md) · [FAQ](docs/FAQ.md) · [Benchmark harness](bench/README.md) · [Changelog](CHANGELOG.md)
 
----
+> **Not to be confused with** the npm packages `astrolabe` (a 2014 Protractor page-object library) and `astrolabe-ai` (an unrelated resume tool), or other MCP servers named "astrolabe". This project lives at `github.com/wojiushirencai/Astrolabe`; the binary is `astrolabe`.
 
-## 一、你是否也经历过这些 AI 编程的“至暗时刻”？
+## Fact card (as of 2026-10-18)
 
-在几十万行代码的复杂项目里用 AI 编程助手（Claude Code / Cursor / Windsurf），你大概率遇到过这些抓狂场景：
+| | |
+|---|---|
+| Latest release | [v0.13.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.13.0), published 2026-10-18 |
+| What it exposes | 7 MCP tools: `resolve_context`, `search_code`, `find_symbol`, `find_references`, `goto_definition`, `get_diagnostics`, `get_languages` |
+| `tools/list` size | about 7.6 KB compact JSON (7,584 B measured on Linux; 8,001 B measured on macOS, difference not yet reconciled) |
+| Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |
+| Platforms | macOS arm64/x64, Linux x64 (glibc/musl), Linux arm64, Windows x64 |
+| Languages | 17 matrix rows incl. Python, Go, Rust, Java, TypeScript/JavaScript, C/C++, Swift, Objective-C, PHP, Vue, Dart, C#, VB.NET, Kotlin, Shell, Ruby, Lua ([details](docs/REFERENCE.zh-CN.md)) |
+| Needs an API key / network? | No. Indexing and search do not call an LLM. (The model that reads the results still spends tokens.) |
+| Clients documented | Claude Code, Cursor, Codex, Windsurf/Cline/Roo Code/Continue, Codebuddy, Grok Build, Kimi Code, ZCode, OpenCode |
+| License | MIT OR Apache-2.0 |
+| Tests | `cargo test --workspace -- --list` lists 1,117 test cases (2026-10-18) |
 
-1. **Token 碎钞机，全库盲搜卡到怀疑人生**：
-   让 AI 改个需求或排查问题，它第一反应往往是全库疯狂执行 `grep`、`find` 和整文件全量 `Read`。几万甚至几十万 Token 瞬间蒸发，AI 苦转半天圈，最后还因为上下文窗口被无用代码撑爆而“截断失忆”，甚至开始胡说八道（产生代码幻觉）。
-2. **MCP 工具配了也白配，AI 聊两句就开始摆烂**：
-   明明在客户端里配置了专业工具，但长对话只要多聊几轮，AI 就会发生“注意力漂移”（Agent Drift），把专业工具抛到九霄云外，再次退化回低效的原始文本扫描模式。
-3. **老牌分析工具笨重吃内存，机器风扇直接起飞**：
-   传统的静态分析或代码图谱工具动辄基于重型 Node 或 Python 运行时，分析千级文件就要耗时十几秒，峰值内存动辄吃掉 3~4 GB，后台常驻甚至能把笔记本拖到卡死。
+## Quick start (3 steps)
 
-**Astrolabe 就是为了彻底终结这些痛苦而生的。** 它用 Rust 原生重写，构建了一套“确定性代码拓扑 + 按需精准分流”的高性能引擎，在 AI 思考前为它递上一张高清晰度的代码全景雷达地图。
-
----
-
-## 二、硬核实测：比老工具快 10 倍，内存节省 99%
-
-在包含 1028 个源文件的真实中型仓库（serena）上的同机实测对比：
-
-| 引擎方案 | 首次全量索引耗时 | 缓存命中（二次索引） | 峰值内存占用 | 解析失败文件数 |
-|---|---:|---:|---:|---:|
-| **Astrolabe (Rust 原生)** | **1.0 秒** | **0.10 秒** | **84 MB** | **0 (全部精确解析)** |
-| Serena (Python + LSP) | 5.7 秒 | — | 373 MB | — |
-| OpenVisio (Node.js) | 12.6 秒 | — | 4566 MB (4.5 GB) | 205 个文件解析丢失 |
-
-**通俗点评：**
-- **千文件项目 1 秒建立全库拓扑**：Rust 原生系统级解析，文件未修改时二次命中缓存仅需 0.1 秒，AI 眨眼的功夫图谱就已就绪，彻底告别卡顿等待。
-- **内存仅 84 MB，仅为老方案的 1/50**：彻底告别动辄数 GB 的内存巨兽，稳态内存甚至仅 31 MB，极度轻巧，后台常驻毫无负担。
-- **零静默丢文件**：深入各大主流语言的真实构建规则解析，五大主流语言实现 100% 仓库内导入解析率，不搞“模糊匹配”、不静默吞掉报错，绝不用假结果误导 AI 删改有效代码。
-
----
-
-## 三、它是怎么做到的？三大底层杀手锏（原理通俗解读）
-
-Astrolabe 为什么能做到又快、又准、还省钱？核心在于三项工程设计：
-
-### 1. 确定性图谱：不烧一分钱 Token 的全库高清雷达
-- **人话解读**：看项目的宏观架构分层、查模块间的依赖关系、查改动一个文件会波及哪些上游代码……这些工作**根本不需要耗费昂贵的 LLM 算力去反复推理猜想**。
-- **原理**：Astrolabe 直接用 Rust 原生快速扫描源码并解析 `import` / `use` 语句，结合各语言构建配置（Cargo / Go Module / Maven / tsconfig / pubspec 等）把模块路径精确映射成一张依赖拓扑图。查文件、查影响范围 1 秒返回精准结果，**一分钱 Token 都不用花**，而且保证 100% 确定，零模型幻觉。
-
-### 2. 按需 LSP 分流：聪明干活、从不赖着不走的语言专家
-- **人话解读**：平时的架构浏览和依赖梳理只走超轻量的图谱；只有遇到“跨文件安全重命名”、“精确函数跳转”、“编译器语法诊断”这些真正需要编译器级精准分析的硬骨头时，Astrolabe 才会在后台悄悄启动对应的语言服务器（LSP）。
-- **原理**：一旦这几个重型任务完成，语言服务器闲置超过 5 分钟就会被**自动回收释放**，绝不长期常驻霸占机器内存。兼顾了“编译器级精确”与“极致轻量”。
-
-### 3. 防漂移三级火箭与 Hook 拦截：专治 AI 的“健忘与偷懒”
-- **人话解读**：AI 像个容易健忘的学生，聊久了就经常偷懒，放弃专业工具重新开始盲目 grep 和全文裸读代码。
-- **原理**：Astrolabe 设计了三层递进约束体系：
-  - **L1 握手注入**：会话建立第一秒就将当前仓库绝对根目录和工具使用军规刻进上下文；
-  - **L2 行为指导**：握手 `instructions` 与 `print-cc-system-prompt-override` 注入工具守则，明确禁止盲目大面积读代码；
-  - **PreToolUse 门禁 Hook**：在底层的工具调用拦截层设卡 —— 一旦抓到 AI 连续 3 次无脑 grep 或连续 3 次大段裸读源码，**直接敲黑板打断并报错拦截**，逼迫 AI 回归星盘图谱工具；同时对特定小范围的精准行阅读智能放行。
-
----
-
-## 四、10 秒极速上手（傻瓜化配置）
-
-无论是 Claude Code 还是 Cursor，只需两步即可完成接入：
-
-### 第一步：获取二进制文件（约 11 MB 单文件，无运行时依赖）
-
-#### 选项 A：开箱即用二进制（推荐，支持 macOS / Windows）
-Astrolabe 提供了已完成本地原生编译的 Release 产物（位于本仓库 `dist/release-binaries/`，亦可在 GitHub Releases 中下载）：
-
-- **macOS（Universal 通用二进制，支持 M1/M2/M3/M4 及 Intel）**：
-  ```bash
-  # 复制到系统路径并赋予执行权限
-  mkdir -p ~/.cargo/bin /usr/local/bin
-  cp dist/release-binaries/astrolabe-macos-universal ~/.cargo/bin/astrolabe
-  chmod +x ~/.cargo/bin/astrolabe
-  xattr -d com.apple.quarantine ~/.cargo/bin/astrolabe 2>/dev/null || true
-  ln -sf ~/.cargo/bin/astrolabe /usr/local/bin/astrolabe
-  
-  # 验证安装
-  astrolabe -h
-  ```
-- **Windows (x64)**：
-  解压 `dist/release-binaries/astrolabe-windows-x64.zip`，将 `astrolabe-windows-x64.exe` 放置在如 `C:\Tools\astrolabe\astrolabe.exe`，并将其添加到系统环境变量 `PATH` 中。
-
-#### 选项 B：从源码编译（需 Rust 1.90+）
-```bash
-git clone <repo-url> astrolabe && cd astrolabe
-cargo build --release
-# 产物即为：target/release/astrolabe（单文件约 11 MB）
-```
-
-#### 选项 C：npx 免安装运行（Node 环境）
-```bash
-npx -y astrolabe /path/to/your/repo
-```
-
-> **详细平台支持与配置说明**：请参阅完整文档 [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md)。
-
----
-
-### 第二步：配置 AI 编程客户端（复制粘贴即用）
-
-#### 1. Claude Code 配置
-在全局配置 `~/.claude.json` 或项目级根目录 `.mcp.json` 中添加：
-
-```json
-{
-  "mcpServers": {
-    "astrolabe": {
-      "command": "/usr/local/bin/astrolabe",
-      "args": [".", "--context=claude-code"],
-      "env": {}
-    }
-  }
-}
-```
-*(Windows 用户将 command 替换为实际路径，如 `"C:/Tools/astrolabe/astrolabe.exe"`)*
-
-> **注入防漂移 Hook（强烈推荐）**：
-> 将以下配置写入项目 `.claude/settings.json`（或全局 `~/.claude/settings.json`），即可开启自动防偷懒拦截：
-> ```json
-> {
->   "hooks": {
->     "PreToolUse": [
->       {
->         "matcher": "",
->         "hooks": [
->           {
->             "type": "command",
->             "command": "astrolabe hooks remind --client=claude-code"
->           }
->         ]
->       }
->     ],
->     "SessionEnd": [
->       {
->         "matcher": "",
->         "hooks": [
->           {
->             "type": "command",
->             "command": "astrolabe hooks cleanup"
->           }
->         ]
->       }
->     ]
->   }
-> }
-> ```
-
-#### 1b. Codebuddy / Grok 等 CLI
-
-Astrolabe 防漂移 Hook 层已内置对 **Codebuddy** 与 **Grok** 客户端的识别与拦截输出：
-- `--client=codebuddy`：走与 Claude Code 同构的工具名识别规则（覆盖 `grep`、`read`、`search_for_pattern`、`read_file` 及 shell 常见命令），输出兼容 CC 的 `hookSpecificOutput` 结构化决策；
-- `--client=grok`（支持 `grokbuild`、`grok-build` 别名）：识别 `grep` 与 `read_file` 及 shell 命令，输出 Grok 规范的扁平 JSON 格式（`{"decision":"deny","reason":...}`）；
-- **Context 行为**：Codebuddy 与 Grok 目前均使用 `default` 温和级上下文（无特殊 schema 限制或工具过滤，无需指定单独 `--context` 参数）。
-
-> **Hook 配方示例（适用于宿主支持 CC 兼容 hooks 的情况）**：
->
-> 若要对该客户端**硬禁用** Grep/Glob/shell 文本搜索，在 mcp.json 的 Astrolabe `env` 与 hooks 命令两侧同时打开开关，例如：
->
-> ```json
-> {
->   "mcpServers": {
->     "astrolabe": {
->       "command": "astrolabe",
->       "args": ["--context=claude-code"],
->       "env": {
->         "ASTROLABE_DENY_TEXT_SEARCH": "true"
->       }
->     }
->   }
-> }
-> ```
->
-> ```json
-> "command": "ASTROLABE_DENY_TEXT_SEARCH=true astrolabe hooks remind --client=claude-code --deny-text-search"
-> ```
->
-> 或把 `deny_text_search: true` 写进自定义 context YAML，hooks 用 `--context=/path/to.yml`（优先级：CLI `--deny-text-search` > 环境变量 > context YAML > 默认 off）。
->
-> 若所使用的 Codebuddy 或 Grok 宿主环境支持 Claude Code 兼容的 hooks 配置语法，可沿用与上方 CC 相同的 settings 配方，只需将 PreToolUse 命令中的 `--client` 替换为对应值即可：
->
-> *Codebuddy 示例*：
-> ```json
-> {
->   "hooks": {
->     "PreToolUse": [
->       {
->         "matcher": "",
->         "hooks": [
->           {
->             "type": "command",
->             "command": "astrolabe hooks remind --client=codebuddy"
->           }
->         ]
->       }
->     ],
->     "SessionEnd": [
->       {
->         "matcher": "",
->         "hooks": [
->           {
->             "type": "command",
->             "command": "astrolabe hooks cleanup"
->           }
->         ]
->       }
->     ]
->   }
-> }
-> ```
->
-> *Grok 示例*：
-> 将 command 替换为 `astrolabe hooks remind --client=grok` 即可。若宿主为其它自定义 hook 触发机制，只需将 PreToolUse payload（包含 `session_id` 与 `tool_name` 等 JSON 字段）经 stdin 送入该命令，并读取 stdout 返回的扁平 deny 决策。
-
-#### 1c. Cursor / Kimi / ZCode / OpenCode / Grok Build
-
-##### 1. Cursor CLI
-
-Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容能力：
-- **配置文件**：放置于 `~/.cursor/hooks.json`（全局）或当前项目根目录 `.cursor/hooks.json`。事件名使用小驼峰（`preToolUse`、`sessionEnd`）。另外，Cursor 也会自动加载 `.claude/settings.json`（第三方兼容模式，PreToolUse 自动映射，但注意该模式不映射 `additionalContext`）。
-- **工具识别与输出格式**：内置工具名包括 `Shell`、`Read`、`Write`、`Grep`、`Task`；Astrolabe `--client=cursor`（别名：`cursor-agent`、`cursor_agent`、`cursor-cli`）输出 Cursor 原生扁平格式 `{"permission":"deny","user_message":...,"agent_message":...}`，长引导文案直接注入 `agent_message` 送达模型。
-- **会话识别兼容**：Cursor 原生 preToolUse 事件仅传递 `conversation_id`，Astrolabe 内部会话提取逻辑已原生兼容 `conversation_id` / `conversationId` fallback。
-
-**完整配方（`.cursor/hooks.json`）**：
-```json
-{
-  "version": 1,
-  "hooks": {
-    "preToolUse": [
-      {
-        "command": "astrolabe hooks remind --client=cursor",
-        "matcher": "Shell|Read|Grep"
-      }
-    ],
-    "sessionEnd": [
-      {
-        "command": "astrolabe hooks cleanup"
-      }
-    ]
-  }
-}
-```
-
-##### 2. Grok Build
-
-针对 `xai-org/grok-build`（CLI 名 `grok`）：
-- **配置文件**：放置于 `~/.grok/hooks/astrolabe.json`（全局）或项目级 `.grok/hooks/astrolabe.json`。
-- **项目级授信提示**：若使用项目级 hooks 配置，必须在 Grok CLI 中执行 `/hooks-trust` 完成授信后方可生效。
-- **匹配与决策**：Grok 内置工具使用 snake_case（`run_terminal_command`、`read_file`、`grep`），matcher 建议同时编写 PascalCase 别名与 snake_case：`"Bash|Read|Grep|run_terminal_command|read_file|grep"`。Astrolabe 原生兼容驼峰 payload（`sessionId`、`toolName`、`toolInput`），并通过 `--client=grok` 输出 Grok 一等公民原生扁平决策 `{"decision":"deny","reason":...}`；退出码遵循规范（2 代表阻断、1 代表 fail-open 放行）。
-
-**完整配方（`~/.grok/hooks/astrolabe.json`）**：
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash|Read|Grep|run_terminal_command|read_file|grep",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "astrolabe hooks remind --client=grok",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "astrolabe hooks cleanup",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-##### 3. Kimi Code CLI 与 ZCode
-
-- **Kimi Code CLI**（Moonshot，CLI 命令 `kimi`，仓库 `MoonshotAI/kimi-code`）：
-  - 配置文件位于 `~/.kimi-code/config.toml` 的 `[[hooks]]` 配置块（支持 `PreToolUse`、`PostToolUse` 与 `matcher`）；
-  - 协议与 Claude Code 同构（通过 stdin 输入 JSON：包含 `session_id`、`tool_name`、`tool_input`；deny 拦截输出 `hookSpecificOutput` 结构化决策或 exit 2 阻断）；内置工具识别覆盖 `Read`、`Grep`、`Bash`；
-  - PreToolUse 命令参数使用 `--client=kimicode`（别名：`kimi-code`、`kimi_code`、`kimi`）；
-  - *示意配置（注：TOML 具体键名未经逐字核对，以下为示意级示例，请以官方文档为准）*：
-    ```toml
-    # ~/.kimi-code/config.toml 示意配置（具体键名以官方文档为准）
-    [[hooks]]
-    event = "PreToolUse"
-    matcher = "Read|Grep|Bash"
-    command = "astrolabe hooks remind --client=kimicode"
-
-    [[hooks]]
-    event = "SessionEnd"
-    command = "astrolabe hooks cleanup"
-    ```
-- **ZCode**（智谱 Z.ai，仓库 `zai-org/ZCode`）：
-  - **事件集与 Claude Code 不同**：ZCode 仅支持 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`PostToolUseFailure`、`Stop` 七个事件，且对事件名做严格校验——**配置中出现 `SessionEnd` 等未知事件会导致整段 hooks 加载失败**（PreToolUse 也随之失效，见 issue #30）。
-  - **配置文件**：用户级 `~/.zcode/cli/config.json`（Windows：`%USERPROFILE%\.zcode\cli\config.json`）的 `hooks` 字段。注意必须有 `"enabled": true`，且事件写在 `events` 包装层内（与 CC 的 `hooks.PreToolUse` 直挂不同）。ZCode 读到的 `~/.claude/settings.json` 等 CC 旧配置默认是禁用、只读的，不能依赖。
-  - **不要**把 `astrolabe hooks cleanup` 挂到 `Stop` 上：`Stop` 每轮回答结束都会触发，会把防漂移计数每轮清零。ZCode 无 `SessionEnd`，状态目录由 `astrolabe hooks remind` 内置的过期 GC 自动清理（超过 24 小时未活动的会话，可用 `ASTROLABE_HOOK_GC_HOURS` 调整），也可手动执行 `astrolabe hooks gc`。
-  - 配置示例（合并进已有 `config.json`，保留其它字段）：
-    ```json
-    {
-      "hooks": {
-        "enabled": true,
-        "events": {
-          "PreToolUse": [
-            {
-              "matcher": "*",
-              "hooks": [
-                {
-                  "type": "command",
-                  "command": "astrolabe hooks remind --client=zcode",
-                  "timeout": 10
-                }
-              ]
-            }
-          ]
-        }
-      }
-    }
-    ```
-  - `--client=zcode`（别名：`z-code`、`zai`）：已对照 ZCode 3.14.1 源码核实，stdin 为 CC 同构 payload（`session_id`、`hook_event_name`、`tool_name`、`tool_input`、`tool_use_id`、`cwd`、`transcript_path` 等，另附 camelCase 副本）；内置工具名 `Read`（`file_path`/`offset`/`limit`）、`Grep`、`Glob`、`Bash`（`command`），MCP 工具名为 `mcp__<server>__<tool>`；stdout JSON 的 `hookSpecificOutput.permissionDecision: "deny"` 生效，exit 2 亦视为 deny（以 stderr 为原因），其它非零退出码视为 hook 执行失败。matcher 使用 `*`：remind 需要同时看到 `mcp__astrolabe__*` 调用才能清零计数，非相关工具由 Astrolabe 自行放行。
-
-##### 4. OpenCode
-
-针对 `anomalyco/opencode`（`opencode.ai`）：
-- **机制说明**：OpenCode 宿主本身未提供预置 hooks 命令体系，但提供了灵活的 TypeScript 插件扩展能力。通过在 `tool.execute.before` 钩子中抛出 `Error` 即可实现工具调用拦截。
-- `--client=opencode` 输出扁平 `{"decision":"deny","reason":...}`，正好供 TypeScript 桥接插件解析。
-- **桥接插件模板（`.opencode/plugins/astrolabe-guard.ts`）**：
-```typescript
-import type { Plugin } from "@opencode-ai/plugin";
-
-export const AstrolabeGuard: Plugin = async () => {
-  return {
-    "tool.execute.before": async (input, output) => {
-      const payload = JSON.stringify({
-        session_id: input.sessionID,
-        tool_name: input.tool,
-        tool_input: output.args ?? {},
-      });
-      const proc = Bun.spawnSync(["astrolabe", "hooks", "remind", "--client=opencode"], {
-        stdin: payload, stdout: "pipe", stderr: "pipe",
-      });
-      const stdout = new TextDecoder().decode(proc.stdout).trim();
-      if (stdout) {
-        const decision = JSON.parse(stdout);
-        if (decision.decision === "deny") {
-          throw new Error(decision.reason);
-        }
-      }
-    },
-  };
-};
-export default AstrolabeGuard;
-```
-
-#### 2. Cursor 配置
-在项目根目录 `.cursor/mcp.json` 中添加配置：
-
-```json
-{
-  "mcpServers": {
-    "astrolabe": {
-      "command": "/usr/local/bin/astrolabe",
-      "args": [".", "--context=cursor"]
-    }
-  }
-}
-```
-
-配置 MCP 之后，请按 [安装指南「Cursor 配置」](docs/INSTALL_GUIDE.md#2-cursor-配置) 写入 `~/.cursor/permissions.json`，或运行 `node scripts/setup-cursor-permissions.mjs`，以免去 Cursor 原生 MCP 审批。
-
-#### 3. Codex / Windsurf 等通用客户端
-- **Codex**：在 `~/.codex/config.toml` 中配置 `args = [".", "--context=codex"]`。
-- **通用客户端**：使用标准输入输出（stdio），日志统一走 stderr（stdout 为 JSON-RPC 通道），完全符合标准 MCP 规范。
-
----
-
-## 五、AI 助手可以用它做什么？（核心工具速查）
-
-Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、依赖图、热点、重命名、记忆等 15 个入口已移除，无兼容层）：
-
-| 工具名称 | 核心参数 | 它能帮 AI 解决什么？（大白话解读） |
-|---|---|---|
-| `resolve_context` | `task_description` | **【核心主入口】** 丢给它一句任务描述，它自动把相关代码骨架、依赖邻域与核心文件聚合整理好；结果末尾一行提示下一步该用哪个工具。 |
-| `search_code` | `query`, `path_filter`, `offset`, `group`, `aggregate`, `exclude`, `skip_comments`, `count_only` | **确定性代码全文检索**：带正则与路径过滤；少量命中（≤5 处）自带所在函数体；跨文件命中自动分组并标注 `[定义]/[使用]/[加载]/[注释]/[断言]/[引用]` 角色（业务代码在前、测试在后；命中不多时每行全部展开）；每次结果末尾有一行“汇总”（总命中数、文件数、是否完整）；同会话已输出的函数体折叠为带签名的指针，重复查询返回首次结果的摘要（计数、最多命中的文件、首处与签名）；宽查询（>60 处）按目录汇总计数并预览最相关命中；零命中给出相近名称建议；结果被截断时给出 `total` 和 `next_offset`。`aggregate=top|dir|file` 按顶层目录/目录/文件统计，每行“N 处 / M 个文件”并给总计（统计、计数每个目录有多少处调用）；`count_only` 只返回总数；`skip_comments=true` 跳过注释与字符串里的命中；`exclude` 为 glob 黑名单（如 `["vendor","_test.go","*_test.go"]`），三者可组合；命中多时结果末尾提示这些用法；汇总行写“23/23 处，无截断”；文档命中单列“文档”组。 |
-| `find_symbol` | `query` | **快速定位符号**：按名字或子串秒搜函数、类或类型，可直接带出定义体。 |
-| `find_references` | `symbol`, `path`, `dry_run_rename` | **编译器级引用查找**：找到全库中所有调用该符号的准确位置；传 `dry_run_rename=新名` 得到按文件的改名清单（只读，不写盘），用于批量改名。 |
-| `goto_definition` | `path`, `symbol` | **精准定义跳转**：利用 LSP 语义绑定直达真实定义处。 |
-| `get_diagnostics` | `path` | **改后即时体检**：获取当前文件的语法报错与类型错误。 |
-| `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态。 |
-
-## 六、进阶配置与运行细节
-
-### 1. 仓库定位逻辑
-启动时按以下顺序判定要索引的仓库根目录：
-1. **显式指定优先**：CLI 位置参数（如 `astrolabe /path/to/repo`）或环境变量 `ASTROLABE_ROOT`。用户明确给出的路径直接采用，不做任何拦截；目录里装了多个子项目时，最多提醒一句，不替用户做主。
-2. **默认 `.` 时，先向上找**：从当前目录一路向上找最近的 `.git`（支持普通目录、worktree、submodule）或 `.serena/project.yml`，找到即为仓库根——哪怕你是在仓库深处的子目录里启动，也能正确解析到仓库根。
-3. **向上找不到，再看脚下**：比如在一个普通的非 git 目录里启动。此时检查当前目录的**直接子目录**里有没有 `.git`，也就是“一个目录装了多个项目”的情况——命中则进入多项目模式（见下一节）。
-4. **都不沾边，数数把关**：子目录里也没有 `.git` 时，清点当前目录的文件数量。不超过 2 万个，当作普通目录正常索引；超过 2 万个则**拒绝启动**，并打印两条出路：进入具体项目目录再启动，或用 `ASTROLABE_ROOT` 显式指定。上限可用 `ASTROLABE_MAX_ROOT_FILES` 调整。
-
-**为什么要立这些规矩？** 很多人把项目集中放在一个“收纳目录”里（比如 ~/Projects 装了十几个仓库）。旧版本在这种目录里启动，会把几十万个文件当成一个巨型仓库硬啃，内存和 CPU 直接被打爆——真实案例：一个 35 万文件的目录吃掉了 5 GB 内存。新规则兜住底线：**无论在哪个目录启动，都不会失控**。
-
-> **安全机制**：每条工具输出第一行均包含 `index_root: /abs/path`。当路径与当前正在编辑的仓库不匹配时，智能体会明确收到提示，绝不会张冠李戴。传入不存在的目录会直接报错退出，不会静默索引错地方。
-
-### 2. 多项目目录：用到哪个子项目，就索引哪个
-检测到当前目录装着多个 git 子项目时（上一节的第 3 步），Astrolabe 绝不建“大而全”的总索引：
-- **启动零负担**：不为父目录建任何总索引，启动瞬间完成。
-- **用到才建，建在子项目自己家里**：AI 的提问或操作涉及到某个子项目时，才临时为**那个子项目**建索引；索引缓存文件也放在子项目自己的目录里，父目录不会堆积任何索引数据。
-- **来得快，让得也快**：同一时刻最多 3 个子项目保持“活跃”（最久没用的会让位）；一个子项目 5 分钟没人用，就自动释放干净——文件监听、缓存、语言服务器全部停掉。下次再用，秒级热身恢复，不必从头建起。
-- **指代不清就问，绝不猜**：AI 的提问同时提到两个子项目、说不清要哪个时，工具会返回子项目清单让 AI 自己挑。
-
-两个上限/时长可调：`ASTROLABE_RESIDENT_ROOTS`（同时活跃的子项目数，默认 3）、`ASTROLABE_IDLE_EVICT_SECS`（闲置多少秒后自动释放，默认 300）。
-
-### 3. 客户端上下文（`--context`）
-内置 5 种客户端上下文模式：
-- `default`：通用默认模式。
-- `claude-code`：专为 Claude Code 优化，关闭破坏性的残缺 `structuredContent`，只返回安全完整的文本流。
-- `cursor`：专为 Cursor 优化，保证 `content[0]` 始终为有效文本，避免被 Cursor 静默丢弃。
-- `codex`：适配 Codex 的 cwd 与参数特性。
-- `readonly`：**只读安全模式**（目录工具均为只读，适用于安全审计、演示账号或只读审查代理）。
-
-### 4. 环境变量速查表
-
-按主题聚拢排列：仓库定位与多项目 → 客户端与输出 → 索引更新与缓存 → 语言服务器与拦截 → 日志。
-
-| 环境变量 | 作用说明 | 默认值 |
-|---|---|---|
-| `ASTROLABE_ROOT` | 指定被索引仓库的根目录 | `.` (自动探测) |
-| `ASTROLABE_MAX_ROOT_FILES` | 非 git 目录建索引的文件数上限，超过则拒绝启动并提示 | `20000` |
-| `ASTROLABE_RESIDENT_ROOTS` | 多项目目录下同时保持活跃的子项目数上限 | `3` |
-| `ASTROLABE_IDLE_EVICT_SECS` | 多项目模式下子项目闲置多少秒后自动释放 | `300` |
-| `ASTROLABE_CONTEXT` | 指定客户端模式（`default` / `claude-code` / `cursor` / `codex` / `readonly`） | `default` |
-| `ASTROLABE_STRUCTURED` | 是否开启结构化输出（`1` 开启，`0` 关闭） | 默认关闭 |
-| `ASTROLABE_RESOURCE_THRESHOLD` | 工具结果超过该 token 估算值时卸载为 MCP resource（附前瞻摘要）；实际阈值为它与 `budget_tokens`（钳制后）的较大值 | `4000` |
-| `ASTROLABE_MAX_BUDGET_TOKENS` | `budget_tokens` 硬上限：动态卸载阈值取 `max(阈值基线, budget)` 时防止异常大的 budget 把阈值顶穿 | `32000` |
-| `ASTROLABE_WATCH_SECS` | 文件变更监听：未设置走原生系统事件（空闲 0% CPU）；`0` 关闭；`N` 走轮询兜底 | 未设置（原生事件优先） |
-| `ASTROLABE_REINDEX_MS` | 两次索引更新之间的最小间隔毫秒数（0 关间隔） | `2000` |
-| `ASTROLABE_STORM_PATHS` | 一次文件变动超过多少个路径时退回整库核对 | `5000` |
-| `ASTROLABE_BARRIER_MAX` | 查询前“自动体检”当场补修的文件数上限 | `64` |
-| `ASTROLABE_SAFETY_SECS` | 兜底巡检间隔秒数（0 关闭） | `1800` |
-| `ASTROLABE_CACHE_MB` | 文件解析内存缓存大小预算（MB） | `256` |
-| `ASTROLABE_PARSE_CACHE_MB` | 增量索引的内存缓存预算（MB） | `256` |
-| `ASTROLABE_LSP_TIMEOUT` | 单次 LSP 语言服务器响应超时时间（秒） | `300` |
-| `ASTROLABE_LSP_DART` | 覆盖 Dart 语言服务器（`dart language-server`）可执行文件路径 | 自动探测（随 Dart/Flutter SDK 自带） |
-| `ASTROLABE_LSP_<LANG>` | 覆盖指定语言 LSP 服务器可执行文件路径（如 `ASTROLABE_LSP_PYTHON`, `ASTROLABE_LSP_RUST`, `ASTROLABE_LSP_C` 等） | 自动探测对应 LSP |
-| `ASTROLABE_SEARCH_REPEAT_MAX` | 防循环：同一条 `search_code` / `find_symbol` 查询（查询串 + path_filter + 选项（含 budget_tokens、offset）完全相同）在窗口内最多执行几次，超出后不再重新搜索，直接返回“已执行过、请使用先前结果或换方法”的短提示（`0` 关闭） | `3` |
-| `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` | 上述重复查询的滑动窗口秒数 | `600` |
-| `ASTROLABE_SEARCH_RATE_MAX` | 防循环：窗口内搜索工具（`search_code` + `find_symbol`）总调用次数超过该值后，在结果末尾追加循环警告（仍正常返回结果；`0` 关闭） | `300` |
-| `ASTROLABE_SEARCH_RATE_WINDOW_SECS` | 上述总频率的滑动窗口秒数 | `600` |
-| `ASTROLABE_SLICE_READ_MAX` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为切片读 | `200` |
-| `ASTROLABE_SLICE_READ_THRESHOLD` | 连续切片读提醒阈值：连续 N 次切片读且期间无任何 Astrolabe 工具调用时触发 deny | `10` |
-| `ASTROLABE_READ_THRESHOLD` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） | `3` |
-| `ASTROLABE_GREP_THRESHOLD` | 连续 Grep/shell 文本搜索 deny 阈值（soft 模式；`1` ≈ 首次即拦） | `3` |
-| `ASTROLABE_DENY_TEXT_SEARCH` | 硬禁用宿主 Grep / Glob / shell 文本搜索（`true`/`1`/`yes`/`on`）；开启后首次即 deny，覆盖 soft 阈值。多进程/多客户端可在各自 mcp.json `env` 中分别配置 | 关闭 |
-| `ASTROLABE_DENY_SILENCE_SECS` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） | `15` |
-| `RUST_LOG` | 日志级别（`error` / `warn` / `info` / `debug`） | `info` |
-
-### 5. 索引缓存与增量更新
-- **哈希增量缓存**：解析结果按内容哈希持久化于被索引仓库下的 `.astrolabe/` 目录（自动写入 `.gitignore`，不污染版本控制）。未变更的文件二次索引时跳过语法解析，冷启动 1.0 秒、热启动 0.1 秒。
-- **只补改动，不掀屋顶**：保存文件后只重新解析改动的那几个文件、只更新受影响的部分，不再整库重建；改的是文档、日志这类不参与索引的文件时，连重建都不会触发。
-- **多开不打架**：同一个仓库开多个 AI 会话（多个 Astrolabe 进程）时，多个进程里只有一位“账房先生”负责写磁盘缓存，其他人只用自己的内存副本——互不抢锁，也不重复干活。
-- **答案出场前的自动体检**：每次查询返回前，顺带核对结果涉及的文件是不是最新版本。个别文件过期就当场补修，快到无感；大面积过期时不装没事，会在结果里如实标注“结果可能过期”，并触发后台补建。当场补修的文件数上限由 `ASTROLABE_BARRIER_MAX` 控制（默认 64）。
-- **漏网之鱼的兜底**：极少数情况下，操作系统的文件通知可能漏发。Astrolabe 会低频巡检补漏（默认每 30 分钟一次，检测到异常会自动加大巡检频率），间隔由 `ASTROLABE_SAFETY_SECS` 调整。
-- **启动期间改文件不丢失**：先登记文件清单、再建图。建图期间保存的文件，会在建完后自动补进索引，不会出现“刚启动时改的代码查不到”。
-- **重建期间不断服务、坏编辑不瘫痪**：后台自动监听文件变更，改动时平滑更新图谱；重建期间旧索引继续对外服务，保存文件不会中断工具调用。一次语法错误的坏编辑只记日志并保留旧图，绝不使服务瘫痪。
-
-### 6. 语言服务器的生命周期管理
-精确层调用的语言服务器完全实现智能化按需调度：
-- **空闲 5 分钟自动释放**：单次问答中保持热态，跨任务后自动回收，绝不占用系统常驻资源。
-- **内存防护上限**：稳态内存上限设为 2 GiB，硬上限 4 GiB，防止失控的语言服务器拖垮整机。
-- **真就绪判定**：监控语言服务器启动后必须连续安静 1 秒无待处理任务，才正式标记为就绪，彻底杜绝冷索引期返回虚假空结果导致误删代码的问题。
-
-### 7. 语言支持与 LSP 矩阵
-
-Astrolabe 深度适配主流语言构建系统与语言服务器，实现无 LLM 消耗的文件级确定性图谱与按需编译级精确分析：
-
-| 语言 | 扩展名 | LSP 语言服务器 | 环境变量覆盖 | 备注 |
-|---|---|---|---|---|
-| **Python** | `.py`, `.pyi` | `pyright` | `ASTROLABE_LSP_PYTHON` | `npm i -g pyright`；支持 `pyproject.toml`、PEP 420 命名空间包 |
-| **Go** | `.go` | `gopls` | `ASTROLABE_LSP_GO` | `go install golang.org/x/tools/gopls@latest`；支持 `go.mod`、`go.work` |
-| **Rust** | `.rs` | `rust-analyzer` | `ASTROLABE_LSP_RUST` | `rustup component add rust-analyzer`；支持 Cargo workspace |
-| **Java** | `.java` | `jdtls` | `ASTROLABE_LSP_JAVA` | `brew install jdtls`；支持 Maven、Gradle 源根解析 |
-| **TypeScript / JS** | `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs` | `typescript-language-server` | `ASTROLABE_LSP_TYPESCRIPT` | 支持 `tsconfig.json` paths、Node workspace `package.json` |
-| **C / C++** | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++`, `.ipp`, `.inl`, `.tpp`, `.tcc`, `.cu`, `.cuh`, `.cppm`, `.ixx` | `clangd` / `ccls` | `ASTROLABE_LSP_C`, `ASTROLABE_LSP_CXX` | `clangd --background-index`；支持 `#include` 路径解析；`.h` 按内容判定：含 `@interface` / `#import` 等 ObjC 标记归 ObjC，含 C++ 构造归 C++，否则为 C；C++ 抽取含析构函数与嵌套命名空间 |
-| **Swift** | `.swift` | `sourcekit-lsp` | `ASTROLABE_LSP_SWIFT` | `xcode-select --install`：macOS Command Line Tools 自带 `sourcekit-lsp`（Linux / Windows 需另装 [Swift 工具链](https://www.swift.org/install/)）。Astrolabe 以 `backgroundIndexing` 启动 sourcekit-lsp，SwiftPM 包无需事先 `swift build` 即可跨文件查引用；没有 `Package.swift`（纯 Xcode 工程）或代码处于本机不生效的 `#if` 分支时，`find_references` 退回 tree-sitter 检索，标为 `Syntactic`。tree-sitter 符号抽取：class / struct / enum / protocol / extension / actor / func / init / 属性 / typealias；带大段属性（如 `@Test(arguments:)`）的声明锚点落在名字所在行 |
-| **Objective-C / ObjC++** | `.m`, `.mm`，以及判定为 ObjC 的 `.h` | `clangd`（回退 `sourcekit-lsp`） | `ASTROLABE_LSP_OBJC`, `ASTROLABE_LSP_OBJCPP` | `brew install llvm` / `apt-get install clangd`。仓库没有 `compile_commands.json` 时，Astrolabe 在 `.astrolabe/clangd/` 生成一份（`-x objective-c`、`-fobjc-arc`、头文件搜索路径；macOS 用 `xcrun` 的 SDK，Linux 用自带的 Foundation 桩头文件），ObjC 的 `.h` 也按 ObjC 交给 clangd。语言服务器没有索引时，`find_references` 退回 tree-sitter 检索，标为 `Syntactic`。tree-sitter 符号抽取：`@interface` / `@implementation` / `@protocol` / category / 方法（完整 selector）/ 属性。解析前把 Cocoa 宏（`NS_ASSUME_NONNULL_*`、弃用 / 可用性宏等）与 `#if` 分支改写成可解析形式（行号不变）；`.mm` 先把 range-for、`auto`、lambda、引用等 C++ 写法改写后走 ObjC 语法，再用 C++ 语法解析一遍合并结果。签名从原始源码截取。`RCT_ENUM_CONVERTER` 这类复杂宏内的声明仍可能漏 |
-| **PHP** | `.php` | `intelephense` / `phpactor` | `ASTROLABE_LSP_PHP` | `npm i -g intelephense`；支持 include/require 路径解析 |
-| **Vue** | `.vue` | `vue-language-server` (Volar) | `ASTROLABE_LSP_VUE` | `npm i -g @vue/language-server typescript-language-server typescript`。Volar 2.x 以 `hybridMode=false` 单进程运行；Volar 3.x 自动识别版本，由 Astrolabe 桥接 `typescript-language-server` + `@vue/typescript-plugin`（转发 `tsserver/request`），跳转/引用/hover 由带插件的 TS 服务回答。SFC 内嵌 `<script>` / `<script setup>` 走 TS/JS 语法抽取；另抽组件名、`defineProps` / `defineEmits` / `defineModel` 与选项式 API 的 props / emits |
-| **Dart** | `.dart` | `dart language-server` | `ASTROLABE_LSP_DART` | 随 Dart / Flutter SDK 自带；`pubspec.yaml` 行级解析与多 pubspec monorepo 支持；`rootUri` 置 `null` 规避重复分析 |
-| **C#** | `.cs`, `.csx`, `.razor`, `.cshtml` | `Microsoft.CodeAnalysis.LanguageServer`（可选 Roslyn） | `ASTROLABE_LSP_CSHARP` | `.cs` / `.csx` / `.razor` / `.cshtml` 同为 C#（不另建语言变体，没有 Razor 语言）。`.csx` 用 C# 语法（含顶层语句与 local function）。`.razor` / `.cshtml` 在 tree-sitter 之前抽出 C#（`@code`、`@{ }`、行首 `@using` / `@inherits`；标记不当成 C# 符号；换行保留，列号不映射）。没有工程时 Roslyn 加载不了松散 `.csx`，这类脚本只走语法索引。命名空间 using 扇出到每个声明文件（不进 PageRank），`_ViewImports.cshtml` 的 `@using` 走同一解析（仅仓内命名空间；`System` / NuGet 为 None）。`ProjectReference` 记为 Import。Roslyn 为 `dotnet <dll> --stdio`，需要 .NET 10 runtime（工程目标框架可更旧），不静默下载，不是 OmniSharp / csharp-ls。Razor 没有语言服务器：现有启动器只认 Roslyn 的 `solution/open` / `project/open`，不是 Razor 协议，因此没有 `ASTROLABE_LSP_RAZOR`。 |
-| **Visual Basic .NET** | `.vb` | 同一个 `Microsoft.CodeAnalysis.LanguageServer` | `ASTROLABE_LSP_CSHARP`（与 C# 共用，无第二个变量） | 只索引 `.vb`（不含 `.bas` / `.frm`）。`Imports` 命名空间扇出到每个声明文件（Namespace，不进 PageRank）；类型 `Imports` 仅在恰好一个仓内目标时记为 Import。`.vbproj` 的 `ProjectReference` 与 C# 一样记在项目元数据上，工程文件本身不是图节点，不伪造边。`.sln` / `.vbproj` 走同一 `dotnet <dll> --stdio`。 |
-| **Kotlin** | `.kt`, `.kts` | `kotlin-lsp`（回退 `kotlin-language-server`） | `ASTROLABE_LSP_KOTLIN` | `brew install JetBrains/utils/kotlin-lsp`（预览版，或从 [Releases](https://github.com/Kotlin/kotlin-lsp/releases) 下载）；回退 `brew install kotlin-language-server`。class / interface / object / companion / fun / 属性 / typealias / enum entry；import 按文件声明的 `package` 解析（包名不必与目录一致），支持与 Java 混写项目 |
-| **Shell / Bash** | `.sh`, `.bash`，以及 `#!` 为 sh/bash/dash/ksh 的无后缀脚本 | `bash-language-server` | `ASTROLABE_LSP_SHELL` | `npm i -g bash-language-server`（可选 `shellcheck` 提供诊断）。函数定义（含 `a::b` 风格名字）与 `source` / `.` 相对路径；`.bats` 暂按纯文本；zsh 专有语法不在 bash 语法覆盖范围内 |
-| **Ruby** | `.rb`, `.rake`, `.gemspec`，`Rakefile` / `Gemfile` 等，以及 ruby shebang 脚本 | `ruby-lsp`（回退 `solargraph`） | `ASTROLABE_LSP_RUBY` | `gem install ruby-lsp`（回退 `gem install solargraph`）。class / module / def / `def self.x` / 常量；`define_method`、`alias_method`、`attr_*` 与 `A::B` 嵌套命名；`require_relative` / `require`（经 `lib/`）解析 |
-| **Lua** | `.lua`，以及 lua/luajit shebang 脚本 | `lua-language-server` | `ASTROLABE_LSP_LUA` | `brew install lua-language-server`（或从 [Releases](https://github.com/LuaLS/lua-language-server/releases) 下载）。`function a.b:c()`、`local function`、表字段函数与模块表；`require("a.b")` → `a/b.lua` / `a/b/init.lua` |
-
----
-
-## 七、防漂移拦截机制详解 (Anti-Drift Hooks)
-
-即使有 System Prompt 军规约束，大模型在上下文拉长后依然可能出现注意力衰退（Agent Drift），退化为盲目使用 `grep` / `read`。Astrolabe 提供了硬核的门禁拦截机制：
-
-### 核心拦截与放行规则
-- **拦截（Deny）触发条件**：在没有调用 Astrolabe 符号工具的情况下，只要检测到 AI 连续 3 次无脑 grep（可用 `ASTROLABE_GREP_THRESHOLD` 调整）、连续 3 次裸读源码文件（基于 41 种支持语言源码后缀过滤，可通过 `ASTROLABE_READ_THRESHOLD` 调整；未支持语言常规读取不予拦截）、连续 4 次混合调用，或连续 10 次切片读（可通过 `ASTROLABE_SLICE_READ_THRESHOLD` 调整，期间无任何 Astrolabe 工具调用），Hook 将坚决拦截，deny 文案直接给出切换指令（"Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe)."）。
-- **硬禁用文本搜索（可选）**：设置 `ASTROLABE_DENY_TEXT_SEARCH=true`（或 hooks 命令加 `--deny-text-search`，或上下文 YAML `deny_text_search: true`）后，**首次**宿主 Grep / Glob / shell 文本搜索（`grep`/`egrep`/`fgrep`/`zgrep`/`rg`/`ag`/`ack`/`git grep`，含管道）即 deny，引导改用 `search_code` / `find_symbol` / `find_references` / `goto_definition`。默认关闭，不影响原 soft 阈值行为。适合同一机器上多个 Astrolabe MCP 进程服务不同宿主时按进程开关。注意：mcp.json 的 `env` 只作用于 MCP 进程本身；hooks 命令需同样带上该环境变量、CLI 开关，或 `--context=` 指向含 `deny_text_search: true` 的 YAML。
-- **切片精读额度制**：带有 `limit ≤ 200`（可通过 `ASTROLABE_SLICE_READ_MAX` 调整）的 Read 切片调用仍可正常使用，但不再无限豁免——连续 10 次切片读且期间无任何 Astrolabe 工具调用时触发提醒式拦截，任何 Astrolabe 工具调用（含 `search_code` 等非符号工具）都会清零该额度。`head -n N` / `tail -n N` / `sed -n 'A,Bp'` 等有界切片 shell 命令仍完全放行、不计数。
-- **计数重置**：AI 调用任意 Astrolabe 符号工具（如 `resolve_context`、`find_symbol` 等）时，全部连续计数立即清零；`search_code` 等非符号 Astrolabe 工具调用只清零切片读额度（不影响 grep/read 计数）；若连续调用间隔超过设定时间，亦自动重置。
-- **智能放行窗口**：触发 Deny 后进入 15 秒静默宽容窗口（可通过 `ASTROLABE_DENY_SILENCE_SECS` 调整）。在此窗口内 Hook 放行且不累加计数，避免在特定需要连续细查的合法场景中打断正常排查。
-- **状态存储与清理**：会话状态持久化于 `~/.astrolabe/hook_data/<session_id>/counter.json`；子代理调用时（payload 携带 `agent_id` / `agentId` 字段）按 `~/.astrolabe/hook_data/<session_id>/<agent_id>/counter.json` 分片，并发子代理各自独立计数、互不清零互不消音；会话结束时通过 `SessionEnd` 自动清理（含子代理分片目录）；无 `SessionEnd` 的宿主（如 ZCode）或会话异常退出时，`hooks remind` 每小时至多一次机会式清理超过 24 小时未活动的会话目录（`ASTROLABE_HOOK_GC_HOURS` 调整，`0` 关闭），亦可手动 `astrolabe hooks gc`，不留垃圾。
-
----
-
-## 八、质量契约：真实开源仓库验收
-
-质量不是口号，必须经得起真实复杂开源仓库的考验。Astrolabe 在 CI 的 `five-language corpus gate` 里跑两道门禁：五门主流语言的 import 解析验收（`scripts/verify.sh`），以及 v0.11 新增七门语言的声明召回验收（`scripts/recall-gate/recall_gate.py`，由 `verify.sh` 构建 debug 二进制后调用）。所有语料都锁定 commit，浅克隆并缓存。
-
-### 1. 真实开源项目内部 Import 解析率（2985 条依赖语句基准）
-
-| 语言 | 测试语料项目 | 锁定 Commit / Tag | 仓库内真实 Import 数 | 旧版方案解析率 | Astrolabe 实测解析率 |
-|---|---|---|---:|---:|---:|
-| **Python** | serena | `701e7c84` | 1575 | 12% | **100%** |
-| **Go** | gin | `v1.12.0` | 31 | 0% | **100%** |
-| **Java** | gson | `gson-parent-2.14.0` | 971 | 0% | **100%** |
-| **Rust** | ripgrep | `15.2.0` | 197 | 23% | **100%** |
-| **TypeScript** | openvisio-oss | `bdb1d2a3` | 211 | 100% | **100%** |
-
-> **分母规则严谨性**：分母严格掩码剥离注释与字符串中的虚假样例，严格识别 PEP 420 命名空间包与各语言真实语法。分母独立计算，即使解析出错也不会缩小分母掩盖问题。
-
-### 2. 符号召回率实测
-在真实语料上对照严格语法定义的扫描基线：
-- **Python**: 100.00%
-- **Rust**: 99.41%
-- **Go**: 99.29%
-- **Java**: 96.51%
-- **TypeScript**: 93.97%
-
-### 3. 新增语言声明召回门禁（每门一个锁定语料）
-
-启动真实 MCP 服务，对冻结的全部声明清单（`scripts/recall-gate/gt/*.json.gz`）逐个调用 `find_symbol` 精确查询，锚点落在声明所在文件、行号 −3 至 +20 范围内算命中；另抽 200 个名字，每个名字的所有定义都要找到。
-
-| 语言 | 测试语料项目 | 锁定 Commit | 声明数 | v0.10.2 | 当前 | CI 门槛 |
-|---|---|---|---:|---:|---:|---:|
-| **Swift** | swift-argument-parser | `efd239f0` | 4132 | 0% | **100%** | ≥99.9%，200/200 |
-| **Objective-C** | AFNetworking | `d9f589cc` | 1473 | 0.54% | **100%** | ≥99.9%，200/200 |
-| **Kotlin** | okhttp | `42e5888d` | 11732 | 0% | **100%** | ≥99.9%，200/200 |
-| **Ruby** | sinatra | `cb22afd7` | 1342 | 0% | **100%** | ≥99.9%，200/200 |
-| **Shell** | bats-core | `0c92eb4c` | 463 | 0% | **100%** | ≥99.9%，200/200 |
-| **Lua** | nvim-lspconfig | `6d27c288` | 3312 | 0% | **100%** | ≥99.9%，200/200 |
-| **Vue** | vue-vben-admin | `4634655c` | 4620 | 90.2% | **99.98%** | ≥99.9%，200/200 |
-
-> 更大语料上的结果（PR #51）：Alamofire、kotlinx.coroutines、rubocop、nvm、LuaLS、Kong、element-plus、vuejs/core、SDWebImage、MMKV、React Native 均在 99.14%–100%。Vue 唯一漏项是模块顶层 `for` 循环计数变量，本不算声明。
-
----
-
-## 九、本地开发与构建命令
+**1. Install** (macOS / Linux; verifies the release sha256):
 
 ```bash
-cargo build                                          # 构建开发版本
-cargo test --workspace                               # 运行全部单元与集成测试（190+ 项）
-bash scripts/fetch-corpora.sh                        # 拉取锁定版本的验收语料到 corpus/
-bash scripts/verify.sh                               # 五语言 import 解析 + 七门新语言声明召回验收（RECALL_GATE=0 只跑前者）
-cargo run --release --example index_bench -- <repo>  # 测试任意指定仓库的索引耗时与内存
+curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 ```
 
----
+Other ways (manual download, Windows, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md). An npm package `@astrolabe-ai/astrolabe` is prepared but **not published yet**.
 
-## 十、致敬与技术渊源 (Acknowledgements & Lineage)
+**2. Connect your client.** Claude Code:
 
-Astrolabe 站在开源代码智能体探索的坚实肩膀之上。在架构设计与关键功能实现中，我们深度汲取并由衷致敬 **[Serena](https://github.com/oraios/serena)** 与 **[OpenVisio](https://github.com/openvisio/openvisio)** 两个优秀项目的工程实践与理论思想：
+```bash
+claude mcp add --scope user astrolabe -- astrolabe . --context=claude-code
+```
 
-### 汲取自 Serena (Oraios AI) 的工程智慧
-- **三级提示词范式（Tiered Instructions L1–L3）**：学习 Serena 层次分明的 Agent 引导思路 —— 在握手阶段确立项目根与边界（L1），用连接指令与可选的 `--system-prompt` 覆写注入行为纪律（L2），在工具元数据中给出精准描述（L3），有效约束大模型遵循工具使用准则。
-- **多客户端兼容性对齐（Client Alignment）**：吸纳 Serena 在异构环境下的适配策略，包括支持 `.git` 与 `.serena/project.yml` 双标记就近项目探测（彻底杜绝子仓库与 worktree 越界），以及对 Claude Code 和 Cursor 各自 output 缺陷的精细处理。
-- **PreToolUse 防漂移拦截体系**：继承 Serena 主动对抗 Agent 遗忘偏置的治理思路，通过在 PreToolUse 阶段对高频盲目 grep / read 进行硬性计数拦截，主动将偏离轨道的 AI 重新拉回高效的图谱工具轨道。
+Cursor (`.cursor/mcp.json`): `{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`.
+Codex, Windsurf and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-client-configuration).
 
-### 汲取自 OpenVisio (OpenVisio contributors) 的算法思想
-- **目录级架构聚合图**：借鉴 OpenVisio 将微观文件依赖折叠为顶层目录或宏观模块组件视图的思想（实现保留在 core，不再单独暴露为 MCP 工具）。
-- **双向多跳邻域探索**：对齐 OpenVisio 的依赖子图切片能力，沿导入边进行 1~3 跳双向 BFS 扩展（实现保留在 core）。
-- **中心性拓扑热点探测**：借鉴 OpenVisio 基于图拓扑度数与中心度发现系统“承重墙”的算法（实现保留在 core）。
+**3. Verify.** `astrolabe --version` prints the version; in your client, ask it to call `get_languages` or `search_code`. Restart the client session after adding the server.
 
-### Astrolabe 的系统级重写与实质飞跃
-在继承上述前沿思想的同时，Astrolabe 针对传统工具在长周期生产环境下的性能瓶颈与脆弱性，**采用 Rust 进行了全面的系统级工程重写**，实现了质的跨越：
-1. **速度大幅飞跃**：将以往脚本语言动辄十几秒的索引时间压缩至 **首次 1.0 秒**，哈希缓存命中时更是低至 **0.10 秒**，彻底消除 MCP 导致 AI 陷入长时间等待的停顿感。
-2. **内存压减 99%**：利用显式资源释放的 `ParserPool` 与受限字节计权 LRU 缓存，将曾经高达 4.5 GB 的内存峰值压低至 **84 MB**，稳态常驻仅 **31 MB**，彻底消除语言服务器内存泄漏隐患。
-3. **消除静默失败**：摒弃传统正则粗暴扫描或用 `try-catch` 静默忽略解析失败的做法，深入语言构建语义，实现五大语言主流项目 **100% 导入解析率**，保证每一条返回给 AI 的结果都有据可查。
-4. **单二进制极致分发**：彻底摆脱复杂的 Python 虚拟环境或 Node 运行时依赖，打包为仅 **约 11 MB 的独立二进制文件**，开箱即用，坚若磐石。
+## The seven tools
 
----
+| Tool | Use it for |
+|---|---|
+| `search_code` | Literal/regex search with path filters. Groups hits and labels each as definition / use / comment; ends with a verifiable summary ("23/23 hits, no truncation"). Counting: `aggregate=top\|dir\|file` (hits and files per top-level dir / dir / file), `count_only`, `skip_comments`, `exclude` (e.g. `_test.go`, `vendor`). |
+| `resolve_context` | Give it a task description; it gathers relevant files and code skeletons and hints which tool to use next. |
+| `find_symbol` | Find a function, class or type by name or substring. |
+| `find_references` | Compiler-grade references via the language server; `dry_run_rename=<new name>` lists per-file edit locations without writing anything. |
+| `goto_definition` | Jump to the real definition through the language server. |
+| `get_diagnostics` | Syntax and type errors for a file. |
+| `get_languages` | Languages, file counts, lines of code, language-server status. |
 
-## 十一、开源许可证
+## Evidence: what we measured, and what we did not
 
-本项目采用 **MIT OR Apache-2.0** 双重开源授权。完整的开源合规说明与上游许可证保留信息，请参阅根目录 [NOTICE](NOTICE) 文件。
+All numbers below come from our own paired A/B runs: **A** = Claude Code without Astrolabe, **C** = the same task with Astrolabe connected. Cost is Claude Code's `total_cost_usd`, time is `duration_ms`. One model was used: `gemini-3.8-flash-high` through Claude Code and an Anthropic-compatible proxy (so USD figures use that proxy's pricing). WebSearch/WebFetch were disabled in every arm. Reports: `REPORT_V013E` and `REPORT_V012_BASELINE` (summarized in [bench/README.md](bench/README.md)).
+
+**Simultaneous pairs on v0.13.0 (40 pairs, 4 tasks, 10 pairs each).** Each pair started A and C at the same instant.
+
+| | A (no Astrolabe) | C (Astrolabe v0.13.0) | C − A, paired, 95% bootstrap CI |
+|---|---|---|---|
+| Cost, mean per run | $3.00 | $2.35 | **−$0.65 [−0.98, −0.31]** |
+| Time, mean per run | 600 s | 492 s | **−108 s [−178, −37]** |
+| Turns, mean | 50.3 | 40.0 | −10.3 [−14.4, −6.2] |
+| Correct, lenient N5 scoring | 38/40 | 40/40 | |
+| Correct, strict N5 scoring | 38/40 | 31/40 | see below |
+
+Per task (cost, C − A): N5 −$0.64 [−1.22, −0.02]; N8 −$0.91 [−1.48, −0.31]; N4 −$0.51 [−1.20, +0.21]; E3b −$0.52 [−1.22, +0.18]. The last two intervals include zero, and in N4/E3b the model never used the new `aggregate` options, so those two gains cannot be credited to them.
+
+*Strict N5 scoring:* the reference answer for N5 counts 2 call sites that sit inside comments (model=15/44, total=321). With `skip_comments=true` Astrolabe returns 15/43 and 319, which is also a defensible answer but fails the strict check. The harness scores both conventions ([bench/](bench/README.md)); we report both.
+
+**What this does not show.**
+- It covers 4 tasks that we chose because they are counting/locating/editing work. On the other 11 tasks there is **no simultaneous v0.13.0-vs-A run** yet.
+- The older v0.12.0 matrix (75 cells, 15 tasks, 5 rounds, triplets started together) found Astrolabe **more expensive**, not cheaper, than not using it: cost C − A = **+$0.244 [+0.035, +0.467]**; time +53 s [−8, +119] and correctness −4.0 points [−10.7, +2.7] both include zero. On its 40 control cells the extra cost was +$0.294 [+0.085, +0.540]. Most of that gap came from four tasks (E3b, N8, H1, N4; picked after seeing the data, so treat it as a hypothesis): without them C − A was +$0.03 [−0.14, +0.21].
+- One model, one harness, small samples (10 pairs per task). Latency per turn drifts during the day, so only simultaneous pairs are comparable for time.
+- Of the four headline tasks, N5 and N8 run on a public repo (QuantumNous/new-api). N4 and E3b ran on private repos and **cannot be reproduced** by others. The reference snapshot we used was a local copy; see [bench/README.md](bench/README.md) for how to check your checkout against it.
+
+Reproduce the public part: `bash bench/fetch_corpora.sh && bash bench/run_pairs.sh --tasks N5,N8 --pairs 10` (real API spend: our 40-pair run cost about $214), then `python3 bench/report.py`.
+
+## When it helps, when it does not
+
+- **Measured to help:** counting or listing occurrences per directory/module with exclusions (N5, N8): fewer turns and lower cost than the same model doing it with shell scripts.
+- **Not shown to help:** the 40 general-purpose control cells of the v0.12.0 matrix (small public repos such as cobra and express among them) cost more with Astrolabe; batch edit workflows (N4, E3b) were cheaper on average but not significantly.
+- **Overlap:** Claude Code can provide go-to-definition and find-references through its own LSP plugins ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)); our `goto_definition` / `find_references` overlap with that.
+- **Adoption is not guaranteed:** models sometimes ignore MCP tools. In v0.12.0 the model used Astrolabe in 0/5 runs of N5 and 1/5 of N8; after the v0.13.0 changes it did so in 20/20 runs of those two tasks. That is an observation about these tasks, not a promise.
+
+## Related projects
+
+[Serena](https://github.com/oraios/serena) (LSP-based coding toolkit), [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp), [codegraph](https://github.com/colbymchenry/codegraph), [claude-context](https://github.com/zilliztech/claude-context), the Sourcegraph MCP server, and Claude Code's built-in LSP plugins. We have not benchmarked Astrolabe against any of them; indexing-time numbers that older versions of this README published against Serena and OpenVisio are archived with their caveats in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## More documentation
+
+[Install & clients](docs/INSTALL_GUIDE.md) · [FAQ](docs/FAQ.md) · [Reference (Chinese): config, env vars, language matrix, quality gates](docs/REFERENCE.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Performance method](docs/PERFORMANCE.md) · [Optional anti-drift hooks (effect not benchmarked)](docs/HOOKS.md) · [Releasing](.github/RELEASING.md) · [llms.txt](llms.txt)
+
+Build from source: `cargo build --release --bin astrolabe` (Rust 1.90+). Tests: `cargo test --workspace`.
+
+## License
+
+MIT OR Apache-2.0, see [NOTICE](NOTICE). Astrolabe was inspired by [Serena](https://github.com/oraios/serena) and [OpenVisio](https://github.com/openvisio/openvisio); details in [docs/REFERENCE.zh-CN.md](docs/REFERENCE.zh-CN.md#五致谢与技术渊源).

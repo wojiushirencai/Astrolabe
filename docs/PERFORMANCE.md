@@ -205,3 +205,15 @@ current > max(baseline × ratio, baseline + floor)
 3. 尽量空闲；记下 `git rev-parse HEAD` 和是否脏
 4. `bash scripts/bench.sh --ci`
 5. 结果 JSON 在 `target/bench/`；对照 `crates/astrolabe-core/examples/baselines/`
+
+## 历史对照：与 Serena / OpenVisio 的索引耗时（自述数字，不可复现）
+
+旧版 README 曾给出下表（serena 仓库，1028 个源文件）。**这些数字来自当时的一次手工同机测量，原始命令、对手版本、机器配置没有记录**，且如上一节所述与 `index_bench` 的口径不同，因此**不再作为项目对外的主张**，这里仅作存档：
+
+| 引擎 | 首次全量索引耗时 | 峰值内存 | 备注 |
+|---|---:|---:|---|
+| Astrolabe（Rust） | 1.0 s | 84 MB | 口径与 `index_bench` 不同（见上） |
+| Serena（Python + LSP） | 5.7 s | 373 MB | 按这组数字算约 5.7×、内存约 −77% |
+| OpenVisio（Node.js） | 12.6 s | 4566 MB | 按这组数字算约 12.6×、内存约 −98% |
+
+另外，建索引耗时不等于任务成本：Serena 默认按需启动 LSP，并不预建同类全库索引。对 AI 任务的成本/时间/正确率，请看 [bench/README.md](../bench/README.md) 里的配对实测。
