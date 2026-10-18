@@ -510,6 +510,9 @@ fn extract_imports(
     if lang == Language::Ruby {
         return extract_ruby_imports(query, root, source);
     }
+    if lang == Language::Php {
+        return extract_php_imports(query, root, source);
+    }
     if lang != Language::CSharp && lang != Language::VisualBasic {
         return extract_named_captures(query, root, source, |name| {
             name == "import" || name == "source" || name == "module"
@@ -564,6 +567,95 @@ fn extract_imports(
 /// Ruby: `require_relative "x"` is emitted as `relative:x` so the resolver
 /// resolves it against the requiring file only — never a same-named file on
 /// the `$LOAD_PATH` (`lib/x.rb`). `require` / `load` / `autoload` stay raw.
+/// PHP: the query supplies include/require literals. `use` declarations are
+/// walked here instead so grouped `use A\\{B, C as D}` yields the full
+/// `A\\B`, `A\\C` (the query alone would only see the bare `B`, `C`), and a
+/// leading `\\` is dropped.
+fn extract_php_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let mut output: Vec<String> =
+        extract_named_captures(query, root, source, |name| name == "import")
+            .into_iter()
+            .filter_map(|(text, _)| {
+                // Skipped here: `use` names, collected by the walk below.
+                let t = unquote(text.trim());
+                (!t.is_empty()).then(|| t.to_owned())
+            })
+            .collect();
+    // Drop the query's bare `use` names; keep only include/require literals.
+    let mut uses = Vec::new();
+    collect_php_uses(root, source, &mut uses);
+    let mut bare = Vec::new();
+    collect_php_use_nodes(root, source, &mut bare);
+    output.retain(|t| !bare.contains(t));
+    output.extend(uses);
+    output
+}
+
+fn collect_php_use_nodes(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    if node.kind() == "namespace_use_clause" {
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if matches!(ch.kind(), "name" | "qualified_name") {
+                if let Ok(t) = ch.utf8_text(source.as_bytes()) {
+                    out.push(unquote(t.trim()).to_owned());
+                }
+            }
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_php_use_nodes(ch, source, out);
+    }
+}
+
+fn php_clause_name<'a>(clause: tree_sitter::Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut c = clause.walk();
+    let found = clause
+        .children(&mut c)
+        .find(|n| matches!(n.kind(), "name" | "qualified_name"))?;
+    found.utf8_text(source.as_bytes()).ok()
+}
+
+fn collect_php_uses(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    if node.kind() == "namespace_use_declaration" {
+        let mut prefix: Option<&str> = None;
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            match ch.kind() {
+                "namespace_name" => prefix = ch.utf8_text(source.as_bytes()).ok(),
+                "namespace_use_clause" => {
+                    if let Some(n) = php_clause_name(ch, source) {
+                        out.push(n.trim_start_matches('\\').to_owned());
+                    }
+                }
+                "namespace_use_group" => {
+                    let pre = prefix.unwrap_or("").trim_matches('\\');
+                    let mut g = ch.walk();
+                    for cl in ch.children(&mut g) {
+                        if matches!(cl.kind(), "namespace_use_clause" | "namespace_use_group_clause")
+                        {
+                            if let Some(n) = php_clause_name(cl, source) {
+                                let n = n.trim_start_matches('\\');
+                                out.push(if pre.is_empty() {
+                                    n.to_owned()
+                                } else {
+                                    format!("{pre}\\{n}")
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_php_uses(ch, source, out);
+    }
+}
+
 fn extract_ruby_imports(query: &Query, root: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
@@ -3240,6 +3332,29 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             }
         }
         s
+    }
+
+    #[test]
+    fn php_use_forms_and_include_literals() {
+        let pool = ParserPool::new();
+        let src = "<?php\nnamespace X;\nuse \\App\\A;\nuse App\\B as Bee;\nuse App\\Models\\{User, Post as P};\nuse function App\\helper;\nrequire_once __DIR__ . '/inc/x.php';\ninclude 'y.php';\n";
+        let mut got = pool
+            .parse(Language::Php, &RelPath::new("a.php"), src)
+            .expect("parse php")
+            .imports;
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "/inc/x.php",
+                "App\\A",
+                "App\\B",
+                "App\\Models\\Post",
+                "App\\Models\\User",
+                "App\\helper",
+                "y.php"
+            ]
+        );
     }
 
     #[test]
