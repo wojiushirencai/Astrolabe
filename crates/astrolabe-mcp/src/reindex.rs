@@ -70,6 +70,9 @@ pub(crate) fn mcp_index_options(persist: bool, parse_cache_bytes: u64) -> IndexO
     IndexOptions {
         call_edges: true,
         persist,
+        // A follower never writes the store, but reading the leader's cache
+        // saves it a cold reparse of every file.
+        persist_read_only: !persist,
         parse_cache_bytes,
         ..IndexOptions::default()
     }

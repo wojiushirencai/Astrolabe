@@ -296,18 +296,26 @@ pub(crate) fn load_source_lines(
     rel_path: &str,
 ) -> Option<(Arc<Vec<String>>, bool)> {
     let disk = root.join(rel_path);
-    let mtime_ms = file_mtime_ms(&disk).unwrap_or(0);
-    if let Some(lines) = cache.get(rel_path, mtime_ms) {
-        return Some((lines, true));
+    // Stat before reading: a write after this point changes mtime/len, so
+    // the entry inserted below is never served for the newer content.
+    let metadata = fs::metadata(&disk).ok();
+    let mtime_ms = metadata.as_ref().and_then(mtime_ms_of).unwrap_or(0);
+    let len = metadata.as_ref().map(fs::Metadata::len);
+    if let Some(len) = len {
+        if let Some(lines) = cache.get_checked(rel_path, mtime_ms, len) {
+            return Some((lines, true));
+        }
     }
     let source = astrolabe_core::text::read_source(&disk).ok()?;
-    let lines: Vec<String> = source.lines().map(str::to_owned).collect();
-    cache.insert(rel_path, lines.clone(), mtime_ms);
-    Some((Arc::new(lines), false))
+    let lines = Arc::new(source.lines().map(str::to_owned).collect::<Vec<String>>());
+    if let Some(len) = len {
+        cache.insert_checked(rel_path, Arc::clone(&lines), mtime_ms, len);
+    }
+    Some((lines, false))
 }
 
-fn file_mtime_ms(path: &Path) -> Option<u64> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
+fn mtime_ms_of(metadata: &fs::Metadata) -> Option<u64> {
+    let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
     Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }

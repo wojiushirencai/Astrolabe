@@ -19,7 +19,10 @@ use crate::types::{
     CodeEdge, CodeFile, CodeSymbol, Confidence, EdgeKind, FileId, Language, RelPath, SymbolId,
     SymbolKind,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -31,6 +34,11 @@ pub enum StoreError {
     Version { found: u32, expected: u32 },
     #[error("database locked: {0}")]
     Locked(String),
+    /// The file is not a readable database (truncated, overwritten, torn
+    /// write). The store is a rebuildable cache, so this is safe to repair
+    /// by moving the file aside and recreating it.
+    #[error("storage corrupt: {0}")]
+    Corrupt(String),
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -43,10 +51,62 @@ const FILES: TableDefinition<u32, &[u8]> = TableDefinition::new("files");
 const SYMBOLS: TableDefinition<u32, &[u8]> = TableDefinition::new("symbols");
 const EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("edges");
 const PARSE_CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("parse-cache");
+/// `path -> FileStamp` (JSON): lets a warm start skip reading a file whose
+/// `(mtime, len)` is unchanged. Created lazily; absent in older databases.
+const FILE_STAMPS: TableDefinition<&str, &[u8]> = TableDefinition::new("file-stamps");
 const VERSION_KEY: &str = "schema-version";
 
 pub struct Store {
-    db: Database,
+    db: Db,
+    read_only: bool,
+}
+
+/// A writable handle, or a shared read-only one that never touches the file
+/// (redb's writable `open` rewrites the header, bumping mtime and taking the
+/// exclusive lock).
+enum Db {
+    Rw(Database),
+    Ro(ReadOnlyDatabase),
+}
+
+impl Db {
+    fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        match self {
+            Db::Rw(db) => db.begin_read(),
+            Db::Ro(db) => db.begin_read(),
+        }
+    }
+
+    fn begin_write(&self) -> Result<redb::WriteTransaction, StoreError> {
+        match self {
+            Db::Rw(db) => db.begin_write().map_err(classify_txn_error),
+            Db::Ro(_) => Err(StoreError::Backend("store opened read-only".to_string())),
+        }
+    }
+}
+
+/// What the previous index run learned about one file, enough to reuse its
+/// cached parse without reading the file again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub mtime_ns: u128,
+    pub len: u64,
+    /// Full [`parse_cache_key`] (including any path salt).
+    pub key: String,
+    pub sha: String,
+    pub loc: u32,
+    pub language: u8,
+}
+
+impl FileStamp {
+    pub fn language(&self) -> Option<Language> {
+        language_from_u8(self.language)
+    }
+}
+
+/// Prefix shared by every [`parse_cache_key`] written by this binary.
+pub fn parse_cache_key_prefix() -> String {
+    format!("x{EXTRACTOR_VERSION}-v{}:", env!("CARGO_PKG_VERSION"))
 }
 
 impl Store {
@@ -65,9 +125,9 @@ impl Store {
                     "Database already open. Cannot acquire lock.".to_string(),
                 ));
             }
-            Err(error) => return Err(backend(error)),
+            Err(error) => return Err(classify_open_error(error)),
         };
-        let write = db.begin_write().map_err(backend)?;
+        let write = db.begin_write().map_err(classify_txn_error)?;
         {
             let mut meta = write.open_table(META).map_err(backend)?;
             let found = meta
@@ -92,8 +152,75 @@ impl Store {
         drop(write.open_table(SYMBOLS).map_err(backend)?);
         drop(write.open_table(EDGES).map_err(backend)?);
         drop(write.open_table(PARSE_CACHE).map_err(backend)?);
+        drop(write.open_table(FILE_STAMPS).map_err(backend)?);
         write.commit().map_err(backend)?;
-        Ok(Self { db })
+        Ok(Self {
+            db: Db::Rw(db),
+            read_only: false,
+        })
+    }
+
+    /// Open an existing store without creating or modifying anything.
+    ///
+    /// Returns `Ok(None)` when there is no database file, or when its schema
+    /// is not the current one (a read-only user must not delete it). Writes
+    /// on the returned store fail. redb still takes its single-process file
+    /// lock, so this reports [`StoreError::Locked`] while a writer holds it.
+    pub fn open_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let db = match ReadOnlyDatabase::open(path) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                return Err(StoreError::Locked(
+                    "Database already open. Cannot acquire lock.".to_string(),
+                ));
+            }
+            Err(error) => return Err(classify_open_error(error)),
+        };
+        let read = db.begin_read().map_err(classify_txn_error)?;
+        let version = match read.open_table(META) {
+            Ok(meta) => meta
+                .get(VERSION_KEY)
+                .map_err(backend)?
+                .map(|value| value.value()),
+            Err(_) => None,
+        };
+        if version != Some(SCHEMA_VERSION) {
+            return Ok(None);
+        }
+        drop(read);
+        Ok(Some(Self {
+            db: Db::Ro(db),
+            read_only: true,
+        }))
+    }
+
+    /// [`Self::open_read_only`] with the same retry policy as
+    /// [`Self::open_or_heal_with_retry`].
+    pub fn open_read_only_with_retry(
+        path: &Path,
+        attempts: usize,
+        delay: std::time::Duration,
+    ) -> Result<Option<Self>, StoreError> {
+        let attempts = attempts.max(1);
+        for attempt in 0..attempts {
+            match Self::open_read_only(path) {
+                Ok(store) => return Ok(store),
+                Err(error) => {
+                    if attempt + 1 == attempts || !is_lock_contention(&error) {
+                        return Err(error);
+                    }
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+        unreachable!("retry loop returns on its final attempt")
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Open an existing store, or delete and recreate it when the on-disk
@@ -117,6 +244,29 @@ impl Store {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(backend(error)),
+                }
+                Self::open(path)
+            }
+            Err(StoreError::Corrupt(reason)) => {
+                // The file is a rebuildable cache; keep the broken copy for
+                // inspection but never let it disable persistence forever.
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(format!(".bad-{stamp}"));
+                tracing::warn!(
+                    reason = %reason,
+                    path = %path.display(),
+                    "store corrupt; moving it aside and recreating"
+                );
+                if std::fs::rename(path, &aside).is_err() {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(backend(error)),
+                    }
                 }
                 Self::open(path)
             }
@@ -167,7 +317,7 @@ impl Store {
         // `chunks` is the hard bound: no transaction can retain more than
         // WRITE_BATCH newly serialized values.
         for chunk in files.chunks(WRITE_BATCH) {
-            let write = self.db.begin_write().map_err(backend)?;
+            let write = self.db.begin_write()?;
             {
                 let mut table = write.open_table(FILES).map_err(backend)?;
                 for file in chunk {
@@ -182,7 +332,7 @@ impl Store {
 
     pub fn put_symbols(&self, symbols: &[CodeSymbol]) -> Result<(), StoreError> {
         for chunk in symbols.chunks(WRITE_BATCH) {
-            let write = self.db.begin_write().map_err(backend)?;
+            let write = self.db.begin_write()?;
             {
                 let mut table = write.open_table(SYMBOLS).map_err(backend)?;
                 for symbol in chunk {
@@ -199,7 +349,7 @@ impl Store {
 
     pub fn put_edges(&self, edges: &[CodeEdge]) -> Result<(), StoreError> {
         for chunk in edges.chunks(WRITE_BATCH) {
-            let write = self.db.begin_write().map_err(backend)?;
+            let write = self.db.begin_write()?;
             {
                 let mut table = write.open_table(EDGES).map_err(backend)?;
                 for edge in chunk {
@@ -272,9 +422,10 @@ impl Store {
     where
         I: IntoIterator<Item = (&'a str, &'a [u8])>,
     {
+        self.ensure_writable()?;
         let entries: Vec<(&str, &[u8])> = entries.into_iter().collect();
         for chunk in entries.chunks(WRITE_BATCH) {
-            let write = self.db.begin_write().map_err(backend)?;
+            let write = self.db.begin_write()?;
             {
                 let mut table = write.open_table(PARSE_CACHE).map_err(backend)?;
                 for (sha, parsed) in chunk {
@@ -284,6 +435,119 @@ impl Store {
             write.commit().map_err(backend)?;
         }
         Ok(())
+    }
+
+    fn ensure_writable(&self) -> Result<(), StoreError> {
+        if self.read_only {
+            Err(StoreError::Backend("store opened read-only".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Number of parse-cache entries (diagnostics and tests).
+    pub fn parse_cache_len(&self) -> Result<u64, StoreError> {
+        let read = self.db.begin_read().map_err(backend)?;
+        let table = read.open_table(PARSE_CACHE).map_err(backend)?;
+        table.len().map_err(backend)
+    }
+
+    /// Delete every parse-cache entry whose key is not in `live` and every
+    /// file stamp whose path is not in `live_paths`, then return how many
+    /// parse entries were removed.
+    ///
+    /// Call after a *full* scan only: the live sets must cover every file of
+    /// the repository, otherwise still-valid entries are dropped (that only
+    /// costs a re-parse, never wrong data). Keys from other crate or
+    /// extractor versions are never in `live`, so an upgrade's dead entries
+    /// go the first time the new binary indexes. redb reuses freed pages, so
+    /// the file stops growing; it does not shrink.
+    pub fn prune_parse_cache(
+        &self,
+        live_keys: &std::collections::HashSet<String>,
+        live_paths: &std::collections::HashSet<String>,
+    ) -> Result<usize, StoreError> {
+        self.ensure_writable()?;
+        let stale_keys: Vec<String> = {
+            let read = self.db.begin_read().map_err(backend)?;
+            let table = read.open_table(PARSE_CACHE).map_err(backend)?;
+            let mut stale = Vec::new();
+            for entry in table.iter().map_err(backend)? {
+                let (key, _) = entry.map_err(backend)?;
+                if !live_keys.contains(key.value()) {
+                    stale.push(key.value().to_owned());
+                }
+            }
+            stale
+        };
+        let stale_paths: Vec<String> = {
+            let read = self.db.begin_read().map_err(backend)?;
+            let table = read.open_table(FILE_STAMPS).map_err(backend)?;
+            let mut stale = Vec::new();
+            for entry in table.iter().map_err(backend)? {
+                let (key, _) = entry.map_err(backend)?;
+                if !live_paths.contains(key.value()) {
+                    stale.push(key.value().to_owned());
+                }
+            }
+            stale
+        };
+        for chunk in stale_keys.chunks(WRITE_BATCH) {
+            let write = self.db.begin_write()?;
+            {
+                let mut table = write.open_table(PARSE_CACHE).map_err(backend)?;
+                for key in chunk {
+                    table.remove(key.as_str()).map_err(backend)?;
+                }
+            }
+            write.commit().map_err(backend)?;
+        }
+        for chunk in stale_paths.chunks(WRITE_BATCH) {
+            let write = self.db.begin_write()?;
+            {
+                let mut table = write.open_table(FILE_STAMPS).map_err(backend)?;
+                for key in chunk {
+                    table.remove(key.as_str()).map_err(backend)?;
+                }
+            }
+            write.commit().map_err(backend)?;
+        }
+        Ok(stale_keys.len())
+    }
+
+    /// Record `(mtime, len, key)` per path so a later run can skip reading
+    /// an unchanged file. Batched like [`Self::put_cached_parses`].
+    pub fn put_file_stamps(&self, stamps: &[(String, FileStamp)]) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        for chunk in stamps.chunks(WRITE_BATCH) {
+            let write = self.db.begin_write()?;
+            {
+                let mut table = write.open_table(FILE_STAMPS).map_err(backend)?;
+                for (path, stamp) in chunk {
+                    let value = serde_json::to_vec(stamp).map_err(backend)?;
+                    table
+                        .insert(path.as_str(), value.as_slice())
+                        .map_err(backend)?;
+                }
+            }
+            write.commit().map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    /// Stamp recorded for `path`, if any. A missing table (database from an
+    /// older binary opened read-only) is just "no stamp".
+    pub fn file_stamp(&self, path: &str) -> Result<Option<FileStamp>, StoreError> {
+        let read = self.db.begin_read().map_err(backend)?;
+        let table = match read.open_table(FILE_STAMPS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(backend(error)),
+        };
+        Ok(table
+            .get(path)
+            .map_err(backend)?
+            .and_then(|value| serde_json::from_slice(value.value()).ok()))
     }
 
     /// Cached parse result keyed by content hash, so an unchanged file is
@@ -337,6 +601,41 @@ pub fn decode_parsed(bytes: &[u8]) -> Result<crate::parse::ParsedFile, StoreErro
 
 fn backend(error: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(error.to_string())
+}
+
+/// Corruption (not locks, permissions or full disks) is the only open failure
+/// that deleting the cache can fix.
+fn classify_storage_error(error: redb::StorageError) -> StoreError {
+    match error {
+        redb::StorageError::Corrupted(reason) => StoreError::Corrupt(reason),
+        // redb reports a wrong magic number / short header as an I/O error.
+        redb::StorageError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            StoreError::Corrupt(io.to_string())
+        }
+        other => backend(other),
+    }
+}
+
+fn classify_txn_error(error: redb::TransactionError) -> StoreError {
+    match error {
+        redb::TransactionError::Storage(storage) => classify_storage_error(storage),
+        other => backend(other),
+    }
+}
+
+fn classify_open_error(error: redb::DatabaseError) -> StoreError {
+    match error {
+        redb::DatabaseError::Storage(storage) => classify_storage_error(storage),
+        redb::DatabaseError::UpgradeRequired(version) => {
+            StoreError::Corrupt(format!("file format version {version} needs an upgrade"))
+        }
+        other => backend(other),
+    }
 }
 
 /// Whether an open failure looks like another process holding the file lock.
@@ -395,7 +694,7 @@ impl From<FileWire> for CodeFile {
     }
 }
 
-fn language_to_u8(language: Language) -> u8 {
+pub fn language_to_u8(language: Language) -> u8 {
     match language {
         Language::Python => 0,
         Language::Go => 1,
@@ -451,7 +750,7 @@ impl From<ParsedWire> for crate::parse::ParsedFile {
     }
 }
 
-fn language_from_u8(language: u8) -> Option<Language> {
+pub fn language_from_u8(language: u8) -> Option<Language> {
     Some(match language {
         0 => Language::Python,
         1 => Language::Go,
@@ -868,6 +1167,81 @@ mod tests {
             found: 1,
             expected: 2
         }));
+    }
+
+    #[test]
+    fn corrupt_store_is_moved_aside_and_recreated() {
+        let dir = TestDir::new("corrupt");
+        std::fs::write(dir.db(), vec![0xABu8; 4096]).unwrap();
+        // Plain `open` still reports it.
+        assert!(matches!(Store::open(&dir.db()), Err(StoreError::Corrupt(_))));
+        let store = Store::open_or_heal(&dir.db()).expect("heals a corrupt cache");
+        store.put_cached_parse("k", b"v").unwrap();
+        assert_eq!(store.cached_parse("k").unwrap(), Some(b"v".to_vec()));
+        drop(store);
+        Store::open(&dir.db()).expect("recreated database is valid");
+        let aside = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".bad-"));
+        assert!(aside, "the broken file is kept for inspection");
+    }
+
+    #[test]
+    fn truncated_store_is_healed_too() {
+        let dir = TestDir::new("truncated");
+        {
+            let store = Store::open(&dir.db()).unwrap();
+            store.put_cached_parse("k", &vec![7u8; 100_000]).unwrap();
+        }
+        let len = std::fs::metadata(dir.db()).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(dir.db()).unwrap();
+        f.set_len(len / 3).unwrap();
+        drop(f);
+        let store = Store::open_or_heal(&dir.db()).expect("heals a truncated cache");
+        assert_eq!(store.cached_parse("k").unwrap(), None);
+    }
+
+    #[test]
+    fn read_only_open_never_creates_or_writes() {
+        let dir = TestDir::new("ro");
+        assert!(Store::open_read_only(&dir.db()).unwrap().is_none());
+        assert!(!dir.db().exists());
+        {
+            let store = Store::open(&dir.db()).unwrap();
+            store.put_cached_parse("k", b"v").unwrap();
+        }
+        let ro = Store::open_read_only(&dir.db()).unwrap().unwrap();
+        assert!(ro.is_read_only());
+        assert_eq!(ro.cached_parse("k").unwrap(), Some(b"v".to_vec()));
+        assert!(ro.put_cached_parse("x", b"y").is_err());
+    }
+
+    #[test]
+    fn prune_keeps_only_live_entries_and_stamps() {
+        let dir = TestDir::new("prune");
+        let store = Store::open(&dir.db()).unwrap();
+        store
+            .put_cached_parses([("a", b"1".as_slice()), ("b", b"2".as_slice())])
+            .unwrap();
+        let stamp = |k: &str| FileStamp {
+            mtime_ns: 1,
+            len: 1,
+            key: k.into(),
+            sha: "s".into(),
+            loc: 1,
+            language: 0,
+        };
+        store
+            .put_file_stamps(&[("p1".into(), stamp("a")), ("p2".into(), stamp("b"))])
+            .unwrap();
+        let live_keys = ["a".to_string()].into_iter().collect();
+        let live_paths = ["p1".to_string()].into_iter().collect();
+        assert_eq!(store.prune_parse_cache(&live_keys, &live_paths).unwrap(), 1);
+        assert_eq!(store.cached_parse("a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(store.cached_parse("b").unwrap(), None);
+        assert!(store.file_stamp("p1").unwrap().is_some());
+        assert!(store.file_stamp("p2").unwrap().is_none());
     }
 
     #[test]
