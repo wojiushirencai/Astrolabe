@@ -12,9 +12,18 @@
 //!     root itself,
 //!   * rockspec `build.modules` entries (`["kong.foo"] = "kong/foo.lua"`),
 //!     which map a module name straight to a file,
-//!   * finally the importing file's ancestor directories, innermost first —
-//!     projects that set `package.path` to their own directory
-//!     (`test/`, `spec/` helpers, LuaLS `script/`).
+//!   * finally, only for files living under a `test`/`tests`/`spec`/`script`/
+//!     `scripts` directory, the importing file's ancestor directories,
+//!     innermost first — projects that set `package.path` to their own
+//!     directory (`test/`, `spec/` helpers, LuaLS `script/`). Library code
+//!     does not get this fallback, so `require("json")` for an external
+//!     module is not matched to a sibling `json.lua`.
+//!
+//! A module never resolves to the importing file itself.
+//!
+//! Rockspecs are read anywhere in the tree (paths relative to the rockspec's
+//! directory); every `["name"] = "file.lua"` and `name = "file.lua"` pair is
+//! picked up, one per line or several on a line.
 //!
 //! External modules (`require "cjson"`, `require "vim.lsp"`) yield `None`.
 
@@ -38,13 +47,14 @@ impl ModuleResolver for LuaResolver {
             }
         }
         for path in files.iter() {
-            if path.extension() == Some("rockspec") && !path.as_str().contains('/') {
+            if path.extension() == Some("rockspec") {
                 if let Some(text) = files.read(path.as_str()) {
-                    rockspec_modules(&text, files, &mut meta.modules);
+                    rockspec_modules(&text, path.dir(), files, &mut meta.modules);
                 }
             }
         }
-        meta.modules.sort_by(|a, b| a.name.cmp(&b.name));
+        meta.modules
+            .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.dir.cmp(&b.dir)));
         meta.modules.dedup_by(|a, b| a.name == b.name);
         meta
     }
@@ -56,6 +66,17 @@ impl ModuleResolver for LuaResolver {
         files: &FileIndex,
         meta: &ProjectMeta,
     ) -> Option<RelPath> {
+        resolve_module(from, spec, files, meta).filter(|p| p != from)
+    }
+}
+
+fn resolve_module(
+    from: &RelPath,
+    spec: &str,
+    files: &FileIndex,
+    meta: &ProjectMeta,
+) -> Option<RelPath> {
+    {
         let spec = spec.trim();
         if spec.is_empty() {
             return None;
@@ -73,9 +94,10 @@ impl ModuleResolver for LuaResolver {
         if spec.contains(['/', '\\', ' ']) {
             return None;
         }
-        if let Ok(i) = meta.modules.binary_search_by(|m| m.name.as_str().cmp(spec)) {
-            if files.contains(&meta.modules[i].dir) {
-                return Some(RelPath::new(&meta.modules[i].dir));
+        let first = meta.modules.partition_point(|m| m.name.as_str() < spec);
+        for m in meta.modules[first..].iter().take_while(|m| m.name == spec) {
+            if files.contains(&m.dir) && m.dir != from.as_str() {
+                return Some(RelPath::new(&m.dir));
             }
         }
         let rel = spec.replace('.', "/");
@@ -87,13 +109,22 @@ impl ModuleResolver for LuaResolver {
             };
             [format!("{base}.lua"), format!("{base}/init.lua")]
                 .into_iter()
-                .find(|p| files.contains(p))
+                .find(|p| files.contains(p) && p != from.as_str())
                 .map(RelPath::new)
         };
         if let Some(hit) = meta.source_roots.iter().find_map(|r| probe(r)) {
             return Some(hit);
         }
-        // Ancestor directories of the importing file, innermost first.
+        // Ancestor directories of the importing file, innermost first; only
+        // for test/spec/script helpers.
+        if !from.dir().split('/').any(|seg| {
+            matches!(
+                seg,
+                "test" | "tests" | "spec" | "specs" | "script" | "scripts"
+            )
+        }) {
+            return None;
+        }
         let mut dir = from.dir();
         while !dir.is_empty() {
             if let Some(hit) = probe(dir) {
@@ -108,31 +139,31 @@ impl ModuleResolver for LuaResolver {
     }
 }
 
-/// `["kong.api"] = "kong/api/init.lua",` entries of a rockspec `build.modules`.
-fn rockspec_modules(text: &str, files: &FileIndex, out: &mut Vec<ModuleUnit>) {
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("[\"") else {
+/// `["kong.api"] = "kong/api/init.lua"` and `kong = "kong.lua"` pairs of a
+/// rockspec, one or many per line. `base` is the rockspec's directory.
+fn rockspec_modules(text: &str, base: &str, files: &FileIndex, out: &mut Vec<ModuleUnit>) {
+    use std::sync::OnceLock;
+    static PAIR: OnceLock<regex::Regex> = OnceLock::new();
+    let re = PAIR.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?:\[\s*["']([^"']+)["']\s*\]|\b([A-Za-z_][A-Za-z0-9_]*))\s*=\s*(?:"([^"]+\.lua)"|'([^']+\.lua)')"#,
+        )
+        .expect("static regex")
+    });
+    for cap in re.captures_iter(text) {
+        let Some(name) = cap.get(1).or_else(|| cap.get(2)) else {
             continue;
         };
-        let Some((name, rest)) = rest.split_once("\"]") else {
+        let Some(path) = cap.get(3).or_else(|| cap.get(4)) else {
             continue;
         };
-        let Some(value) = rest.trim_start().strip_prefix('=') else {
+        let Some(full) = crate::types::join_rel(base, path.as_str()) else {
             continue;
         };
-        let value = value.trim().trim_end_matches(',').trim();
-        let Some(path) = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-        else {
-            continue;
-        };
-        if path.ends_with(".lua") && files.contains(path) {
+        if files.contains(&full) {
             out.push(ModuleUnit {
-                name: name.to_owned(),
-                dir: path.to_owned(),
+                name: name.as_str().to_owned(),
+                dir: full,
             });
         }
     }
@@ -162,7 +193,12 @@ mod tests {
             Some("kong/tools/utils.lua")
         );
         assert_eq!(r("kong.db").as_deref(), Some("kong/db/init.lua"));
-        assert_eq!(r("kong").as_deref(), Some("kong/init.lua"));
+        // `require("kong")` from kong/init.lua itself is a self-reference.
+        assert_eq!(r("kong"), None);
+        assert_eq!(
+            resolve(&files, "kong/db/init.lua", "kong").as_deref(),
+            Some("kong/init.lua")
+        );
         assert_eq!(r("cjson.safe"), None);
     }
 
@@ -186,10 +222,10 @@ mod tests {
 
     #[test]
     fn ancestor_directory_fallback() {
-        let files = index(&["tools/gen/a.lua", "tools/gen/helpers/b.lua"]);
+        let files = index(&["spec/gen/a.lua", "spec/gen/helpers/b.lua"]);
         assert_eq!(
-            resolve(&files, "tools/gen/a.lua", "helpers.b").as_deref(),
-            Some("tools/gen/helpers/b.lua")
+            resolve(&files, "spec/gen/a.lua", "helpers.b").as_deref(),
+            Some("spec/gen/helpers/b.lua")
         );
     }
 
@@ -212,10 +248,51 @@ mod tests {
         let files = index(&["kong/api/init.lua"]);
         rockspec_modules(
             "build = { modules = {\n  [\"kong.api\"] = \"kong/api/init.lua\",\n  [\"x\"] = \"missing.lua\",\n} }",
+            "",
             &files,
             &mut out,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "kong.api");
+    }
+
+    #[test]
+    fn rockspec_single_line_unquoted_and_subdir() {
+        let files = index(&["pkg/lua/foo/bar.lua", "pkg/main.lua", "pkg/lua/plain.lua"]);
+        let mut out = Vec::new();
+        rockspec_modules(
+            r#"build = { type = "builtin", modules = { ["m.a"]="lua/foo/bar.lua", plain = "lua/plain.lua", main='main.lua' } }"#,
+            "pkg",
+            &files,
+            &mut out,
+        );
+        let names: Vec<_> = out
+            .iter()
+            .map(|m| (m.name.as_str(), m.dir.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("m.a", "pkg/lua/foo/bar.lua"),
+                ("plain", "pkg/lua/plain.lua"),
+                ("main", "pkg/main.lua")
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestor_fallback_is_limited_to_test_dirs_and_never_self() {
+        // Library code: `require("json")` is an external module even though a
+        // sibling json.lua exists; `require("bar")` must not loop back.
+        let files = index(&["lua/foo/bar.lua", "lua/foo/json.lua"]);
+        assert_eq!(resolve(&files, "lua/foo/bar.lua", "json"), None);
+        assert_eq!(resolve(&files, "lua/foo/bar.lua", "bar"), None);
+        // Same shape under a spec dir keeps the helper fallback, minus self.
+        let files = index(&["spec/foo/bar.lua", "spec/foo/json.lua"]);
+        assert_eq!(
+            resolve(&files, "spec/foo/bar.lua", "json").as_deref(),
+            Some("spec/foo/json.lua")
+        );
+        assert_eq!(resolve(&files, "spec/foo/bar.lua", "bar"), None);
     }
 }

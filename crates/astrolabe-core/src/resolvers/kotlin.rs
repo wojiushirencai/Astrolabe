@@ -33,6 +33,11 @@
 //! importing file wins; ties break on path order, so the result is
 //! deterministic.
 //!
+//! With several declaring files the single-file `resolve` keeps that rule, but
+//! `resolve_import` returns [`ImportResolution::Files`] with *all* of them
+//! (excluding the importer), so a KMP `expect`/`actual` set (common, android,
+//! ios) is fully linked instead of only one platform source set.
+//!
 //! A star import naming a package (`import a.b.*`) is `None` — a package is
 //! not a file, exactly like the Java resolver. A star import naming a type
 //! (`import a.b.Outer.*`) resolves to that type's file. Stdlib and third-party
@@ -40,7 +45,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::types::{FileIndex, Language, ModuleResolver, ProjectMeta, RelPath, TypeDecl};
+use crate::types::{
+    FileIndex, ImportResolution, Language, ModuleResolver, ProjectMeta, RelPath, TypeDecl,
+};
 
 pub struct KotlinResolver;
 
@@ -101,28 +108,82 @@ impl ModuleResolver for KotlinResolver {
         _files: &FileIndex,
         meta: &ProjectMeta,
     ) -> Option<RelPath> {
-        let (name, star) = normalize_spec(spec)?;
-        let segs: Vec<&str> = name.split('.').collect();
-        if segs.iter().any(|s| s.is_empty()) {
-            return None;
+        let (pkg, simple) = locate(spec, meta)?;
+        let file = lookup(&meta.type_decls, &pkg, &simple, from.as_str())?;
+        // `import q.Self.Companion.x` inside `Self.kt` names the file itself.
+        (file != from.as_str()).then(|| RelPath::new(file))
+    }
+
+    fn resolve_import(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> ImportResolution {
+        let Some((pkg, simple)) = locate(spec, meta) else {
+            return ImportResolution::Unresolved;
+        };
+        let all = lookup_all(&meta.type_decls, &pkg, &simple);
+        if all.len() > 1 {
+            let targets: Vec<RelPath> = all
+                .into_iter()
+                .filter(|f| *f != from.as_str())
+                .map(RelPath::new)
+                .collect();
+            return if targets.is_empty() {
+                ImportResolution::Unresolved
+            } else {
+                ImportResolution::Files(targets)
+            };
         }
-        // `import a.b.*` naming a package: not a file.
-        if star && meta.type_decls.iter().any(|d| d.namespace == name) {
-            return None;
+        match self.resolve(from, spec, files, meta) {
+            Some(p) => ImportResolution::File(p),
+            None => ImportResolution::Unresolved,
         }
-        for n in (1..segs.len()).rev() {
-            let pkg = segs[..n].join(".");
-            let simple = segs[n];
-            if let Some(file) = lookup(&meta.type_decls, &pkg, simple, from.as_str()) {
-                return Some(RelPath::new(file));
-            }
-        }
-        None
     }
 }
 
+/// `(package, simple name)` of the first backoff level that has a declaration.
+fn locate(spec: &str, meta: &ProjectMeta) -> Option<(String, String)> {
+    let (name, star) = normalize_spec(spec)?;
+    let segs: Vec<&str> = name.split('.').collect();
+    if segs.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    // `import a.b.*` naming a package: not a file.
+    if star && meta.type_decls.iter().any(|d| d.namespace == name) {
+        return None;
+    }
+    for n in (1..segs.len()).rev() {
+        let pkg = segs[..n].join(".");
+        let simple = segs[n];
+        if !lookup_all(&meta.type_decls, &pkg, simple).is_empty() {
+            return Some((pkg, simple.to_string()));
+        }
+    }
+    None
+}
+
+/// Every file declaring `pkg.name`, in path order.
+fn lookup_all<'m>(decls: &'m [TypeDecl], pkg: &str, name: &str) -> Vec<&'m str> {
+    let start = decls.partition_point(|d| (d.namespace.as_str(), d.name.as_str()) < (pkg, name));
+    let mut v: Vec<&str> = decls[start..]
+        .iter()
+        .take_while(|d| d.namespace == pkg && d.name == name)
+        .map(|d| d.file.as_str())
+        .collect();
+    v.dedup();
+    v
+}
+
 /// Best file declaring `pkg.name`, nearest to `from`.
-fn lookup<'m>(decls: &'m [TypeDecl], pkg: &str, name: &str, from: &str) -> Option<&'m str> {
+pub(crate) fn lookup<'m>(
+    decls: &'m [TypeDecl],
+    pkg: &str,
+    name: &str,
+    from: &str,
+) -> Option<&'m str> {
     let start = decls.partition_point(|d| (d.namespace.as_str(), d.name.as_str()) < (pkg, name));
     decls[start..]
         .iter()
@@ -210,7 +271,7 @@ fn code_lines(src: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 /// First `package a.b.c` (Kotlin or Java) in a source file.
-fn package_decl(src: &str) -> Option<String> {
+pub(crate) fn package_decl(src: &str) -> Option<String> {
     // Paren depth of an annotation that spans lines
     // (`@file:Suppress(\n  "X",\n)` above the package line).
     let mut depth = 0i32;
@@ -283,7 +344,7 @@ const MODIFIERS: &[&str] = &[
 ];
 
 /// Names of top-level declarations (column-0 lines).
-fn top_level_names(src: &str) -> Vec<String> {
+pub(crate) fn top_level_names(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in code_lines(src) {
         if line.starts_with(char::is_whitespace) || line.is_empty() {

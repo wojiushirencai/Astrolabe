@@ -26,14 +26,21 @@
 //!   a `go.work` `use` directive explicitly points at them.
 //! * `go.work` `use ./dir` entries are followed so workspace members that live
 //!   in otherwise-ignored directories still register.
-//! * If two `go.mod` files declare the same module path, the shallowest wins.
+//! * If two `go.mod` files declare the same module path, all of them are kept
+//!   (`examples/*/go.mod` all saying `module example` is common). `resolve`
+//!   picks the one whose directory encloses the importing file, innermost
+//!   first, and falls back to the shallowest.
+//! * `replace old => ./local/dir` (a local path target) registers a unit named
+//!   `old` at that directory, unless a `go.mod` there already declared it.
 //! * `source_roots` mirrors the module directories; `excludes` stays empty
 //!   because Go has no configured build-output directory.
 //!
 //! # How `resolve` picks a file
 //!
-//! An import names a directory, but the graph is file-level, so one `.go`
-//! file in that directory stands for the package:
+//! An import names a directory, so [`GoResolver::resolve_import`] returns every
+//! non-test `.go` file of the package as a real import edge (a change to any
+//! file in the package affects the importer). [`GoResolver::resolve`] keeps
+//! returning the one file that stands for the package, chosen like this:
 //!
 //! 1. files starting with `.` or `_` are ignored (the Go tool ignores them);
 //! 2. `_test.go` files are ignored;
@@ -54,7 +61,8 @@
 use std::collections::BTreeSet;
 
 use crate::types::{
-    join_rel, FileIndex, Language, ModuleResolver, ModuleUnit, ProjectMeta, RelPath,
+    join_rel, FileIndex, ImportResolution, Language, ModuleResolver, ModuleUnit, ProjectMeta,
+    RelPath,
 };
 
 pub struct GoResolver;
@@ -106,17 +114,27 @@ impl ModuleResolver for GoResolver {
             modules.push(ModuleUnit { name, dir });
         }
 
-        // 3. One unit per module path: the shallowest directory wins. Sort by
-        //    (name, depth, dir) so `dedup_by` keeps the shallowest, then order
-        //    by dir for a deterministic, readable result.
-        modules.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| depth(&a.dir).cmp(&depth(&b.dir)))
-                .then_with(|| a.dir.cmp(&b.dir))
-        });
-        modules.dedup_by(|later, earlier| later.name == earlier.name);
-        modules.sort_by(|a, b| a.dir.cmp(&b.dir));
+        // 3. `replace x => ./local` with a local directory target.
+        for go_mod in &candidates {
+            let Some(content) = files.read(go_mod) else {
+                continue;
+            };
+            let base = RelPath::new(go_mod).dir().to_string();
+            for (old, target) in parse_local_replaces(&content) {
+                let Some(dir) = join_rel(&base, &target) else {
+                    continue;
+                };
+                if !files.has_dir(&dir) {
+                    continue;
+                }
+                modules.push(ModuleUnit { name: old, dir });
+            }
+        }
+
+        // 4. Keep every unit, even with a repeated module path; `resolve`
+        //    chooses by proximity. Only exact duplicates are dropped.
+        modules.sort_by(|a, b| a.dir.cmp(&b.dir).then_with(|| a.name.cmp(&b.name)));
+        modules.dedup();
 
         let source_roots = modules.iter().map(|m| m.dir.clone()).collect();
         ProjectMeta {
@@ -133,6 +151,42 @@ impl ModuleResolver for GoResolver {
         files: &FileIndex,
         meta: &ProjectMeta,
     ) -> Option<RelPath> {
+        resolve_package(from, spec, files, meta)
+            .map(|p| p.primary)
+            .filter(|p| p != from)
+    }
+
+    fn resolve_import(
+        &self,
+        from: &RelPath,
+        spec: &str,
+        files: &FileIndex,
+        meta: &ProjectMeta,
+    ) -> ImportResolution {
+        let Some(pkg) = resolve_package(from, spec, files, meta) else {
+            return ImportResolution::Unresolved;
+        };
+        let all: Vec<RelPath> = pkg.all.into_iter().filter(|p| p != from).collect();
+        if all.is_empty() {
+            ImportResolution::Unresolved
+        } else {
+            ImportResolution::Files(all)
+        }
+    }
+}
+
+struct Package {
+    primary: RelPath,
+    all: Vec<RelPath>,
+}
+
+fn resolve_package(
+    from: &RelPath,
+    spec: &str,
+    files: &FileIndex,
+    meta: &ProjectMeta,
+) -> Option<Package> {
+    {
         let spec = normalize_spec(spec);
         // `import "C"` is the cgo pseudo-package.
         if spec.is_empty() || spec == "C" {
@@ -143,13 +197,13 @@ impl ModuleResolver for GoResolver {
         // but cost nothing to support.
         if spec.starts_with("./") || spec.starts_with("../") {
             let dir = join_rel(from.dir(), spec)?;
-            return package_file(files, &dir, package_hint(&dir));
+            return package_files(files, &dir, package_hint(&dir));
         }
 
         // Longest-prefix module match, then strip the module path. For the
         // module root package `rest` is empty and the package directory is the
         // module directory itself.
-        if let Some(unit) = meta.module_for(spec) {
+        for unit in module_candidates(meta, from.dir(), spec) {
             let rest = spec[unit.name.len()..].trim_start_matches('/');
             let dir = join_dir(&unit.dir, rest);
             let hint = if rest.is_empty() {
@@ -157,7 +211,7 @@ impl ModuleResolver for GoResolver {
             } else {
                 package_hint(rest)
             };
-            if let Some(found) = package_file(files, &dir, hint) {
+            if let Some(found) = package_files(files, &dir, hint) {
                 return Some(found);
             }
         }
@@ -176,7 +230,7 @@ impl ModuleResolver for GoResolver {
         roots.dedup();
         for root in roots {
             let vendor = join_dir(&join_dir(root, "vendor"), spec);
-            if let Some(found) = package_file(files, &vendor, package_hint(spec)) {
+            if let Some(found) = package_files(files, &vendor, package_hint(spec)) {
                 return Some(found);
             }
         }
@@ -187,11 +241,45 @@ impl ModuleResolver for GoResolver {
 
 // ----------------------------------------------------------------- helpers
 
-/// Pick the file that stands for the package in `dir`. See the module docs
-/// for the selection order.
-fn package_file(files: &FileIndex, dir: &str, hint: &str) -> Option<RelPath> {
+/// Units whose module path prefixes `spec`, best first: longest module path,
+/// then the innermost unit whose directory encloses the importing file, then
+/// the shallowest directory. Several units may share one module path.
+fn module_candidates<'m>(meta: &'m ProjectMeta, from_dir: &str, spec: &str) -> Vec<&'m ModuleUnit> {
+    let mut v: Vec<&ModuleUnit> = meta
+        .modules
+        .iter()
+        .filter(|m| {
+            spec == m.name
+                || spec
+                    .strip_prefix(m.name.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        })
+        .collect();
+    v.sort_by_key(|m| {
+        let encloses = dir_within(from_dir, &m.dir);
+        (
+            std::cmp::Reverse(m.name.len()),
+            std::cmp::Reverse(encloses),
+            // Enclosing units: innermost (longest dir) first. Others: shallowest.
+            if encloses {
+                usize::MAX - m.dir.len()
+            } else {
+                m.dir.len()
+            },
+            m.dir.clone(),
+        )
+    });
+    v
+}
+
+/// The package in `dir`: `primary` is the file that stands for it in
+/// [`GoResolver::resolve`] (see the module docs for the selection order),
+/// `all` is every file of the package for [`GoResolver::resolve_import`].
+fn package_files(files: &FileIndex, dir: &str, hint: &str) -> Option<Package> {
     let mut best: Option<&RelPath> = None;
     let mut best_test: Option<&RelPath> = None;
+    let mut hinted: Option<&RelPath> = None;
+    let mut all: Vec<RelPath> = Vec::new();
     for p in files.entries(dir) {
         let name = p.file_name();
         let Some(stem) = name.strip_suffix(".go") else {
@@ -206,14 +294,47 @@ fn package_file(files: &FileIndex, dir: &str, hint: &str) -> Option<RelPath> {
             }
             continue;
         }
+        all.push(p.clone());
         if stem == hint {
-            return Some(p.clone());
+            hinted = Some(p);
         }
         if best.is_none_or(|b| p < b) {
             best = Some(p);
         }
     }
-    best.or(best_test).cloned()
+    all.sort();
+    match hinted.or(best) {
+        Some(primary) => Some(Package {
+            primary: primary.clone(),
+            all,
+        }),
+        None => best_test.map(|t| Package {
+            primary: t.clone(),
+            all: vec![t.clone()],
+        }),
+    }
+}
+
+/// `replace` directives whose target is a local directory: `(old module,
+/// relative target)`. Handles single-line and block forms and an optional
+/// version after the old module path.
+fn parse_local_replaces(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, arg) in directives(content) {
+        if name != "replace" {
+            continue;
+        }
+        let Some((lhs, rhs)) = arg.split_once("=>") else {
+            continue;
+        };
+        let old = first_token(lhs);
+        let target = first_token(rhs);
+        if old.is_empty() || !(target.starts_with("./") || target.starts_with("../")) {
+            continue;
+        }
+        out.push((old.to_string(), target.to_string()));
+    }
+    out
 }
 
 /// Last path segment, skipping a `/vN` major-version suffix
@@ -258,14 +379,6 @@ fn dir_within(dir: &str, root: &str) -> bool {
         || dir
             .strip_prefix(root)
             .is_some_and(|r| r.is_empty() || r.starts_with('/'))
-}
-
-fn depth(dir: &str) -> usize {
-    if dir.is_empty() {
-        0
-    } else {
-        dir.matches('/').count() + 1
-    }
 }
 
 /// Trees the Go tool never treats as part of a module: `testdata`, and any
@@ -507,6 +620,11 @@ mod tests {
                 ModuleUnit {
                     name: "example.com/hidden".into(),
                     dir: "_fixtures/hidden".into()
+                },
+                // Same module path as the root: kept (nearest wins at resolve).
+                ModuleUnit {
+                    name: "example.com/app".into(),
+                    dir: "copy".into()
                 },
                 ModuleUnit {
                     name: "example.com/app/tools".into(),
@@ -977,5 +1095,64 @@ func f() string { return "import \"not/an/import\"" }
             "no in-module imports found — extractor or corpus broken"
         );
         assert_eq!(resolved, total, "unresolved in-module imports: {missed:?}");
+    }
+
+    #[test]
+    fn same_module_name_resolves_to_enclosing_module() {
+        let files = index(
+            "/nonexistent",
+            &[
+                "examples/a/util/util.go",
+                "examples/a/main.go",
+                "examples/b/util/util.go",
+                "examples/b/main.go",
+            ],
+        );
+        let m = meta(&[("example", "examples/a"), ("example", "examples/b")]);
+        assert_eq!(
+            resolve(&files, &m, "examples/b/main.go", "example/util").as_deref(),
+            Some("examples/b/util/util.go")
+        );
+        assert_eq!(
+            resolve(&files, &m, "examples/a/main.go", "example/util").as_deref(),
+            Some("examples/a/util/util.go")
+        );
+    }
+
+    #[test]
+    fn resolve_import_returns_every_non_test_file_of_the_package() {
+        let files = index(
+            "/nonexistent",
+            &[
+                "go.mod",
+                "app.go",
+                "p/a.go",
+                "p/b.go",
+                "p/b_test.go",
+                "p/_x.go",
+            ],
+        );
+        let m = meta(&[("m", "")]);
+        match GoResolver.resolve_import(&RelPath::new("app.go"), "m/p", &files, &m) {
+            ImportResolution::Files(v) => {
+                let got: Vec<&str> = v.iter().map(RelPath::as_str).collect();
+                assert_eq!(got, vec!["p/a.go", "p/b.go"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_local_replace_directives() {
+        let got = parse_local_replaces(
+            "module m\nreplace example.com/x => ./third/x\nreplace (\n  a.b/c v1.0.0 => ../c // note\n  d.e/f => github.com/g/h v1\n)\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("example.com/x".to_string(), "./third/x".to_string()),
+                ("a.b/c".to_string(), "../c".to_string())
+            ]
+        );
     }
 }

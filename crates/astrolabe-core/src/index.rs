@@ -902,8 +902,24 @@ fn assemble_graph(
         let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
         for spec in &row.parsed.imports {
             match resolvers.resolve_import_as(import_lang, &row.path, spec, files) {
+                ImportResolution::Files(targets) => {
+                    for target in targets {
+                        if let Some(&to) = index_of.get(&target) {
+                            if to == from {
+                                continue;
+                            }
+                            edges.push(CodeEdge {
+                                from: from.0,
+                                to: to.0,
+                                kind: EdgeKind::Import,
+                                weight: 1,
+                                confidence: Confidence::Scoped,
+                            });
+                        }
+                    }
+                }
                 ImportResolution::File(target) => {
-                    if let Some(&to) = index_of.get(&target) {
+                    if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
                         edges.push(CodeEdge {
                             from: from.0,
                             to: to.0,
@@ -918,7 +934,7 @@ fn assemble_graph(
                     // Every declaring file, partials included. Not an Import:
                     // PageRank stays on real file edges.
                     for target in targets {
-                        if let Some(&to) = index_of.get(&target) {
+                        if let Some(&to) = index_of.get(&target).filter(|&&to| to != from) {
                             edges.push(CodeEdge {
                                 from: from.0,
                                 to: to.0,
@@ -940,9 +956,9 @@ fn assemble_graph(
         }
     }
 
-    // ProjectReference is a file-level import even when no source file
-    // repeats it as a using. Endpoints that were not parsed are skipped;
-    // the relationship still lives on ProjectMeta::project_refs.
+    // ProjectReference pairs become an edge only when both manifests were
+    // parsed as files. In practice `.csproj` is not a parsed source, so this
+    // adds nothing today; the relationship lives on ProjectMeta::project_refs.
     for (_lang, meta) in resolvers.iter_meta() {
         for pref in &meta.project_refs {
             let from_path = RelPath::new(&pref.from);
