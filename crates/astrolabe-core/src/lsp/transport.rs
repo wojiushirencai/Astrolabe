@@ -1586,14 +1586,6 @@ fn write_rpc(shared: &Shared, payload: &Value) -> Result<(), LspError> {
     }
 }
 
-fn write_frame(writer: &mut impl Write, body: &[u8]) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(32 + body.len());
-    write!(buf, "Content-Length: {}\r\n\r\n", body.len())?;
-    buf.extend_from_slice(body);
-    writer.write_all(&buf)?;
-    writer.flush()
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()

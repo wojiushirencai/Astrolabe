@@ -1830,7 +1830,7 @@ mod tests {
                 ),
                 (
                     "ui/tsconfig.json",
-                    r#"{"compilerOptions": {"paths": {"@/*": ["ui/src/*"]}}}"#,
+                    r#"{"compilerOptions": {"paths": {"@/*": ["src/*"]}}}"#,
                 ),
             ],
             &["src/a.ts", "ui/src/a.ts", "ui/b.ts", "c.ts"],

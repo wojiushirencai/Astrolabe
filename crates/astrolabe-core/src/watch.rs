@@ -1124,7 +1124,7 @@ fn event_loop<F: EventFeed, G>(
                 if !noted.is_empty() {
                     // Ignore-rule files change the admitted set of other
                     // paths; only a full scan can re-evaluate those.
-                    if noted.iter().any(|r| is_ignore_rule_file(r)) {
+                    if noted.iter().any(is_ignore_rule_file) {
                         all_dirty = true;
                     }
                     watcher.freshness.note_paths(&noted);

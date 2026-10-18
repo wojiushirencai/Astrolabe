@@ -766,13 +766,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn ready_session(dir: &PathBuf) -> Arc<RootSession> {
+    fn ready_session(dir: &Path) -> Arc<RootSession> {
         let knobs = McpKnobs {
             watch_mode: None,
             parse_cache_bytes: DEFAULT_PARSE_CACHE_BYTES,
             ..McpKnobs::default()
         };
-        let session = RootSession::new(dir.clone(), knobs, 8 * 1024 * 1024);
+        let session = RootSession::new(dir.to_path_buf(), knobs, 8 * 1024 * 1024);
         let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
         let cold = build_index(&session.root, persist, session.knobs.parse_cache_bytes);
         assert!(matches!(cold, IndexState::Ready(_)));

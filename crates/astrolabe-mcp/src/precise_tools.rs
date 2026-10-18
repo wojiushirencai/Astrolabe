@@ -60,7 +60,7 @@ const COORD_NOTE: &str =
 /// One page of `items` starting at `offset`, cut by `budget`. Always keeps at
 /// least one item when any remain, so `next_offset` advances. Returns the kept
 /// items and how many remain after them.
-fn page<'a>(items: &'a [String], offset: usize, budget: usize) -> (Vec<&'a String>, usize) {
+fn page(items: &[String], offset: usize, budget: usize) -> (Vec<&String>, usize) {
     let rest = items.get(offset..).unwrap_or(&[]);
     let (mut kept, mut omitted) = truncate_ranked(rest, budget, |line| format!("{line}\n"));
     if kept.is_empty() && !rest.is_empty() {
@@ -81,7 +81,8 @@ pub(crate) struct FindReferencesParams {
     pub root: Option<String>,
     #[schemars(description = "Symbol name to find references for.")]
     pub symbol: String,
-    #[serde(default)]
+    // No `serde(default)`: schemars would then drop it from `required`. A
+    // missing `Option` field still deserializes to `None`.
     #[schemars(
         required,
         description = "Repo-relative file (selects the language server)."
@@ -1201,9 +1202,10 @@ mod tests {
         assert!(text.contains("confidence: Exact"), "{text}");
         assert!(text.contains("@src/a.rs:3"), "{text}");
         assert!(text.contains("@src/b.rs:10"), "{text}");
+        // Backend order is kept (origin file first), not re-sorted by path.
         let a = text.find("@src/a.rs:3").unwrap();
         let b = text.find("@src/b.rs:10").unwrap();
-        assert!(a < b, "locations must be sorted by path: {text}");
+        assert!(b < a, "backend order must be preserved: {text}");
     }
 
     #[test]
@@ -1518,7 +1520,7 @@ mod tests {
 
     #[test]
     fn budget_is_capped_and_preview_shares_it() {
-        let many: Vec<Location> = (0..3000).map(|i| loc("src/lib.rs", i, 0)).collect();
+        let many: Vec<Location> = (0..30_000).map(|i| loc("src/lib.rs", i, 0)).collect();
         let tools = fake_refs(Precise::exact(many));
         let r = tools.find_references(Parameters(refs_params(100_000_000, None, None)));
         let s = r.structured_content.clone().unwrap();

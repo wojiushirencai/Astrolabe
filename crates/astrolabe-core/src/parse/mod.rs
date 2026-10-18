@@ -1375,7 +1375,12 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
         let pool = ParserPool::new();
         for (lang, path, src, callee) in [
             (Language::JavaScript, "a.js", "function f(){ h(a); }\n", "h"),
-            (Language::Python, "a.py", "def f():\n    os.path.join(1)\n", "join"),
+            (
+                Language::Python,
+                "a.py",
+                "def f():\n    os.path.join(1)\n",
+                "join",
+            ),
         ] {
             let parsed = pool.parse(lang, &RelPath::new(path), src).unwrap();
             assert!(
@@ -1443,8 +1448,12 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
                             break;
                         }
                         let _g = serialize.then(|| gate.lock().unwrap());
-                        pool.parse(Language::Rust, &RelPath::new("x.rs"), &files[i % files.len()])
-                            .unwrap();
+                        pool.parse(
+                            Language::Rust,
+                            &RelPath::new("x.rs"),
+                            &files[i % files.len()],
+                        )
+                        .unwrap();
                     });
                 }
             });
@@ -1452,7 +1461,10 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
         };
         let serial = run(true);
         let parallel = run(false);
-        println!("files={} serialized={serial:?} parallel={parallel:?}", files.len());
+        println!(
+            "files={} serialized={serial:?} parallel={parallel:?}",
+            files.len()
+        );
     }
 
     #[test]

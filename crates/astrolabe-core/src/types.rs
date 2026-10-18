@@ -306,7 +306,10 @@ impl Language {
             "python" | "pypy" | "pypy3" => Some(Language::Python),
             "node" | "nodejs" | "deno" | "bun" => Some(Language::JavaScript),
             "php" => Some(Language::Php),
-            i if i.len() > 6 && i.starts_with("python") && i[6..].bytes().all(|b| b.is_ascii_digit() || b == b'.') => {
+            i if i.len() > 6
+                && i.starts_with("python")
+                && i[6..].bytes().all(|b| b.is_ascii_digit() || b == b'.') =>
+            {
                 Some(Language::Python)
             }
             _ => None,
@@ -687,7 +690,10 @@ pub enum ImportResolution {
     /// One import statement that names several repo files (Rust
     /// `use crate::{a::X, b::Y}`). Each is a real import edge, like `File`.
     Files(Vec<RelPath>),
-    Namespace { name: String, files: Vec<RelPath> },
+    Namespace {
+        name: String,
+        files: Vec<RelPath>,
+    },
 }
 
 // ------------------------------------------------------------------- graph
@@ -775,7 +781,11 @@ mod tests {
             "const char *s = \"a::b\";\n",
             "// namespace foo { }\nint x;\n",
         ] {
-            assert_eq!(Language::from_path_and_source(&h, c), Some(Language::C), "{c:?}");
+            assert_eq!(
+                Language::from_path_and_source(&h, c),
+                Some(Language::C),
+                "{c:?}"
+            );
         }
         for c in [
             "template <typename T>\nstruct S {};\n",
@@ -785,7 +795,11 @@ mod tests {
             "void* p = nullptr;\n",
             "extern \"C++\" void f();\n",
         ] {
-            assert_eq!(Language::from_path_and_source(&h, c), Some(Language::Cpp), "{c:?}");
+            assert_eq!(
+                Language::from_path_and_source(&h, c),
+                Some(Language::Cpp),
+                "{c:?}"
+            );
         }
     }
 
@@ -810,7 +824,10 @@ mod tests {
                 "{src:?}"
             );
         }
-        assert_eq!(Language::from_path(&RelPath::new("a.pyw")), Some(Language::Python));
+        assert_eq!(
+            Language::from_path(&RelPath::new("a.pyw")),
+            Some(Language::Python)
+        );
     }
 
     #[test]

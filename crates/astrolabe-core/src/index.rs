@@ -554,6 +554,7 @@ fn stamp_hit(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_one(
     root: &Path,
     path: &RelPath,
@@ -648,10 +649,10 @@ fn parse_one(
                 // Syntax errors: symbols/imports/calls may be incomplete.
                 // Keep what was extracted but surface it, and do not cache
                 // it so the signal is not lost on the next (cache-hit) run.
-                failures
-                    .lock()
-                    .expect("failure list poisoned")
-                    .push((path.clone(), "partial parse: syntax errors in file".to_owned()));
+                failures.lock().expect("failure list poisoned").push((
+                    path.clone(),
+                    "partial parse: syntax errors in file".to_owned(),
+                ));
             } else if store.is_some() {
                 side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
                 match store::encode_parsed(&parsed) {
@@ -1713,7 +1714,12 @@ mod tests {
         // A syntax-error file is still parsed (partial symbols kept) AND
         // reported, so incompleteness is never silent.
         assert_eq!(report.files_parsed, 1);
-        assert_eq!(report.parse_failures.len(), 1, "{:?}", report.parse_failures);
+        assert_eq!(
+            report.parse_failures.len(),
+            1,
+            "{:?}",
+            report.parse_failures
+        );
         assert!(
             report.parse_failures[0].1.starts_with("partial parse"),
             "{:?}",
@@ -2823,7 +2829,9 @@ mod persist_audit_tests {
             ..IndexOptions::default()
         };
         let inc = IncrementalIndex::build(&root, &opts);
-        let big: String = (0..40).map(|i| format!("def f{i}():\n    pass\n")).collect();
+        let big: String = (0..40)
+            .map(|i| format!("def f{i}():\n    pass\n"))
+            .collect();
         assert!(big.len() > 200);
         write_old(&root, "a.py", &big);
         let changes = ChangeSet {

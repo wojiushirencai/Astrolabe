@@ -145,7 +145,7 @@ mod tests {
         std::fs::write(d.join("u16.txt"), utf16).unwrap();
         // GBK bytes are transcoded, not dropped or searched as mojibake.
         let (gbk, _, _) = encoding_rs::GBK.encode("hello 你好，这是中文注释\n");
-        std::fs::write(d.join("gbk.txt"), gbk.into_owned()).unwrap();
+        std::fs::write(d.join("gbk.txt"), &gbk).unwrap();
         let paths = [
             "a.md",
             "bin.dat",

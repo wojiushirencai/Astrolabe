@@ -568,7 +568,7 @@ impl Store {
 /// same bytes (new captures, different anchors/kinds). The parse cache is
 /// keyed by content hash, so without this an upgraded binary keeps serving
 /// symbols extracted by the old version until each file is edited.
-pub const EXTRACTOR_VERSION: u32 = 2;
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// Cache key for a parsed file: extractor version, crate version, language
 /// and content hash.
@@ -1174,7 +1174,10 @@ mod tests {
         let dir = TestDir::new("corrupt");
         std::fs::write(dir.db(), vec![0xABu8; 4096]).unwrap();
         // Plain `open` still reports it.
-        assert!(matches!(Store::open(&dir.db()), Err(StoreError::Corrupt(_))));
+        assert!(matches!(
+            Store::open(&dir.db()),
+            Err(StoreError::Corrupt(_))
+        ));
         let store = Store::open_or_heal(&dir.db()).expect("heals a corrupt cache");
         store.put_cached_parse("k", b"v").unwrap();
         assert_eq!(store.cached_parse("k").unwrap(), Some(b"v".to_vec()));
@@ -1195,7 +1198,10 @@ mod tests {
             store.put_cached_parse("k", &vec![7u8; 100_000]).unwrap();
         }
         let len = std::fs::metadata(dir.db()).unwrap().len();
-        let f = std::fs::OpenOptions::new().write(true).open(dir.db()).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.db())
+            .unwrap();
         f.set_len(len / 3).unwrap();
         drop(f);
         let store = Store::open_or_heal(&dir.db()).expect("heals a truncated cache");
