@@ -1461,6 +1461,7 @@ mod tests {
         rename: Option<&str>,
     ) -> FindReferencesParams {
         FindReferencesParams {
+            root: None,
             symbol: "Run".into(),
             path: Some("a.go".into()),
             line: None,
@@ -1520,7 +1521,7 @@ mod tests {
         let many: Vec<Location> = (0..3000).map(|i| loc("src/lib.rs", i, 0)).collect();
         let tools = fake_refs(Precise::exact(many));
         let r = tools.find_references(Parameters(refs_params(100_000_000, None, None)));
-        let s = r.structured_content.unwrap();
+        let s = r.structured_content.clone().unwrap();
         assert_eq!(s["budget_tokens"], json!(MAX_BUDGET_TOKENS));
         assert!(s["truncated"].as_bool().unwrap());
         let text = first_text(&r);
@@ -1575,6 +1576,7 @@ mod tests {
             diagnostics: Precise::exact(Vec::new()),
         });
         let r = tools.goto_definition(Parameters(GotoDefinitionParams {
+            root: None,
             path: "a.go".into(),
             symbol: Some("Run".into()),
             line: None,

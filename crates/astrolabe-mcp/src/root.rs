@@ -23,7 +23,8 @@
 //! 1. Walk **up** first — a nested checkout such as `newapi/web` must still
 //!    resolve to `newapi`. Downward probes must not change that.
 //! 2. Look **down** one level for direct children that contain `.git`
-//!    (hidden names such as `.Trash` are skipped). One hit is `MultiProject`.
+//!    (hidden names such as `.Trash` are skipped). Exactly one hit is served
+//!    directly as `Repo`; two or more are `MultiProject`.
 //! 3. Count files (capped) and accept as `Single` or refuse as `TooLarge`.
 //!
 //! The MCP binary starts `MultiProject` in dispatcher mode (lazy per-child
@@ -47,7 +48,7 @@ pub enum ResolvedRoot {
     Repo(PathBuf),
     /// No project marker, no child git repos, file count ≤ `limit`.
     Single(PathBuf),
-    /// Direct children contain `.git` (≥ 1). Hidden names are not listed.
+    /// Two or more direct children contain `.git`. Hidden names are not listed.
     MultiProject {
         root: PathBuf,
         children: Vec<PathBuf>,
@@ -89,29 +90,67 @@ pub fn is_cwd_sentinel(path: &Path) -> bool {
 ///
 /// Upward detection is first and final: a nested repo is never reclassified
 /// because a parent directory happens to contain sibling checkouts.
+///
+/// A marker found in an *ancestor* of `cwd` is size-checked like an unmarked
+/// directory: a stray `~/.git` (dotfiles) or a repo above the limit must not
+/// silently make the whole ancestor the index root. Such an ancestor is
+/// skipped (with a warning) and `cwd` is classified instead; set
+/// `ASTROLABE_ROOT` or raise `ASTROLABE_MAX_ROOT_FILES` to force it.
 pub fn resolve_root(cwd: &Path, limit: u64) -> ResolvedRoot {
+    let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     if let Some(found) = find_project_root(cwd) {
-        return ResolvedRoot::Repo(found);
+        if found == cwd_canon {
+            return ResolvedRoot::Repo(found);
+        }
+        match ancestor_rejection(&found, limit) {
+            None => return ResolvedRoot::Repo(found),
+            Some(reason) => tracing::warn!(
+                ancestor = %found.display(),
+                cwd = %cwd_canon.display(),
+                "ignoring project marker in ancestor directory ({reason}); \
+                 set ASTROLABE_ROOT or ASTROLABE_MAX_ROOT_FILES to use it"
+            ),
+        }
     }
-    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let children = child_git_repos(&root);
+    let root = cwd_canon;
+    let mut children = child_git_repos(&root);
+    if children.len() == 1 {
+        // A single nested repo needs no routing: serve it directly.
+        return ResolvedRoot::Repo(children.remove(0));
+    }
     if !children.is_empty() {
         return ResolvedRoot::MultiProject { root, children };
     }
     let (files, truncated) = count_root_files(&root, limit);
-    if truncated || files > limit {
+    if truncated {
         return ResolvedRoot::TooLarge { root, files, limit };
     }
     ResolvedRoot::Single(root)
 }
 
+/// Why an ancestor project root must not be adopted, if any.
+fn ancestor_rejection(found: &Path, limit: u64) -> Option<String> {
+    let is_home = ["HOME", "USERPROFILE"].iter().any(|var| {
+        std::env::var_os(var)
+            .and_then(|home| Path::new(&home).canonicalize().ok())
+            .is_some_and(|home| home == found)
+    });
+    if is_home {
+        return Some("it is the home directory".to_string());
+    }
+    let (_, truncated) = count_root_files(found, limit);
+    truncated.then(|| format!("it holds more than {limit} files"))
+}
+
 /// `(files, truncated)` for the unmarked-root gate and startup telemetry.
 ///
-/// Thin wrapper around [`astrolabe_core::scan::count_files`] so the binary
-/// and [`resolve_root`] share one call site.
+/// `truncated` is true only when the tree holds **more than** `limit` files,
+/// so a directory with exactly `limit` files is accepted. `files` is then a
+/// lower bound (`> limit`). Wrapper around
+/// [`astrolabe_core::scan::count_files`], which stops at its own cap.
 pub fn count_root_files(root: &Path, limit: u64) -> (u64, bool) {
-    let count = count_files(root, &ScanOptions::default(), limit);
-    (count.files, count.truncated)
+    let count = count_files(root, &ScanOptions::default(), limit.saturating_add(1));
+    (count.files, count.files > limit)
 }
 
 /// Direct child directories of `root` that contain a `.git` marker.
@@ -148,9 +187,14 @@ impl ResolvedRoot {
                 Some(format_multi_project_refuse(root, children))
             }
             Self::TooLarge { root, files, limit } => Some(format!(
-                "Astrolabe refused to index {}: found {files} files (limit {limit}).\n\
+                "Astrolabe refused to index {}: found {} files (limit {limit}).\n\
                  cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root",
-                root.display()
+                root.display(),
+                if *files > *limit {
+                    format!("more than {limit}")
+                } else {
+                    files.to_string()
+                }
             )),
             Self::Repo(_) | Self::Single(_) => None,
         }
@@ -508,6 +552,7 @@ mod tests {
     fn resolve_root_hidden_dirs_are_not_children() {
         let root = unique_temp_dir();
         git_marker(&root.join("visible"));
+        git_marker(&root.join("visible2"));
         git_marker(&root.join(".Trash"));
         git_marker(&root.join(".hidden"));
         match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
@@ -516,7 +561,7 @@ mod tests {
                     .iter()
                     .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
                     .collect();
-                assert_eq!(names, ["visible"]);
+                assert_eq!(names, ["visible", "visible2"]);
             }
             other => panic!("expected MultiProject, got {other:?}"),
         }
@@ -600,5 +645,63 @@ mod tests {
         assert!(!msg.contains("/tmp/workspace/r20"));
         assert!(msg.contains("…and 1 more"));
         assert!(msg.contains("cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root"));
+    }
+
+    #[test]
+    fn resolve_root_single_child_repo_is_served_directly() {
+        let root = unique_temp_dir();
+        git_marker(&root.join("solo"));
+        std::fs::write(root.join("notes.txt"), b"x").unwrap();
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => {
+                assert_eq!(found, root.join("solo").canonicalize().unwrap());
+            }
+            other => panic!("expected Repo(solo), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_with_exactly_limit_files_is_accepted() {
+        let root = unique_temp_dir();
+        write_n_files(&root, 10);
+        assert_eq!(count_root_files(&root, 10), (10, false));
+        match resolve_root(&root, 10) {
+            ResolvedRoot::Single(_) => {}
+            other => panic!("exactly `limit` files must be accepted, got {other:?}"),
+        }
+        write_n_files(&root, 11);
+        assert!(
+            count_root_files(&root, 10).1,
+            "limit + 1 files is too large"
+        );
+        match resolve_root(&root, 10) {
+            ResolvedRoot::TooLarge { .. } => {}
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        let msg = resolve_root(&root, 10).refuse_guidance().unwrap();
+        assert!(msg.contains("more than 10 files"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn oversized_ancestor_repo_is_not_adopted_as_root() {
+        let ancestor = unique_temp_dir();
+        git_marker(&ancestor);
+        write_n_files(&ancestor, 6);
+        let proj = ancestor.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("a.rs"), b"fn a() {}").unwrap();
+        // Ancestor holds more than the limit: cwd is classified on its own.
+        match resolve_root(&proj, 3) {
+            ResolvedRoot::Single(found) => assert_eq!(found, proj.canonicalize().unwrap()),
+            other => panic!("expected Single(proj), got {other:?}"),
+        }
+        // Within the limit the ancestor repo is still the root.
+        match resolve_root(&proj, 100) {
+            ResolvedRoot::Repo(found) => assert_eq!(found, ancestor.canonicalize().unwrap()),
+            other => panic!("expected Repo(ancestor), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ancestor);
     }
 }
