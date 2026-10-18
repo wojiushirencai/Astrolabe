@@ -6,6 +6,8 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-18
+
 基于 v0.12.0 实测分析（模型不信任 `search_code` 结果、反复重查，聚合/批量任务不用 Astrolabe）的收口改进；工具目录仍为 7 个，`tools/list` 约 8 KB 以内。
 
 ### 变更
@@ -25,6 +27,11 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 - **命中多（>40 处）时**结果末尾也给“下一步”提示（统计用 `aggregate`，改名用 `find_references dry_run_rename`）。
 - **“已全部列出”可核验**：改为“汇总：23/23 处命中 / M 个文件，无截断”；未列全写“已列 K/N 处，有截断”。
 - **分组结果把文档（`docs/`、md/rst/txt）从“生产代码”拆出**，单列“文档”组，命中行标 `[文档]`。
+
+### 依赖与文档
+
+- `zip` 8.6 → 9（修复 RUSTSEC-2026-0367/0368/0369，cargo-deny 门禁）。
+- README 工具表改为固定 7 个并更新 `search_code` 说明（#72）。
 
 ## [0.12.0] - 2026-10-17
 
