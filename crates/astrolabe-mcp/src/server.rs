@@ -892,7 +892,7 @@ fn classify_task(task: &str) -> TaskKind {
 fn next_step_hint(task: &str) -> &'static str {
     match classify_task(task) {
         TaskKind::Rename => "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后 get_diagnostics 验证。\n",
-        TaskKind::Count => "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 处 / M 个文件计数；只要总数加 count_only=true。\n",
+        TaskKind::Count => "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 行 / M 个文件计数（按行计，同一行多次出现算 1）；只要总数加 count_only=true。\n",
         TaskKind::Refs => "下一步：find_references(symbol) 取精确调用点；定义用 goto_definition。\n",
         TaskKind::Other => "下一步：已知名字用 find_symbol（include_body=true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n",
     }
@@ -5453,7 +5453,7 @@ mod tests {
         assert_eq!(text.matches("  L").count(), 11, "{text}");
         assert!(!text.contains("未列出"), "{text}");
         assert!(
-            text.contains("汇总：11/11 处命中 / 2 个文件，无截断，已全部列出（结果完整"),
+            text.contains("汇总：11/11 行命中 / 2 个文件，无截断，已全部列出（结果完整"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -5490,7 +5490,7 @@ mod tests {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
         let text = text_of(&server.search_code(Parameters(search("marker_x"))));
         assert!(
-            text.contains("汇总：2/2 处命中 / 1 个文件，无截断，已全部列出（结果完整"),
+            text.contains("汇总：2/2 行命中 / 1 个文件，无截断，已全部列出（结果完整"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -5522,14 +5522,14 @@ mod tests {
         p.aggregate = Some("dir".into());
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(
-            text.contains("总计 6 处命中 / 5 个文件 / 3 个目录 / 3 个顶层目录"),
+            text.contains("总计 6 行命中 / 5 个文件 / 3 个目录 / 3 个顶层目录"),
             "{text}"
         );
-        assert!(text.contains("每个目录: N 处 / M 个文件"), "{text}");
-        assert!(text.contains("    4 处 /    3 个文件  svc/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  web/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  vendor/x/"), "{text}");
-        assert!(text.contains("    6 处 /    5 个文件  总计"), "{text}");
+        assert!(text.contains("每个目录: N 行 / M 个文件"), "{text}");
+        assert!(text.contains("    4 行 /    3 个文件  svc/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  web/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  vendor/x/"), "{text}");
+        assert!(text.contains("    6 行 /    5 个文件  总计"), "{text}");
         assert!(!text.contains("@svc/a.go"), "no hit lines: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5540,12 +5540,12 @@ mod tests {
         let mut p = search("SysLog(");
         p.aggregate = Some("file".into());
         let text = text_of(&server.search_code(Parameters(p)));
-        assert!(text.contains("    2 处 /    1 个文件  svc/a.go"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  web/c.go"), "{text}");
+        assert!(text.contains("    2 行 /    1 个文件  svc/a.go"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  web/c.go"), "{text}");
         let mut c = search("SysLog(");
         c.count_only = true;
         let text = text_of(&server.search_code(Parameters(c)));
-        assert!(text.contains("总计 6 处命中 / 5 个文件"), "{text}");
+        assert!(text.contains("总计 6 行命中 / 5 个文件"), "{text}");
         assert!(!text.contains("总计\n"), "count_only has no rows: {text}");
         let mut bad = search("SysLog(");
         bad.aggregate = Some("package".into());
@@ -5574,11 +5574,11 @@ mod tests {
         let mut p = search("SysLog(");
         p.aggregate = Some("top".into());
         let text = text_of(&server.search_code(Parameters(p)));
-        assert!(text.contains("每个顶层目录: N 处 / M 个文件"), "{text}");
-        assert!(text.contains("    7 处 /    3 个文件  svc/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  web/"), "{text}");
-        assert!(text.contains("    1 处 /    1 个文件  ./"), "{text}");
-        assert!(text.contains("   10 处 /    6 个文件  总计"), "{text}");
+        assert!(text.contains("每个顶层目录: N 行 / M 个文件"), "{text}");
+        assert!(text.contains("    7 行 /    3 个文件  svc/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  web/"), "{text}");
+        assert!(text.contains("    1 行 /    1 个文件  ./"), "{text}");
+        assert!(text.contains("   10 行 /    6 个文件  总计"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5591,8 +5591,8 @@ mod tests {
         p.exclude = Some(vec!["_test.go".into()]);
         let text = text_of(&server.search_code(Parameters(p)));
         // a.go keeps the SysLog(1) line and the `*/ SysLog(5)` line.
-        assert!(text.contains("    3 处 /    2 个文件  svc/"), "{text}");
-        assert!(text.contains("    5 处 /    4 个文件  总计"), "{text}");
+        assert!(text.contains("    3 行 /    2 个文件  svc/"), "{text}");
+        assert!(text.contains("    5 行 /    4 个文件  总计"), "{text}");
         assert!(!text.contains("docs/"), "{text}");
         assert!(
             text.contains("skip_comments：已跳过注释/字符串/文档中的 4 处命中"),
@@ -5602,7 +5602,7 @@ mod tests {
         let mut q = search("SysLog(");
         q.aggregate = Some("file".into());
         let text = text_of(&server.search_code(Parameters(q)));
-        assert!(text.contains("    5 处 /    1 个文件  svc/a.go"), "{text}");
+        assert!(text.contains("    5 行 /    1 个文件  svc/a.go"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5721,7 +5721,7 @@ mod tests {
         p.exclude = Some(vec!["vendor".into(), "*_test.go".into()]);
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(
-            text.contains("总计 4 处命中 / 3 个文件 / 2 个目录 / 2 个顶层目录"),
+            text.contains("总计 4 行命中 / 3 个文件 / 2 个目录 / 2 个顶层目录"),
             "{text}"
         );
         assert!(!text.contains("vendor"), "{text}");
@@ -5747,7 +5747,7 @@ mod tests {
         let again = text_of(&server.search_code(Parameters(p)));
         assert!(again.contains("不再重发全文"), "{again}");
         assert!(
-            again.contains("首次结果摘要：6 处命中 / 5 个文件"),
+            again.contains("首次结果摘要：6 行命中 / 5 个文件"),
             "{again}"
         );
         assert!(again.contains("svc/a.go×2"), "{again}");

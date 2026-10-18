@@ -740,6 +740,12 @@ fn sniff_binary(path: &Path, known_source: bool) -> io::Result<bool> {
     let mut header = Vec::with_capacity(BINARY_SNIFF_BYTES as usize);
     reader.read_to_end(&mut header)?;
 
+    // UTF-16 with a BOM (Windows .rc/.resx/.sql/.csproj) is full of NULs but
+    // is text; the readers transcode it.
+    let utf32_le = header.starts_with(&[0xFF, 0xFE, 0x00, 0x00]);
+    if !utf32_le && (header.starts_with(&[0xFF, 0xFE]) || header.starts_with(&[0xFE, 0xFF])) {
+        return Ok(false);
+    }
     if !known_source {
         return Ok(memchr(0, &header).is_some());
     }
