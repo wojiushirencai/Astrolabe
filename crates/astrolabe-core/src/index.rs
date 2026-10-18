@@ -3070,7 +3070,7 @@ mod incremental_resolve_tests {
     }
 
     fn changes(added: &[&str], modified: &[&str], removed: &[&str]) -> ChangeSet {
-        let to = |v: &[&str]| v.iter().map(|p| RelPath::new(p)).collect();
+        let to = |v: &[&str]| v.iter().map(RelPath::new).collect();
         ChangeSet {
             added: to(added),
             modified: to(modified),
