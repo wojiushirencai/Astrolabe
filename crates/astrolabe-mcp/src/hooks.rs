@@ -244,6 +244,8 @@ pub(crate) const READ_SHELL_COMMANDS: &[&str] = &[
     "bat",
     "get-content",
     "gc",
+    // Windows cmd 的 `type file`
+    "type",
 ];
 
 /// 仅 Astrolabe 支持语言的源码扩展名（hook 拦截口径）。
@@ -5970,5 +5972,43 @@ mod tests {
         // 状态本就是零：不应创建 counter.json
         assert!(!path.exists(), "no-op reset must not write counter.json");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn h6_residual_windows_type_and_find_exec() {
+        let (n, args) = effective_shell_command("type src\\a.rs").unwrap();
+        assert_eq!(n, "type");
+        assert!(READ_SHELL_COMMANDS.contains(&n.as_str()));
+        assert_eq!(args.as_deref(), Some("src\\a.rs"));
+        // 硬模式：find -exec grep 属于已知未覆盖（grep 不在命令位置），这里固化现状
+        let _ = command_contains_text_search("find . -name '*.rs' -exec grep foo {} +");
+    }
+
+    #[test]
+    fn resolve_context_resets_all_burst_counters_by_design() {
+        // resolve_context 是入口导航工具：它的回答取代了之前 grep/read 的探索，
+        // 因此与 find_symbol 等一样清零全部 burst 计数。
+        let cfg = HooksConfig::default();
+        let mut c = CounterState::default();
+        c.n_grep = 2;
+        c.n_read = 2;
+        c.n_slice = 1;
+        c.n_non_symbolic = 3;
+        let kind = classify_tool(
+            "mcp__astrolabe__resolve_context",
+            Client::ClaudeCode,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(kind, ToolKind::AstrolabeSymbolic);
+        c.reset_burst();
+        assert_eq!(
+            (c.n_grep, c.n_read, c.n_slice, c.n_non_symbolic),
+            (0, 0, 0, 0)
+        );
+        let _ = cfg;
     }
 }
