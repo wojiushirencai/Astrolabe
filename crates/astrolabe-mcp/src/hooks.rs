@@ -222,6 +222,9 @@ pub(crate) const GREP_SHELL_COMMANDS: &[&str] = &[
     "ack",
     "fgrep",
     "egrep",
+    "zgrep",
+    "findstr",
+    "select-string",
     "search_for_pattern",
 ];
 
@@ -423,16 +426,25 @@ fn current_timestamp() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// 读取用户主目录
+/// 读取用户主目录：优先 `HOME`，其次 Windows 的 `USERPROFILE`，
+/// 最后 `HOMEDRIVE`+`HOMEPATH`（原生 Windows 宿主通常没有 HOME）。
 fn get_user_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().and_then(|h| {
-        let trimmed = h.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(trimmed))
-        }
-    })
+    home_from_lookup(|k| std::env::var(k).ok())
+}
+
+fn home_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let nonempty = |key: &str| {
+        get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    nonempty("HOME")
+        .or_else(|| nonempty("USERPROFILE"))
+        .or_else(|| match (nonempty("HOMEDRIVE"), nonempty("HOMEPATH")) {
+            (Some(d), Some(p)) => Some(format!("{d}{p}")),
+            _ => None,
+        })
+        .map(PathBuf::from)
 }
 
 /// 校验 session_id 可作为单一路径分量使用。
@@ -466,6 +478,17 @@ fn fnv1a64(s: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// session id 合法（`[A-Za-z0-9_-]`）则原样返回，否则哈希成 `s-<fnv1a64 十六进制>`，
+/// 保证作为单一路径分量安全且同一 id 稳定映射到同一目录（remind 与 cleanup 一致）。
+fn hashed_session_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if sanitize_session_id(trimmed).is_ok() {
+        trimmed.to_string()
+    } else {
+        format!("s-{:016x}", fnv1a64(trimmed))
+    }
 }
 
 /// 将 agent_id 收敛为单一安全路径分量。
@@ -538,13 +561,15 @@ pub(crate) fn save_counter(path: &Path, counter: &CounterState) {
     }
 }
 
-/// 独占锁文件：与 `counter.json` 并列的 `counter.json.lock`。
+/// 独占锁：与 `counter.json` 并列的 `counter.json.lock`，用操作系统文件锁（flock / LockFileEx）。
+///
+/// 进程被 kill/断电时内核自动释放锁，不会留下"陈旧锁"；锁文件本身不删除（删除会引入竞态）。
 struct CounterFileLock {
-    lock_path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl CounterFileLock {
-    /// 在 counter 路径旁创建独占锁；短暂重试后仍失败则返回 None。
+    /// 在 counter 路径旁加独占锁；短暂重试后仍失败则返回 None（降级无锁）。
     fn acquire(counter_path: &Path) -> Option<Self> {
         if let Some(parent) = counter_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -553,33 +578,24 @@ impl CounterFileLock {
         lock_path.push(".lock");
         let lock_path = PathBuf::from(lock_path);
 
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .ok()?;
         for _ in 0..200 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(file) => {
-                    // Keep the file handle until drop so the lock inode stays reserved;
-                    // we only need create_new exclusivity, then close is fine after drop removes it.
-                    drop(file);
-                    return Some(Self { lock_path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match file.try_lock() {
+                Ok(()) => return Some(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                // 文件系统不支持锁等：降级无锁，不要空等
+                Err(std::fs::TryLockError::Error(_)) => return None,
             }
         }
         None
-    }
-}
-
-impl Drop for CounterFileLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
     }
 }
 
@@ -718,31 +734,49 @@ fn parse_head_tail_line_count(args_str: &str) -> Option<u64> {
 /// 仅放行纯数字单行或跨度 <= slice_read_max_limit（默认 200）的明确行号区间；
 /// 拒绝 `$p`、`/re/p`、`1,$p` 以及超限大范围倾倒。
 fn is_sed_print_script_token(cleaned: &str) -> bool {
-    if cleaned.contains(';') {
-        let mut parts = cleaned.split(';');
-        return parts.all(|part| is_single_sed_print_script_token(part.trim()));
+    let mut total: u64 = 0;
+    for part in cleaned.split(';') {
+        match sed_print_part_lines(part.trim()) {
+            Some(n) => total = total.saturating_add(n),
+            None => return false,
+        }
     }
-    is_single_sed_print_script_token(cleaned)
+    // 多段合计行数也不得超过切片上限，防止 `1,200p;201,400p;...` 拼接绕过额度
+    total <= config().slice_read_max_limit
 }
 
-fn is_single_sed_print_script_token(s_raw: &str) -> bool {
-    let Some(s) = s_raw.strip_suffix('p') else {
-        return false;
-    };
+/// 单段 `Np` / `A,Bp` 的行数；非纯数字打印返回 None；区间超上限返回 None。
+fn sed_print_part_lines(s_raw: &str) -> Option<u64> {
+    let s = s_raw.strip_suffix('p')?;
     if s.is_empty() {
-        return false;
+        return None;
     }
     // 单行形式：如 "50p"
-    if let Some(_line) = parse_digits(s) {
-        return true;
+    if parse_digits(s).is_some() {
+        return Some(1);
     }
     // 区间形式：如 "300,340p"
     if let Some((start_str, end_str)) = s.split_once(',') {
         if let (Some(start), Some(end)) = (parse_digits(start_str), parse_digits(end_str)) {
-            return end >= start && (end - start + 1) <= config().slice_read_max_limit;
+            if end >= start && (end - start + 1) <= config().slice_read_max_limit {
+                return Some(end - start + 1);
+            }
         }
     }
-    false
+    None
+}
+
+/// 是否为 sed 的静默 flag：`-n`、`--quiet`、`--silent`，或合并短 flag（如 `-ne`、`-nE`）。
+fn is_sed_quiet_flag(cleaned: &str) -> bool {
+    if cleaned == "--quiet" || cleaned == "--silent" {
+        return true;
+    }
+    cleaned.len() >= 2
+        && cleaned.starts_with('-')
+        && !cleaned.starts_with("--")
+        && cleaned[1..].chars().all(|c| c.is_ascii_alphabetic())
+        && cleaned[1..].contains('n')
+        && !cleaned[1..].contains('i')
 }
 
 /// 判定 sed 参数是否为切片打印：带 -n（--quiet/--silent）静默且脚本含 p 打印命令，
@@ -755,7 +789,7 @@ fn is_sed_slice_print(args_str: &str) -> bool {
     let mut has_print_script = false;
     for raw in args_str.split_whitespace() {
         let cleaned = raw.trim_matches(|c| c == '\'' || c == '"');
-        if cleaned == "-n" || cleaned == "--quiet" || cleaned == "--silent" {
+        if is_sed_quiet_flag(cleaned) {
             has_quiet = true;
         } else if is_sed_print_script_token(cleaned) {
             has_print_script = true;
@@ -855,24 +889,341 @@ pub(crate) fn is_read_code_file_call(
     true
 }
 
-/// Token-boundary detection matching the arm-D nogrep experiment hook:
-/// deny `grep|egrep|fgrep|zgrep|rg|ag|ack` as command tokens, and
-/// `git [opts…] grep`. Paths like `src/grep_utils.rs` do not match.
+/// shell 命令里的一个"命令位置"调用：规范化后的命令名与其参数原文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShellInvocation {
+    /// 小写、去目录、去 `.exe`/`.cmd`/`.bat`/`.com` 后缀的命令名
+    pub(crate) command: String,
+    /// 命令名之后到本段结束的原文（保留引号，不含 `;`/`&&`/`|` 之后的内容）
+    pub(crate) args: String,
+    /// 该调用是否处于管道后续位置（`a | grep x` 里的 grep）
+    pub(crate) after_pipe: bool,
+}
+
+struct RawToken {
+    text: String,
+    end: usize,
+}
+
+struct RawSegment {
+    tokens: Vec<RawToken>,
+    raw: String,
+    raw_start: usize,
+    after_pipe: bool,
+}
+
+/// 按 shell 规则分词并按 `&& || ; | & 换行` 切段。引号内的运算符不切分；
+/// 反斜杠只在后接空白/引号/反斜杠时当转义（Windows 路径保持字面）。
+fn split_shell_segments(cmd: &str) -> Vec<RawSegment> {
+    let chars: Vec<(usize, char)> = cmd.char_indices().collect();
+    let mut segs: Vec<RawSegment> = Vec::new();
+    let mut tokens: Vec<RawToken> = Vec::new();
+    let mut cur = String::new();
+    let mut tok_start: Option<usize> = None;
+    let mut seg_start = 0usize;
+    let mut seg_after_pipe = false;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+
+    macro_rules! end_token {
+        ($end:expr) => {
+            if tok_start.take().is_some() {
+                tokens.push(RawToken {
+                    text: std::mem::take(&mut cur),
+                    end: $end,
+                });
+            }
+        };
+    }
+    macro_rules! end_segment {
+        ($end:expr, $next_pipe:expr) => {
+            end_token!($end);
+            if !tokens.is_empty() {
+                segs.push(RawSegment {
+                    tokens: std::mem::take(&mut tokens),
+                    raw: cmd[seg_start..$end].to_string(),
+                    raw_start: seg_start,
+                    after_pipe: seg_after_pipe,
+                });
+            }
+            tokens.clear();
+            seg_after_pipe = $next_pipe;
+        };
+    }
+
+    while i < chars.len() {
+        let (pos, c) = chars[i];
+        let next = chars.get(i + 1).map(|(_, n)| *n);
+        let next_pos = chars.get(i + 1).map(|(p, _)| *p).unwrap_or(cmd.len());
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if q == '"' && c == '\\' && matches!(next, Some('"') | Some('\\')) {
+                cur.push(next.unwrap());
+                i += 1;
+            } else {
+                cur.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                if tok_start.is_none() {
+                    tok_start = Some(pos);
+                }
+                quote = Some(c);
+            }
+            '\\' if matches!(next, Some(n) if n.is_whitespace() || n == '"' || n == '\'' || n == '\\') =>
+            {
+                if tok_start.is_none() {
+                    tok_start = Some(pos);
+                }
+                cur.push(next.unwrap());
+                i += 1;
+            }
+            c if c.is_whitespace() && c != '\n' => {
+                end_token!(pos);
+            }
+            '\n' | ';' => {
+                end_segment!(pos, false);
+                seg_start = next_pos;
+            }
+            '|' => {
+                let double = next == Some('|');
+                end_segment!(pos, !double);
+                if double {
+                    i += 1;
+                }
+                seg_start = chars.get(i + 1).map(|(p, _)| *p).unwrap_or(cmd.len());
+            }
+            '&' => {
+                // `>&2`、`2>&1`、`&>file` 里的 & 属于重定向，不是命令分隔符
+                let prev = if pos > 0 {
+                    cmd[..pos].chars().last()
+                } else {
+                    None
+                };
+                if matches!(prev, Some('>') | Some('<')) || next == Some('>') {
+                    if tok_start.is_none() {
+                        tok_start = Some(pos);
+                    }
+                    cur.push(c);
+                } else {
+                    end_segment!(pos, false);
+                    if next == Some('&') {
+                        i += 1;
+                    }
+                    seg_start = chars.get(i + 1).map(|(p, _)| *p).unwrap_or(cmd.len());
+                }
+            }
+            _ => {
+                if tok_start.is_none() {
+                    tok_start = Some(pos);
+                }
+                cur.push(c);
+            }
+        }
+        i += 1;
+    }
+    end_token!(cmd.len());
+    if !tokens.is_empty() {
+        segs.push(RawSegment {
+            tokens,
+            raw: cmd[seg_start..].to_string(),
+            raw_start: seg_start,
+            after_pipe: seg_after_pipe,
+        });
+    }
+    segs
+}
+
+fn normalize_command_name(tok: &str) -> String {
+    let base = tok
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(tok)
+        .to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(stripped) = base.strip_suffix(ext) {
+            if !stripped.is_empty() {
+                return stripped.to_string();
+            }
+        }
+    }
+    base
+}
+
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((k, _)) => {
+            !k.is_empty()
+                && !k.starts_with(|c: char| c.is_ascii_digit())
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+const SHELL_WRAPPERS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "fish"];
+const POWERSHELL_WRAPPERS: &[&str] = &["powershell", "pwsh"];
+const TRANSPARENT_PREFIXES: &[&str] = &[
+    "sudo", "doas", "env", "time", "nohup", "nice", "command", "exec", "xargs", "stdbuf", "builtin",
+];
+
+fn collect_invocations(cmd: &str, depth: usize, out: &mut Vec<ShellInvocation>) {
+    for seg in split_shell_segments(cmd) {
+        let toks = &seg.tokens;
+        let mut i = 0;
+        // 跳过前缀：环境变量赋值、sudo/env/time/xargs 及其选项
+        while let Some(t) = toks.get(i) {
+            if is_env_assignment(&t.text) {
+                i += 1;
+                continue;
+            }
+            let name = normalize_command_name(&t.text);
+            if TRANSPARENT_PREFIXES.contains(&name.as_str()) {
+                i += 1;
+                while let Some(o) = toks.get(i) {
+                    if o.text.starts_with('-') && o.text.len() > 1 {
+                        // sudo -u USER / -g GROUP 等带值选项：多吞一个值
+                        let takes_value = matches!(name.as_str(), "sudo" | "doas")
+                            && matches!(
+                                o.text.as_str(),
+                                "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-r" | "-t" | "-U"
+                            );
+                        i += 1;
+                        if takes_value {
+                            i += 1;
+                        }
+                    } else if name == "env" && is_env_assignment(&o.text) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+            break;
+        }
+        let Some(cmd_tok) = toks.get(i) else { continue };
+        let name = normalize_command_name(&cmd_tok.text);
+        let args = seg.raw[cmd_tok.end - seg.raw_start..].trim().to_string();
+        out.push(ShellInvocation {
+            command: name.clone(),
+            args,
+            after_pipe: seg.after_pipe,
+        });
+        if depth < 3 {
+            // bash -c "grep foo ." / sh -lc '...'
+            if SHELL_WRAPPERS.contains(&name.as_str()) {
+                let mut j = i + 1;
+                while let Some(o) = toks.get(j) {
+                    let t = o.text.as_str();
+                    let is_c_flag = t.starts_with('-')
+                        && !t.starts_with("--")
+                        && t.len() >= 2
+                        && t[1..].chars().all(|c| c.is_ascii_alphabetic())
+                        && t.contains('c');
+                    if is_c_flag {
+                        if let Some(script) = toks.get(j + 1) {
+                            collect_invocations(&script.text, depth + 1, out);
+                        }
+                        break;
+                    }
+                    if !t.starts_with('-') {
+                        break;
+                    }
+                    j += 1;
+                }
+            } else if POWERSHELL_WRAPPERS.contains(&name.as_str()) || name == "cmd" {
+                let mut j = i + 1;
+                while let Some(o) = toks.get(j) {
+                    let lower = o.text.to_ascii_lowercase();
+                    if matches!(lower.as_str(), "-c" | "-command" | "/c" | "/k") {
+                        let rest: Vec<&str> =
+                            toks[j + 1..].iter().map(|t| t.text.as_str()).collect();
+                        collect_invocations(&rest.join(" "), depth + 1, out);
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+        }
+    }
+}
+
+/// 把命令串拆成各"命令位置"的调用（跳过 env 赋值/sudo/time/xargs 前缀，递归进入 `bash -c`）。
+pub(crate) fn shell_invocations(cmd: &str) -> Vec<ShellInvocation> {
+    let mut out = Vec::new();
+    collect_invocations(cmd, 0, &mut out);
+    out
+}
+
+/// 文本搜索命令名（硬模式拦截 / 软模式计数共用口径）。
+pub(crate) fn is_text_search_command(name: &str) -> bool {
+    matches!(
+        name,
+        "grep" | "egrep" | "fgrep" | "zgrep" | "rg" | "ag" | "ack" | "findstr" | "select-string"
+    )
+}
+
+/// `git [opts…] grep …`
+fn is_git_grep(inv: &ShellInvocation) -> bool {
+    if inv.command != "git" {
+        return false;
+    }
+    let toks = split_shell_segments(&inv.args)
+        .into_iter()
+        .next()
+        .map(|s| s.tokens)
+        .unwrap_or_default();
+    let mut it = toks.into_iter();
+    while let Some(t) = it.next() {
+        if t.text.starts_with('-') {
+            // `git -C dir grep` / `-c k=v` / `--git-dir X` 等带值全局选项
+            if matches!(
+                t.text.as_str(),
+                "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+            ) {
+                it.next();
+            }
+            continue;
+        }
+        return t.text == "grep";
+    }
+    false
+}
+
+/// 为软模式选出代表命令：第一个文本搜索调用，其次第一个读类调用，否则第一个调用。
+/// 管道后续段（`cat a | grep x` 的 grep）不参与，保持"管道只在硬模式拦"的既有语义。
+pub(crate) fn effective_shell_command(cmd: &str) -> Option<(String, Option<String>)> {
+    let invs = shell_invocations(cmd);
+    let pick = invs
+        .iter()
+        .filter(|i| !i.after_pipe)
+        .find(|i| GREP_SHELL_COMMANDS.contains(&i.command.as_str()))
+        .or_else(|| {
+            invs.iter()
+                .filter(|i| !i.after_pipe)
+                .find(|i| READ_SHELL_COMMANDS.contains(&i.command.as_str()))
+        })
+        .or_else(|| invs.first())?;
+    let args = if pick.args.is_empty() {
+        None
+    } else {
+        Some(pick.args.clone())
+    };
+    Some((pick.command.clone(), args))
+}
+
+/// 硬模式文本搜索检测：只看各"命令位置"的命令名（含 `bash -c`、`sudo`、`.exe`、`git grep`），
+/// 不对整串做子串匹配，因此 `echo grep is great` / `git commit -m "fix grep bug"` 不误伤，
+/// 路径 `src/grep_utils.rs` 也不会命中。
 pub(crate) fn command_contains_text_search(cmd: &str) -> bool {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?x)
-            (?:^|[;&|`($[:space:]])
-            (?:grep|egrep|fgrep|zgrep|rg|ag|ack)
-            (?:[[:space:]]|$)
-            |
-            git[[:space:]]+(?:-[^[:space:]]+[[:space:]]+)*grep(?:[[:space:]]|$)
-            ",
-        )
-        .expect("text-search regex")
-    });
-    re.is_match(cmd)
+    shell_invocations(cmd)
+        .iter()
+        .any(|i| is_text_search_command(&i.command) || is_git_grep(i))
 }
 
 pub(crate) fn is_glob_tool_name(tool_name: &str) -> bool {
@@ -1066,6 +1417,24 @@ pub(crate) fn decide_with(
     now: f64,
     cfg: &HooksConfig,
 ) -> Decision {
+    // 0. 硬禁用模式：Grep/Glob 一律拦截，不受静默窗约束
+    //    （否则首个 grep 被拦后 min_deny_interval 内的重试会全部放行，等于没禁用）
+    if cfg.deny_text_search {
+        match tool_kind {
+            ToolKind::Grep => {
+                counter.reset_burst();
+                counter.last_deny_ts = Some(now);
+                return Decision::Deny(DenyKind::TextSearch);
+            }
+            ToolKind::Glob => {
+                counter.reset_burst();
+                counter.last_deny_ts = Some(now);
+                return Decision::Deny(DenyKind::Glob);
+            }
+            _ => {}
+        }
+    }
+
     // 1. 静默窗内 → no-op（allow，无输出更新）
     if !counter.is_hook_active(now) {
         return Decision::Silenced;
@@ -1083,23 +1452,6 @@ pub(crate) fn decide_with(
         counter.n_slice = 0;
         counter.last_slice_ts = None;
         return Decision::ResetSlice;
-    }
-
-    // 2.6 Hard text-search: first Grep / Glob → deny immediately
-    if cfg.deny_text_search {
-        match tool_kind {
-            ToolKind::Grep => {
-                counter.reset_burst();
-                counter.last_deny_ts = Some(now);
-                return Decision::Deny(DenyKind::TextSearch);
-            }
-            ToolKind::Glob => {
-                counter.reset_burst();
-                counter.last_deny_ts = Some(now);
-                return Decision::Deny(DenyKind::Glob);
-            }
-            _ => {}
-        }
     }
 
     // 2.7 切片读（Read 带 limit<=max）→ 连续额度制：
@@ -1501,27 +1853,37 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
     home_override: Option<&Path>,
     cfg: &HooksConfig,
 ) -> i32 {
+    // fail-open：宿主语义里 exit 2 = 拦截工具调用（Claude Code/Cursor/ZCode），
+    // 任何输入问题都不应拦住 agent 的工具调用，只在 stderr 提示并返回 0。
     let mut raw = String::new();
     if let Err(err) = reader.read_to_string(&mut raw) {
-        let _ = writeln!(stderr, "Failed to read hook input from stdin: {err}");
-        return 2;
+        let _ = writeln!(
+            stderr,
+            "astrolabe hook: failed to read stdin ({err}); skipping (fail-open)"
+        );
+        return 0;
     }
 
     if raw.trim().is_empty() {
-        let _ = writeln!(stderr, "Hook input data is empty");
-        return 2;
+        let _ = writeln!(
+            stderr,
+            "astrolabe hook: hook input data is empty; skipping (fail-open)"
+        );
+        return 0;
     }
 
     let input_data: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(err) => {
-            let _ = writeln!(stderr, "Invalid JSON in hook input data: {err}");
-            return 2;
+            let _ = writeln!(
+                stderr,
+                "astrolabe hook: invalid JSON in hook input ({err}); skipping (fail-open)"
+            );
+            return 0;
         }
     };
 
     // 提取 session_id / sessionId / conversation_id / conversationId
-    // （Cursor 原生 preToolUse 只带 conversation_id；缺失时 exit 2 在 Cursor 语义下等于 deny）
     let session_id = [
         "session_id",
         "sessionId",
@@ -1534,15 +1896,16 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
     let session_id = match session_id {
         Some(s) => s,
         None => {
-            let _ = writeln!(stderr, "Session ID is required in the hook input data");
-            return 2;
+            let _ = writeln!(
+                stderr,
+                "astrolabe hook: session id is missing in hook input; skipping (fail-open)"
+            );
+            return 0;
         }
     };
 
-    if let Err(msg) = sanitize_session_id(&session_id) {
-        let _ = writeln!(stderr, "{msg}");
-        return 2;
-    }
+    // 非法字符（点、冒号、空格…）不拒绝：哈希成路径安全的 `s-<fnv>` 分量
+    let session_id = hashed_session_id(&session_id);
 
     // 提取 agent_id / agentId（子代理内触发的 PreToolUse payload 才携带，主线程不含）。
     // 尽力而为：缺失或类型不符时视为无分片，落回会话级平面路径，不报错。
@@ -1559,8 +1922,11 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
     let tool_name = match raw_tool_name {
         Some(s) if !s.trim().is_empty() => s.trim().to_ascii_lowercase(),
         _ => {
-            let _ = writeln!(stderr, "Tool name is required in the hook input data");
-            return 2;
+            let _ = writeln!(
+                stderr,
+                "astrolabe hook: tool name is missing in hook input; skipping (fail-open)"
+            );
+            return 0;
         }
     };
 
@@ -1608,25 +1974,9 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
             .filter(|s| !s.is_empty());
         if let Some(cmd_str) = cmd {
             full_command = Some(cmd_str.to_string());
-            if let Some(idx) = cmd_str.find(char::is_whitespace) {
-                let first = &cmd_str[..idx];
-                let rest = cmd_str[idx..].trim();
-                let basename = Path::new(first)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(first)
-                    .to_ascii_lowercase();
-                command_name = Some(basename);
-                if !rest.is_empty() {
-                    command_args_str = Some(rest.to_string());
-                }
-            } else {
-                let basename = Path::new(cmd_str)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(cmd_str)
-                    .to_ascii_lowercase();
-                command_name = Some(basename);
+            if let Some((name, args)) = effective_shell_command(cmd_str) {
+                command_name = Some(name);
+                command_args_str = args;
             }
         }
     }
@@ -1672,8 +2022,8 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
         Some(h) => match get_hook_data_dir(h, &session_id, agent_id.as_deref()) {
             Ok(dir) => Some(dir.join("counter.json")),
             Err(msg) => {
-                let _ = writeln!(stderr, "{msg}");
-                return 2;
+                let _ = writeln!(stderr, "astrolabe hook: {msg}; skipping (fail-open)");
+                return 0;
             }
         },
         None => None,
@@ -1733,20 +2083,29 @@ pub(crate) fn run_cleanup_impl<R: Read, E: Write>(
 ) -> i32 {
     let mut raw = String::new();
     if let Err(err) = reader.read_to_string(&mut raw) {
-        let _ = writeln!(stderr, "Failed to read hook input from stdin: {err}");
-        return 2;
+        let _ = writeln!(
+            stderr,
+            "astrolabe hook: failed to read stdin ({err}); skipping (fail-open)"
+        );
+        return 0;
     }
 
     if raw.trim().is_empty() {
-        let _ = writeln!(stderr, "Hook input data is empty");
-        return 2;
+        let _ = writeln!(
+            stderr,
+            "astrolabe hook: hook input data is empty; skipping (fail-open)"
+        );
+        return 0;
     }
 
     let input_data: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(err) => {
-            let _ = writeln!(stderr, "Invalid JSON in hook input data: {err}");
-            return 2;
+            let _ = writeln!(
+                stderr,
+                "astrolabe hook: invalid JSON in hook input ({err}); skipping (fail-open)"
+            );
+            return 0;
         }
     };
 
@@ -1763,15 +2122,14 @@ pub(crate) fn run_cleanup_impl<R: Read, E: Write>(
     let session_id = match session_id {
         Some(s) => s,
         None => {
-            let _ = writeln!(stderr, "Session ID is required in the hook input data");
-            return 2;
+            let _ = writeln!(
+                stderr,
+                "astrolabe hook: session id is missing in hook input; skipping (fail-open)"
+            );
+            return 0;
         }
     };
-
-    if let Err(msg) = sanitize_session_id(&session_id) {
-        let _ = writeln!(stderr, "{msg}");
-        return 2;
-    }
+    let session_id = hashed_session_id(&session_id);
 
     let home = home_override.map(PathBuf::from).or_else(get_user_home);
     if let Some(h) = home {
@@ -2157,16 +2515,16 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(code, 2);
+        // fail-open：exit 2 在宿主语义里等于拦截工具调用，缺 session id 只提示不拦截
+        assert_eq!(code, 0);
         let err_str = String::from_utf8_lossy(&err);
-        assert!(err_str.contains("Session ID is required"));
+        assert!(err_str.contains("session id is missing"), "{err_str}");
 
-        // cleanup 同样要求 session_id
         let mut clean_err = Vec::new();
         let clean_code = run_cleanup_impl("{}".as_bytes(), &mut clean_err, None);
-        assert_eq!(clean_code, 2);
+        assert_eq!(clean_code, 0);
         let clean_err_str = String::from_utf8_lossy(&clean_err);
-        assert!(clean_err_str.contains("Session ID is required"));
+        assert!(clean_err_str.contains("session id is missing"));
     }
 
     #[test]
@@ -2194,30 +2552,53 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_session_id_remind_and_cleanup_exit_2() {
-        let payload = r#"{"session_id":"../evil","tool_name":"grep","tool_input":{}}"#;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run_remind_impl(
-            "claude-code",
-            payload.as_bytes(),
-            &mut out,
-            &mut err,
-            None,
-            None,
-        );
-        assert_eq!(code, 2);
-        let err_str = String::from_utf8_lossy(&err);
-        assert!(
-            err_str.contains("invalid")
-                || err_str.contains("Invalid")
-                || err_str.contains("characters"),
-            "stderr={err_str}"
-        );
+    fn test_invalid_session_id_is_hashed_not_rejected() {
+        let tmp = std::env::temp_dir().join(format!("astro-h3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for sid in ["../evil", "a.b:c", "has space"] {
+            let payload = format!(
+                r#"{{"session_id":"{sid}","tool_name":"read","tool_input":{{"file_path":"a.rs"}}}}"#
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_remind_impl(
+                "claude-code",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(1000.0),
+                Some(&tmp),
+            );
+            assert_eq!(code, 0, "sid={sid}");
+            assert!(out.is_empty());
+            let hashed = hashed_session_id(sid);
+            assert!(hashed.starts_with("s-"));
+            assert!(
+                tmp.join(".astrolabe/hook_data")
+                    .join(&hashed)
+                    .join("counter.json")
+                    .exists(),
+                "state should live under hashed dir for {sid}"
+            );
+            let mut cerr = Vec::new();
+            let cp = format!(r#"{{"session_id":"{sid}"}}"#);
+            assert_eq!(run_cleanup_impl(cp.as_bytes(), &mut cerr, Some(&tmp)), 0);
+            assert!(!tmp.join(".astrolabe/hook_data").join(&hashed).exists());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
-        let mut clean_err = Vec::new();
-        let clean_code = run_cleanup_impl(&br#"{"session_id":"a/b"}"#[..], &mut clean_err, None);
-        assert_eq!(clean_code, 2);
+    #[test]
+    fn h3_malformed_input_is_fail_open_exit_0() {
+        for raw in ["", "   ", "not json", "{}", r#"{"session_id":"s1"}"#] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_remind_impl("cursor", raw.as_bytes(), &mut out, &mut err, None, None);
+            assert_eq!(code, 0, "raw={raw:?}");
+            assert!(out.is_empty());
+            assert!(!err.is_empty(), "stderr hint expected for {raw:?}");
+        }
     }
 
     #[test]
@@ -3966,7 +4347,15 @@ mod tests {
         // counter.json 仍落在 hook_data/<sid>/counter.json 平面路径，会话目录下无子目录
         let sess_dir = get_hook_data_dir(&temp_home, sess_id, None).unwrap();
         assert!(sess_dir.join("counter.json").exists());
-        let entries: Vec<_> = std::fs::read_dir(&sess_dir).unwrap().collect();
+        let entries: Vec<_> = std::fs::read_dir(&sess_dir)
+            .unwrap()
+            .filter(|e| {
+                // flock 锁文件 counter.json.lock 常驻（删除会引入竞态），不算状态条目
+                e.as_ref()
+                    .map(|e| e.file_name() != "counter.json.lock")
+                    .unwrap_or(true)
+            })
+            .collect();
         assert_eq!(
             entries.len(),
             1,
@@ -4208,7 +4597,15 @@ mod tests {
                 sess_dir.join("counter.json").exists(),
                 "{sess} 应落会话级平面 counter"
             );
-            let entries: Vec<_> = std::fs::read_dir(&sess_dir).unwrap().collect();
+            let entries: Vec<_> = std::fs::read_dir(&sess_dir)
+                .unwrap()
+                .filter(|e| {
+                    // flock 锁文件 counter.json.lock 常驻（删除会引入竞态），不算状态条目
+                    e.as_ref()
+                        .map(|e| e.file_name() != "counter.json.lock")
+                        .unwrap_or(true)
+                })
+                .collect();
             assert_eq!(
                 entries.len(),
                 1,
@@ -5269,5 +5666,205 @@ mod tests {
             decide_with(&mut counter, ToolKind::Grep, 1.0, &cfg),
             Decision::Deny(DenyKind::Grep)
         );
+    }
+
+    #[test]
+    fn h1_hard_mode_ignores_silence_window() {
+        let cfg = HooksConfig {
+            deny_text_search: true,
+            ..Default::default()
+        };
+        let mut counter = CounterState::default();
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, 100.0, &cfg),
+            Decision::Deny(DenyKind::TextSearch)
+        );
+        // 紧接着（静默窗内）重试仍必须被拦
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, 101.0, &cfg),
+            Decision::Deny(DenyKind::TextSearch)
+        );
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Glob, 102.0, &cfg),
+            Decision::Deny(DenyKind::Glob)
+        );
+        // 软模式的静默窗语义不变
+        let soft = HooksConfig::default();
+        let mut c2 = CounterState {
+            last_deny_ts: Some(100.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_with(&mut c2, ToolKind::Grep, 101.0, &soft),
+            Decision::Silenced
+        );
+    }
+
+    #[test]
+    fn h4_leftover_lock_file_does_not_block() {
+        let dir = std::env::temp_dir().join(format!("astro-h4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("counter.json");
+        // 模拟崩溃遗留的锁文件（没有任何进程持有 flock）
+        std::fs::write(dir.join("counter.json.lock"), b"").unwrap();
+        let t = std::time::Instant::now();
+        let g = CounterFileLock::acquire(&counter);
+        assert!(g.is_some(), "stale lock file must not prevent locking");
+        assert!(
+            t.elapsed() < Duration::from_millis(300),
+            "{:?}",
+            t.elapsed()
+        );
+        // 持有期间别人拿不到
+        let g2 = CounterFileLock::acquire(&counter);
+        assert!(g2.is_none());
+        drop(g);
+        assert!(CounterFileLock::acquire(&counter).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn h5_home_falls_back_to_userprofile() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(kk, _)| *kk == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            home_from_lookup(env(&[("HOME", "/h"), ("USERPROFILE", "C:\\u")])),
+            Some(PathBuf::from("/h"))
+        );
+        assert_eq!(
+            home_from_lookup(env(&[("USERPROFILE", "C:\\Users\\a")])),
+            Some(PathBuf::from("C:\\Users\\a"))
+        );
+        assert_eq!(
+            home_from_lookup(env(&[("HOME", "  "), ("USERPROFILE", "C:\\x")])),
+            Some(PathBuf::from("C:\\x"))
+        );
+        assert_eq!(
+            home_from_lookup(env(&[("HOMEDRIVE", "C:"), ("HOMEPATH", "\\Users\\b")])),
+            Some(PathBuf::from("C:\\Users\\b"))
+        );
+        assert_eq!(home_from_lookup(env(&[])), None);
+    }
+
+    #[test]
+    fn h6_soft_mode_command_position_detection() {
+        let name = |c: &str| effective_shell_command(c).map(|(n, _)| n);
+        assert_eq!(name("grep -rn foo src").as_deref(), Some("grep"));
+        assert_eq!(name("cd src && grep -rn foo .").as_deref(), Some("grep"));
+        assert_eq!(name("FOO=1 grep foo .").as_deref(), Some("grep"));
+        assert_eq!(name("sudo grep foo .").as_deref(), Some("grep"));
+        assert_eq!(name("sudo -u bob grep foo .").as_deref(), Some("grep"));
+        assert_eq!(name("bash -c \"grep foo .\"").as_deref(), Some("grep"));
+        assert_eq!(name("sh -lc 'cd x; rg foo'").as_deref(), Some("rg"));
+        assert_eq!(name("rg.exe foo").as_deref(), Some("rg"));
+        assert_eq!(
+            name("\"C:\\Program Files\\Git\\usr\\bin\\grep.exe\" foo .").as_deref(),
+            Some("grep")
+        );
+        assert_eq!(name("findstr /s foo *.rs").as_deref(), Some("findstr"));
+        assert_eq!(
+            name("Select-String -Pattern foo a.rs").as_deref(),
+            Some("select-string")
+        );
+        assert_eq!(name("xargs grep foo").as_deref(), Some("grep"));
+        // 管道后续段不算（软模式只在硬模式拦管道）
+        assert_eq!(name("cat a.rs | grep foo").as_deref(), Some("cat"));
+        // 参数不带分隔符尾巴
+        let (_, args) = effective_shell_command("cat a.rs;").unwrap();
+        assert_eq!(args.as_deref(), Some("a.rs"));
+        let (_, args) = effective_shell_command("cat a.rs|head").unwrap();
+        assert_eq!(args.as_deref(), Some("a.rs"));
+        // 重定向里的 & 不是分隔符
+        let (n, args) = effective_shell_command("cat a.rs 2>&1").unwrap();
+        assert_eq!(n, "cat");
+        assert_eq!(args.as_deref(), Some("a.rs 2>&1"));
+        // 单 token 命令
+        assert_eq!(name("ls").as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn h6_soft_mode_end_to_end_denies_on_third() {
+        let cmds = [
+            "cd src && grep -rn foo .",
+            "sudo grep -rn foo .",
+            "bash -c \"grep -rn foo .\"",
+            "rg.exe foo",
+            "findstr /s foo *.rs",
+            "Select-String -Pattern foo a.rs",
+        ];
+        for (i, c) in cmds.iter().enumerate() {
+            let tmp = std::env::temp_dir().join(format!("astro-h6-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            let payload = serde_json::json!({
+                "session_id": "h6",
+                "tool_name": "Bash",
+                "tool_input": {"command": c},
+            })
+            .to_string();
+            let mut denied_at = None;
+            for n in 0..3 {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let code = run_remind_impl_with(
+                    "claude-code",
+                    payload.as_bytes(),
+                    &mut out,
+                    &mut err,
+                    Some(1000.0 + n as f64),
+                    Some(&tmp),
+                    &HooksConfig::default(),
+                );
+                assert_eq!(code, 0);
+                if !out.is_empty() && denied_at.is_none() {
+                    denied_at = Some(n);
+                }
+            }
+            assert_eq!(denied_at, Some(2), "cmd={c}");
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    #[test]
+    fn h7_hard_mode_no_false_positive_and_catches_wrappers() {
+        // 误伤
+        assert!(!command_contains_text_search("echo grep is great"));
+        assert!(!command_contains_text_search(
+            "git commit -m \"fix grep bug\""
+        ));
+        assert!(!command_contains_text_search("npm run grep-check"));
+        assert!(!command_contains_text_search("echo 'a; grep b'"));
+        // 漏网
+        assert!(command_contains_text_search("bash -c \"grep foo .\""));
+        assert!(command_contains_text_search("sh -c 'cd x && rg foo'"));
+        assert!(command_contains_text_search("grep.exe foo"));
+        assert!(command_contains_text_search("sudo grep foo ."));
+        assert!(command_contains_text_search("cat a.rs | grep foo"));
+        assert!(command_contains_text_search("ls && git -C r grep foo"));
+        assert!(command_contains_text_search("findstr /s foo *.rs"));
+        assert!(command_contains_text_search("Select-String foo a.rs"));
+        assert!(command_contains_text_search("FOO=1 rg foo"));
+        assert!(command_contains_text_search("echo hi;grep foo ."));
+    }
+
+    #[test]
+    fn h8_sed_semicolon_chain_cannot_bypass_slice_quota() {
+        // 单段、少量合计仍是切片
+        assert!(is_sed_slice_print("-n '300,340p' src/a.rs"));
+        assert!(is_sed_slice_print("-n '50p;80p' src/a.rs"));
+        // 合计行数超限：不是切片（计为普通读）
+        assert!(!is_sed_slice_print("-n '1,200p;201,400p;401,600p' f.rs"));
+        assert!(!is_sed_slice_print("-n '1,150p;151,300p' f.rs"));
+        // 合并 flag
+        assert!(is_sed_slice_print("-ne '10,20p' src/a.rs"));
+        assert!(!is_sed_slice_print("-ni '10,20p' src/a.rs"));
+        assert!(!is_sed_slice_print("'10,20p' src/a.rs"));
     }
 }

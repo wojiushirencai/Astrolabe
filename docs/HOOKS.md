@@ -112,6 +112,7 @@ Astrolabe 防漂移 Hook 层已内置对 **Codebuddy** 与 **Grok** 客户端的
 Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容能力：
 - **配置文件**：放置于 `~/.cursor/hooks.json`（全局）或当前项目根目录 `.cursor/hooks.json`。事件名使用小驼峰（`preToolUse`、`sessionEnd`）。另外，Cursor 也会自动加载 `.claude/settings.json`（第三方兼容模式，PreToolUse 自动映射，但注意该模式不映射 `additionalContext`）。
 - **工具识别与输出格式**：内置工具名包括 `Shell`、`Read`、`Write`、`Grep`、`Task`；Astrolabe `--client=cursor`（别名：`cursor-agent`、`cursor_agent`、`cursor-cli`）输出 Cursor 原生扁平格式 `{"permission":"deny","user_message":...,"agent_message":...}`，长引导文案直接注入 `agent_message` 送达模型。
+- **matcher 必须包含 Astrolabe 的 MCP 工具**：remind 要看到 `mcp__astrolabe__*` 调用才能在你用了符号工具后清零 grep/read 计数；matcher 只写 `Shell|Read|Grep` 会让计数只增不清，已在正确使用 Astrolabe 的会话里仍可能被拦。`mcp__astrolabe__.*` 这一写法（Cursor 与 Grok 的 MCP 工具名格式）**未在真实宿主上验证**，若你的宿主不识别，请改用 `*`（ZCode 一节同理），非相关工具由 Astrolabe 自行放行。
 - **会话识别兼容**：Cursor 原生 preToolUse 事件仅传递 `conversation_id`，Astrolabe 内部会话提取逻辑已原生兼容 `conversation_id` / `conversationId` fallback。
 
 **完整配方（`.cursor/hooks.json`）**：
@@ -122,7 +123,7 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
     "preToolUse": [
       {
         "command": "astrolabe hooks remind --client=cursor",
-        "matcher": "Shell|Read|Grep"
+        "matcher": "Shell|Read|Grep|mcp__astrolabe__.*"
       }
     ],
     "sessionEnd": [
@@ -139,7 +140,7 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
 针对 `xai-org/grok-build`（CLI 名 `grok`）：
 - **配置文件**：放置于 `~/.grok/hooks/astrolabe.json`（全局）或项目级 `.grok/hooks/astrolabe.json`。
 - **项目级授信提示**：若使用项目级 hooks 配置，必须在 Grok CLI 中执行 `/hooks-trust` 完成授信后方可生效。
-- **匹配与决策**：Grok 内置工具使用 snake_case（`run_terminal_command`、`read_file`、`grep`），matcher 建议同时编写 PascalCase 别名与 snake_case：`"Bash|Read|Grep|run_terminal_command|read_file|grep"`。Astrolabe 原生兼容驼峰 payload（`sessionId`、`toolName`、`toolInput`），并通过 `--client=grok` 输出 Grok 一等公民原生扁平决策 `{"decision":"deny","reason":...}`；退出码遵循规范（2 代表阻断、1 代表 fail-open 放行）。
+- **匹配与决策**：Grok 内置工具使用 snake_case（`run_terminal_command`、`read_file`、`grep`），matcher 建议同时编写 PascalCase 别名与 snake_case，并加上 `mcp__astrolabe__.*`：`"Bash|Read|Grep|run_terminal_command|read_file|grep|mcp__astrolabe__.*"`。Astrolabe 原生兼容驼峰 payload（`sessionId`、`toolName`、`toolInput`），并通过 `--client=grok` 输出 Grok 一等公民原生扁平决策 `{"decision":"deny","reason":...}`；退出码遵循规范（2 代表阻断、1 代表 fail-open 放行）。
 
 **完整配方（`~/.grok/hooks/astrolabe.json`）**：
 ```json
@@ -147,7 +148,7 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|run_terminal_command|read_file|grep",
+        "matcher": "Bash|Read|Grep|run_terminal_command|read_file|grep|mcp__astrolabe__.*",
         "hooks": [
           {
             "type": "command",
@@ -184,7 +185,7 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
     # ~/.kimi-code/config.toml 示意配置（具体键名以官方文档为准）
     [[hooks]]
     event = "PreToolUse"
-    matcher = "Read|Grep|Bash"
+    matcher = "Read|Grep|Bash|mcp__astrolabe__.*"
     command = "astrolabe hooks remind --client=kimicode"
 
     [[hooks]]
@@ -266,3 +267,15 @@ export default AstrolabeGuard;
 - **状态存储与清理**：会话状态持久化于 `~/.astrolabe/hook_data/<session_id>/counter.json`；子代理调用时（payload 携带 `agent_id` / `agentId` 字段）按 `~/.astrolabe/hook_data/<session_id>/<agent_id>/counter.json` 分片，并发子代理各自独立计数、互不清零互不消音；会话结束时通过 `SessionEnd` 自动清理（含子代理分片目录）；无 `SessionEnd` 的宿主（如 ZCode）或会话异常退出时，`hooks remind` 每小时至多一次机会式清理超过 24 小时未活动的会话目录（`ASTROLABE_HOOK_GC_HOURS` 调整，`0` 关闭），亦可手动 `astrolabe hooks gc`，不留垃圾。
 
 ---
+
+
+## 输入异常与退出码（fail-open）
+
+宿主语义里 exit 2 通常等于"拦截这次工具调用"，所以 `astrolabe hooks remind` / `cleanup` 遇到空 stdin、非 JSON、缺 `session_id`/`tool_name` 一律 **fail-open**：stderr 打一行提示并返回 0，不会拦住工具调用。`session_id` 含点、冒号、空格等字符时不拒绝，而是哈希成 `s-<fnv1a64>` 目录名（remind 与 cleanup 用同一映射）。只有"拦截"本身通过 stdout 的 deny JSON 表达。
+
+## 硬禁用与命令识别说明
+
+- `ASTROLABE_DENY_TEXT_SEARCH=true`（或 `--deny-text-search`）下 Grep/Glob 每次都拦，不受 `min_deny_interval_seconds` 静默窗约束；静默窗只作用于软模式。
+- 命令识别按 shell 分词后只看"命令位置"的 token：支持 `cd x && grep`、`sudo grep`、`FOO=1 rg`、`bash -c "grep …"`、`grep.exe`/`rg.exe`、`findstr`、`Select-String`、`git [opts] grep`；`echo grep is great`、`git commit -m "fix grep bug"` 不会被当成搜索。软模式不把管道后段（`cat a | grep x`）当 grep，硬模式会拦。
+- Windows 原生环境没有 `HOME` 时，状态目录回退到 `USERPROFILE`（再回退 `HOMEDRIVE`+`HOMEPATH`）。这一点只通过单元测试覆盖，**未在真实 Windows 上验证**。
+- 计数文件锁使用操作系统文件锁（flock / LockFileEx），进程崩溃后自动释放，不会遗留需要手动清理的锁。
