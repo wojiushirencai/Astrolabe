@@ -2,7 +2,7 @@
 
 This directory is the harness behind the numbers in the project README. It answers one question: *for the same task and model, does connecting Astrolabe change cost, time, turns or correctness?* Arm **A** runs Claude Code without MCP; arm **C** runs it with Astrolabe. Pairs start together so slow-moving API latency hits both arms equally.
 
-> **Real money.** `run_pairs.sh` calls the model API. Our 40-pair run (4 tasks x 10) cost about $214 in total (summary in `results/`). Start with `--pairs 2` and set a spend limit on your provider.
+> **Real money.** `run_pairs.sh` calls the model API. Our 40-pair run (4 tasks x 10) cost about $214 and the 55-pair run (11 tasks x 5) about $121 (summaries in `results/`). Start with `--pairs 2` and set a spend limit on your provider.
 
 ## What is here
 
@@ -15,7 +15,7 @@ This directory is the harness behind the numbers in the project README. It answe
 | `score.py`, `checks.py` | Answer scoring (regexes on the text after the last `ANSWER:`) and edit-task repo checks |
 | `report.py` | Paired differences C − A with bootstrap CIs, adoption, timeouts |
 | `monitor_load.sh` | Records host load and detects machine freezes (> 20 s gaps) during a run |
-| `results/` | Number-only summaries of the two runs quoted in the README |
+| `results/` | Number-only summaries of the runs quoted in the README: `v013f_paired_summary.md` (15 tasks, 95 pairs, current headline), `v013e_paired_summary.md` (first 4 tasks), `v012_baseline_summary.md` |
 
 ## Run it
 
@@ -42,15 +42,16 @@ Credentials: `claude` inherits your environment (for example `ANTHROPIC_API_KEY`
 ## Scoring conventions
 
 - Answer tasks put the answer on a final `ANSWER:` line; every regex in `must` has to match it and none in `must_not` may.
-- **N5 and N8 have two accepted conventions** because some counted call sites sit inside comments: `must_with_comments` (the reference count includes them) and `must_skip_comments` (comment hits excluded, which is what `search_code skip_comments=true` returns). `score.py` reports `ok` (reference convention) and `ok_either`. Our README reports both for N5.
+- **N5 and N8 have two accepted conventions** because some counted call sites sit inside comments: `must_with_comments` (the reference count includes them) and `must_skip_comments` (comment hits excluded, which is what `search_code skip_comments=true` returns). `score.py` reports `ok_strict` (reference convention only), `ok_either` (lenient) and `ok`, the **primary** verdict.
+- **N5's primary verdict is lenient** (either convention accepted; `"primary": "lenient"` in `tasks.json`). Reason: the reference count includes 2 call sites inside comments (total 321), while excluding comments (15/43, total 319) is a defensible reading of "calls to `common.SysError(`" and is exactly what `skip_comments=true` returns; marking it wrong would score a correct answer as wrong. Strict is still computed and `report.py` prints both columns side by side; the README and `results/` quote both numbers (N5 arm C: 10/10 primary, 1/10 strict). N8 stays strict-primary; both conventions gave the same result there.
 - Edit tasks also need `checks.py` to pass (a verify command plus a needle string in the tree).
 
 ## What is deliberately not here
 
 Six of the 15 tasks in our runs cannot be published: five use a **private repository** (N4, E3b, H4, H5, E1; a Flutter + Go monorepo and a Rust codebase) and N7 uses an edited copy of cobra with injected compile errors. Their prompts and checks reveal private file names, so they are not published. Consequences:
-- The headline 40-pair result includes N4 and E3b, which **others cannot reproduce**. Only N5 and N8 (20 of the 40 pairs) can be re-run on public code.
+- The headline result includes N4 and E3b, which **others cannot reproduce**. Of the 15 tasks only the public-repo ones can be re-run; the rest need private or edited material. Check `tasks/tasks.json` for which ones ship.
 - The new-api / cobra / express snapshots we used were local single-commit copies with unknown upstream commits (new-api had one uncommitted change). `fetch_corpora.sh` compares your checkout's tree sha with ours; if it differs, expected counts (N5, N8, N2, N3, H1–H3) may not match and results are not comparable with our reports.
 
 ## Known limitations
 
-One model family and one proxy; small samples (10 pairs per task); tasks chosen by us; no simultaneous v0.13.0-vs-A run on the other 11 tasks; N5/N8 are counting questions where `aggregate=top` fits well, so they favor Astrolabe by design. The older v0.12.0 matrix (`results/v012_baseline_summary.md`) shows the other side: no benefit across 15 tasks.
+One model family and one proxy; 15 tasks chosen by us; small samples (5 pairs for 11 tasks, 10 for 4); gains are concentrated in aggregation/discovery tasks (N1, N5, N8), where Astrolabe's options fit well by design, and most other tasks are about even; no claim of a general benefit. The older v0.12.0 matrix (`results/v012_baseline_summary.md`) shows the other side: no benefit across 15 tasks.

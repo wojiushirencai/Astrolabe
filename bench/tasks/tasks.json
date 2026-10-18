@@ -156,6 +156,7 @@
   "feature": "literal with >60 hits, counting per directory",
   "prompt": "In this Go repository (do not modify files): count the calls to `common.SysError(` in non-test .go source files (ignore node_modules, web/ and *_test.go). Report, for each of the top-level directories controller, relay, model, service, providerauth and setting, the number of files that contain at least one such call and the number of calls, and the total number of calls across the whole repository (including root main.go and every other directory). End with a line starting ANSWER: in the form `ANSWER: controller=F/C relay=F/C model=F/C service=F/C providerauth=F/C setting=F/C total=N`.",
   "answer_only": true,
+  "primary": "lenient",
   "must_with_comments": [
    "controller=23/108",
    "relay=20/61",

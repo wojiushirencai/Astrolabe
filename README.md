@@ -57,36 +57,38 @@ Codex, Windsurf and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-clie
 
 ## Evidence: what we measured, and what we did not
 
-All numbers below come from our own paired A/B runs: **A** = Claude Code without Astrolabe, **C** = the same task with Astrolabe connected. Cost is Claude Code's `total_cost_usd`, time is `duration_ms`. One model was used: `gemini-3.8-flash-high` through Claude Code and an Anthropic-compatible proxy (so USD figures use that proxy's pricing). WebSearch/WebFetch were disabled in every arm. Reports: `REPORT_V013E` and `REPORT_V012_BASELINE` (summarized in [bench/README.md](bench/README.md)).
+All numbers below come from our own paired A/B runs: **A** = Claude Code without Astrolabe, **C** = the same task with Astrolabe connected. Cost is Claude Code's `total_cost_usd`, time is `duration_ms`. One model was used: `gemini-3.8-flash-high` through Claude Code and an Anthropic-compatible proxy (so USD figures use that proxy's pricing). WebSearch/WebFetch were disabled in every arm. Summaries of the reports are in [bench/results/](bench/results/) and the method in [bench/README.md](bench/README.md).
 
-**Simultaneous pairs on v0.13.0 (40 pairs, 4 tasks, 10 pairs each).** Each pair started A and C at the same instant.
+**Simultaneous pairs on v0.13.0: 15 tasks, 95 pairs.** 11 tasks with 5 pairs each and 4 tasks (N5, N8, N4, E3b) with 10 pairs each. Each pair started A and C at the same instant.
 
 | | A (no Astrolabe) | C (Astrolabe v0.13.0) | C − A, paired, 95% bootstrap CI |
 |---|---|---|---|
-| Cost, mean per run | $3.00 | $2.35 | **−$0.65 [−0.98, −0.31]** |
-| Time, mean per run | 600 s | 492 s | **−108 s [−178, −37]** |
-| Turns, mean | 50.3 | 40.0 | −10.3 [−14.4, −6.2] |
-| Correct, lenient N5 scoring | 38/40 | 40/40 | |
-| Correct, strict N5 scoring | 38/40 | 31/40 | see below |
+| Cost, mean per run | $2.01 | $1.51 | **−$0.49 [−0.73, −0.28]** |
+| Time, mean per run | 440 s | 357 s | **−83 s [−129, −41]** |
+| Turns, mean | 34.9 | 28.1 | −6.8 [−9.2, −4.3] |
+| Correct, primary scoring | 93/95 | 95/95 | +2.1 pp [0.0, +5.3] |
+| Correct, strict scoring | 93/95 | 86/95 | −7.4 pp [−14.7, −1.1] |
 
-Per task (cost, C − A): N5 −$0.64 [−1.22, −0.02]; N8 −$0.91 [−1.48, −0.31]; N4 −$0.51 [−1.20, +0.21]; E3b −$0.52 [−1.22, +0.18]. The last two intervals include zero, and in N4/E3b the model never used the new `aggregate` options, so those two gains cannot be credited to them.
+Equal weight per task gives a similar picture: cost −$0.45 [−0.90, −0.15], time −76 s [−153, −21]; C is cheaper than A on average in 11 of 15 tasks. Dropping the pairs that overlapped a machine freeze changes little (87 pairs: cost −$0.45, time −87 s).
 
-*Strict N5 scoring:* the reference answer for N5 counts 2 call sites that sit inside comments (model=15/44, total=321). With `skip_comments=true` Astrolabe returns 15/43 and 319, which is also a defensible answer but fails the strict check. The harness scores both conventions ([bench/](bench/README.md)); we report both.
+*Primary vs strict scoring (N5):* the reference answer for N5 counts 2 call sites that sit inside comments (model=15/44, total=321). With `skip_comments=true` Astrolabe returns 15/43 and 319, which is also a defensible answer. The primary N5 verdict therefore accepts either convention; the strict verdict (reference convention only) is still computed and reported next to it. The whole strict gap comes from N5 (C 1/10 strict, 10/10 primary). We changed the N5 primary after seeing this result; both numbers are published so you can judge it.
+
+**Where the gain is.** It is concentrated in aggregation/discovery tasks: N1 (cost C − A −$3.10 [−4.88, −1.32] over 5 pairs), N5 −$0.64 [−1.22, −0.02], N8 −$0.91 [−1.48, −0.31] over 10 pairs each. The other 10 of the 11 newly added tasks have cost intervals that include zero, and simple locating/small tasks (H2, H3, H6, H7, E2, N6, N7) are about even. N4 and E3b (private repos) were cheaper on average but not significantly, and in them the model never used the `aggregate` options. Per-turn latency did not differ (+0.6 s [−0.3, +1.4]); the time saving comes from fewer turns.
 
 **What this does not show.**
-- It covers 4 tasks that we chose because they are counting/locating/editing work. On the other 11 tasks there is **no simultaneous v0.13.0-vs-A run** yet.
-- The older v0.12.0 matrix (75 cells, 15 tasks, 5 rounds, triplets started together) found Astrolabe **more expensive**, not cheaper, than not using it: cost C − A = **+$0.244 [+0.035, +0.467]**; time +53 s [−8, +119] and correctness −4.0 points [−10.7, +2.7] both include zero. On its 40 control cells the extra cost was +$0.294 [+0.085, +0.540]. Most of that gap came from four tasks (E3b, N8, H1, N4; picked after seeing the data, so treat it as a hypothesis): without them C − A was +$0.03 [−0.14, +0.21].
-- One model, one harness, small samples (10 pairs per task). Latency per turn drifts during the day, so only simultaneous pairs are comparable for time.
-- Of the four headline tasks, N5 and N8 run on a public repo (QuantumNous/new-api). N4 and E3b ran on private repos and **cannot be reproduced** by others. The reference snapshot we used was a local copy; see [bench/README.md](bench/README.md) for how to check your checkout against it.
+- It does **not** show a general benefit. The 15 tasks are our own, there is one model, and each task has only 5 or 10 pairs, so per-task intervals are wide. Treat the averages as describing these tasks only.
+- The older v0.12.0 matrix (75 cells, 15 tasks, 5 rounds, triplets started together) found Astrolabe **more expensive**, not cheaper: cost C − A = **+$0.244 [+0.035, +0.467]**; time +53 s [−8, +119] and correctness −4.0 points [−10.7, +2.7] both include zero. On its 40 control cells the extra cost was +$0.294 [+0.085, +0.540]. Newer results used v0.13.0, which changed `search_code` and the tool list, so the two runs are not the same product.
+- Six of the 15 tasks use private or edited code (N4, E3b, H4, H5, E1, N7) and **cannot be reproduced** by others. The public-repo tasks can be re-run. The reference snapshot we used was a local copy; see [bench/README.md](bench/README.md) for how to check your checkout against it.
+- Latency per turn drifts during the day, so only simultaneous pairs are comparable for time.
 
-Reproduce the public part: `bash bench/fetch_corpora.sh && bash bench/run_pairs.sh --tasks N5,N8 --pairs 10` (real API spend: our 40-pair run cost about $214), then `python3 bench/report.py`.
+Reproduce the public part: `bash bench/fetch_corpora.sh && bash bench/run_pairs.sh --tasks N5,N8 --pairs 10` (real API spend: our 40-pair run cost about $214, the 55-pair run about $121), then `python3 bench/report.py`.
 
 ## When it helps, when it does not
 
-- **Measured to help:** counting or listing occurrences per directory/module with exclusions (N5, N8): fewer turns and lower cost than the same model doing it with shell scripts.
-- **Not shown to help:** the 40 general-purpose control cells of the v0.12.0 matrix (small public repos such as cobra and express among them) cost more with Astrolabe; batch edit workflows (N4, E3b) were cheaper on average but not significantly.
+- **Measured to help:** counting or listing occurrences per directory/module with exclusions (N5, N8) and one broad discovery task (N1): fewer turns and lower cost than the same model doing it with shell scripts.
+- **Not shown to help:** simple locating or small-edit tasks (H2, H3, H6, H7, E2, N6, N7 are about even, intervals include zero); the 40 general-purpose control cells of the v0.12.0 matrix cost more with Astrolabe; batch edit workflows (N4, E3b) were cheaper on average but not significantly.
 - **Overlap:** Claude Code can provide go-to-definition and find-references through its own LSP plugins ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)); our `goto_definition` / `find_references` overlap with that.
-- **Adoption is not guaranteed:** models sometimes ignore MCP tools. In v0.12.0 the model used Astrolabe in 0/5 runs of N5 and 1/5 of N8; after the v0.13.0 changes it did so in 20/20 runs of those two tasks. That is an observation about these tasks, not a promise.
+- **Adoption is not guaranteed:** models sometimes ignore MCP tools. In v0.12.0 the model used Astrolabe in 0/5 runs of N5 and 1/5 of N8; with v0.13.0 it did so in 92 of 95 runs across the 15 tasks. That is an observation about this model and these tasks, not a promise.
 
 ## Related projects
 

@@ -2,14 +2,14 @@
 
 Prepared 2026-10-18 for v0.13.0. Every submission is a public action and needs the maintainer's go-ahead. Order matters: (1) publish npm, (2) Glama, (3) awesome-mcp-servers, (4) official registry, (5) the rest.
 
-Honesty rule for all copy: use only the measured claims in the README (4 tasks, 40 simultaneous pairs, cost −$0.65 / time −108 s; v0.12.0 matrix not cheaper). No "faster than X" claims — we have not benchmarked against other servers.
+Honesty rule for all copy: use only the measured claims in the README (15 self-designed tasks, 95 simultaneous pairs, one model, cost −$0.49 / time −83 s, concentrated in aggregation/discovery tasks; v0.12.0 matrix not cheaper). No "faster than X" claims — we have not benchmarked against other servers.
 
 ## Shared copy
 
 - **Name:** Astrolabe AI (binary `astrolabe`; repo `wojiushirencai/Astrolabe`)
 - **Short (≤100 chars):** `Local MCP server for code search and navigation: search_code, find_symbol, find_references.`
 - **One sentence:** Astrolabe AI is a local MCP server that gives Claude Code, Cursor and Codex fast code search, symbol lookup and reference navigation, with directory-level counts for questions like "how many call sites per module".
-- **Long:** Single Rust binary; tree-sitter index; language servers started on demand for references/definition/diagnostics; 7 tools; no API key, no LLM calls in the server. Measured on 4 counting/locating/editing tasks (40 simultaneous A/B pairs): cost −$0.65 per run [−0.98, −0.31], time −108 s [−178, −37]; not shown to help on general control tasks. Not related to the npm packages `astrolabe` / `astrolabe-ai`.
+- **Long:** Single Rust binary; tree-sitter index; language servers started on demand for references/definition/diagnostics; 7 tools; no API key, no LLM calls in the server. Measured on 15 self-designed tasks with one model (95 simultaneous A/B pairs): cost −$0.49 per run [−0.73, −0.28], time −83 s [−129, −41], concentrated in aggregation/discovery tasks; not shown to help on simple tasks. Not related to the npm packages `astrolabe` / `astrolabe-ai`.
 - **Install:** `curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh` · `claude mcp add --scope user astrolabe -- astrolabe . --context=claude-code`
 - **Categories/tags:** code search, code navigation, developer tools, coding agents; mcp, mcp-server, claude-code, codex, cursor, tree-sitter, lsp, rust
 
