@@ -10,7 +10,7 @@ use std::{
 
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
-    cache::DEFAULT_MEMORY_BUDGET_BYTES,
+    cache::{FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
     graph::{cached_centrality, match_task, rank_for_task},
     render::{confidence_note, symbol_line},
     CodeSymbol, Confidence, FileId,
@@ -433,10 +433,72 @@ fn loosened_filter(filter: &str) -> Option<String> {
 /// Role of a hit line. Tests: assertion vs plain reference; code: load/read,
 /// definition, or other use. Heuristic, text-based.
 fn hit_role(is_test: bool, text: &str) -> &'static str {
+    hit_role_split(is_test, text, text)
+}
+
+/// Lexer-aware view of a hit line: `code` is the line without comment bytes
+/// (string contents kept), `bare` also without string contents. `None` view
+/// means no lexer for the file type.
+struct RoleView {
+    code: String,
+    bare: String,
+}
+
+/// Role of hit lines using the file's `code_mask`: trailing comments no longer
+/// leak words into the label, and lines inside multi-line / raw strings (Go
+/// backticks, Python triple quotes) are tagged `字符串` instead of `定义`/`加载`.
+fn role_views(path: &str, lines: &[String], wanted: &[usize]) -> Option<HashMap<usize, RoleView>> {
+    let comments_only = crate::code_mask::code_mask(path, lines, true)?;
+    let bare_mask = crate::code_mask::code_mask(path, lines, false)?;
+    let pick = |line: &str, mask: &[bool]| -> String {
+        let bytes: Vec<u8> = line
+            .bytes()
+            .zip(mask.iter())
+            .filter(|(_, keep)| **keep)
+            .map(|(b, _)| b)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let mut out = HashMap::new();
+    for &i in wanted {
+        let (Some(line), Some(c), Some(b)) = (lines.get(i), comments_only.get(i), bare_mask.get(i))
+        else {
+            continue;
+        };
+        out.insert(
+            i,
+            RoleView {
+                code: pick(line, c),
+                bare: pick(line, b),
+            },
+        );
+    }
+    Some(out)
+}
+
+fn hit_role_view(is_test: bool, raw: &str, view: &RoleView) -> &'static str {
+    if view.code.trim().is_empty() {
+        return if raw.trim().is_empty() {
+            hit_role(is_test, raw)
+        } else {
+            "注释"
+        };
+    }
+    if view.bare.trim().is_empty() {
+        return "字符串";
+    }
+    hit_role_split(is_test, &view.bare, &view.code)
+}
+
+/// `words`: text used for word keys (strings blanked when known); `lit`: text
+/// used for keys that need a string literal (`= "`).
+fn hit_role_split(is_test: bool, words: &str, lit: &str) -> &'static str {
+    let text = words;
     if is_comment_line(text) {
         return "注释";
     }
     let any = |keys: &[&str]| keys.iter().any(|k| contains_word_start(text, k));
+    let any_lit = |keys: &[&str]| keys.iter().any(|k| contains_word_start(lit, k));
     if is_test {
         if any(&[
             "assert", "expect", "require.", "require(", "want", "equal", "eq!(", "should", "tobe",
@@ -468,9 +530,9 @@ fn hit_role(is_test: bool, text: &str) -> &'static str {
         "import ",
     ]) {
         "加载"
-    } else if any(&[
-        "const ", "static ", "#define", " := ", "let ", "var ", "= \"", "=\"", ": \"",
-    ]) {
+    } else if any(&["const ", "static ", "#define", " := ", "let ", "var "])
+        || any_lit(&["= \"", "=\"", ": \""])
+    {
         "定义"
     } else {
         "使用"
@@ -899,7 +961,12 @@ fn next_step_hint(task: &str) -> &'static str {
 }
 
 /// `group=true`: hits grouped per file, production first then tests.
-fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (String, usize) {
+fn render_grouped_hits(
+    index: &RepoIndex,
+    cache: &FileCache,
+    hits: &[SearchHit],
+    limit: usize,
+) -> (String, usize) {
     struct Row {
         line: usize,
         role: &'static str,
@@ -933,9 +1000,19 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
             continue;
         }
         let file_is_test = crate::explain::is_test_caller(path, "");
+        let wanted: Vec<usize> = rows.iter().map(|r| r.line.saturating_sub(1)).collect();
+        let views = index
+            .cached_lines(cache, path)
+            .and_then(|(lines, _)| role_views(path, &lines, &wanted));
         for r in &mut rows {
             let test = file_is_test || crate::explain::is_test_caller(path, &r.sym);
-            r.role = hit_role(test, &r.text);
+            r.role = match views
+                .as_ref()
+                .and_then(|v| v.get(&r.line.saturating_sub(1)))
+            {
+                Some(view) => hit_role_view(test, &r.text, view),
+                None => hit_role(test, &r.text),
+            };
         }
         if file_is_test {
             tests.push((path, rows));
@@ -947,7 +1024,7 @@ fn render_grouped_hits(index: &RepoIndex, hits: &[SearchHit], limit: usize) -> (
     tests.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     docs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     let mut out = format!(
-        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个，文档 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]，文档 [文档]。\n",
+        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个，文档 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]，字符串内 [字符串]，文档 [文档]。\n",
         hits.len(),
         prod.len() + tests.len() + docs.len(),
         prod.len(),
@@ -3248,6 +3325,7 @@ impl AstrolabeServer {
                 if ((params.group == Some(true) && params.offset == 0) || auto_group) && total > 0 {
                     let (grouped, shown) = render_grouped_hits(
                         index,
+                        &session.file_cache,
                         &matches,
                         clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS),
                     );
@@ -5413,6 +5491,45 @@ mod tests {
         assert_eq!(hit_role(false, "v := os.Getenv(\"K\")"), "加载");
         assert_eq!(hit_role(false, "const K = \"v\""), "定义");
         assert_eq!(hit_role(false, "log(\"v\")"), "使用");
+    }
+
+    #[test]
+    fn hit_roles_use_lexer_for_trailing_comments_and_raw_strings() {
+        let go: Vec<String> = [
+            "package p",
+            "func f() {",
+            "\ts := `",
+            "\tx := 1",
+            "\t`",
+            "\treturn s // a := b",
+            "}",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let v = role_views("a.go", &go, &[3, 5]).unwrap();
+        // inside a Go raw string: not a definition
+        assert_eq!(hit_role_view(false, &go[3], &v[&3]), "字符串");
+        // trailing comment words do not leak into the label
+        assert_eq!(hit_role_view(false, &go[5], &v[&5]), "使用");
+        let py: Vec<String> = [
+            "def g(thread):",
+            "    return thread  # read SysLog(x)",
+            "    # SysLog(x)",
+            "    x = 1  # note",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let v = role_views("b.py", &py, &[1, 2]).unwrap();
+        assert_eq!(hit_role_view(false, &py[1], &v[&1]), "使用");
+        assert_eq!(hit_role_view(false, &py[2], &v[&2]), "注释");
+        // no lexer: falls back to text heuristic
+        assert!(role_views("a.txt", &py, &[0]).is_none());
+        // string literal keys still see strings
+        let rs: Vec<String> = vec!["let k = \"v\"; // read".into()];
+        let v = role_views("a.rs", &rs, &[0]).unwrap();
+        assert_eq!(hit_role_view(false, &rs[0], &v[&0]), "定义");
     }
 
     #[test]
