@@ -2120,12 +2120,8 @@ impl AstrolabeServer {
         tools
     }
 
-    /// Current index generation for the session `hint` routes to, after the
-    /// freshness barrier has absorbed pending edits. `None` when the index is
-    /// not ready (the call then just runs and is never counted).
-    fn index_stamp(&self, hint: &str) -> Option<u64> {
-        let session = self.session_for(hint).ok()?;
-        let _ = run_barrier(&session);
+    /// Generation of an already-routed session's Ready index; no barrier.
+    fn stamp_of(session: &RootSession) -> Option<u64> {
         let state = session.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             IndexState::Ready(index) => Some(index.generation()),
@@ -2146,7 +2142,14 @@ impl AstrolabeServer {
         signature: &str,
         run: impl FnOnce() -> CallToolResult,
     ) -> CallToolResult {
-        let Some(stamp) = self.index_stamp(hint) else {
+        // Route once; the barrier runs once here. The tool body's own
+        // `with_fresh_index` runs it again, and the post-run stamp reuses the
+        // routed session instead of routing and waiting a third time.
+        let Ok(session) = self.session_for(hint) else {
+            return run();
+        };
+        let _ = run_barrier(&session);
+        let Some(stamp) = Self::stamp_of(&session) else {
             return run();
         };
         let verdict = self
@@ -2165,7 +2168,7 @@ impl AstrolabeServer {
         let mut result = run();
         if result.is_error != Some(true) {
             // Re-read the stamp: the run itself may have absorbed edits.
-            if let Some(after) = self.index_stamp(hint) {
+            if let Some(after) = Self::stamp_of(&session) {
                 self.loop_guard
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
