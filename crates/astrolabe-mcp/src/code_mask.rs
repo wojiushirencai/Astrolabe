@@ -134,6 +134,14 @@ enum State {
     Block(u32),
     /// Multi-line string: triple quote (the quote byte) or backtick.
     Multi(u8),
+    /// C# raw string `"""…"""` (`quotes` >= 3, closed by as many quotes; no
+    /// escapes) or verbatim string `@"…"` (`quotes` == 0; `""` is a quote).
+    /// Both may span lines. `dollars`: interpolation opens with that many
+    /// `{` (`$$"""…{{x}}…"""`); 0 = not interpolated.
+    CsStr {
+        quotes: usize,
+        dollars: usize,
+    },
     /// Rust `"` string that continued past the end of a line.
     Str(u8),
     /// Raw string / long comment closed by an exact terminator.
@@ -401,6 +409,70 @@ pub(crate) fn code_mask(
                         state = State::Code;
                     }
                 }
+                State::CsStr { quotes, dollars } => {
+                    let start = i;
+                    let run =
+                        |b: &[u8], i: usize, c: u8| b[i..].iter().take_while(|&&x| x == c).count();
+                    let mut closed = false;
+                    let mut opened = None;
+                    while i < n {
+                        if b[i] == b'"' {
+                            let r = run(b, i, b'"');
+                            if quotes == 0 {
+                                // Verbatim: `""` is an escaped quote.
+                                if r >= 2 {
+                                    i += 2;
+                                    continue;
+                                }
+                                i += 1;
+                                closed = true;
+                                break;
+                            }
+                            i += r;
+                            if r >= quotes {
+                                closed = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        if dollars > 0 && b[i] == b'{' {
+                            let r = run(b, i, b'{');
+                            let need = dollars.max(1);
+                            if quotes == 0 && r >= 2 {
+                                // `{{` is a literal brace in `$@"…"`.
+                                i += 2;
+                                continue;
+                            }
+                            if r >= need {
+                                // Extra leading braces are content.
+                                i += r - need;
+                                opened = Some(need);
+                                break;
+                            }
+                            i += r;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    if let Some(len) = opened {
+                        string(&mut mask, start, i + len);
+                        frames.push(Frame {
+                            depth: 0,
+                            open: b'{',
+                            close: b'}',
+                            resume: State::CsStr { quotes, dollars },
+                            fstr: false,
+                        });
+                        fs = false;
+                        i += len;
+                        state = State::Code;
+                    } else {
+                        string(&mut mask, start, i);
+                        if closed {
+                            state = State::Code;
+                        }
+                    }
+                }
                 State::Str(q) => {
                     let start = i;
                     let mut closed = false;
@@ -600,6 +672,11 @@ pub(crate) fn code_mask(
                         };
                         string(&mut mask, i, i + len);
                         i += len;
+                    } else if lg == Lang::CSharp && c == b'"' && cs_string_open(b, i).is_some() {
+                        let (quotes, dollars, len) = cs_string_open(b, i).expect("checked");
+                        state = State::CsStr { quotes, dollars };
+                        string(&mut mask, i, i + len);
+                        i += len;
                     } else if (c == b'"' || c == b'\'')
                         && lg.triple(c)
                         && next == c
@@ -685,6 +762,25 @@ pub(crate) fn code_mask(
         out.push(mask);
     }
     Some(out)
+}
+
+/// C# raw (`"""`, `$$"""`) or verbatim (`@"`, `$@"`, `@$"`) string opener at
+/// the quote `i`: (quote count, 0 = verbatim; `$` count; opener length from
+/// `i`). `None` for a regular string.
+fn cs_string_open(b: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+    let quotes = b[i..].iter().take_while(|&&x| x == b'"').count();
+    let mut s = i;
+    while s > 0 && matches!(b[s - 1], b'$' | b'@') && i - s < 16 {
+        s -= 1;
+    }
+    if s > 0 && is_ident(b[s - 1]) {
+        return None;
+    }
+    let dollars = b[s..i].iter().filter(|&&x| x == b'$').count();
+    if quotes >= 3 {
+        return Some((quotes, dollars, quotes));
+    }
+    b[s..i].contains(&b'@').then_some((0, dollars.min(1), 1))
 }
 
 /// Rust `r"`, `r#"`, `br#"`, `cr#"`: (hash count, opener length).
@@ -1121,6 +1217,41 @@ mod tests {
             "foo_call",
             false
         ));
+    }
+
+    #[test]
+    fn csharp_raw_and_verbatim_strings() {
+        // Raw string over lines, with `""` and a lone `\` inside: all string.
+        let raw = "var s = \"\"\"\n  say \"\"hi\"\" foo_call() \\\n  \"\"\";\nreal();";
+        assert!(!is_code("a.cs", raw, 1, "foo_call", false));
+        assert!(is_code("a.cs", raw, 3, "real", false));
+        // Four quotes: a `"""` inside does not close it.
+        let four = "var s = \"\"\"\"a \"\"\" foo_call()\"\"\"\"; real();";
+        assert!(!is_code("a.cs", four, 0, "foo_call", false));
+        assert!(is_code("a.cs", four, 0, "real", false));
+        // `$$"""`: `{` is content, `{{…}}` is code.
+        let dd = "var j = $$\"\"\"{\"k\": {{foo_call()}}, \"v\": {lit_call()}}\"\"\"; real();";
+        assert!(is_code("a.cs", dd, 0, "foo_call", false));
+        assert!(!is_code("a.cs", dd, 0, "lit_call", false));
+        assert!(is_code("a.cs", dd, 0, "real", false));
+        // `$"""` multi-line with an interpolation on a later line.
+        let d1 = "var s = $\"\"\"\n  a {foo_call()} lit_call()\n  \"\"\"; real();";
+        assert!(is_code("a.cs", d1, 1, "foo_call", false));
+        assert!(!is_code("a.cs", d1, 1, "lit_call", false));
+        assert!(is_code("a.cs", d1, 2, "real", false));
+        // Verbatim: `\` is not an escape, `""` is a quote, lines continue.
+        let v = "var p = @\"C:\\dir\\\"; real();\nvar q = @\"a \"\"lit_call()\"\"\n lit_call() \"; real();";
+        assert!(is_code("a.cs", v, 0, "real", false));
+        assert!(!is_code("a.cs", v, 1, "lit_call", false));
+        assert!(!is_code("a.cs", v, 2, "lit_call", false));
+        assert!(is_code("a.cs", v, 2, "real", false));
+        // `$@"…{{lit}}…{x}"` and `@$"`.
+        let vi = "var s = @$\"{{lit_call()}} {foo_call()}\n\"; real();";
+        assert!(!is_code("a.cs", vi, 0, "lit_call", false));
+        assert!(is_code("a.cs", vi, 0, "foo_call", false));
+        assert!(is_code("a.cs", vi, 1, "real", false));
+        // A normal empty string next to code is untouched.
+        assert!(is_code("a.cs", "var e = \"\" + real();", 0, "real", false));
     }
 
     #[test]
