@@ -315,6 +315,10 @@ struct Slot {
     start_gate: Mutex<()>,
 }
 
+/// Retry delay while discovery reports a background auto-install in
+/// progress (see `installer::Installs`).
+const INSTALL_PENDING_RETRY: Duration = Duration::from_secs(2);
+
 /// Consecutive request timeouts after which a server is judged wedged and
 /// replaced.
 const WEDGED_AFTER_TIMEOUTS: u32 = 3;
@@ -386,10 +390,18 @@ impl StartFailure {
             LspError::ContentModified => StartFailureKind::Protocol(err.to_string()),
             LspError::Crashed => StartFailureKind::Crashed,
         };
+        // An auto-install still downloading is not a failed start: retry
+        // soon, so the server comes up shortly after the download lands
+        // instead of a full cooldown later.
+        let retry_after = matches!(
+            err,
+            LspError::Unavailable(_, message) if message.contains(super::installer::INSTALL_PENDING)
+        )
+        .then_some(INSTALL_PENDING_RETRY);
         StartFailure {
             at: Instant::now(),
             kind,
-            retry_after: None,
+            retry_after,
         }
     }
 
@@ -1532,6 +1544,23 @@ mod tests {
             .expect("query on second generation");
         drop(second);
         pool.shutdown();
+    }
+
+    #[test]
+    fn pending_auto_install_is_retried_soon_not_after_the_full_cooldown() {
+        let pending = LspError::Unavailable(
+            Language::Cpp,
+            format!(
+                "{} of clangd (started 3s ago)",
+                super::super::installer::INSTALL_PENDING
+            ),
+        );
+        assert_eq!(
+            StartFailure::from_error(&pending).retry_after,
+            Some(INSTALL_PENDING_RETRY)
+        );
+        let missing = LspError::Unavailable(Language::Cpp, "clangd not found".into());
+        assert_eq!(StartFailure::from_error(&missing).retry_after, None);
     }
 
     #[test]

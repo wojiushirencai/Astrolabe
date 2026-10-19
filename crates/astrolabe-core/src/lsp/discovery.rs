@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use crate::types::Language;
 
 use super::installer::{
-    self, ensure_installed_with, AutoInstallMode, InstallContext, InstallSpec, NeedsInstall,
-    UreqFetcher,
+    self, ensure_installed_with, AutoInstallMode, BackgroundInstall, InstallContext, InstallSpec,
+    Installs, NeedsInstall, UreqFetcher,
 };
 use super::{LspError, ServerSpec};
 
@@ -75,6 +75,19 @@ pub struct Discovery {
     /// Install roots searched for an unpacked kotlin-lsp distribution when
     /// none is on PATH. Empty for [`Discovery::new`] (hermetic tests).
     kotlin_roots: Vec<PathBuf>,
+    /// How long a probe waits for a background auto-install before answering
+    /// "in progress". Zero (default): never wait inside the probe.
+    install_wait: std::time::Duration,
+}
+
+/// Registry key of one artifact install.
+fn install_key(spec: &InstallSpec, cache_root: &Path) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        cache_root.display(),
+        spec.name,
+        spec.version
+    )
 }
 
 /// One language's probe outcome. Missing is a row, not an omitted row.
@@ -378,6 +391,7 @@ impl Discovery {
                 |k| std::env::var(k).ok(),
                 cfg!(windows),
             ),
+            install_wait: std::time::Duration::ZERO,
         }
     }
 
@@ -392,6 +406,7 @@ impl Discovery {
             cache_root: None,
             auto_install: AutoInstallMode::Off,
             kotlin_roots: Vec::new(),
+            install_wait: std::time::Duration::ZERO,
         }
     }
 
@@ -416,6 +431,12 @@ impl Discovery {
     /// Override [`AutoInstallMode`] (tests / session policy).
     pub fn with_auto_install(mut self, mode: AutoInstallMode) -> Self {
         self.auto_install = mode;
+        self
+    }
+
+    /// Let a probe wait up to `wait` for a background auto-install.
+    pub fn with_install_wait(mut self, wait: std::time::Duration) -> Self {
+        self.install_wait = wait;
         self
     }
 
@@ -525,30 +546,15 @@ impl Discovery {
             }
         }
 
-        // Auto-install only when mode is On (never for Prompt/Off).
+        // Auto-install only when mode is On (never for Prompt/Off). The
+        // download runs on a background thread (once per artifact, see
+        // `installer::Installs`): this probe runs inside the pool's start gate
+        // and inside `get_languages`, which must not wait minutes on it.
         if self.auto_install == AutoInstallMode::On {
             if let Some(install_spec) = catalog_install_spec(language) {
                 if let Some(cache_root) = &self.cache_root {
-                    let fetcher = UreqFetcher::default();
-                    let ctx = InstallContext {
-                        cache_root: cache_root.clone(),
-                        fetcher: &fetcher,
-                        offline: std::env::var(installer::ENV_OFFLINE)
-                            .map(|v| {
-                                matches!(
-                                    v.trim().to_ascii_lowercase().as_str(),
-                                    "1" | "true" | "yes" | "on"
-                                )
-                            })
-                            .unwrap_or(false),
-                        mirror_github: std::env::var(installer::ENV_MIRROR_GITHUB)
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()),
-                        lock_timeout: std::time::Duration::from_secs(120),
-                    };
-                    match ensure_installed_with(&install_spec, &ctx) {
-                        Ok(command) => {
+                    match self.background_install(&install_spec, cache_root) {
+                        BackgroundInstall::Ready(command) => {
                             let cands = candidates(language);
                             let candidate = cands.first().expect("catalog langs have candidates");
                             let spec = spec_from_candidate(language, command, candidate);
@@ -560,7 +566,18 @@ impl Discovery {
                                 needs_install: None,
                             };
                         }
-                        Err(err) => {
+                        BackgroundInstall::Pending { elapsed } => {
+                            let hint = format!(
+                                "{} of {} (started {}s ago); the language server starts once \
+                                 it finishes. {}",
+                                installer::INSTALL_PENDING,
+                                install_spec.name,
+                                elapsed.as_secs(),
+                                self.missing_hint(language)
+                            );
+                            return self.unavailable(language, hint);
+                        }
+                        BackgroundInstall::Failed(err) => {
                             let hint = format!(
                                 "auto-install of {} failed: {err}. {}",
                                 install_spec.name,
@@ -574,6 +591,34 @@ impl Discovery {
         }
 
         self.unavailable(language, self.missing_hint(language))
+    }
+
+    /// Poll (or start) the background install of `spec` under `cache_root`.
+    fn background_install(&self, spec: &InstallSpec, cache_root: &Path) -> BackgroundInstall {
+        let key = install_key(spec, cache_root);
+        let spec = spec.clone();
+        let cache_root = cache_root.to_path_buf();
+        Installs::global().poll_or_start(&key, self.install_wait, move || {
+            let fetcher = UreqFetcher::default();
+            let ctx = InstallContext {
+                cache_root,
+                fetcher: &fetcher,
+                offline: std::env::var(installer::ENV_OFFLINE)
+                    .map(|v| {
+                        matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    })
+                    .unwrap_or(false),
+                mirror_github: std::env::var(installer::ENV_MIRROR_GITHUB)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                lock_timeout: std::time::Duration::from_secs(120),
+            };
+            ensure_installed_with(&spec, &ctx).map_err(|e| e.to_string())
+        })
     }
 
     /// Upgrade a kotlin-lsp spec that points at the deprecated wrapper (or a
@@ -1810,6 +1855,49 @@ mod tests {
         assert!(result.spec.is_none());
         let needs = result.needs_install.expect("structured hint");
         assert_eq!(needs.hint.mode, AutoInstallMode::Prompt);
+    }
+
+    #[test]
+    fn auto_install_in_progress_answers_at_once_and_starts_no_second_download() {
+        let Some(spec) = catalog_install_spec(Language::Cpp) else {
+            return; // no pinned artifact for this host
+        };
+        let cache = scratch();
+        let key = install_key(&spec, &cache.0);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let bin = cache.0.join("fake-clangd");
+        let bin_done = bin.clone();
+        // Stand-in for a slow download already running for this artifact.
+        let first = Installs::global().poll_or_start(&key, std::time::Duration::ZERO, move || {
+            let _ = release_rx.recv();
+            fs::write(&bin_done, "x").map_err(|e| e.to_string())?;
+            Ok(bin_done)
+        });
+        assert!(matches!(first, BackgroundInstall::Pending { .. }));
+
+        let d = Discovery::new("")
+            .with_cache_root(&cache.0)
+            .with_auto_install(AutoInstallMode::On);
+        let started = std::time::Instant::now();
+        let probed = d.probe(Language::Cpp);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "probe waited on the download: {:?}",
+            started.elapsed()
+        );
+        assert!(probed.spec.is_none());
+        assert!(
+            probed.install_hint.contains(installer::INSTALL_PENDING),
+            "{}",
+            probed.install_hint
+        );
+
+        release_tx.send(()).unwrap();
+        let d = d.with_install_wait(std::time::Duration::from_secs(5));
+        let ready = d
+            .discover(Language::Cpp)
+            .expect("installed by the background job");
+        assert_eq!(ready.command, bin);
     }
 
     #[test]
