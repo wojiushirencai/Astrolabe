@@ -19,8 +19,8 @@ use astrolabe_core::lsp::diagnostics::{query_server, FetchOptions};
 use astrolabe_core::lsp::discovery::Discovery;
 use astrolabe_core::lsp::pool::{LspPool, LspPoolConfig};
 use astrolabe_core::lsp::queries::{
-    apple_references_fallback, find_references, goto_definition, identifier_at,
-    text_fallback_references, SymbolAt,
+    apple_references_fallback_in, find_references, goto_definition, identifier_at,
+    text_fallback_references_in, SymbolAt,
 };
 use astrolabe_core::lsp::router::primary_server_name;
 use astrolabe_core::lsp::transport::StdioSpawn;
@@ -531,13 +531,20 @@ impl PreciseCapability for LiveBackend {
             Some(position) => SymbolAt::Position(position),
             None => SymbolAt::Name(symbol),
         };
+        // The text fallbacks walk the file list of the current (barrier-
+        // fresh) index instead of re-scanning the whole tree per query.
+        let index = self.syntax.as_ref().and_then(|f| f());
+        let files = index
+            .as_deref()
+            .and_then(RepoIndex::incremental)
+            .map(|inc| inc.admitted_paths());
         let result = match self.with_server(language, |server| {
             let result = find_references(server, &self.root, &rel, target);
             (result, server.is_none_or(|s| s.is_busy()))
         }) {
             Ok((result, busy)) if busy && warming_unknown(&result.value, &result) => {
                 let reason = warming_note(language, 0, "");
-                match text_fallback_references(&self.root, &rel, target, &reason) {
+                match text_fallback_references_in(&self.root, &rel, target, &reason, files) {
                     Some(fallback) if !fallback.value.is_empty() => fallback,
                     _ => result,
                 }
@@ -553,7 +560,7 @@ impl PreciseCapability for LiveBackend {
                     || (language == Language::Kotlin && result.value.len() <= 1) =>
             {
                 let reason = empty_note(language, "引用");
-                match text_fallback_references(&self.root, &rel, target, &reason) {
+                match text_fallback_references_in(&self.root, &rel, target, &reason, files) {
                     Some(fallback) if fallback.value.len() > result.value.len().max(1) => fallback,
                     _ => result,
                 }
@@ -565,7 +572,7 @@ impl PreciseCapability for LiveBackend {
         };
         // Swift / ObjC servers without an index answer nothing; fall back to
         // a clearly labelled tree-sitter search instead of an empty Unknown.
-        let mut result = apple_references_fallback(&self.root, &rel, target, result);
+        let mut result = apple_references_fallback_in(&self.root, &rel, target, result, files);
         if language == Language::Go {
             if let Some(line) = self.go_implementors_line(&rel, target) {
                 let note = result.note.get_or_insert_with(String::new);

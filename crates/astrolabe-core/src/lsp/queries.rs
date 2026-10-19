@@ -156,6 +156,18 @@ pub fn apple_references_fallback(
     target: SymbolAt<'_>,
     result: Precise<Vec<Location>>,
 ) -> Precise<Vec<Location>> {
+    apple_references_fallback_in(repo_root, path, target, result, None)
+}
+
+/// [`apple_references_fallback`] over a known file list (the admitted paths
+/// of a fresh index) instead of a fresh directory walk.
+pub fn apple_references_fallback_in(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    result: Precise<Vec<Location>>,
+    files: Option<&[RelPath]>,
+) -> Precise<Vec<Location>> {
     if !result.value.is_empty() || result.confidence != Confidence::Unknown {
         return result;
     }
@@ -178,7 +190,7 @@ pub fn apple_references_fallback(
         .filter(|n| !n.is_empty())
         .unwrap_or("language server returned no references")
         .to_string();
-    super::fallback::syntactic_references(repo_root, path, &name, &reason)
+    super::fallback::syntactic_references(repo_root, path, &name, &reason, files)
 }
 
 fn is_apple_source(repo_root: &Path, path: &RelPath) -> bool {
@@ -226,7 +238,7 @@ fn references_failed(
     err: &LspError,
 ) -> Precise<Vec<Location>> {
     if matches!(err, LspError::Timeout(_)) {
-        if let Some(fallback) = timeout_fallback(repo_root, path, target, &err.to_string()) {
+        if let Some(fallback) = timeout_fallback(repo_root, path, target, &err.to_string(), None) {
             return fallback;
         }
     }
@@ -240,6 +252,7 @@ fn timeout_fallback(
     path: &RelPath,
     target: SymbolAt<'_>,
     reason: &str,
+    files: Option<&[RelPath]>,
 ) -> Option<Precise<Vec<Location>>> {
     let name = match target {
         SymbolAt::Name(name) if !name.is_empty() => name.to_string(),
@@ -248,7 +261,7 @@ fn timeout_fallback(
     };
     let reason = reason.split(';').next().unwrap_or(reason);
     Some(super::fallback::text_references(
-        repo_root, path, &name, reason,
+        repo_root, path, &name, reason, files,
     ))
 }
 
@@ -261,7 +274,19 @@ pub fn text_fallback_references(
     target: SymbolAt<'_>,
     reason: &str,
 ) -> Option<Precise<Vec<Location>>> {
-    timeout_fallback(repo_root, path, target, reason)
+    timeout_fallback(repo_root, path, target, reason, None)
+}
+
+/// [`text_fallback_references`] over a known file list (the admitted paths
+/// of a fresh index) instead of a fresh directory walk.
+pub fn text_fallback_references_in(
+    repo_root: &Path,
+    path: &RelPath,
+    target: SymbolAt<'_>,
+    reason: &str,
+    files: Option<&[RelPath]>,
+) -> Option<Precise<Vec<Location>>> {
+    timeout_fallback(repo_root, path, target, reason, files)
 }
 
 /// Identifier under `position` in `path` (UTF-16 column), if any.

@@ -59,6 +59,7 @@ pub(crate) fn text_references(
     origin: &RelPath,
     name: &str,
     reason: &str,
+    files: Option<&[RelPath]>,
 ) -> Precise<Vec<Location>> {
     let Some(language) = Language::from_path(origin) else {
         // Unknown origin language: matching "every unknown file" would sweep
@@ -77,6 +78,7 @@ pub(crate) fn text_references(
         name,
         |f| Language::from_path(f) == Some(language),
         false,
+        files,
     );
     let mut note = format!(
         "{reason}; fell back to a whole-word text search for `{name}`. \
@@ -105,6 +107,7 @@ pub(crate) fn syntactic_references(
     origin: &RelPath,
     name: &str,
     reason: &str,
+    files: Option<&[RelPath]>,
 ) -> Precise<Vec<Location>> {
     let swift = Language::from_path(origin) == Some(Language::Swift);
     let (hits, truncated) = collect(
@@ -122,6 +125,7 @@ pub(crate) fn syntactic_references(
             }
         },
         true,
+        files,
     );
     let mut note = format!(
         "{reason}. 已退回 tree-sitter 语法检索：以下是 `{name}` 在代码中（已排除注释和字符串）的同名出现，\
@@ -137,15 +141,22 @@ pub(crate) fn syntactic_references(
     }
 }
 
+/// `known_files`: the admitted file list of a fresh index, when the caller
+/// has one; reusing it skips a full directory walk per query. `None` walks
+/// the tree with the default scan options.
 fn collect(
     repo_root: &Path,
     origin: &RelPath,
     name: &str,
     keep: impl Fn(&RelPath) -> bool,
     code_only: bool,
+    known_files: Option<&[RelPath]>,
 ) -> (Vec<Location>, bool) {
     let started = Instant::now();
-    let mut files = scan(repo_root, &ScanOptions::default()).files;
+    let mut files: Vec<RelPath> = match known_files {
+        Some(known) => known.iter().filter(|f| keep(f)).cloned().collect(),
+        None => scan(repo_root, &ScanOptions::default()).files,
+    };
     files.retain(|f| keep(f));
     files.sort();
     // Origin first: if the budget runs out, the local hits survive.
@@ -292,9 +303,15 @@ mod tests {
         let t = Instant::now();
         let mut n = 0;
         for _ in 0..5 {
-            n = text_references(dir.path(), &RelPath::new("d0/m0.rs"), "needle_fn", "x")
-                .value
-                .len();
+            n = text_references(
+                dir.path(),
+                &RelPath::new("d0/m0.rs"),
+                "needle_fn",
+                "x",
+                None,
+            )
+            .value
+            .len();
         }
         let ts = Instant::now();
         let nfiles = scan(dir.path(), &ScanOptions::default()).files.len();
@@ -310,6 +327,67 @@ mod tests {
         );
         eprintln!("BENCH5 scan alone {nfiles} files: {:?}", ts.elapsed());
         eprintln!("BENCH5 5000 files, {n} hits: {:?}/call", t.elapsed() / 5);
+        let known = scan(dir.path(), &ScanOptions::default()).files;
+        let tk = Instant::now();
+        for _ in 0..5 {
+            n = text_references(
+                dir.path(),
+                &RelPath::new("d0/m0.rs"),
+                "needle_fn",
+                "x",
+                Some(&known),
+            )
+            .value
+            .len();
+        }
+        eprintln!(
+            "BENCH5 known file list, {n} hits: {:?}/call",
+            tk.elapsed() / 5
+        );
+    }
+
+    /// A caller-supplied file list (the index's admitted paths) gives the
+    /// same answer as walking the tree, in any order, and is what is
+    /// searched: a file missing from the list is not read.
+    #[test]
+    fn known_file_list_matches_directory_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &str, s: &str| {
+            let full = dir.path().join(p);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, s).unwrap();
+        };
+        w("a.rs", "fn foo() {}\nfn bar() { foo(); }\n");
+        w(
+            "sub/b.rs",
+            "// foo in a comment\nfn baz() { foo(); foo_x(); }\n",
+        );
+        w("sub/c.py", "foo()\n");
+        w("A.h", "@interface Widget : NSObject\n@end\n");
+        w(
+            "A.m",
+            "@implementation Widget\n- (void)f { [Widget new]; }\n@end\n",
+        );
+        let mut walked = scan(dir.path(), &ScanOptions::default()).files;
+        walked.reverse();
+        let origin = RelPath::new("a.rs");
+        let a = text_references(dir.path(), &origin, "foo", "x", None);
+        let b = text_references(dir.path(), &origin, "foo", "x", Some(&walked));
+        assert_eq!(a.value, b.value);
+        assert_eq!(a.note, b.note);
+        assert_eq!(a.value.len(), 4, "{:?}", a.value);
+        let h = RelPath::new("A.h");
+        let a = syntactic_references(dir.path(), &h, "Widget", "x", None);
+        let b = syntactic_references(dir.path(), &h, "Widget", "x", Some(&walked));
+        assert_eq!(a.value, b.value);
+        let only_a = [RelPath::new("a.rs")];
+        let c = text_references(dir.path(), &origin, "foo", "x", Some(&only_a));
+        assert!(
+            c.value.iter().all(|l| l.path.as_str() == "a.rs"),
+            "{:?}",
+            c.value
+        );
+        assert_eq!(c.value.len(), 2);
     }
 
     #[test]
@@ -317,7 +395,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.weird1"), "foo\n").unwrap();
         std::fs::write(dir.path().join("b.weird2"), "foo\n").unwrap();
-        let out = text_references(dir.path(), &RelPath::new("a.weird1"), "foo", "x");
+        let out = text_references(dir.path(), &RelPath::new("a.weird1"), "foo", "x", None);
         assert!(out.value.is_empty());
         assert_eq!(out.confidence, Confidence::Unknown);
         assert!(out.note.unwrap().contains("not recognised"));
@@ -337,7 +415,7 @@ mod tests {
             encoding_rs::GBK.encode("// 中文注释，这是一个测试\nfn y() { needle_fn(); }\n");
         std::fs::write(dir.path().join("b.rs"), &gbk).unwrap();
         std::fs::write(dir.path().join("c.rs"), "fn z() {}\n").unwrap();
-        let r = text_references(dir.path(), &RelPath::new("a.rs"), "needle_fn", "x");
+        let r = text_references(dir.path(), &RelPath::new("a.rs"), "needle_fn", "x", None);
         let mut paths: Vec<_> = r
             .value
             .iter()
@@ -355,7 +433,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn foo() {}\nfn foobar() {}\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn x() { foo(); }\n").unwrap();
         std::fs::write(dir.path().join("c.py"), "foo()\n").unwrap();
-        let r = text_references(dir.path(), &RelPath::new("a.rs"), "foo", "timed out");
+        let r = text_references(dir.path(), &RelPath::new("a.rs"), "foo", "timed out", None);
         assert_eq!(r.confidence, Confidence::Syntactic);
         assert!(r.note.unwrap().contains("timed out"));
         let paths: Vec<_> = r
@@ -382,6 +460,7 @@ mod tests {
             &RelPath::new("A.h"),
             "Widget",
             "clangd has no index",
+            None,
         );
         assert_eq!(r.confidence, Confidence::Syntactic);
         assert!(r.note.as_deref().unwrap().contains("tree-sitter"));
@@ -405,7 +484,13 @@ mod tests {
             "D.swift",
             "/// Widget doc\nstruct Gadget { let w: Widget }\n",
         );
-        let r = syntactic_references(dir.path(), &RelPath::new("C.swift"), "Widget", "no index");
+        let r = syntactic_references(
+            dir.path(),
+            &RelPath::new("C.swift"),
+            "Widget",
+            "no index",
+            None,
+        );
         let got: Vec<_> = r
             .value
             .iter()
@@ -422,10 +507,10 @@ mod tests {
             "$name = 1;\necho $name; echo name;\necho $names;\n",
         )
         .unwrap();
-        let r = text_references(dir.path(), &RelPath::new("a.php"), "$name", "x");
+        let r = text_references(dir.path(), &RelPath::new("a.php"), "$name", "x", None);
         assert_eq!(r.value.len(), 2);
         // `name` alone must not match inside `$name`.
-        let r = text_references(dir.path(), &RelPath::new("a.php"), "name", "x");
+        let r = text_references(dir.path(), &RelPath::new("a.php"), "name", "x", None);
         assert_eq!(r.value.len(), 1);
         let pos = Position {
             line: 1,
@@ -441,7 +526,7 @@ mod tests {
     fn single_huge_file_cannot_exceed_hit_cap() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("big.rs"), "foo\n".repeat(MAX_HITS * 3)).unwrap();
-        let r = text_references(dir.path(), &RelPath::new("big.rs"), "foo", "x");
+        let r = text_references(dir.path(), &RelPath::new("big.rs"), "foo", "x", None);
         assert_eq!(r.value.len(), MAX_HITS);
         assert!(r.note.unwrap().contains("budget"));
     }
