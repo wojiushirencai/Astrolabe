@@ -121,6 +121,15 @@ struct Shared {
     /// results" unless we track this.
     active_progress: Mutex<HashSet<String>>,
     ready_confirmed: AtomicBool,
+    /// Roslyn (C# / VB) has not yet sent `workspace/projectInitializationComplete`.
+    ///
+    /// Roslyn loads the solution / projects after `solution/open`, and its
+    /// `$/progress` tokens come and go several times while it does, so the
+    /// generic quiet-period check can call it ready before the project model
+    /// exists and cross-file references come back partial. This is Roslyn's
+    /// own "projects loaded" signal. Bounded by [`ROSLYN_INIT_CAP`] so an
+    /// older build that never sends it costs a bounded wait, not a hang.
+    roslyn_init_pending: AtomicBool,
     /// When the process was spawned. Servers that never report progress are
     /// treated as warming up for [`SETTLE_WINDOW`] after this.
     started: Instant,
@@ -244,6 +253,7 @@ impl LspTransport {
             saw_progress: AtomicBool::new(false),
             active_progress: Mutex::new(HashSet::new()),
             ready_confirmed: AtomicBool::new(false),
+            roslyn_init_pending: AtomicBool::new(is_roslyn(spec.language)),
             started: Instant::now(),
             initialize_result: Mutex::new(None),
             workspace_folders: Mutex::new(None),
@@ -382,6 +392,9 @@ impl LspTransport {
     /// Callers use this to avoid reporting an empty result as authoritative
     /// while the server is still building its index.
     pub fn is_busy(&self) -> bool {
+        if roslyn_init_pending(&self.shared) {
+            return true;
+        }
         if !lock(&self.shared.active_progress).is_empty() {
             return true;
         }
@@ -410,12 +423,16 @@ impl LspTransport {
         // is indistinguishable from having finished. Give it a window to
         // announce its work before believing it is idle.
         let settle_until = Instant::now() + SETTLE_WINDOW.min(deadline);
-        while !self.shared.saw_progress.load(Ordering::SeqCst) && Instant::now() < settle_until {
+        while !self.shared.saw_progress.load(Ordering::SeqCst)
+            && !roslyn_init_pending(&self.shared)
+            && Instant::now() < settle_until
+        {
             std::thread::sleep(tick);
         }
         // Servers that never report progress have no startup phase to wait
-        // out; the window above was the whole cost.
-        if !self.shared.saw_progress.load(Ordering::SeqCst) {
+        // out; the window above was the whole cost. Roslyn still owes its
+        // project-load signal, which the loop below waits for via `is_busy`.
+        if !self.shared.saw_progress.load(Ordering::SeqCst) && !roslyn_init_pending(&self.shared) {
             self.shared.ready_confirmed.store(true, Ordering::Release);
             return true;
         }
@@ -749,6 +766,39 @@ const CONTENT_MODIFIED_BACKOFF: Duration = Duration::from_millis(250);
 /// before we accept its silence as "already indexed".
 const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 
+/// Longest a Roslyn server is treated as busy while it has not sent
+/// `workspace/projectInitializationComplete` (Serena waits 30 s for the same
+/// signal). Past this its answers are used as they are, still subject to the
+/// usual progress tracking.
+const ROSLYN_INIT_CAP: Duration = Duration::from_secs(30);
+
+/// Roslyn's "projects loaded" notification (VS Code C# `roslynProtocol.ts`).
+const ROSLYN_PROJECT_INIT_COMPLETE: &str = "workspace/projectInitializationComplete";
+
+/// Roslyn asks the client to run `dotnet restore` for these projects.
+const ROSLYN_PROJECT_NEEDS_RESTORE: &str = "workspace/_roslyn_projectNeedsRestore";
+
+fn is_roslyn(language: Language) -> bool {
+    matches!(language, Language::CSharp | Language::VisualBasic)
+}
+
+/// Roslyn's project load is still outstanding (and within its cap).
+fn roslyn_init_pending(shared: &Shared) -> bool {
+    shared.roslyn_init_pending.load(Ordering::Acquire) && shared.started.elapsed() < ROSLYN_INIT_CAP
+}
+
+/// Methods we re-issue on `ContentModified` (see [`LspTransport::request_value`]),
+/// declared through `general.staleRequestSupport` so a server that follows the
+/// spec answers -32801 instead of a result computed from stale text.
+const RETRY_ON_CONTENT_MODIFIED: &[&str] = &[
+    "textDocument/references",
+    "textDocument/definition",
+    "textDocument/hover",
+    "textDocument/diagnostic",
+    "textDocument/rename",
+    "textDocument/documentSymbol",
+];
+
 /// How long the server must stay quiet before its index is trusted.
 ///
 /// Covers the transient gaps between a server's startup tasks; measured at
@@ -869,6 +919,26 @@ const MAX_OPEN_DOCS: usize = 512;
 /// Watched-file events per notification, so a checkout touching thousands of
 /// files does not become one giant frame.
 const WATCHED_FILES_BATCH: usize = 500;
+
+/// Newly created files announced with didOpen/didClose per watcher batch. A
+/// branch switch that adds thousands of files is left to the watched-file
+/// events alone rather than streamed through the server one by one.
+const MAX_CREATED_ANNOUNCE: usize = 64;
+
+/// Larger new files (generated bundles, fixtures) are not announced.
+const MAX_ANNOUNCE_BYTES: u64 = 1024 * 1024;
+
+/// Whether a server started for `server` handles files of `file`.
+fn serves(server: Language, file: Language) -> bool {
+    use Language::*;
+    let family = |l: Language| match l {
+        TypeScript | Tsx | JavaScript => 1,
+        C | Cpp | ObjC | ObjCpp => 2,
+        CSharp | VisualBasic => 3,
+        _ => 0,
+    };
+    server == file || (family(server) != 0 && family(server) == family(file))
+}
 
 /// `FileChangeType` values from the LSP spec.
 const FILE_CREATED: u8 = 1;
@@ -1011,6 +1081,60 @@ impl LspSession {
         }
     }
 
+    /// `didOpen` then `didClose` a file that was just created on disk.
+    ///
+    /// Some servers (pyright is the documented case; Serena works around it
+    /// the same way) do not add a file to their program on a watched-file
+    /// `Created` event alone, so references from the new file stay invisible
+    /// until it is opened. Opening and closing it once makes the server read
+    /// it. Only files this server's language handles, below
+    /// [`MAX_ANNOUNCE_BYTES`], are announced. Never starts a server: this
+    /// runs only on one that is already resident.
+    fn announce_created(&self, path: &RelPath) -> bool {
+        let Some(file_language) = Language::from_path(path) else {
+            return false;
+        };
+        if !serves(self.transport.language(), file_language) {
+            return false;
+        }
+        let abs = self.root.join(path.as_str());
+        match std::fs::metadata(&abs) {
+            Ok(meta) if meta.is_file() && meta.len() <= MAX_ANNOUNCE_BYTES => {}
+            _ => return false,
+        }
+        let Ok(bytes) = std::fs::read(&abs) else {
+            return false;
+        };
+        let text = crate::text::decode_source(bytes);
+        let uri = self.file_uri(path);
+        // Hold the open-doc lock so a concurrent query's didOpen of the same
+        // file cannot interleave with our close.
+        let opened = lock(&self.opened);
+        if opened.contains_key(path.as_str()) {
+            return false;
+        }
+        let sent = self.transport.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id(file_language),
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        );
+        if sent.is_err() {
+            return false;
+        }
+        let _ = self.transport.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        drop(opened);
+        true
+    }
+
     fn close_if_open(&self, path: &RelPath) {
         if lock(&self.opened).remove(path.as_str()).is_some() {
             let _ = self.transport.notify(
@@ -1139,12 +1263,18 @@ impl LanguageServer for LspSession {
                 json!({ "changes": batch }),
             );
         }
+        let mut announced = 0usize;
         for change in changes {
             match change.kind {
                 FileChangeKind::Deleted => self.close_if_open(&change.path),
                 FileChangeKind::Created | FileChangeKind::Changed => {
                     if lock(&self.opened).contains_key(change.path.as_str()) {
                         let _ = self.ensure_open(&change.path);
+                    } else if change.kind == FileChangeKind::Created
+                        && announced < MAX_CREATED_ANNOUNCE
+                        && self.announce_created(&change.path)
+                    {
+                        announced += 1;
                     }
                 }
             }
@@ -1609,6 +1739,12 @@ fn client_capabilities() -> Value {
         },
         "general": {
             "positionEncodings": ["utf-16"],
+            // We cancel timed-out requests (`$/cancelRequest`) and retry
+            // these on ContentModified.
+            "staleRequestSupport": {
+                "cancel": true,
+                "retryOnContentModified": RETRY_ON_CONTENT_MODIFIED,
+            },
         },
     })
 }
@@ -2022,6 +2158,12 @@ fn handle_notification(shared: &Shared, method: &str, params: Option<&Value>) {
     if method == "intellij/workspaceImportState" {
         track_kotlin_import(shared, &params);
     }
+    if method == ROSLYN_PROJECT_INIT_COMPLETE {
+        // Counts as reported work: readiness then only needs the usual quiet
+        // period, not the silent-server settle window.
+        shared.saw_progress.store(true, Ordering::SeqCst);
+        shared.roslyn_init_pending.store(false, Ordering::Release);
+    }
     if method == "textDocument/publishDiagnostics" {
         if let Ok(parsed) = serde_json::from_value::<PublishDiagnosticsLoose>(params.clone()) {
             {
@@ -2221,6 +2363,20 @@ fn reverse_request_result(shared: &Shared, method: &str, params: &Value) -> Valu
             .unwrap_or(Value::Null),
         "workspace/applyEdit" => json!({ "applied": false }),
         "window/showDocument" => json!({ "success": false }),
+        // VS Code answers by running `dotnet restore`. We never run builds or
+        // package restores on the user's tree from a read-only query; an
+        // empty answer lets Roslyn carry on with what is already restored.
+        ROSLYN_PROJECT_NEEDS_RESTORE => {
+            let projects = params
+                .get("projectFilePaths")
+                .map(Value::to_string)
+                .unwrap_or_default();
+            tracing::info!(
+                projects = %projects,
+                "Roslyn reports projects needing `dotnet restore`; not restoring"
+            );
+            Value::Null
+        }
         _ => Value::Null,
     }
 }
@@ -2531,6 +2687,7 @@ INITIALIZE_PARAMS = None
 DOCS = {}
 WATCHED = []
 SAVES = []
+EVENTS = []
 BUFFERS = "--buffers" in sys.argv
 HANG_REFS = "--hang-refs" in sys.argv
 
@@ -2557,6 +2714,8 @@ while True:
         continue
     if method == "exit":
         break
+    if method in ("textDocument/didOpen", "textDocument/didClose"):
+        EVENTS.append([method, msg["params"]["textDocument"]["uri"], msg["params"]["textDocument"].get("languageId")])
     if method == "textDocument/didOpen":
         td = msg["params"]["textDocument"]
         DOCS[td["uri"]] = {"version": td["version"], "text": td["text"]}
@@ -2641,7 +2800,14 @@ while True:
         n = int((msg.get("params") or {}).get("n") or 0)
         reply(msg, {"blob": "x" * n})
     elif method == "fake-state":
-        reply(msg, {"docs": DOCS, "watched": WATCHED, "saves": SAVES})
+        reply(msg, {"docs": DOCS, "watched": WATCHED, "saves": SAVES, "events": EVENTS})
+    elif method == "roslyn-init-done":
+        send({"jsonrpc": "2.0", "method": "workspace/projectInitializationComplete"})
+        reply(msg, {"ok": True})
+    elif method == "probe-restore":
+        send({"jsonrpc": "2.0", "id": 88, "method": "workspace/_roslyn_projectNeedsRestore", "params": {"projectFilePaths": ["/x/a.csproj"]}})
+        resp = read_msg()
+        reply(msg, resp)
     elif method == "textDocument/references" and HANG_REFS:
         time.sleep(30)
         reply(msg, [])
@@ -3068,6 +3234,124 @@ while True:
         let params = t.request("last-initialize", json!({})).unwrap();
         assert_eq!(params["initializationOptions"], json!({ "custom": true }));
         t.shutdown().unwrap();
+    }
+
+    /// S4: the client declares the ContentModified retries it performs.
+    #[test]
+    fn initialize_declares_stale_request_support() {
+        let (session, _tmp) = spawn_session(&[], Duration::from_secs(10));
+        let params = session
+            .transport
+            .request("last-initialize", json!({}))
+            .unwrap();
+        let stale = &params["capabilities"]["general"]["staleRequestSupport"];
+        assert_eq!(stale["cancel"], json!(true));
+        let methods: Vec<&str> = stale["retryOnContentModified"]
+            .as_array()
+            .expect("retryOnContentModified")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for m in [
+            "textDocument/references",
+            "textDocument/definition",
+            "textDocument/hover",
+        ] {
+            assert!(methods.contains(&m), "{m} missing from {methods:?}");
+        }
+    }
+
+    /// S4: Roslyn counts as busy until `workspace/projectInitializationComplete`,
+    /// however quiet its `$/progress` is; other servers are unaffected.
+    #[test]
+    fn roslyn_is_busy_until_project_initialization_complete() {
+        let (t, _tmp) = spawn_fake_as(Language::CSharp, false, Duration::from_secs(5));
+        assert!(t.is_busy());
+        assert!(
+            !t.wait_until_ready(Duration::from_millis(300)),
+            "must not be ready before the project-load signal"
+        );
+        assert!(!t.shared.ready_confirmed.load(Ordering::Acquire));
+        t.request("roslyn-init-done", json!({})).unwrap();
+        assert!(!roslyn_init_pending(&t.shared));
+        let started = Instant::now();
+        assert!(t.wait_until_ready(Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "after the signal only the quiet period remains: {:?}",
+            started.elapsed()
+        );
+        t.shutdown().unwrap();
+
+        let (py, _tmp) = spawn_fake(false, Duration::from_secs(5));
+        assert!(!roslyn_init_pending(&py.shared));
+        py.shutdown().unwrap();
+    }
+
+    /// S4: `_roslyn_projectNeedsRestore` gets an empty success, not an error
+    /// and not a restore.
+    #[test]
+    fn roslyn_project_needs_restore_is_answered_empty() {
+        let (t, _tmp) = spawn_fake_as(Language::CSharp, false, Duration::from_secs(5));
+        let resp = t.request("probe-restore", json!({})).unwrap();
+        assert_eq!(resp["id"], json!(88));
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(resp["result"], Value::Null);
+        t.shutdown().unwrap();
+    }
+
+    /// S4: a file created on disk is opened and closed once so servers that
+    /// ignore watched-file `Created` events still read it; files of other
+    /// languages, oversized files and files past the per-batch cap are not.
+    #[test]
+    fn created_files_are_announced_with_open_and_close() {
+        let (session, tmp) = spawn_session(&[], Duration::from_secs(10));
+        fs::write(tmp.0.join("new.py"), "def fresh():\n    pass\n").unwrap();
+        fs::write(tmp.0.join("other.rs"), "fn main() {}\n").unwrap();
+        fs::write(tmp.0.join("big.py"), "x = 1\n".repeat(200_000)).unwrap();
+        let mut changes: Vec<FileChange> = ["new.py", "other.rs", "big.py", "missing.py"]
+            .iter()
+            .map(|p| FileChange {
+                path: RelPath::new(*p),
+                kind: FileChangeKind::Created,
+            })
+            .collect();
+        for i in 0..(MAX_CREATED_ANNOUNCE + 6) {
+            let name = format!("gen_{i:03}.py");
+            fs::write(tmp.0.join(&name), "y = 2\n").unwrap();
+            changes.push(FileChange {
+                path: RelPath::new(name),
+                kind: FileChangeKind::Created,
+            });
+        }
+        session.files_changed(&changes);
+        let state = session.transport.request("fake-state", json!({})).unwrap();
+        let events = state["events"].as_array().unwrap();
+        let new_uri = session.file_uri(&RelPath::new("new.py"));
+        assert_eq!(
+            events[0],
+            json!(["textDocument/didOpen", new_uri, "python"])
+        );
+        assert_eq!(events[1], json!(["textDocument/didClose", new_uri, null]));
+        let opens: Vec<&str> = events
+            .iter()
+            .filter(|e| e[0] == "textDocument/didOpen")
+            .map(|e| e[1].as_str().unwrap())
+            .collect();
+        assert_eq!(opens.len(), MAX_CREATED_ANNOUNCE);
+        assert!(!opens
+            .iter()
+            .any(|u| u.ends_with("other.rs") || u.ends_with("big.py")));
+        assert_eq!(
+            events.len(),
+            2 * MAX_CREATED_ANNOUNCE,
+            "every open is closed"
+        );
+        assert!(state["docs"].as_object().unwrap().is_empty());
+        assert_eq!(state["watched"].as_array().unwrap().len(), changes.len());
+        // Announced files are not tracked as open: the next query opens them
+        // for real.
+        assert_eq!(session.open_version(&RelPath::new("new.py")), None);
     }
 
     #[test]
