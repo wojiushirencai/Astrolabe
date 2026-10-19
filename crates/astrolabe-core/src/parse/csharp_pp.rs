@@ -232,6 +232,71 @@ fn blank_inactive_for(source: &str, vb: bool, pick: &Pick) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// tree-sitter-vb-dotnet only accepts `Option` / `Imports` statements as one
+/// contiguous block at the top: a blank or comment-only line before or
+/// between them (`Imports System\n\nImports Acme`) ends the header, and every
+/// later `Imports` is an ERROR that fails the whole file. Returns the source
+/// with the header lines regrouped (`Option`s, then `Imports`, then the
+/// blank / comment lines, each line kept whole), or `None` when the header
+/// is already contiguous. Total length and line count are unchanged; only
+/// header lines move, and they carry no symbols, so every symbol and call
+/// keeps its line.
+pub(super) fn regroup_vb_header(source: &str) -> Option<String> {
+    let mut options: Vec<&str> = Vec::new();
+    let mut imports: Vec<&str> = Vec::new();
+    let mut other: Vec<&str> = Vec::new();
+    let mut end = 0usize;
+    // Lines of one logical statement (` _` continuations) stay together.
+    let mut lines = source.split_inclusive('\n').peekable();
+    while let Some(first) = lines.peek().copied() {
+        if !first.ends_with('\n') {
+            break;
+        }
+        let head = first.trim_start_matches([' ', '\t']);
+        let word = head
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("");
+        let is_option = word.eq_ignore_ascii_case("Option");
+        let is_imports = word.eq_ignore_ascii_case("Imports");
+        let blank_or_comment = head.trim().is_empty()
+            || head.starts_with('\'')
+            || (word.eq_ignore_ascii_case("REM") && head.len() > 3);
+        if !(is_option || is_imports || blank_or_comment) {
+            break;
+        }
+        let start = end;
+        loop {
+            let Some(line) = lines.next() else { break };
+            end += line.len();
+            let continued = line.trim_end().ends_with(" _") || line.trim_end() == "_";
+            if !continued || !line.ends_with('\n') {
+                break;
+            }
+        }
+        if !source[start..end].ends_with('\n') {
+            return None;
+        }
+        let chunk = &source[start..end];
+        if is_option {
+            options.push(chunk);
+        } else if is_imports {
+            imports.push(chunk);
+        } else {
+            other.push(chunk);
+        }
+    }
+    let mut out = String::with_capacity(source.len());
+    for chunk in options.iter().chain(&imports).chain(&other) {
+        out.push_str(chunk);
+    }
+    if out == source[..end] {
+        return None;
+    }
+    out.push_str(&source[end..]);
+    Some(out)
+}
+
 /// Imports of the original (partial) parse in source order, then those only
 /// the retry found. The blanked branches' `using`s are real dependencies of
 /// some build configuration, so dropping them would lose import edges.
@@ -438,8 +503,7 @@ mod tests {
         #[test]
         fn vb_if_directives_in_class_body() {
             // tree-sitter-vb has no `#If` support at all: any directive is an
-            // ERROR. (Blank lines between `Imports` are a separate grammar bug,
-            // so the fixture keeps directives inside the class.)
+            // ERROR.
             let src = "Imports System.Linq\nPublic Class X\n#If DEBUG Then\n    Sub M()\n    End Sub\n#ElseIf B Then\n    Sub Q()\n    End Sub\n#End If\n    Sub N()\n    End Sub\nEnd Class\n";
             let p = ParserPool::new()
                 .parse(Language::VisualBasic, &RelPath::new("X.vb"), src)
@@ -466,6 +530,45 @@ mod tests {
             assert_eq!(p.symbols.iter().filter(|s| s.name == "Size").count(), 1);
             assert_eq!(p.symbols.iter().filter(|s| s.name == "X").count(), 1);
             assert!(p.calls.iter().any(|(n, l)| n == "Call2" && *l == 10));
+        }
+
+        fn vb(src: &str) -> ParsedFile {
+            ParserPool::new()
+                .parse(Language::VisualBasic, &RelPath::new("M.vb"), src)
+                .expect("parse")
+        }
+
+        #[test]
+        fn vb_blank_and_comment_lines_in_imports_header() {
+            for src in [
+                "Imports System\n\nImports System.Linq\nPublic Class X\n    Sub M()\n    End Sub\nEnd Class\n",
+                "\nImports System\nImports System.Linq\nPublic Class X\n    Sub M()\n    End Sub\nEnd Class\n",
+                "' header comment\r\nImports System\r\n\r\nImports System.Linq\r\nPublic Class X\r\n    Sub M()\r\n    End Sub\r\nEnd Class\r\n",
+                "Option Strict On\n\nImports System, _\n    System.Linq\n\nPublic Class X\n    Sub M()\n    End Sub\nEnd Class\n",
+            ] {
+                let p = vb(src);
+                assert!(!p.partial, "{src:?}");
+                let class_line = src.lines().position(|l| l.contains("Class X")).unwrap() as u32 + 1;
+                assert_eq!(has(&p, "Class", "X").map(|r| r.0), Some(class_line), "{src:?}");
+                assert_eq!(has(&p, "Method", "M").map(|r| r.0), Some(class_line + 1));
+                assert!(p.imports.iter().any(|i| i.contains("System.Linq")), "{:?}", p.imports);
+            }
+        }
+
+        #[test]
+        fn vb_header_regroup_shape() {
+            let src =
+                "' c\nOption Strict On\n\nImports A\nImports B, _\n  C\nModule M\nEnd Module\n";
+            let out = super::super::regroup_vb_header(src).unwrap();
+            assert_eq!(out.len(), src.len());
+            assert_eq!(out.lines().count(), src.lines().count());
+            assert!(out
+                .starts_with("Option Strict On\nImports A\nImports B, _\n  C\n' c\n\nModule M\n"));
+            assert!(super::super::regroup_vb_header(
+                "Imports A\nImports B\n\nModule M\nEnd Module\n"
+            )
+            .is_none());
+            assert!(super::super::regroup_vb_header("Module M\nEnd Module\n").is_none());
         }
 
         #[test]

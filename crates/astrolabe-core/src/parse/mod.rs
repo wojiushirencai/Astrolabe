@@ -255,10 +255,16 @@ impl ParserPool {
         // clean. Blanked branches' `using`s stay (import edges are a union),
         // and their declarations come from a last-branch retry.
         if parsed.partial && matches!(lang, Language::CSharp | Language::VisualBasic) {
-            let fixed = if lang == Language::CSharp {
-                csharp_pp::blank_inactive(source)
+            let vb = lang == Language::VisualBasic;
+            // VB: `Imports` after a blank / comment line, too.
+            let vb_header = |text: Option<String>| match &text {
+                Some(t) => csharp_pp::regroup_vb_header(t).or(text),
+                None => csharp_pp::regroup_vb_header(source),
+            };
+            let fixed = if vb {
+                vb_header(csharp_pp::blank_inactive_vb(source))
             } else {
-                csharp_pp::blank_inactive_vb(source)
+                csharp_pp::blank_inactive(source)
             };
             if let Some(fixed) = fixed {
                 if let Ok(mut retry) = self.parse_raw(lang, path, &fixed) {
@@ -266,10 +272,13 @@ impl ParserPool {
                         retry.imports = csharp_pp::union_imports(parsed.imports, retry.imports);
                         // Declarations only in a later branch: from the
                         // last-branch text, when that parses clean too.
-                        let vb = lang == Language::VisualBasic;
-                        if let Some(alt) =
-                            csharp_pp::blank_alternate(source, vb).filter(|alt| *alt != fixed)
-                        {
+                        let alt = csharp_pp::blank_alternate(source, vb)
+                            .map(|a| match vb {
+                                true => csharp_pp::regroup_vb_header(&a).unwrap_or(a),
+                                false => a,
+                            })
+                            .filter(|alt| *alt != fixed);
+                        if let Some(alt) = alt {
                             if let Ok(alt_parsed) = self.parse_raw(lang, path, &alt) {
                                 if !alt_parsed.partial {
                                     csharp_pp::merge_alternate(
