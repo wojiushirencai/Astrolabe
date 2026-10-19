@@ -30,6 +30,8 @@ use tree_sitter::{Parser, Query, QueryCursor, QueryCursorOptions, StreamingItera
 pub mod queries;
 mod razor;
 mod vue;
+
+mod csharp_pp;
 // lang-batch-8 per-language hooks (one file per worker).
 mod dart;
 mod decor;
@@ -226,6 +228,25 @@ impl ParserPool {
             }
         }
         let parsed = self.parse_raw(lang, path, source)?;
+        // C# / VB: `#if` that splits a declaration, and .NET 10 `#:` lines,
+        // are ERROR nodes. Only on a partial first pass, blank inactive
+        // branches and `#:` lines (same length) and keep the retry if it is
+        // clean. Blanked branches' `using`s stay (import edges are a union).
+        if parsed.partial && matches!(lang, Language::CSharp | Language::VisualBasic) {
+            let fixed = if lang == Language::CSharp {
+                csharp_pp::blank_inactive(source)
+            } else {
+                csharp_pp::blank_inactive_vb(source)
+            };
+            if let Some(fixed) = fixed {
+                if let Ok(mut retry) = self.parse_raw(lang, path, &fixed) {
+                    if !retry.partial {
+                        retry.imports = csharp_pp::union_imports(parsed.imports, retry.imports);
+                        return Ok(retry);
+                    }
+                }
+            }
+        }
         // TS import types in generics (`f<typeof import('x')>()`,
         // `Ref<import('vue').Ref<T>>`) make tree-sitter-typescript emit ERROR
         // nodes. Only when the first pass is partial, blank those
