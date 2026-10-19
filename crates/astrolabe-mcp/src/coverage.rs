@@ -456,6 +456,41 @@ mod tests {
     }
 
     #[test]
+    fn coverage_block_size_does_not_grow_with_file_count() {
+        let mk = |n: usize| {
+            let report = IndexReport {
+                partial_parses: (0..n)
+                    .map(|i| {
+                        (
+                            RelPath::new(format!("src/deep/dir/m{i:06}.c")),
+                            String::new(),
+                        )
+                    })
+                    .collect(),
+                parse_failures: (0..n)
+                    .map(|i| {
+                        (
+                            RelPath::new(format!("gen/x{i:06}.c")),
+                            "read: denied".into(),
+                        )
+                    })
+                    .collect(),
+                ..IndexReport::default()
+            };
+            let dir = temp_dir("size");
+            let index = RepoIndex::from_graph(dir.clone(), CodeGraph::default(), report);
+            let len = index.coverage_detail().len();
+            let _ = std::fs::remove_dir_all(&dir);
+            len
+        };
+        let small = mk(50);
+        let large = mk(5000);
+        assert!(large <= 600, "coverage block is {large} B");
+        // Only the digits of the counts may differ.
+        assert!(large <= small + 16, "{small} -> {large}");
+    }
+
+    #[test]
     fn unsupported_files_are_summarised_by_type_with_bounded_size() {
         let mut counts = std::collections::BTreeMap::new();
         for (i, ext) in [
