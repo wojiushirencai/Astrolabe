@@ -252,7 +252,8 @@ impl ParserPool {
         // C# / VB: `#if` that splits a declaration, and .NET 10 `#:` lines,
         // are ERROR nodes. Only on a partial first pass, blank inactive
         // branches and `#:` lines (same length) and keep the retry if it is
-        // clean. Blanked branches' `using`s stay (import edges are a union).
+        // clean. Blanked branches' `using`s stay (import edges are a union),
+        // and their declarations come from a last-branch retry.
         if parsed.partial && matches!(lang, Language::CSharp | Language::VisualBasic) {
             let fixed = if lang == Language::CSharp {
                 csharp_pp::blank_inactive(source)
@@ -263,6 +264,20 @@ impl ParserPool {
                 if let Ok(mut retry) = self.parse_raw(lang, path, &fixed) {
                     if !retry.partial {
                         retry.imports = csharp_pp::union_imports(parsed.imports, retry.imports);
+                        // Declarations only in a later branch: from the
+                        // last-branch text, when that parses clean too.
+                        let vb = lang == Language::VisualBasic;
+                        if let Some(alt) =
+                            csharp_pp::blank_alternate(source, vb).filter(|alt| *alt != fixed)
+                        {
+                            if let Ok(alt_parsed) = self.parse_raw(lang, path, &alt) {
+                                if !alt_parsed.partial {
+                                    csharp_pp::merge_alternate(
+                                        &mut retry, source, &fixed, alt_parsed,
+                                    );
+                                }
+                            }
+                        }
                         return Ok(retry);
                     }
                 }

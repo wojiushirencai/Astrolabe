@@ -7,6 +7,16 @@
 //! truncates symbol ranges. Roslyn treats inactive branches as disabled text.
 //! Without the project's `DefineConstants` we keep the first branch of every
 //! conditional (`#if false` keeps the next one instead) and blank the others.
+//! Declarations that exist only in a later branch (`#if NET20 … #else class
+//! New … #endif`) are then recovered from a second, alternate retry that
+//! keeps the *last* branch of every conditional: its symbols and calls on
+//! lines the first-branch text blanked are added (see [`merge_alternate`]).
+//!
+//! Choosing branches from the owning project's `DefineConstants` and target
+//! framework instead was measured on Newtonsoft.Json / serilog / Polly and
+//! rejected: a single configuration drops whole files of the other targets
+//! (`#if HAVE_HALF` test files under the tests' first framework `net46`),
+//! 156 symbols lost against 1 gained.
 //!
 //! .NET 10 file-based apps start with `#:package` / `#:property` lines the
 //! grammar does not know; those lines are blanked too.
@@ -86,22 +96,67 @@ struct Group {
     parent_active: bool,
     /// Some branch of this group was already taken.
     taken: bool,
+    /// Index of this group in source order (see [`Pick::Last`]).
+    id: usize,
+    /// Index of the current branch within the group.
+    branch: usize,
+}
+
+/// Which branch of each conditional stays.
+enum Pick {
+    /// The first branch whose condition is not literally false.
+    First,
+    /// Per group (source order), the last such branch.
+    Last(Vec<Option<usize>>),
 }
 
 /// Returns the source with directive lines and inactive conditional branches
 /// blanked (same byte length), or `None` when the source has no `#if` /
 /// `#:` directive at all.
 pub(super) fn blank_inactive(source: &str) -> Option<String> {
-    blank_inactive_for(source, false)
+    blank_inactive_for(source, false, &Pick::First)
 }
 
 /// [`blank_inactive`] for Visual Basic (`#If … Then` / `#ElseIf` / `#Else` /
 /// `#End If`; no `#:` lines).
 pub(super) fn blank_inactive_vb(source: &str) -> Option<String> {
-    blank_inactive_for(source, true)
+    blank_inactive_for(source, true, &Pick::First)
 }
 
-fn blank_inactive_for(source: &str, vb: bool) -> Option<String> {
+/// Like [`blank_inactive`] / [`blank_inactive_vb`] but keeps the last
+/// branch of every conditional (`#else`, or the last `#elif`), for
+/// [`merge_alternate`].
+pub(super) fn blank_alternate(source: &str, vb: bool) -> Option<String> {
+    if !source.contains('#') {
+        return None;
+    }
+    let mut last: Vec<Option<usize>> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for line in source.split_inclusive('\n') {
+        match directive(line, vb) {
+            Some(Directive::If(expr)) => {
+                let id = last.len();
+                last.push(branch_taken(expr, vb).then_some(0));
+                stack.push((id, 0));
+            }
+            Some(d @ (Directive::Elif(_) | Directive::Else)) => {
+                if let Some((id, branch)) = stack.last_mut() {
+                    *branch += 1;
+                    if !matches!(d, Directive::Elif(e) if !branch_taken(e, vb)) {
+                        last[*id] = Some(*branch);
+                    }
+                }
+            }
+            Some(Directive::Endif) => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    blank_inactive_for(source, vb, &Pick::Last(last))
+}
+
+fn blank_inactive_for(source: &str, vb: bool, pick: &Pick) -> Option<String> {
     if !source.contains('#') {
         return None;
     }
@@ -110,23 +165,37 @@ fn blank_inactive_for(source: &str, vb: bool) -> Option<String> {
     let mut stack: Vec<Group> = Vec::new();
     let mut active = true;
     let mut pos = 0usize;
+    let mut next_id = 0usize;
     for line in source.split_inclusive('\n') {
         let blank = match directive(line, vb) {
             Some(Directive::FileLevel) => true,
             Some(Directive::If(expr)) => {
-                let taken = branch_taken(expr, vb);
+                let id = next_id;
+                next_id += 1;
+                let taken = match pick {
+                    Pick::First => branch_taken(expr, vb),
+                    Pick::Last(last) => last.get(id).copied().flatten() == Some(0),
+                };
                 stack.push(Group {
                     parent_active: active,
                     taken,
+                    id,
+                    branch: 0,
                 });
                 active = active && taken;
                 true
             }
             Some(d @ (Directive::Elif(_) | Directive::Else)) => {
                 if let Some(group) = stack.last_mut() {
-                    let cur = match d {
-                        Directive::Elif(expr) => !group.taken && branch_taken(expr, vb),
-                        _ => !group.taken,
+                    group.branch += 1;
+                    let cur = match (pick, d) {
+                        (Pick::Last(last), _) => {
+                            last.get(group.id).copied().flatten() == Some(group.branch)
+                        }
+                        (Pick::First, Directive::Elif(expr)) => {
+                            !group.taken && branch_taken(expr, vb)
+                        }
+                        (Pick::First, _) => !group.taken,
                     };
                     group.taken |= cur;
                     active = group.parent_active && cur;
@@ -171,6 +240,39 @@ pub(super) fn union_imports(original: Vec<String>, retry: Vec<String>) -> Vec<St
     let known: std::collections::HashSet<String> = out.iter().cloned().collect();
     out.extend(retry.into_iter().filter(|i| !known.contains(i)));
     out
+}
+
+/// Add to `primary` (the clean parse of the first-branch text `kept`) what
+/// the clean parse `alt` of the last-branch text found on lines `kept`
+/// blanked although the source has code there: symbols whose name
+/// `primary` does not already have, calls, and imports. Line numbers are
+/// shared because blanking keeps every line in place.
+pub(super) fn merge_alternate(
+    primary: &mut super::ParsedFile,
+    source: &str,
+    kept: &str,
+    alt: super::ParsedFile,
+) {
+    // 1-based line -> blanked by the first-branch text although it has code.
+    let mut dropped = vec![false];
+    for (orig, kept) in source.split('\n').zip(kept.split('\n')) {
+        dropped.push(kept.trim().is_empty() && !orig.trim().is_empty());
+    }
+    let on_dropped = |line: u32| dropped.get(line as usize).copied().unwrap_or(false);
+    // By name: the same member declared per branch with another kind
+    // (`const` vs `static readonly`) or signature is one declaration.
+    let mut known: std::collections::HashSet<String> =
+        primary.symbols.iter().map(|s| s.name.clone()).collect();
+    for sym in alt.symbols {
+        if on_dropped(sym.start_line) && known.insert(sym.name.clone()) {
+            primary.symbols.push(sym);
+        }
+    }
+    primary
+        .calls
+        .extend(alt.calls.into_iter().filter(|(_, line)| on_dropped(*line)));
+    let imports = std::mem::take(&mut primary.imports);
+    primary.imports = union_imports(imports, alt.imports);
 }
 
 #[cfg(test)]
@@ -230,6 +332,30 @@ mod tests {
             .filter(|l| !l.is_empty())
             .collect();
         assert_eq!(kept, ["B", "#Region \"R\"", "#End Region"]);
+    }
+
+    #[test]
+    fn alternate_keeps_last_branch_and_skips_literal_false() {
+        let src = "#if A\nA\n#elif B\nB\n#else\nC\n#endif\n#if X\nX\n#endif\n#if P\nP\n#elif false\nF\n#endif\n#if Q\n#if R\nR\n#else\nS\n#endif\n#else\nT\n#endif\n";
+        let out = super::blank_alternate(src, false).unwrap();
+        assert_eq!(out.len(), src.len());
+        let kept: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        // Last branch of each group; a lone `#if` stays; `#elif false` is
+        // never chosen; nested groups inside a dropped branch stay dropped.
+        assert_eq!(kept, ["C", "X", "P", "T"]);
+        let vb = "#If A Then\nA\n#Else\nB\n#End If\n";
+        let out = super::blank_alternate(vb, true).unwrap();
+        assert_eq!(
+            out.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>(),
+            ["B"]
+        );
     }
 
     #[test]
@@ -322,7 +448,24 @@ mod tests {
             assert!(has(&p, "Class", "X").is_some());
             assert_eq!(has(&p, "Method", "M").map(|r| r.0), Some(4));
             assert!(has(&p, "Method", "N").is_some());
-            assert!(has(&p, "Method", "Q").is_none(), "inactive branch");
+            // Only in the `#ElseIf` branch: recovered by the last-branch retry.
+            assert_eq!(has(&p, "Method", "Q").map(|r| r.0), Some(7));
+        }
+
+        #[test]
+        fn else_only_declarations_are_recovered_once() {
+            // The `#if` splitting the base list forces the retry; `New` and
+            // `Helper` exist only in `#else` branches, `Size` in both (with
+            // another kind), so it is not duplicated.
+            let src = "public class X\n#if A\n  : Base\n#endif\n{\n#if NET20\n  void Old() { Call1(); }\n  const int Size = 1;\n#else\n  void New() { Call2(); }\n  static readonly int Size = 2;\n#endif\n}\n#if NET20\n#else\nclass Helper { }\n#endif\n";
+            let p = parse("X.cs", src);
+            assert!(!p.partial);
+            assert_eq!(has(&p, "Method", "Old").map(|r| r.0), Some(7));
+            assert_eq!(has(&p, "Method", "New").map(|r| r.0), Some(10));
+            assert_eq!(has(&p, "Class", "Helper").map(|r| r.0), Some(16));
+            assert_eq!(p.symbols.iter().filter(|s| s.name == "Size").count(), 1);
+            assert_eq!(p.symbols.iter().filter(|s| s.name == "X").count(), 1);
+            assert!(p.calls.iter().any(|(n, l)| n == "Call2" && *l == 10));
         }
 
         #[test]
