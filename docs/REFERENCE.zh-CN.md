@@ -189,7 +189,7 @@ cargo run --release --example index_bench -- <repo>  # 测试任意指定仓库�
 
 ## 五、致谢与技术渊源
 
-Astrolabe 的设计受 **[Serena](https://github.com/oraios/serena)** 与 **[OpenVisio](https://github.com/openvisio/openvisio)** 启发（三级提示词范式、多客户端兼容性对齐、PreToolUse 拦截思路；目录级聚合、多跳邻域、中心性热点这几类算法思想，实现保留在 core 中、不再作为 MCP 工具暴露）。具体借鉴点见 [NOTICE](../NOTICE)。
+Astrolabe 的设计受 **[Serena](https://github.com/oraios/serena)** 与 **[OpenVisio](https://github.com/syntaxPriest/openvisio-oss)** 启发（三级提示词范式、多客户端兼容性对齐、PreToolUse 拦截思路；目录级聚合、多跳邻域、中心性热点这几类算法思想，实现保留在 core 中、不再作为 MCP 工具暴露）。具体借鉴点见 [NOTICE](../NOTICE)。
 
 本项目是独立的 Rust 实现；与上述项目的性能对比只在 [PERFORMANCE.md](PERFORMANCE.md) 的「历史对照」里保留，并注明口径限制。
 

@@ -113,4 +113,4 @@ Build from source: `cargo build --release --bin astrolabe` (Rust 1.90+). Tests: 
 
 ## License
 
-MIT OR Apache-2.0, see [NOTICE](NOTICE). Astrolabe was inspired by [Serena](https://github.com/oraios/serena) and [OpenVisio](https://github.com/openvisio/openvisio); details in [docs/REFERENCE.zh-CN.md](docs/REFERENCE.zh-CN.md#五致谢与技术渊源).
+MIT OR Apache-2.0, see [NOTICE](NOTICE). Astrolabe was inspired by [Serena](https://github.com/oraios/serena) and [OpenVisio](https://github.com/syntaxPriest/openvisio-oss); details in [docs/REFERENCE.zh-CN.md](docs/REFERENCE.zh-CN.md#五致谢与技术渊源).
