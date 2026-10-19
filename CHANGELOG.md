@@ -6,6 +6,37 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-19
+
+自 v0.13.0 以来的 PR：#76、#77（文档与分发）、#78、#79（审计修复两批）、#80（`get_languages` 覆盖重做、`resolve_context` 分页）、#81（第 4 批）、#82（第 5 批）。工具目录仍为 7 个，`tools/list` 7,185 B（Linux 实测，上限测试 7,500 B）。`EXTRACTOR_VERSION` 2 → 5：升级后首次启动会重新解析一遍。完整说明与 A/B 数据见 GitHub Release。
+
+### 行为变化（升级时请留意）
+
+- `find_references` / `goto_definition` 输出坐标改为 1 起始（列按 UTF-16）；入参 `line`/`character` 仍为 0 起始。
+- `find_references` 的 `path` 在 schema 中必填；引用为 Unknown 或定义有歧义时不再生成改名预览。
+- 7 个工具新增可选 `root`；全部声明 `readOnlyHint=true`（Claude Code 可同一轮并行执行）。
+- `search_code`：“N 处命中”改为“N 行命中”；`skip_comments` 默认只跳过注释，字符串内部标 `[字符串]`；`count_only` / `aggregate` 不参与会话去重。
+- `resolve_context`：去掉静默截断，改为按相关度分页（新增 `offset`、`path_filter`、`dedup`）。
+- `get_languages`：有语法错误的文件留在索引里；超过 10 个时详情写入 `<仓库>/.astrolabe/coverage-report.md`。
+- 从超过 2 万文件的仓库子目录启动时只索引该子目录；孤立 `\r` 换行按多行处理；C/C++ `<x.h>` 不再连到同名本地文件。
+
+### 修复（摘要）
+
+- 文件监听与新鲜度：已发送未应用批次、ignore 规则对齐、文本类文件新增后不发布、全量扫描阻塞监听线程、轮询模式频繁触发全量扫描、冷构建不可取消。
+- 编码：短 GBK 误判成 EUC-KR；短日文/韩文被强制解成 GB18030（常用字表改为自统计，不含 LGPL/MPL 数据）。
+- 解析：C# `#if` 分支与 `#:`、VB `Imports` 头部、C/C++ 宏改写重试、TS 变体修饰符与 `export type *`、serilog `[method]`、JSX 属性裸 `&`；部分解析结果进缓存。
+- 遮蔽：Lua/Ruby/PHP/C#/Vue/shell/JS 等注释与字符串（含 Ruby `%` 字面量与 heredoc、PHP heredoc/nowdoc、C# 原始字符串）。
+- LSP：进程组/Job Object 清理、stdin 独立写线程、clangd 自动安装不再阻塞、Vue 桥接只启动一次、崩溃后重启并重发、相对路径编译库改写、Roslyn 就绪信号、`staleRequestSupport`。
+- 索引：缓存清理、损坏自愈（`index.redb.bad-<时间戳>`）、增量复用 resolver 与 C# 命名空间边、Java/Kotlin 静默截断。
+
+### 新增
+
+- C/C++ `#include` 解析器、PHP composer 解析器、C/C++ 头文件与源文件配对（跳转定义与 `resolve_context`）。
+- Go 隐式接口实现关系；`find_symbol` / `find_references` 遇到接口时列出实现方。
+- `find_symbol`：`query` 为文件路径（或 `*` + `path_filter`）时返回带行号的大纲；`depth` 展开类型成员；零命中且多子词时按子词兜底排序；新增 `kind=variable`。
+- `find_references` 分页（`offset`），`goto_definition` 列出全部声明。
+- 死代码清理（`rewrite/`、`churn.rs` 等，去掉 4 个 `oxc_*` 依赖）；`scripts/cjk-freq/gen_cjk_freq.py`。
+
 ### 分发与文档（无二进制行为变更）
 
 - **安装修复**：新增 `install.sh`（下载对应平台 Release 归档并校验 sha256，不改 PATH/配置）；README/安装指南删除不存在的 `dist/release-binaries/` 说明，并补 `claude mcp add` 一行命令（已实测语法）。
