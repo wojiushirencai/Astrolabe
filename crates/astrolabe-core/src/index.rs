@@ -565,9 +565,11 @@ fn stamp_hit(
 /// [`split_partial`] moves it out of `parse_failures` into `partial_parses`.
 const PARTIAL_PARSE_REASON: &str = "partial parse: syntax errors in file";
 
+type FailureList = Vec<(RelPath, String)>;
+
 /// Split a raw failure list into real failures (not in the index) and partial
 /// parses (in the index, possibly incomplete).
-fn split_partial(raw: &[(RelPath, String)]) -> (Vec<(RelPath, String)>, Vec<(RelPath, String)>) {
+fn split_partial(raw: &[(RelPath, String)]) -> (FailureList, FailureList) {
     raw.iter()
         .cloned()
         .partition(|(_, reason)| reason != PARTIAL_PARSE_REASON)

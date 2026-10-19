@@ -4096,9 +4096,7 @@ impl AstrolabeServer {
                     excluded.len()
                 ));
             }
-            if unindexed.is_empty() && excluded.is_empty() {
-                body.push_str("unsupported-language source files: none\n");
-            } else if unindexed.is_empty() {
+            if unindexed.is_empty() {
                 body.push_str("unsupported-language source files: none\n");
             } else {
                 body.push_str(&format!(
