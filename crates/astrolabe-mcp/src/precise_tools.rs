@@ -77,7 +77,7 @@ fn omitted_line(omitted: usize, next_offset: usize) -> String {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct FindReferencesParams {
     #[serde(default)]
-    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
     #[schemars(description = "Symbol name to find references for.")]
     pub symbol: String,
@@ -95,7 +95,7 @@ pub(crate) struct FindReferencesParams {
     #[schemars(description = "Optional 0-based UTF-16 column; used with line.")]
     pub character: Option<u32>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Max tokens (capped at 32000).")]
+    #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
     #[serde(default)]
     #[schemars(description = "Skip first N results (paging).")]
@@ -108,7 +108,7 @@ pub(crate) struct FindReferencesParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GotoDefinitionParams {
     #[serde(default)]
-    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
     #[schemars(description = "Repo-relative file containing the target symbol reference.")]
     pub path: String,
@@ -122,7 +122,7 @@ pub(crate) struct GotoDefinitionParams {
     #[schemars(description = "Optional 0-based UTF-16 column.")]
     pub character: Option<u32>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Max tokens (capped at 32000).")]
+    #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
     #[serde(default)]
     #[schemars(description = "Skip first N results (paging).")]
@@ -132,7 +132,7 @@ pub(crate) struct GotoDefinitionParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GetDiagnosticsParams {
     #[serde(default)]
-    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
     #[schemars(description = "Repo-relative file to diagnose.")]
     pub path: String,
@@ -140,7 +140,7 @@ pub(crate) struct GetDiagnosticsParams {
     #[schemars(description = "Minimum severity: error, warning, information, or hint.")]
     pub severity: Option<String>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate token budget.")]
+    #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
 }
 

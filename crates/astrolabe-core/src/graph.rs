@@ -738,7 +738,9 @@ pub fn match_task(g: &CodeGraph, task: &str) -> TaskMatch {
     task_match(g, task, &task_words, &task_compact, &hits)
 }
 
-fn split_words(text: &str) -> BTreeSet<String> {
+/// Lowercase sub-words of identifiers in `text`: split on non-alphanumerics,
+/// camelCase and acronym boundaries (`parse_http_URL` → `http`, `parse`, `url`).
+pub fn split_words(text: &str) -> BTreeSet<String> {
     let mut words = BTreeSet::new();
     let mut current = String::new();
     let chars: Vec<char> = text.chars().collect();

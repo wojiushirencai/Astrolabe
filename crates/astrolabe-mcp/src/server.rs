@@ -33,6 +33,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::loop_guard::{LoopGuard, Verdict};
+
+mod symbol_outline;
 use crate::{
     context::ClientContext,
     index::RepoIndex,
@@ -1468,17 +1470,17 @@ fn structured_output_for(context: &ClientContext) -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct BudgetOnly {
     #[serde(default)]
-    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate token budget.")]
+    #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ResolveContextParams {
     #[serde(default)]
-    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
     #[schemars(description = "Coding task.")]
     pub task_description: String,
@@ -1491,17 +1493,15 @@ pub(crate) struct ResolveContextParams {
     #[serde(default)]
     #[schemars(description = "Next-page offset.")]
     pub offset: usize,
-    // Repo-relative path substring, same as find_symbol's. No schema
-    // description: the tools/list size cap (7500 B) has no room for it, and
-    // the result text says how to use it.
     #[serde(default)]
+    #[schemars(description = "Repo-relative path substring.")]
     pub path_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct QueryParams {
     #[serde(default)]
-    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
     #[schemars(
         description = "Symbol name, substring, or hierarchical path ('Class/method', 'pkg.Func')."
@@ -1526,16 +1526,16 @@ pub(crate) struct QueryParams {
     pub kind: Option<String>,
     /// 仓库相对路径子串过滤（与 search_code 相同语义）。
     #[serde(default)]
-    #[schemars(description = "Optional repo-relative path substring filter.")]
+    #[schemars(description = "Repo-relative path substring.")]
     pub path_filter: Option<String>,
-    /// 路径查询：展开匹配者的嵌套子符号层数（0=不展开）。
+    /// 展开成员的层数（0=不展开）；query 为文件路径或 `*`+path_filter 时输出文件大纲。
     #[serde(default)]
     #[schemars(
-        description = "Path queries: expansion depth for nested children (0 = matches only)."
+        description = "Member levels to show (0 = none). query=<file path> or '*'+path_filter: file outline."
     )]
     pub depth: u8,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate token budget (default 2500).")]
+    #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
     /// 0 起始的翻页偏移（与 search_code 一致）。
     #[serde(default)]
@@ -1572,7 +1572,7 @@ fn kind_from_name(name: &str) -> Result<astrolabe_core::SymbolKind, String> {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub(crate) struct SearchParams {
     #[serde(default)]
-    #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
+    #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
     #[schemars(
         description = "Search string (case-insensitive literal, or regex when regex=true)."
@@ -1592,9 +1592,7 @@ pub(crate) struct SearchParams {
     )]
     pub case_sensitive: Option<bool>,
     #[serde(default = "default_budget")]
-    #[schemars(
-        description = "Maximum approximate token budget (default 2500). Overflow drops later hits; see next_offset for paging."
-    )]
+    #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
     #[serde(default)]
     #[schemars(description = "0-based match offset for pagination (see next_offset in result).")]
@@ -2151,9 +2149,19 @@ impl AstrolabeServer {
             ),
             Snap::Ready(index) => {
                 let result = f(&session, &index);
-                match coverage_note.then(|| index.coverage_note()).flatten() {
-                    Some(note) if result.is_error != Some(true) => append_stale_note(result, &note),
-                    _ => result,
+                if !coverage_note || result.is_error == Some(true) {
+                    result
+                } else {
+                    let text = result
+                        .content
+                        .first()
+                        .and_then(|block| block.as_text())
+                        .map(|t| t.text.as_str())
+                        .unwrap_or_default();
+                    match index.query_coverage_note(text, &session.coverage_note_shown) {
+                        Some(note) => append_stale_note(result, &note),
+                        None => result,
+                    }
                 }
             }
         };
@@ -2196,6 +2204,12 @@ impl AstrolabeServer {
             if let Value::Object(slim) = schema {
                 tool.input_schema = Arc::new(slim);
             }
+            // Every served tool only reads the repository (dry_run_rename
+            // previews, never writes). Claude Code runs MCP calls from one
+            // turn concurrently only when `readOnlyHint` is true
+            // (`isConcurrencySafe`); without it they queue serially. A tool
+            // that writes must not get this hint.
+            tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
         }
         if self.context.openai_tool_compatible() {
             for tool in &mut tools {
@@ -2378,14 +2392,31 @@ impl AstrolabeServer {
 }
 
 /// Drop schemars boilerplate that carries no information for a client:
-/// `$schema`, `"default": null` (the `["x","null"]` union already says it) and
-/// `format: uint*` + `minimum: 0` (the integer type is enough).
+/// `$schema`, `"default": null`, `format: uint*` + `minimum: 0` (the integer
+/// type is enough), and the `["x","null"]` union of `Option<T>` fields, which
+/// becomes plain `"x"`: optional is already expressed by absence from
+/// `required`, and deserialization still accepts an explicit `null`.
 fn slim_schema(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.remove("$schema");
             if map.get("default").is_some_and(Value::is_null) {
                 map.remove("default");
+            }
+            if let Some(Value::Array(types)) = map.get("type") {
+                if let [a, b] = types.as_slice() {
+                    let null = Value::String("null".into());
+                    let kept = if *b == null {
+                        Some(a.clone())
+                    } else if *a == null {
+                        Some(b.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(kept) = kept {
+                        map.insert("type".into(), kept);
+                    }
+                }
             }
             let unsigned = map
                 .get("format")
@@ -2818,7 +2849,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点。Pass include_body=true to retrieve full function/class implementations in indexed languages. Paging via offset=next_offset."
+        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点；query 也可为文件路径输出大纲。Pass include_body=true to retrieve full function/class implementations in indexed languages. Paging via offset=next_offset."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -2904,6 +2935,17 @@ impl AstrolabeServer {
                     Err(message) => return self.finish_at(&session.root, text_error(message)),
                 },
             };
+            // A file path (or `*` + path_filter) as the query: file outline.
+            if let Some(target) =
+                symbol_outline::outline_target(index, &params.query, params.path_filter.as_deref())
+            {
+                return match target {
+                    Ok(target) => {
+                        self.find_symbol_outline(&session.root, index, &params, kind, target)
+                    }
+                    Err(message) => self.finish_at(&session.root, text_error(message)),
+                };
+            }
             let normalized = normalize_symbol_query(&params.query);
             // "Class/method"（及 Type.method / A::b / pkg.Func）路径查询走层级
             // 匹配器（Serena NamePathMatcher 对应物）。
@@ -3011,12 +3053,12 @@ impl AstrolabeServer {
                     params.budget_tokens,
                     params.offset,
                 ));
-            let (kept, omitted) = paged_symbol_lines(
-                index,
-                &hits,
-                offset,
-                params.budget_tokens.saturating_sub(reserve),
-            );
+            let limit = params.budget_tokens.saturating_sub(reserve);
+            let (kept, omitted) = if params.depth > 0 {
+                symbol_outline::paged_lines_with_children(index, &hits, offset, params.depth, limit)
+            } else {
+                paged_symbol_lines(index, &hits, offset, limit)
+            };
             let kept_count = kept.len();
             let truncated = omitted > 0;
             // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
@@ -3061,7 +3103,17 @@ impl AstrolabeServer {
             // include_body 附加，避免误导性的"无可提取的符号体"。
             if hits.is_empty() {
                 body.push_str("(未找到匹配的符号)\n");
-                body.push_str(&symbol_suggestions(index, &needle));
+                let left = params.budget_tokens.saturating_sub(estimate_tokens(&body));
+                match symbol_outline::word_fallback_block(
+                    index,
+                    &normalized.query,
+                    kind,
+                    params.path_filter.as_deref(),
+                    left,
+                ) {
+                    Some(block) => body.push_str(&block),
+                    None => body.push_str(&symbol_suggestions(index, &needle)),
+                }
                 let unindexed = index.unindexed_code_exts(None);
                 if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
                     body.push_str(&hint);
@@ -4014,7 +4066,17 @@ impl AstrolabeServer {
                 .find(|seg| !seg.is_empty())
                 .unwrap_or_default()
                 .to_lowercase();
-            body.push_str(&symbol_suggestions(index, &last));
+            let left = params.budget_tokens.saturating_sub(estimate_tokens(&body));
+            match symbol_outline::word_fallback_block(
+                index,
+                &params.query.replace('/', " "),
+                kind,
+                params.path_filter.as_deref(),
+                left,
+            ) {
+                Some(block) => body.push_str(&block),
+                None => body.push_str(&symbol_suggestions(index, &last)),
+            }
             let unindexed = index.unindexed_code_exts(None);
             if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
                 body.push_str(&hint);
@@ -6841,6 +6903,43 @@ mod tests {
         assert!(result.structured_content.is_none());
     }
 
+    /// The "N 个文件有语法错误" footnote cost 7.2 KB over 87 of 223 results in
+    /// the paging A/B: it is shown once per session (and when it changes),
+    /// on empty results, and as a named line when a hit is in an error file.
+    #[test]
+    fn coverage_note_only_when_relevant() {
+        let (server, dir) = smart_server(&[
+            ("ok.py", "def fine():\n    return 1\n".to_string()),
+            (
+                "bad.py",
+                "def kept_marker():\n    return 2\n\ndef broken(:\n    pass\n".to_string(),
+            ),
+        ]);
+        let note = {
+            let state = server.primary.state.read().unwrap();
+            let IndexState::Ready(index) = &*state else {
+                panic!("index not ready")
+            };
+            index.coverage_note().expect("partial parse yields a note")
+        };
+        let first = text_of(&server.search_code(Parameters(search("fine"))));
+        assert!(first.contains(&note), "first result carries it: {first}");
+        let second = text_of(&server.search_code(Parameters(search("return 1"))));
+        assert!(second.contains("ok.py"), "{second}");
+        assert!(!second.contains(&note), "not repeated: {second}");
+        assert!(!second.contains("有语法错误"), "{second}");
+        let empty = text_of(&server.search_code(Parameters(search("absent_zz_token"))));
+        assert!(empty.contains("(未找到匹配的代码行)"), "{empty}");
+        assert!(empty.contains(&note), "empty result keeps it: {empty}");
+        let hit = text_of(&server.search_code(Parameters(search("kept_marker"))));
+        assert!(
+            hit.contains("命中文件 bad.py 有语法错误"),
+            "error-file hit is named: {hit}"
+        );
+        assert!(!hit.contains(&note), "{hit}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn search_code_uses_file_cache_and_records_hits() {
         let (server, dir) = ready_server_with_disk();
@@ -7643,7 +7742,11 @@ mod tests {
             path_filter.as_str().unwrap().contains("case-sensitive"),
             "{path_filter}"
         );
-        assert!(budget.as_str().unwrap().contains("next_offset"), "{budget}");
+        // Paging is taught by the `offset` description and the tool
+        // description; `budget_tokens` stays the shared one-liner.
+        assert_eq!(budget.as_str(), Some("Token budget."), "{budget}");
+        let offset = schema.pointer("/properties/offset/description").unwrap();
+        assert!(offset.as_str().unwrap().contains("next_offset"), "{offset}");
         assert!(tool_desc.contains("regex=true"), "{tool_desc}");
         assert!(tool_desc.contains("offset=next_offset"), "{tool_desc}");
     }
@@ -9287,6 +9390,61 @@ mod mcp_routing_tests {
 
     /// Upper bound for the compact `tools` array. Raise only with a reason.
     const TOOLS_LIST_MAX_BYTES: usize = 7_500;
+
+    /// Claude Code treats an MCP tool as concurrency-safe only when
+    /// `annotations.readOnlyHint` is true; without it, several Astrolabe calls
+    /// in one turn run one after another. The bytes are paid for by dropping
+    /// the `["x","null"]` unions of optional parameters.
+    #[test]
+    fn every_tool_is_read_only_and_optional_params_have_plain_types() {
+        let server = AstrolabeServer::new(tmp("annotations"));
+        let tools = server.listed_tools();
+        assert_eq!(tools.len(), crate::TOOL_COUNT);
+        for tool in &tools {
+            let json = serde_json::to_value(tool).unwrap();
+            assert_eq!(
+                json.get("annotations"),
+                Some(&json!({ "readOnlyHint": true })),
+                "{}",
+                tool.name
+            );
+            let schema = serde_json::to_string(&*tool.input_schema).unwrap();
+            assert!(!schema.contains("\"null\""), "{}: {schema}", tool.name);
+        }
+        let find_symbol = tools.iter().find(|t| t.name == "find_symbol").unwrap();
+        let schema = Value::Object((*find_symbol.input_schema).clone());
+        let root = schema.pointer("/properties/root/type");
+        assert_eq!(root, Some(&json!("string")));
+        // Explicit nulls from clients that still send them deserialize as None.
+        let params: QueryParams =
+            serde_json::from_value(json!({ "query": "x", "root": null, "kind": null })).unwrap();
+        assert!(params.root.is_none() && params.kind.is_none());
+        let params: SearchParams = serde_json::from_value(
+            json!({ "query": "x", "exclude": null, "case_sensitive": null }),
+        )
+        .unwrap();
+        assert!(params.exclude.is_none() && params.case_sensitive.is_none());
+    }
+
+    #[test]
+    fn slim_schema_collapses_only_two_member_null_unions() {
+        let mut v = json!({
+            "a": { "type": ["integer", "null"] },
+            "b": { "type": ["null", "boolean"] },
+            "c": { "type": ["string", "integer"] },
+            "d": { "type": "string" },
+        });
+        slim_schema(&mut v);
+        assert_eq!(
+            v,
+            json!({
+                "a": { "type": "integer" },
+                "b": { "type": "boolean" },
+                "c": { "type": ["string", "integer"] },
+                "d": { "type": "string" },
+            })
+        );
+    }
 
     #[test]
     fn resource_store_is_lru_bounded_and_uris_carry_a_process_nonce() {

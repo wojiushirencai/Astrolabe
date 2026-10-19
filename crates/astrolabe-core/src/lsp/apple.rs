@@ -11,6 +11,13 @@
 //!   generate stub framework headers (one shared prelude declaring
 //!   `NSObject`, `BOOL`, `NS_ENUM`, …) so the translation unit keeps parsing
 //!   and the project's own symbols get indexed.
+//! * **A repo's own `compile_commands.json` with relative `directory`
+//!   entries** (some generators emit `"directory": "."`). clangd joins a
+//!   relative `file` onto that directory and then compares the result with
+//!   the absolute path of the open document, so nothing matches and every
+//!   file falls back to default flags. We write an absolutized copy under
+//!   `.astrolabe/clangd/` and point clangd at it; the user's file is never
+//!   modified. Applies to clangd for C, C++ and ObjC.
 //! * **sourcekit-lsp** only fills its index from a build; background indexing
 //!   (enabled through `initializationOptions`, see `transport.rs`) runs the
 //!   SwiftPM "prepare" step itself.
@@ -32,16 +39,20 @@ const PRELUDE: &str = "__astrolabe_objc_prelude.h";
 const MAX_FILES: usize = 50_000;
 const MAX_INCLUDE_DIRS: usize = 2_000;
 
-/// Adjust a discovered server spec for Swift / ObjC before it is spawned.
+/// Adjust a discovered server spec for clangd (C / C++ / ObjC) before it is
+/// spawned.
 pub fn prepare_spec(spec: &ServerSpec, root: &Path) -> ServerSpec {
     let mut spec = spec.clone();
-    if !matches!(spec.language, Language::ObjC | Language::ObjCpp) || !is_clangd(&spec.command) {
+    let objc = matches!(spec.language, Language::ObjC | Language::ObjCpp);
+    let c_family = objc || matches!(spec.language, Language::C | Language::Cpp);
+    if !c_family || !is_clangd(&spec.command) {
         return spec;
     }
-    if !spec
-        .args
-        .iter()
-        .any(|a| a.starts_with("--background-index"))
+    if objc
+        && !spec
+            .args
+            .iter()
+            .any(|a| a.starts_with("--background-index"))
     {
         spec.args.push("--background-index".into());
     }
@@ -49,8 +60,24 @@ pub fn prepare_spec(spec: &ServerSpec, root: &Path) -> ServerSpec {
         .args
         .iter()
         .any(|a| a.starts_with("--compile-commands-dir"))
-        || has_own_compile_db(root)
     {
+        return spec;
+    }
+    if let Some(db) = own_compile_commands(root) {
+        match write_absolute_compile_db(root, &db) {
+            Ok(Some(dir)) => spec
+                .args
+                .push(format!("--compile-commands-dir={}", dir.display())),
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                error = %err,
+                db = %db.display(),
+                "could not write absolutized compile_commands.json; clangd uses the original"
+            ),
+        }
+        return spec;
+    }
+    if !objc || has_own_compile_db(root) {
         return spec;
     }
     match write_objc_compile_db(root, apple_sdk().as_deref()) {
@@ -103,6 +130,76 @@ pub fn has_own_compile_db(root: &Path) -> bool {
     ]
     .iter()
     .any(|p| root.join(p).is_file())
+}
+
+/// The repository's own `compile_commands.json`, at the root or in `build/`
+/// (the two places clangd itself looks from the root).
+fn own_compile_commands(root: &Path) -> Option<PathBuf> {
+    ["compile_commands.json", "build/compile_commands.json"]
+        .iter()
+        .map(|p| root.join(p))
+        .find(|p| p.is_file())
+}
+
+/// When `db` has entries whose `directory` is relative, write a copy with
+/// those directories made absolute to `<root>/.astrolabe/clangd/` and return
+/// that directory. `Ok(None)`: every entry is already absolute (or the file
+/// is not a JSON array), so clangd should read the original.
+///
+/// A relative `directory` is resolved against the directory holding the
+/// database, which is where the generator ran for `build/` exports and the
+/// root for a root-level file. Other fields are left untouched: `file`,
+/// `arguments` and `output` are relative to `directory` by definition, and
+/// become correct once it is absolute.
+pub fn write_absolute_compile_db(root: &Path, db: &Path) -> std::io::Result<Option<PathBuf>> {
+    let text = std::fs::read_to_string(db)?;
+    let Ok(Value::Array(mut entries)) = serde_json::from_str::<Value>(&text) else {
+        return Ok(None);
+    };
+    let base = db.parent().unwrap_or(root);
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let mut rewritten = 0usize;
+    for entry in &mut entries {
+        let Some(dir) = entry.get("directory").and_then(Value::as_str) else {
+            continue;
+        };
+        if Path::new(dir).is_absolute() {
+            continue;
+        }
+        let abs = normalize(&base.join(dir));
+        entry["directory"] = Value::String(abs.to_string_lossy().into_owned());
+        rewritten += 1;
+    }
+    if rewritten == 0 {
+        return Ok(None);
+    }
+    let out = root.join(CLANGD_DIR);
+    std::fs::create_dir_all(&out)?;
+    let body =
+        serde_json::to_string_pretty(&Value::Array(entries)).map_err(std::io::Error::other)?;
+    write_if_changed(&out.join("compile_commands.json"), &body)?;
+    tracing::info!(
+        db = %db.display(),
+        rewritten,
+        "compile_commands.json had relative directories; clangd reads an absolutized copy"
+    );
+    Ok(Some(out))
+}
+
+/// Drop `.` and resolve `..` lexically (the directory may not exist yet).
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// `xcrun --show-sdk-path` on macOS; `None` elsewhere or without Xcode.
@@ -952,6 +1049,109 @@ mod tests {
             assert!(fwd.contains("#import") && fwd.contains("B.h") && !fwd.contains(PRELUDE));
             assert!(args.contains(&"-fobjc-runtime=macosx".to_string()));
         }
+    }
+
+    fn c_spec(language: Language, cmd: &str) -> ServerSpec {
+        ServerSpec {
+            language,
+            command: PathBuf::from(cmd),
+            args: Vec::new(),
+            install_hint: String::new(),
+        }
+    }
+
+    fn db_dir(spec: &ServerSpec) -> Option<&str> {
+        spec.args
+            .iter()
+            .find_map(|a| a.strip_prefix("--compile-commands-dir="))
+    }
+
+    /// S4: relative `directory` entries in the repo's own database are made
+    /// absolute in a copy; the original is untouched.
+    #[test]
+    fn relative_compile_db_directories_are_absolutized_in_a_copy() {
+        let t = tmp("reldb");
+        let original = r#"[
+  {"directory": ".", "file": "src/a.c", "arguments": ["cc", "-Iinclude", "-c", "src/a.c"]},
+  {"directory": "sub/../lib", "file": "b.c", "command": "cc -c b.c"},
+  {"directory": "/abs/already", "file": "c.c", "command": "cc -c c.c"}
+]"#;
+        write(&t.0, "compile_commands.json", original);
+        let spec = prepare_spec(&c_spec(Language::C, "/usr/bin/clangd"), &t.0);
+        let dir = db_dir(&spec)
+            .expect("points clangd at the copy")
+            .to_string();
+        assert_eq!(Path::new(&dir), t.0.join(CLANGD_DIR));
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|a| a.starts_with("--background-index")),
+            "C/C++ args are otherwise unchanged"
+        );
+        let copy: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(Path::new(&dir).join("compile_commands.json")).unwrap(),
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(&t.0).unwrap();
+        assert_eq!(copy[0]["directory"], json!(root.to_string_lossy()));
+        assert_eq!(
+            copy[1]["directory"],
+            json!(root.join("lib").to_string_lossy())
+        );
+        assert_eq!(copy[2]["directory"], json!("/abs/already"));
+        assert_eq!(
+            copy[0]["arguments"][1],
+            json!("-Iinclude"),
+            "flags untouched"
+        );
+        assert_eq!(copy[0]["file"], json!("src/a.c"));
+        assert_eq!(
+            std::fs::read_to_string(t.0.join("compile_commands.json")).unwrap(),
+            original
+        );
+
+        // C++ and ObjC clangd get the same treatment; other servers do not.
+        let cpp = prepare_spec(&c_spec(Language::Cpp, "clangd"), &t.0);
+        assert_eq!(db_dir(&cpp), Some(dir.as_str()));
+        let objc = prepare_spec(&objc_spec("clangd"), &t.0);
+        assert_eq!(db_dir(&objc), Some(dir.as_str()));
+        let ccls = prepare_spec(&c_spec(Language::C, "ccls"), &t.0);
+        assert!(ccls.args.is_empty());
+        // An explicit user choice wins.
+        let mut pinned = c_spec(Language::C, "clangd");
+        pinned.args.push("--compile-commands-dir=/elsewhere".into());
+        assert_eq!(prepare_spec(&pinned, &t.0).args, pinned.args);
+    }
+
+    /// S4: `build/compile_commands.json` resolves `.` against `build/`, and a
+    /// database that is already absolute is passed through as is.
+    #[test]
+    fn build_dir_db_resolves_against_its_own_directory() {
+        let t = tmp("builddb");
+        write(
+            &t.0,
+            "build/compile_commands.json",
+            r#"[{"directory": ".", "file": "../src/a.c", "command": "cc -c ../src/a.c"}]"#,
+        );
+        let spec = prepare_spec(&c_spec(Language::Cpp, "clangd"), &t.0);
+        let dir = db_dir(&spec).expect("copy");
+        let copy: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(Path::new(dir).join("compile_commands.json")).unwrap(),
+        )
+        .unwrap();
+        let build = std::fs::canonicalize(t.0.join("build")).unwrap();
+        assert_eq!(copy[0]["directory"], json!(build.to_string_lossy()));
+
+        let t2 = tmp("absdb");
+        write(
+            &t2.0,
+            "compile_commands.json",
+            r#"[{"directory": "/abs", "file": "a.c", "command": "cc -c a.c"}]"#,
+        );
+        let spec = prepare_spec(&c_spec(Language::C, "clangd"), &t2.0);
+        assert!(spec.args.is_empty(), "{:?}", spec.args);
+        assert!(!t2.0.join(CLANGD_DIR).exists());
     }
 
     #[test]

@@ -68,6 +68,17 @@ impl PartialEntry {
     }
 }
 
+/// Body text of a zero-hit result (find_symbol, search_code,
+/// resolve_context): the coverage note is always relevant there.
+const EMPTY_RESULT_MARKERS: &[&str] = &[
+    "(未找到匹配的符号)",
+    "(未找到匹配的代码行)",
+    "没有匹配结果",
+    "未匹配到与任务相关的符号或文件",
+];
+/// Error files named by the per-result note before it switches to a count.
+const CITED_NAMES_MAX: usize = 3;
+
 /// Short reason bucket for a hard gap.
 fn gap_kind(reason: &str) -> &'static str {
     if reason.starts_with("too large") {
@@ -133,6 +144,74 @@ impl RepoIndex {
             "注意：{}，结果可能遗漏；详见 get_languages。",
             parts.join("，")
         ))
+    }
+
+    /// Partial-parse files that `text` cites as a location (`@path:line`,
+    /// `path:line: …`, or a bare path token). Sorted, unique.
+    pub(crate) fn partial_files_cited(&self, text: &str) -> Vec<String> {
+        let partial = &self.report().partial_parses;
+        if partial.is_empty() {
+            return Vec::new();
+        }
+        let set: std::collections::HashSet<&str> =
+            partial.iter().map(|(p, _)| p.as_str()).collect();
+        let mut out = std::collections::BTreeSet::new();
+        let separators = |c: char| {
+            c.is_whitespace() || matches!(c, '`' | '(' | ')' | '[' | ']' | ',' | '，' | '、')
+        };
+        for token in text.split(separators) {
+            let token = token.trim_start_matches('@');
+            let path = token.split_once(':').map_or(token, |(p, _)| p);
+            if !path.is_empty() && set.contains(path) {
+                out.insert(path.to_string());
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Coverage footnote for one query result, or `None` when it would only
+    /// repeat what this session was already told. The full count note is
+    /// shown the first time (and again whenever it changes) and on empty
+    /// results, where a gap may be the reason nothing matched; a result that
+    /// cites a file with syntax errors names that file.
+    pub(crate) fn query_coverage_note(
+        &self,
+        text: &str,
+        shown: &std::sync::Mutex<Option<String>>,
+    ) -> Option<String> {
+        let note = self.coverage_note()?;
+        let fresh = {
+            let mut last = shown.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = last.as_deref() != Some(note.as_str());
+            if fresh {
+                *last = Some(note.clone());
+            }
+            fresh
+        };
+        let empty = EMPTY_RESULT_MARKERS.iter().any(|m| text.contains(m));
+        let cited = self.partial_files_cited(text);
+        let mut lines = Vec::new();
+        if fresh || empty {
+            lines.push(note);
+        }
+        if !cited.is_empty() {
+            let names: Vec<&str> = cited
+                .iter()
+                .take(CITED_NAMES_MAX)
+                .map(String::as_str)
+                .collect();
+            let more = cited.len().saturating_sub(CITED_NAMES_MAX);
+            let tail = if more > 0 {
+                format!(" 等 {} 个", cited.len())
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "注意：命中文件 {}{tail} 有语法错误，其符号可能不全；详见 get_languages。",
+                names.join("、")
+            ));
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     /// Diagnosis of every partial-parse file (first error, kind), computed
@@ -580,6 +659,43 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn query_note_names_cited_error_files_and_dedups_the_count() {
+        let dir = temp_dir("cited");
+        broken(&dir, 5);
+        std::fs::write(dir.join("good.py"), "def fine():\n    pass\n").unwrap();
+        let index = crate::index::build(&dir).unwrap();
+        let shown = std::sync::Mutex::new(None);
+        let full = index.coverage_note().unwrap();
+        // First result of the session: the count note.
+        let first = index
+            .query_coverage_note("def fine()  @good.py:1", &shown)
+            .unwrap();
+        assert_eq!(first, full);
+        // Same note again, no error file cited: nothing.
+        assert!(index
+            .query_coverage_note("def fine()  @good.py:1", &shown)
+            .is_none());
+        // `xbad00.py` / `bad00.pyc` are not `bad00.py`.
+        assert!(index
+            .query_coverage_note("@xbad00.py:1 bad00.pyc:3:", &shown)
+            .is_none());
+        let cited = index
+            .query_coverage_note("@bad00.py:1\nbad01.py:2: x\n`bad02.py`, bad03.py:4", &shown)
+            .unwrap();
+        assert!(!cited.contains(&full), "{cited}");
+        assert!(
+            cited.contains("bad00.py、bad01.py、bad02.py 等 4 个"),
+            "{cited}"
+        );
+        // Empty result: count note again.
+        let empty = index
+            .query_coverage_note("(未找到匹配的符号)", &shown)
+            .unwrap();
+        assert_eq!(empty, full);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Diagnoses are reused across snapshots/restarts only for unchanged

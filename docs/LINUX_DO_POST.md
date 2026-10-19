@@ -69,7 +69,7 @@
 
 Astrolabe 的诞生并非空中楼阁，它站在了开源社区优秀先驱的肩膀上：
 - **致敬 Serena ([Oraios AI](https://github.com/oraios/serena))**：感谢 Serena 团队在代码智能体工具协议、三级提示词工程（L1/L2/L3）以及防漂移机制上的深刻洞察。Astrolabe 继承并严谨对齐了 Serena 的 context 规范、项目探测逻辑与提示词治理哲学。
-- **致敬 OpenVisio ([OpenVisio contributors](https://github.com/openvisio/openvisio))**：感谢 OpenVisio 在多语言代码可视化与拓扑依赖建模上的开拓性探索，为我们提供了宝贵的图谱构建灵感。
+- **致敬 OpenVisio ([OpenVisio contributors](https://github.com/syntaxPriest/openvisio-oss))**：感谢 OpenVisio 在多语言代码可视化与拓扑依赖建模上的开拓性探索，为我们提供了宝贵的图谱构建灵感。
 
 **为什么选择用 Rust 100% 重构？**
 我们深爱前人探索出的方向，但在实际高强度工程落地中，Node.js 运行时的 GC 抖动、WASM 跨语言内存释放缺陷、Python 常驻进程的内存泄漏，让中大型项目的使用体验大打折扣。用 Rust 重写，不仅把常驻内存压到 30MB~80MB、耗时压进 1 秒，更让我们能够实现基于 Redb 的无锁持久化、原生 OS 文件监听（notify 空闲 0% CPU）以及坚固的进程沙箱控制。

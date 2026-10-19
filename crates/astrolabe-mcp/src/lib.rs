@@ -29,6 +29,7 @@ mod reindex;
 mod root;
 pub mod roots;
 mod server;
+mod word_index;
 
 pub use cli::{parse_launch, Launch, USAGE};
 pub use context::{resolve_context_name, ClientContext};

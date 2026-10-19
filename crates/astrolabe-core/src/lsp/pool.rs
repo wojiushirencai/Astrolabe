@@ -371,6 +371,10 @@ pub struct ServerGuard {
     generation: u64,
     /// This checkout started the server.
     first_checkout: bool,
+    /// Checkout of the restarted server, taken when this guard's server
+    /// exited in the middle of a call. Later calls on this guard go there,
+    /// and it is released together with this guard.
+    replacement: Mutex<Option<Arc<ServerGuard>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -470,27 +474,7 @@ impl LspPool {
     ///
     /// The server is not reclaimed while the returned guard is alive.
     pub fn acquire(&self, language: Language) -> Result<ServerGuard, LspError> {
-        let guard = self.inner.acquire(language)?;
-        // Outside the slot lock, and with the guard already holding the
-        // server checked out: waiting here blocks only this caller, not the
-        // other languages or the reclaim monitor.
-        //
-        // Only the checkout that started the server waits. Once that wait
-        // has run out, later callers get the server's current answers right
-        // away (marked incomplete while it is busy) rather than each paying
-        // the full timeout again during a long import.
-        let ready_timeout = config_for(&self.inner.config, language).ready_timeout;
-        if guard.first_checkout
-            && !ready_timeout.is_zero()
-            && !guard.wait_until_ready(ready_timeout)
-        {
-            tracing::warn!(
-                language = language.name(),
-                timeout_ms = ready_timeout.as_millis() as u64,
-                "language server still indexing after timeout; answers may be incomplete"
-            );
-        }
-        Ok(guard)
+        checkout(&self.inner, language)
     }
 
     /// Run `f` against a checked-out server. The checkout is released even
@@ -573,6 +557,37 @@ impl LspPool {
     }
 }
 
+/// Check out the server for `language` (starting it if needed) and, when this
+/// checkout started it, wait for it to finish indexing.
+fn checkout(inner: &Arc<Inner>, language: Language) -> Result<ServerGuard, LspError> {
+    let guard = inner.acquire(language)?;
+    // Outside the slot lock, and with the guard already holding the
+    // server checked out: waiting here blocks only this caller, not the
+    // other languages or the reclaim monitor.
+    //
+    // Only the checkout that started the server waits. Once that wait
+    // has run out, later callers get the server's current answers right
+    // away (marked incomplete while it is busy) rather than each paying
+    // the full timeout again during a long import.
+    let ready_timeout = config_for(&inner.config, language).ready_timeout;
+    if guard.first_checkout && !ready_timeout.is_zero() && !guard.wait_until_ready(ready_timeout) {
+        tracing::warn!(
+            language = language.name(),
+            timeout_ms = ready_timeout.as_millis() as u64,
+            "language server still indexing after timeout; answers may be incomplete"
+        );
+    }
+    Ok(guard)
+}
+
+/// Whether a call that hit an exited server is re-sent once to a restarted
+/// one. Not for servers whose start alone takes many seconds (kotlin-lsp
+/// boots a JVM and re-imports Gradle): the caller is better served by the
+/// syntactic fallback than by blocking on that start inside one query.
+fn resend_after_exit(language: Language) -> bool {
+    !matches!(language, Language::Kotlin)
+}
+
 impl Drop for LspPool {
     fn drop(&mut self) {
         self.request_stop();
@@ -637,6 +652,7 @@ impl Inner {
                 language,
                 generation,
                 first_checkout: false,
+                replacement: Mutex::new(None),
             });
         }
 
@@ -660,6 +676,7 @@ impl Inner {
                 language,
                 generation,
                 first_checkout: false,
+                replacement: Mutex::new(None),
             });
         }
 
@@ -704,6 +721,7 @@ impl Inner {
                     language,
                     generation,
                     first_checkout: true,
+                    replacement: Mutex::new(None),
                 })
             }
             Err(err) => {
@@ -1066,9 +1084,59 @@ impl ServerGuard {
         }
     }
 
+    /// The checkout calls should go to: the replacement after a restart.
+    fn current(&self) -> Option<Arc<ServerGuard>> {
+        lock(&self.replacement).clone()
+    }
+
+    /// Run `op`; if the server exited under it, restart the server once and
+    /// re-send the same request.
+    ///
+    /// Only reached from a query that asked for this language server, so a
+    /// restart here is the same on-demand start the first query does, never
+    /// a proactive one. At most one restart per call; the crash-loop backoff
+    /// in [`Self::retire`] still applies, so a server that dies on every
+    /// request is not respawned in a tight loop. Requests are idempotent
+    /// reads (`references`, `definition`, `hover`, `diagnostic`, `rename`
+    /// computes edits without applying them), so re-sending is safe.
     fn call<T>(
         &self,
-        op: impl FnOnce(&dyn LanguageServer) -> Result<T, LspError>,
+        op: impl Fn(&dyn LanguageServer) -> Result<T, LspError>,
+    ) -> Result<T, LspError> {
+        if let Some(next) = self.current() {
+            return next.call(op);
+        }
+        match self.call_once(&op) {
+            Err(LspError::Crashed) if resend_after_exit(self.language) => {
+                let Some(pool) = self.pool.upgrade() else {
+                    return Err(LspError::Crashed);
+                };
+                let next = match checkout(&pool, self.language) {
+                    Ok(next) => Arc::new(next),
+                    Err(err) => {
+                        tracing::warn!(
+                            language = self.language.name(),
+                            error = %err,
+                            "language server exited; restart for re-send failed"
+                        );
+                        return Err(LspError::Crashed);
+                    }
+                };
+                tracing::info!(
+                    language = self.language.name(),
+                    generation = next.generation,
+                    "language server exited mid-request; restarted and re-sending once"
+                );
+                *lock(&self.replacement) = Some(Arc::clone(&next));
+                next.call_once(&op)
+            }
+            other => other,
+        }
+    }
+
+    fn call_once<T>(
+        &self,
+        op: &impl Fn(&dyn LanguageServer) -> Result<T, LspError>,
     ) -> Result<T, LspError> {
         match op(&*self.server) {
             Err(LspError::Crashed) => {
@@ -1143,15 +1211,24 @@ impl LanguageServer for ServerGuard {
     // Must forward: a guard that always claimed "not busy" would hide a
     // still-indexing server behind the pool.
     fn is_busy(&self) -> bool {
-        self.server.is_busy()
+        match self.current() {
+            Some(next) => next.is_busy(),
+            None => self.server.is_busy(),
+        }
     }
 
     fn wait_until_ready(&self, deadline: Duration) -> bool {
-        self.server.wait_until_ready(deadline)
+        match self.current() {
+            Some(next) => next.wait_until_ready(deadline),
+            None => self.server.wait_until_ready(deadline),
+        }
     }
 
     fn files_changed(&self, changes: &[super::FileChange]) {
-        self.server.files_changed(changes)
+        match self.current() {
+            Some(next) => next.files_changed(changes),
+            None => self.server.files_changed(changes),
+        }
     }
 
     fn references(
@@ -1195,10 +1272,16 @@ impl LanguageServer for ServerGuard {
     }
 
     fn memory_bytes(&self) -> Option<u64> {
-        self.server.memory_bytes()
+        match self.current() {
+            Some(next) => next.memory_bytes(),
+            None => self.server.memory_bytes(),
+        }
     }
 
     fn shutdown(&self) -> Result<(), LspError> {
+        if let Some(next) = self.current() {
+            next.retire(false);
+        }
         self.retire(false);
         Ok(())
     }
@@ -1242,6 +1325,8 @@ mod tests {
         timeout_on_use: Arc<AtomicBool>,
         start_delay_ms: Arc<AtomicU64>,
         shutdown_delay_ms: Arc<AtomicU64>,
+        /// The next this-many servers crash on every use.
+        crash_starts: Arc<AtomicUsize>,
     }
 
     struct FakeServer {
@@ -1264,6 +1349,7 @@ mod tests {
                 timeout_on_use: Arc::new(AtomicBool::new(false)),
                 start_delay_ms: Arc::new(AtomicU64::new(0)),
                 shutdown_delay_ms: Arc::new(AtomicU64::new(0)),
+                crash_starts: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1289,11 +1375,15 @@ mod tests {
                     "rust-analyzer is not installed; try rustup component add rust-analyzer".into(),
                 ));
             }
+            let crash_this = self
+                .crash_starts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
             Ok(Box::new(FakeServer {
                 language,
                 memory: Arc::clone(&self.memory),
                 shutdowns: Arc::clone(&self.shutdowns),
-                crash_on_use: self.crash_on_use.load(Ordering::SeqCst),
+                crash_on_use: crash_this || self.crash_on_use.load(Ordering::SeqCst),
                 timeout_on_use: self.timeout_on_use.load(Ordering::SeqCst),
                 shutdown_delay_ms: self.shutdown_delay_ms.load(Ordering::SeqCst),
             }))
@@ -1599,8 +1689,30 @@ mod tests {
         pool.shutdown();
     }
 
+    /// S4: a server that exits under a request is restarted and the same
+    /// request re-sent, so the caller gets an answer instead of an error.
     #[test]
-    fn crash_is_healed_on_the_next_request() {
+    fn crash_is_healed_within_the_same_request() {
+        let factory = FakeFactory::new();
+        factory.crash_starts.store(1, Ordering::SeqCst);
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+
+        let recovered = pool
+            .with_server(Language::Python, |server| {
+                server.references(&dummy_path(), dummy_pos())
+            })
+            .expect("re-sent to the restarted server");
+        assert!(recovered.is_empty());
+        assert_eq!(factory.starts(), 2);
+        assert_eq!(factory.shutdowns(), 1, "the dead server is retired");
+        assert!(pool.is_resident(Language::Python));
+        pool.shutdown();
+    }
+
+    /// S4: at most one restart per call; a server that dies again is
+    /// reported, and the crash-loop backoff then holds further starts.
+    #[test]
+    fn persistent_crash_restarts_once_then_reports() {
         let factory = FakeFactory::new();
         factory.crash_on_use.store(true, Ordering::SeqCst);
         let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
@@ -1609,19 +1721,53 @@ mod tests {
             .with_server(Language::Python, |server| {
                 server.references(&dummy_path(), dummy_pos())
             })
-            .expect_err("first generation crashes");
+            .expect_err("both generations crash");
         assert!(matches!(crashed, LspError::Crashed));
-        assert_eq!(factory.starts(), 1);
+        assert_eq!(factory.starts(), 2, "exactly one restart");
         assert!(!pool.is_resident(Language::Python));
+        pool.shutdown();
+    }
 
-        factory.crash_on_use.store(false, Ordering::SeqCst);
-        let recovered = pool
-            .with_server(Language::Python, |server| {
-                server.references(&dummy_path(), dummy_pos())
-            })
-            .expect("second generation is healthy");
-        assert!(recovered.is_empty());
+    /// S4: after the restart, later calls on the same checkout go to the
+    /// new server, and releasing the checkout releases the new one too.
+    #[test]
+    fn calls_after_a_restart_use_the_replacement() {
+        let factory = FakeFactory::new();
+        factory.crash_starts.store(1, Ordering::SeqCst);
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+        let guard = pool.acquire(Language::Python).expect("start");
+        guard
+            .references(&dummy_path(), dummy_pos())
+            .expect("re-sent");
+        guard
+            .definition(&dummy_path(), dummy_pos())
+            .expect("goes to the replacement");
+        guard
+            .diagnostics(&dummy_path())
+            .expect("still the replacement");
         assert_eq!(factory.starts(), 2);
+        let slot = Arc::clone(&guard.slot);
+        assert_eq!(lock(&slot.state).in_flight, 1, "the replacement checkout");
+        drop(guard);
+        assert_eq!(lock(&slot.state).in_flight, 0);
+        assert!(pool.is_resident(Language::Python));
+        pool.shutdown();
+    }
+
+    /// S4: Kotlin is not restarted inside a request (a JVM boot plus Gradle
+    /// import is far longer than a query should block).
+    #[test]
+    fn kotlin_crash_is_not_resent() {
+        let factory = FakeFactory::new();
+        factory.crash_starts.store(1, Ordering::SeqCst);
+        let pool = LspPool::with_factory_and_config(factory.clone(), quiet_config());
+        let err = pool
+            .with_server(Language::Kotlin, |s| {
+                s.references(&dummy_path(), dummy_pos())
+            })
+            .expect_err("reported");
+        assert!(matches!(err, LspError::Crashed));
+        assert_eq!(factory.starts(), 1);
         pool.shutdown();
     }
 
