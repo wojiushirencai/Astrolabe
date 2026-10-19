@@ -14,7 +14,7 @@ use std::path::Path;
 pub fn connection_instructions(context_name: &str, root: &Path) -> String {
     let _ = context_name;
     format!(
-        "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages.\n\n\
+        "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages. All are read-only: batch independent calls in parallel in one turn.\n\n\
          当前索引根 index_root: {}。每条工具结果第一行会重复该绝对路径；\
          若与你正在编辑的仓库不符，不要用这些路径读文件。\
          统计/计数（每个目录有多少处调用）用 search_code aggregate=top|dir|file，可加 skip_comments、exclude，不必写脚本。先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
@@ -77,6 +77,9 @@ The built-in tool descriptions in your context will tell you things like "use Re
 ## Pick the lookup that answers in one call
 
 Most wasted turns are search_code → Read on the same file. Pick by what you need:
+- Several independent lookups (a few names, literals, or files)
+    → issue them as parallel Astrolabe calls in ONE turn, not one per turn. All
+      Astrolabe tools are read-only, so the client runs them concurrently.
 - The definition / body of a function, method, class or type you can name
     → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
 - Who calls / uses X (callers, implementations, every reference)
@@ -193,6 +196,9 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
 ## Pick the lookup that answers in one call
 
 Most wasted turns are search_code → Read on the same file. Pick by what you need:
+- Several independent lookups (a few names, literals, or files)
+    → issue them as parallel Astrolabe calls in ONE turn, not one per turn. All
+      Astrolabe tools are read-only, so the client runs them concurrently.
 - The definition / body of a function, method, class or type you can name
     → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
 - Who calls / uses X (callers, implementations, every reference)
@@ -315,7 +321,9 @@ Built-in Read/Edit/Glob/Grep are permitted on code files ONLY when:
 
 All Astrolabe tools are read-only and safe for exploration tasks;
 read-only surveys should still prefer search_code / find_symbol / find_references over
-repeated whole-file Reads.
+repeated whole-file Reads. Because they are read-only they run concurrently: when you
+need several independent lookups (e.g. find_symbol for three names, or search_code for
+two literals), send them as parallel tool calls in a single message.
 
 Read/Edit/Glob are fine for non-code files: markdown, JSON, YAML, TOML, .env,
 config files, lockfiles, plain text, images. Editing stays with the built-in
@@ -349,6 +357,16 @@ mod tests {
         assert!(instructions.contains("resolve_context"));
         assert!(instructions.contains("search_code"));
         assert!(instructions.contains("get_languages"));
+        assert!(instructions.contains("parallel"));
+    }
+
+    #[test]
+    fn every_tier_encourages_parallel_read_only_calls() {
+        for name in ["claude-code", "default"] {
+            let m = manual(name);
+            assert!(m.contains("parallel Astrolabe calls in ONE turn"), "{name}");
+        }
+        assert!(cc_system_prompt_override().contains("parallel tool calls in a single message"));
     }
 
     #[test]

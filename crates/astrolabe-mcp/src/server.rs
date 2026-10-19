@@ -2196,6 +2196,12 @@ impl AstrolabeServer {
             if let Value::Object(slim) = schema {
                 tool.input_schema = Arc::new(slim);
             }
+            // Every served tool only reads the repository (dry_run_rename
+            // previews, never writes). Claude Code runs MCP calls from one
+            // turn concurrently only when `readOnlyHint` is true
+            // (`isConcurrencySafe`); without it they queue serially. A tool
+            // that writes must not get this hint.
+            tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
         }
         if self.context.openai_tool_compatible() {
             for tool in &mut tools {
@@ -2378,14 +2384,31 @@ impl AstrolabeServer {
 }
 
 /// Drop schemars boilerplate that carries no information for a client:
-/// `$schema`, `"default": null` (the `["x","null"]` union already says it) and
-/// `format: uint*` + `minimum: 0` (the integer type is enough).
+/// `$schema`, `"default": null`, `format: uint*` + `minimum: 0` (the integer
+/// type is enough), and the `["x","null"]` union of `Option<T>` fields, which
+/// becomes plain `"x"`: optional is already expressed by absence from
+/// `required`, and deserialization still accepts an explicit `null`.
 fn slim_schema(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.remove("$schema");
             if map.get("default").is_some_and(Value::is_null) {
                 map.remove("default");
+            }
+            if let Some(Value::Array(types)) = map.get("type") {
+                if let [a, b] = types.as_slice() {
+                    let null = Value::String("null".into());
+                    let kept = if *b == null {
+                        Some(a.clone())
+                    } else if *a == null {
+                        Some(b.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(kept) = kept {
+                        map.insert("type".into(), kept);
+                    }
+                }
             }
             let unsigned = map
                 .get("format")
@@ -9287,6 +9310,61 @@ mod mcp_routing_tests {
 
     /// Upper bound for the compact `tools` array. Raise only with a reason.
     const TOOLS_LIST_MAX_BYTES: usize = 7_500;
+
+    /// Claude Code treats an MCP tool as concurrency-safe only when
+    /// `annotations.readOnlyHint` is true; without it, several Astrolabe calls
+    /// in one turn run one after another. The bytes are paid for by dropping
+    /// the `["x","null"]` unions of optional parameters.
+    #[test]
+    fn every_tool_is_read_only_and_optional_params_have_plain_types() {
+        let server = AstrolabeServer::new(tmp("annotations"));
+        let tools = server.listed_tools();
+        assert_eq!(tools.len(), crate::TOOL_COUNT);
+        for tool in &tools {
+            let json = serde_json::to_value(tool).unwrap();
+            assert_eq!(
+                json.get("annotations"),
+                Some(&json!({ "readOnlyHint": true })),
+                "{}",
+                tool.name
+            );
+            let schema = serde_json::to_string(&*tool.input_schema).unwrap();
+            assert!(!schema.contains("\"null\""), "{}: {schema}", tool.name);
+        }
+        let find_symbol = tools.iter().find(|t| t.name == "find_symbol").unwrap();
+        let schema = Value::Object((*find_symbol.input_schema).clone());
+        let root = schema.pointer("/properties/root/type");
+        assert_eq!(root, Some(&json!("string")));
+        // Explicit nulls from clients that still send them deserialize as None.
+        let params: QueryParams =
+            serde_json::from_value(json!({ "query": "x", "root": null, "kind": null })).unwrap();
+        assert!(params.root.is_none() && params.kind.is_none());
+        let params: SearchParams = serde_json::from_value(
+            json!({ "query": "x", "exclude": null, "case_sensitive": null }),
+        )
+        .unwrap();
+        assert!(params.exclude.is_none() && params.case_sensitive.is_none());
+    }
+
+    #[test]
+    fn slim_schema_collapses_only_two_member_null_unions() {
+        let mut v = json!({
+            "a": { "type": ["integer", "null"] },
+            "b": { "type": ["null", "boolean"] },
+            "c": { "type": ["string", "integer"] },
+            "d": { "type": "string" },
+        });
+        slim_schema(&mut v);
+        assert_eq!(
+            v,
+            json!({
+                "a": { "type": "integer" },
+                "b": { "type": "boolean" },
+                "c": { "type": ["string", "integer"] },
+                "d": { "type": "string" },
+            })
+        );
+    }
 
     #[test]
     fn resource_store_is_lru_bounded_and_uris_carry_a_process_nonce() {
