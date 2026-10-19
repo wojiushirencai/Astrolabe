@@ -2028,12 +2028,15 @@ impl AstrolabeServer {
         )
     }
 
-    fn with_index(
+    /// Index access without a write barrier and without the per-query
+    /// coverage note: for `get_languages`, whose own body already carries the
+    /// full coverage block.
+    fn with_index_without_coverage_note(
         &self,
         hint: &str,
         f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
     ) -> CallToolResult {
-        self.with_index_barrier(hint, false, f)
+        self.with_index_barrier(hint, false, false, f)
     }
 
     fn with_fresh_index(
@@ -2041,13 +2044,14 @@ impl AstrolabeServer {
         hint: &str,
         f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
     ) -> CallToolResult {
-        self.with_index_barrier(hint, true, f)
+        self.with_index_barrier(hint, true, true, f)
     }
 
     fn with_index_barrier(
         &self,
         hint: &str,
         barrier: bool,
+        coverage_note: bool,
         f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
     ) -> CallToolResult {
         if cancel::is_cancelled() {
@@ -2086,7 +2090,7 @@ impl AstrolabeServer {
             ),
             Snap::Ready(index) => {
                 let result = f(&session, &index);
-                match index.coverage_note() {
+                match coverage_note.then(|| index.coverage_note()).flatten() {
                     Some(note) if result.is_error != Some(true) => append_stale_note(result, &note),
                     _ => result,
                 }
@@ -3977,7 +3981,7 @@ impl AstrolabeServer {
     }
 
     fn get_languages_inner(&self, params: BudgetOnly, hint: &str) -> CallToolResult {
-        self.with_index(hint, |session, index| {
+        self.with_index_without_coverage_note(hint, |session, index| {
             let mut totals: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
             for file in &index.graph().files {
                 if let Some(language) = file.language {
@@ -4668,7 +4672,7 @@ mod tests {
             IndexState::Ready(i) => Arc::clone(i),
             _ => panic!("ready"),
         };
-        let result = server.with_index("", |_, _| {
+        let result = server.with_index_without_coverage_note("", |_, _| {
             // A watcher publishing a new index must not wait for this tool.
             let s2 = Arc::clone(&session);
             let handle = std::thread::spawn(move || {
@@ -6396,6 +6400,38 @@ mod tests {
             DEFAULT_MEMORY_BUDGET_BYTES
         );
         assert_eq!(parse_cache_budget_mb(Some("0")), 0);
+    }
+
+    #[test]
+    fn get_languages_does_not_repeat_the_per_query_coverage_note() {
+        let (server, dir) = smart_server(&[
+            ("ok.py", "def fine():\n    return 1\n".to_string()),
+            ("bad.py", "def broken(:\n    pass\n".to_string()),
+        ]);
+        let note = {
+            let state = server.primary.state.read().unwrap();
+            let IndexState::Ready(index) = &*state else {
+                panic!("index not ready")
+            };
+            index.coverage_note().expect("partial parse yields a note")
+        };
+        let languages = server.get_languages(Parameters(BudgetOnly {
+            root: None,
+            budget_tokens: 1000,
+        }));
+        let text = languages.content[0].as_text().unwrap().text.as_str();
+        assert!(text.contains("syntax/compile errors: 1"), "{text}");
+        assert!(
+            !text.contains(&note),
+            "note duplicated in get_languages: {text}"
+        );
+        let search = server.search_code(Parameters(search("fine")));
+        let search_text = search.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            search_text.contains(&note),
+            "other tools keep the note: {search_text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
