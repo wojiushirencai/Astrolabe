@@ -266,8 +266,7 @@ pub(super) fn regroup_vb_header(source: &str) -> Option<String> {
             break;
         }
         let start = end;
-        loop {
-            let Some(line) = lines.next() else { break };
+        for line in lines.by_ref() {
             end += line.len();
             let continued = line.trim_end().ends_with(" _") || line.trim_end() == "_";
             if !continued || !line.ends_with('\n') {
