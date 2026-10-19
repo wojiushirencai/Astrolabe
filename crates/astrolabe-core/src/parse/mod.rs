@@ -31,6 +31,7 @@ pub mod queries;
 mod razor;
 mod vue;
 
+mod cfamily;
 mod csharp_pp;
 // lang-batch-8 per-language hooks (one file per worker).
 mod dart;
@@ -228,6 +229,17 @@ impl ParserPool {
             }
         }
         let parsed = self.parse_raw(lang, path, source)?;
+        // C / C++: only when the first pass has errors, retry after
+        // length-preserving rewrites (comments in multi-line `#define`,
+        // `__has_include(<x>)`, `__cplusplus`-guarded `extern "C"` braces,
+        // well-known library macros). See `cfamily.rs`.
+        if parsed.partial && matches!(lang, Language::C | Language::Cpp) {
+            if let Some(retry) =
+                cfamily::retry(lang, source, &parsed, |s| self.parse_raw(lang, path, s))
+            {
+                return Ok(retry);
+            }
+        }
         // C# / VB: `#if` that splits a declaration, and .NET 10 `#:` lines,
         // are ERROR nodes. Only on a partial first pass, blank inactive
         // branches and `#:` lines (same length) and keep the retry if it is
