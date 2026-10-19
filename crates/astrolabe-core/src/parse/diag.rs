@@ -40,6 +40,12 @@ const TOKEN_MAX: usize = 30;
 /// Lines of an ERROR node, from its first site, scanned for macro use.
 const SPAN_LINES: usize = 6;
 
+/// Version of what [`diagnose_indexed_syntax`] reports for given bytes.
+/// Bump it whenever a change here can alter a diagnosis (line, text or kind):
+/// cached diagnoses (the MCP server's `syntax-diagnoses.json` sidecar) are
+/// keyed on it and discarded on mismatch.
+pub const DIAG_FORMAT_VERSION: u32 = 1;
+
 /// Why a file that is in the index has syntax errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SyntaxErrorKind {

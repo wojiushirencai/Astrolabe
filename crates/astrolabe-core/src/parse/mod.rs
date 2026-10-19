@@ -44,7 +44,9 @@ mod diag;
 mod ruby;
 mod shell;
 mod swift;
-pub use diag::{diagnose_indexed_syntax, diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
+pub use diag::{
+    diagnose_indexed_syntax, diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind, DIAG_FORMAT_VERSION,
+};
 mod jsx_amp;
 mod ts_variance;
 

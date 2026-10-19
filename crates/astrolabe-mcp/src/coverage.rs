@@ -137,13 +137,17 @@ impl RepoIndex {
 
     /// Diagnosis of every partial-parse file (first error, kind), computed
     /// once per snapshot in parallel. Sorted by path.
+    ///
+    /// Each diagnosis is a full re-parse, so results are kept in a small
+    /// sidecar next to the index cache, keyed by path + content sha: a warm
+    /// restart (or a watcher apply) only re-parses files whose bytes changed.
     pub(crate) fn partial_entries(&self) -> &[PartialEntry] {
         self.partial_diagnoses_cell().get_or_init(|| {
-            let langs: std::collections::HashMap<&RelPath, Option<Language>> = self
+            let files: std::collections::HashMap<&RelPath, (Option<Language>, &str)> = self
                 .graph()
                 .files
                 .iter()
-                .map(|f| (&f.path, f.language))
+                .map(|f| (&f.path, (f.language, f.sha.as_str())))
                 .collect();
             // C / C++ files whose indexed parse is the macro rewrite are
             // diagnosed on that rewrite, not on errors it already fixed.
@@ -154,28 +158,44 @@ impl RepoIndex {
                 .filter(|(_, why)| why == astrolabe_core::PARTIAL_PARSE_REWRITE_REASON)
                 .map(|(p, _)| p)
                 .collect();
+            let cache = DiagCache::load(&self.root);
             let paths = self.partial_files();
-            paths
+            let results: Vec<(PartialEntry, Option<CachedDiag>, bool)> = paths
                 .par_iter()
                 .enumerate()
                 .map(|(i, path)| {
-                    let language = langs.get(path).copied().flatten();
-                    let diag = (i < DIAG_MAX)
-                        .then_some(language)
-                        .flatten()
-                        .and_then(|lang| {
-                            let source =
-                                astrolabe_core::text::read_source(&self.root.join(path.as_str()))
-                                    .ok()?;
-                            diagnose_indexed_syntax(lang, &source, rewritten.contains(path))
-                        });
-                    PartialEntry {
+                    let (language, sha) = files.get(path).copied().unwrap_or((None, ""));
+                    let is_rewritten = rewritten.contains(path);
+                    let entry = |diag| PartialEntry {
                         path: path.clone(),
                         language,
                         diag,
+                    };
+                    let Some(lang) = language.filter(|_| i < DIAG_MAX) else {
+                        return (entry(None), None, false);
+                    };
+                    if let Some(hit) = cache.get(path.as_str(), sha, is_rewritten) {
+                        return (entry(hit.diagnosis()), Some(hit.clone()), false);
                     }
+                    let Ok(source) =
+                        astrolabe_core::text::read_source(&self.root.join(path.as_str()))
+                    else {
+                        return (entry(None), None, false);
+                    };
+                    let diag = diagnose_indexed_syntax(lang, &source, is_rewritten);
+                    let stored = (!sha.is_empty())
+                        .then(|| CachedDiag::new(sha, is_rewritten, diag.as_ref()));
+                    (entry(diag), stored, true)
                 })
-                .collect()
+                .collect();
+            if results.iter().any(|(_, _, fresh)| *fresh) {
+                let keep = results
+                    .iter()
+                    .filter_map(|(e, c, _)| Some((e.path.as_str().to_owned(), c.clone()?)))
+                    .collect();
+                DiagCache::store(&self.root, keep);
+            }
+            results.into_iter().map(|(e, _, _)| e).collect()
         })
     }
 
@@ -349,6 +369,124 @@ impl RepoIndex {
 
 /// Write the report atomically (temp file + rename) into `<root>/.astrolabe/`
 /// (the self-ignoring cache dir), falling back to the OS temp dir.
+/// Sidecar of syntax diagnoses next to the index cache.
+const DIAG_CACHE_FILE: &str = "syntax-diagnoses.json";
+
+/// One cached [`diagnose_indexed_syntax`] result.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct CachedDiag {
+    sha: String,
+    rewritten: bool,
+    /// `None`: the re-parse was clean (no diagnosis).
+    diag: Option<(u32, String, bool)>,
+}
+
+impl CachedDiag {
+    fn new(sha: &str, rewritten: bool, diag: Option<&SyntaxDiagnosis>) -> Self {
+        CachedDiag {
+            sha: sha.to_owned(),
+            rewritten,
+            diag: diag.map(|d| {
+                (
+                    d.line,
+                    d.what.clone(),
+                    d.kind == SyntaxErrorKind::Preprocessor,
+                )
+            }),
+        }
+    }
+
+    fn diagnosis(&self) -> Option<SyntaxDiagnosis> {
+        self.diag
+            .as_ref()
+            .map(|(line, what, preprocessor)| SyntaxDiagnosis {
+                line: *line,
+                what: what.clone(),
+                kind: if *preprocessor {
+                    SyntaxErrorKind::Preprocessor
+                } else {
+                    SyntaxErrorKind::Syntax
+                },
+            })
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct DiagCache {
+    /// Binary + diagnosis-format stamp ([`Self::format`]); any mismatch
+    /// discards the whole file.
+    format: String,
+    entries: std::collections::BTreeMap<String, CachedDiag>,
+}
+
+impl DiagCache {
+    /// Also stamped with the running executable's size and mtime, so any
+    /// rebuild (a parser fix that forgot to bump a version) starts fresh.
+    fn format() -> String {
+        let exe = std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .map(|m| {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}-{mtime}", m.len())
+            })
+            .unwrap_or_default();
+        format!(
+            "v{}-x{}-d{}-e{exe}",
+            env!("CARGO_PKG_VERSION"),
+            astrolabe_core::store::EXTRACTOR_VERSION,
+            astrolabe_core::parse::DIAG_FORMAT_VERSION
+        )
+    }
+
+    fn path(root: &Path) -> PathBuf {
+        root.join(".astrolabe").join(DIAG_CACHE_FILE)
+    }
+
+    /// The cache for this binary, or an empty one (missing, unreadable,
+    /// corrupt or from another version).
+    fn load(root: &Path) -> Self {
+        std::fs::read(Self::path(root))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DiagCache>(&bytes).ok())
+            .filter(|cache| cache.format == Self::format())
+            .unwrap_or_default()
+    }
+
+    fn get(&self, path: &str, sha: &str, rewritten: bool) -> Option<&CachedDiag> {
+        if sha.is_empty() {
+            return None;
+        }
+        self.entries
+            .get(path)
+            .filter(|c| c.sha == sha && c.rewritten == rewritten)
+    }
+
+    /// Replace the sidecar with `entries` (atomic rename). Best effort: only
+    /// into an existing `.astrolabe` dir, never elsewhere.
+    fn store(root: &Path, entries: std::collections::BTreeMap<String, CachedDiag>) {
+        let dir = root.join(".astrolabe");
+        if !dir.is_dir() {
+            return;
+        }
+        let cache = DiagCache {
+            format: Self::format(),
+            entries,
+        };
+        let Ok(body) = serde_json::to_vec(&cache) else {
+            return;
+        };
+        let dest = Self::path(root);
+        let tmp = dir.join(format!("{DIAG_CACHE_FILE}.tmp{}", std::process::id()));
+        if std::fs::write(&tmp, body).is_err() || std::fs::rename(&tmp, &dest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 fn write_report(root: &Path, body: &str) -> Option<PathBuf> {
     let primary = root.join(".astrolabe");
     if let Some(path) = write_atomic(&primary, body) {
@@ -423,6 +561,63 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn diag_summary(index: &RepoIndex) -> Vec<(String, Option<(u32, String)>)> {
+        index
+            .partial_entries()
+            .iter()
+            .map(|e| {
+                (
+                    e.path.as_str().to_owned(),
+                    e.diag.as_ref().map(|d| (d.line, d.what.clone())),
+                )
+            })
+            .collect()
+    }
+
+    /// Diagnoses are reused across snapshots/restarts only for unchanged
+    /// bytes of the same binary; a fresh compute gives the same answer.
+    #[test]
+    fn syntax_diagnoses_are_cached_by_content_sha() {
+        let dir = temp_dir("diagcache");
+        broken(&dir, 3);
+        let first = crate::index::build_with_options(&dir, true, 1 << 20).unwrap();
+        let fresh = diag_summary(&first);
+        assert_eq!(fresh.len(), 3);
+        assert!(fresh.iter().all(|(_, d)| d.is_some()), "{fresh:?}");
+        let path = DiagCache::path(&dir);
+        let mut cache: DiagCache = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cache.format, DiagCache::format());
+        assert_eq!(cache.entries.len(), 3);
+
+        // Same bytes after a restart: the cached diagnosis is used as is.
+        let again = crate::index::build_with_options(&dir, true, 1 << 20).unwrap();
+        assert_eq!(diag_summary(&again), fresh);
+        if let Some((_, what, _)) = &mut cache.entries.get_mut("bad00.py").unwrap().diag {
+            *what = "FROM CACHE".into();
+        }
+        std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let reused = crate::index::build_with_options(&dir, true, 1 << 20).unwrap();
+        let got = diag_summary(&reused);
+        assert_eq!(got[0].1.as_ref().unwrap().1, "FROM CACHE");
+        assert_eq!(got[1..], fresh[1..]);
+
+        // Changed bytes: re-diagnosed (the tampered entry for bad00 stays).
+        std::fs::write(dir.join("bad01.py"), "x = 1\n\n\ndef late(:\n").unwrap();
+        let edited = crate::index::build_with_options(&dir, true, 1 << 20).unwrap();
+        let got = diag_summary(&edited);
+        assert_eq!(got[0].1.as_ref().unwrap().1, "FROM CACHE");
+        assert_eq!(got[1].1.as_ref().unwrap().0, 4, "{got:?}");
+
+        // Another format stamp: the whole sidecar is ignored.
+        let mut stale: DiagCache = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stale.format = "other-binary".into();
+        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let recomputed = crate::index::build_with_options(&dir, true, 1 << 20).unwrap();
+        let got = diag_summary(&recomputed);
+        assert_eq!(got[0], fresh[0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
