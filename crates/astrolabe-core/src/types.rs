@@ -873,6 +873,11 @@ pub enum EdgeKind {
     /// never collapsed to one file, and never an input to PageRank.
     /// Storage tag 3, appended after Inherit.
     Namespace,
+    /// C-family header -> its implementation file (`foo.h` -> `foo.c`, or the
+    /// `include/` tree mirrored into `src/`). File-level, name-based
+    /// ([`Confidence::Syntactic`]). Not an include: never an input to
+    /// PageRank, dependents or dependencies. Storage tag 4.
+    Pair,
 }
 
 #[derive(Clone, Debug)]

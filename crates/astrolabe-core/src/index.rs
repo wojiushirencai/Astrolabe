@@ -1208,6 +1208,10 @@ fn assemble_graph_with(
         }
     }
 
+    // C-family header -> implementation file. Not an include (see
+    // `EdgeKind::Pair`): lets queries hop from a declaration to its body.
+    edges.extend(crate::resolvers::c_cpp::pair_edges(&graph.files));
+
     if opts.call_edges {
         // Import edges join files; call edges join symbols. Both endpoints are
         // plain u32, so the distinction lives in `kind` — callers must read it

@@ -119,6 +119,25 @@ fn task_match(
             }
         }
     }
+    if !m.exact_files.is_empty() {
+        // C-family: the header declaring the identifier and the file
+        // implementing it are one unit; whichever of the two the exact match
+        // landed in, the other half joins the caller tier.
+        let pairs: Vec<FileId> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Pair)
+            .filter_map(|e| {
+                let (a, b) = (FileId(e.from), FileId(e.to));
+                match (m.exact_files.contains(&a), m.exact_files.contains(&b)) {
+                    (true, false) => Some(b),
+                    (false, true) => Some(a),
+                    _ => None,
+                }
+            })
+            .collect();
+        m.caller_files.extend(pairs);
+    }
     // Interfaces the task is about: spelled out exactly, or named in a file
     // the task gives by path (`Provider` in `oauth/provider.go`). Their
     // implementing types (Go implicit satisfaction, `EdgeKind::Inherit`)
@@ -484,6 +503,28 @@ pub fn dependents(g: &CodeGraph, target: FileId) -> Vec<FileId> {
 
 pub fn dependencies(g: &CodeGraph, target: FileId) -> Vec<FileId> {
     reachable_imports(g, target, false)
+}
+
+/// The other half of a C-family header/source pair ([`EdgeKind::Pair`],
+/// either direction), sorted. Empty for every other language.
+pub fn paired_files(g: &CodeGraph, file: FileId) -> Vec<FileId> {
+    let mut out: Vec<FileId> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Pair)
+        .filter_map(|e| {
+            if e.from == file.0 {
+                Some(FileId(e.to))
+            } else if e.to == file.0 {
+                Some(FileId(e.from))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn sorted_files(g: &CodeGraph) -> Vec<&CodeFile> {
@@ -1246,6 +1287,30 @@ mod tests {
         assert!(m.exact_files.contains(&FileId(0)));
         let m = match_task(&g, "look at other.go");
         assert!(m.files.contains(&FileId(3)) && m.exact_files.is_empty());
+    }
+
+    #[test]
+    fn header_source_pair_of_an_exact_identifier_joins_the_caller_tier() {
+        let mut g = named_graph(
+            &["src/object.h", "src/object.c", "src/other.c"],
+            &[(0, "redisObjectRefcount"), (2, "unrelated")],
+        );
+        g.edges.push(CodeEdge {
+            from: 0,
+            to: 1,
+            kind: EdgeKind::Pair,
+            weight: 1,
+            confidence: Confidence::Syntactic,
+        });
+        let m = match_task(&g, "why does redisObjectRefcount leak");
+        assert_eq!(m.exact_files, BTreeSet::from([FileId(0)]));
+        assert_eq!(m.caller_files, BTreeSet::from([FileId(1)]));
+        assert_eq!(paired_files(&g, FileId(1)), vec![FileId(0)]);
+        assert_eq!(paired_files(&g, FileId(0)), vec![FileId(1)]);
+        assert!(paired_files(&g, FileId(2)).is_empty());
+        // Pair edges are not includes.
+        assert!(dependencies(&g, FileId(1)).is_empty());
+        assert!(dependents(&g, FileId(1)).is_empty());
     }
 
     fn go_graph(paths: &[&str], symbols: &[(u32, &str)]) -> CodeGraph {

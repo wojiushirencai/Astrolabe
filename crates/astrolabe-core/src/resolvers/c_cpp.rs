@@ -17,7 +17,8 @@
 //!    directory prefix, then shortest path, then lexicographic.
 //!
 //! Extension-less specs (`<vector>`) only match through steps 1–2.
-//! Pairing `.h` with its `.c`/`.cpp` is not an include and is out of scope.
+//! Pairing `.h` with its `.c`/`.cpp` is not an include; [`pair_edges`] adds
+//! it as its own [`crate::types::EdgeKind::Pair`] edge.
 //!
 //! `detect` records include dirs in `ProjectMeta::source_roots` and indexes
 //! files by name in `ProjectMeta::modules`, so `resolve` is disk-free.
@@ -27,7 +28,8 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::types::{
-    join_rel, FileIndex, Language, ModuleResolver, ModuleUnit, ProjectMeta, RelPath,
+    join_rel, CodeEdge, CodeFile, Confidence, EdgeKind, FileIndex, Language, ModuleResolver,
+    ModuleUnit, ProjectMeta, RelPath,
 };
 
 pub struct CResolver;
@@ -300,6 +302,127 @@ fn nearest<'a>(dir: &str, candidates: &[&'a str]) -> Option<&'a str> {
     })
 }
 
+// ------------------------------------------------------- header <-> source
+
+const PAIR_HEADERS: [&str; 5] = ["h", "hh", "hpp", "hxx", "h++"];
+const PAIR_SOURCES: [&str; 7] = ["c", "cc", "cpp", "cxx", "c++", "m", "mm"];
+/// Source-tree names an `include/` tree is mirrored into.
+const MIRROR_ROOTS: [&str; 3] = ["src", "source", "lib"];
+/// A header with more same-stem sources than this is ambiguous (generated
+/// per-platform variants) and gets no pair.
+pub const MAX_PAIR_SOURCES: usize = 4;
+
+fn ext_in(path: &str, set: &[&str]) -> bool {
+    path.rsplit_once('.')
+        .filter(|(_, e)| !e.contains('/'))
+        .is_some_and(|(_, e)| set.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// `(dir, stem)` of a path: `a/b/foo.cc` -> `("a/b", "foo")`.
+fn dir_stem(path: &str) -> (&str, &str) {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    (dir, stem)
+}
+
+fn join_dir(a: &str, b: &str) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => b.to_string(),
+        (_, true) => a.to_string(),
+        _ => format!("{a}/{b}"),
+    }
+}
+
+/// Header -> implementation pairs among `paths` (indexes into it), as
+/// `(header, source)`.
+///
+/// A header pairs with the sources of the same stem in its own directory
+/// (`foo.h` / `foo.c`). Failing that, a header under an `include/` tree pairs
+/// with the mirrored source tree: `<p>/include/<rest>/foo.h` with
+/// `<p>/{src,source,lib}/<rest>/foo.*`, else `<rest>` minus its first
+/// directory, else the source root itself (`include/fmt/format.h` ->
+/// `src/format.cc`). Name-based, no
+/// compiler: callers label what they derive from it syntactic. One pass plus
+/// hash lookups, so linear in the number of files.
+pub fn header_source_pairs(paths: &[&str]) -> Vec<(usize, usize)> {
+    use std::collections::HashMap;
+    let mut sources: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    for (i, p) in paths.iter().enumerate() {
+        if ext_in(p, &PAIR_SOURCES) {
+            sources.entry(dir_stem(p)).or_default().push(i);
+        }
+    }
+    let mut out = Vec::new();
+    for (h, p) in paths.iter().enumerate() {
+        if !ext_in(p, &PAIR_HEADERS) {
+            continue;
+        }
+        let (dir, stem) = dir_stem(p);
+        let mut found: Vec<usize> = sources.get(&(dir, stem)).cloned().unwrap_or_default();
+        if found.is_empty() {
+            // Mirror: split at the last `include` segment of the directory.
+            let segs: Vec<&str> = if dir.is_empty() {
+                Vec::new()
+            } else {
+                dir.split('/').collect()
+            };
+            if let Some(at) = segs.iter().rposition(|s| s.eq_ignore_ascii_case("include")) {
+                let prefix = segs[..at].join("/");
+                let rest = &segs[at + 1..];
+                // `<rest>`, `<rest>` minus its first directory, then the
+                // source root itself (`include/jemalloc/internal/arena.h`
+                // -> `src/arena.c`).
+                let mut tails: Vec<String> = vec![rest.join("/")];
+                if rest.len() >= 2 {
+                    tails.push(rest[1..].join("/"));
+                }
+                if !rest.is_empty() {
+                    tails.push(String::new());
+                }
+                'roots: for root in MIRROR_ROOTS {
+                    for tail in &tails {
+                        let cand = join_dir(&join_dir(&prefix, root), tail);
+                        if let Some(hit) = sources.get(&(cand.as_str(), stem)) {
+                            found = hit.clone();
+                            break 'roots;
+                        }
+                    }
+                }
+            }
+        }
+        if found.is_empty() || found.len() > MAX_PAIR_SOURCES {
+            continue;
+        }
+        out.extend(found.into_iter().map(|s| (h, s)));
+    }
+    out
+}
+
+/// [`header_source_pairs`] over the C-family files of a graph, as
+/// [`EdgeKind::Pair`] edges `header -> source`.
+pub fn pair_edges(files: &[CodeFile]) -> Vec<CodeEdge> {
+    let c_family: Vec<&CodeFile> = files
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.language,
+                Some(Language::C | Language::Cpp | Language::ObjC | Language::ObjCpp)
+            )
+        })
+        .collect();
+    let paths: Vec<&str> = c_family.iter().map(|f| f.path.as_str()).collect();
+    header_source_pairs(&paths)
+        .into_iter()
+        .map(|(h, s)| CodeEdge {
+            from: c_family[h].id.0,
+            to: c_family[s].id.0,
+            kind: EdgeKind::Pair,
+            weight: 1,
+            confidence: Confidence::Syntactic,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +578,56 @@ mod tests {
             r.map(|p| p.as_str().to_owned()).as_deref(),
             Some("src/a.hpp")
         );
+    }
+
+    #[test]
+    fn headers_pair_with_same_dir_and_mirrored_sources() {
+        let paths = [
+            "src/server.h",
+            "src/server.c",
+            "src/util/sds.h",
+            "src/util/sds.c",
+            "include/fmt/format.h",
+            "src/format.cc",
+            "lib/include/foo/bar.hpp",
+            "lib/src/foo/bar.cpp",
+            "src/lonely.h",
+            "deps/x.h",
+            "other/x.c",
+            "README.h.md",
+        ];
+        let got: Vec<(&str, &str)> = header_source_pairs(&paths)
+            .into_iter()
+            .map(|(h, s)| (paths[h], paths[s]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("src/server.h", "src/server.c"),
+                ("src/util/sds.h", "src/util/sds.c"),
+                ("include/fmt/format.h", "src/format.cc"),
+                ("lib/include/foo/bar.hpp", "lib/src/foo/bar.cpp"),
+            ]
+        );
+    }
+
+    #[test]
+    fn same_dir_pair_wins_over_mirror_and_ambiguous_stems_get_none() {
+        let paths = [
+            "include/a.h",
+            "include/a.c",
+            "src/a.c",
+            "p/b.h",
+            "p/b.c",
+            "p/b.cc",
+            "p/b.cpp",
+            "p/b.cxx",
+            "p/b.m",
+        ];
+        let got: Vec<(&str, &str)> = header_source_pairs(&paths)
+            .into_iter()
+            .map(|(h, s)| (paths[h], paths[s]))
+            .collect();
+        assert_eq!(got, vec![("include/a.h", "include/a.c")]);
     }
 }

@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use astrolabe_core::graph::{paired_files, CodeGraph};
 use astrolabe_core::lsp::diagnostics::{query_server, FetchOptions};
 use astrolabe_core::lsp::discovery::Discovery;
 use astrolabe_core::lsp::pool::{LspPool, LspPoolConfig};
@@ -21,11 +22,13 @@ use astrolabe_core::lsp::queries::{
     apple_references_fallback, find_references, goto_definition, identifier_at,
     text_fallback_references, SymbolAt,
 };
+use astrolabe_core::lsp::router::primary_server_name;
 use astrolabe_core::lsp::transport::StdioSpawn;
 use astrolabe_core::lsp::Position;
 use astrolabe_core::lsp::Range;
 use astrolabe_core::lsp::{Diagnostic, LanguageServer, Location, LspError, Precise};
-use astrolabe_core::types::{Confidence, Language, RelPath};
+use astrolabe_core::types::{Confidence, EdgeKind, FileId, Language, RelPath};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::index::RepoIndex;
@@ -99,7 +102,8 @@ impl LiveBackend {
             return Vec::new();
         };
         let family = |l: Option<Language>| l.is_some_and(|l| same_family(l, language));
-        let mut hits: Vec<(bool, Location, String)> = Vec::new();
+        let near = near_files(index.graph(), origin);
+        let mut hits: Vec<(u8, Location, String)> = Vec::new();
         for symbol in &index.graph().symbols {
             if symbol.name != name {
                 continue;
@@ -112,8 +116,17 @@ impl LiveBackend {
             }
             let line = symbol.start_line.saturating_sub(1);
             let at = Position { line, character: 0 };
+            // Origin first, then its header/source partner and the files it
+            // includes (with their partners), then the rest.
+            let rank = if file.path == *origin {
+                0
+            } else if near.contains(&symbol.file) {
+                1
+            } else {
+                2
+            };
             hits.push((
-                file.path != *origin,
+                rank,
                 Location {
                     path: file.path.clone(),
                     range: Range { start: at, end: at },
@@ -126,6 +139,90 @@ impl LiveBackend {
             .take(MAX_SYNTACTIC_DEFINITIONS)
             .map(|(_, loc, sig)| (loc, sig))
             .collect()
+    }
+
+    /// C family: a server without a compile database (clangd with no
+    /// `compile_commands.json`) only knows the header it parsed, so "go to
+    /// definition" on a call lands on the prototype. When every answer is in
+    /// a header, add the same-name declarations from that header's paired
+    /// source file ([`EdgeKind::Pair`] in the syntax index). Labelled
+    /// syntactic: the pairing is by file name, the match by symbol name.
+    fn with_paired_definitions(
+        &self,
+        language: Language,
+        rel: &RelPath,
+        target: SymbolAt<'_>,
+        result: Precise<Vec<Location>>,
+    ) -> Precise<Vec<Location>> {
+        if !is_c_family(language)
+            || result.value.is_empty()
+            || !result.value.iter().all(|l| is_c_header(l.path.as_str()))
+        {
+            return result;
+        }
+        let Some(index) = self.syntax.as_ref().and_then(|f| f()) else {
+            return result;
+        };
+        let Some(name) = self.target_name(rel, target) else {
+            return result;
+        };
+        let extra = paired_definitions(index.graph(), &result.value, &name);
+        if extra.is_empty() {
+            return result;
+        }
+        let partners: BTreeSet<&str> = extra.iter().map(|l| l.path.as_str()).collect();
+        let note = format!(
+            "{}语言服务器只给出了头文件里的声明；后面追加的 {} 处是配对源文件 {} 里的同名定义（syntactic：按头文件/源文件同名配对和符号名匹配）。",
+            result.note.as_deref().map(|n| format!("{n} ")).unwrap_or_default(),
+            extra.len(),
+            partners.into_iter().collect::<Vec<_>>().join("、")
+        );
+        let mut value = result.value;
+        value.extend(extra);
+        Precise {
+            confidence: result.confidence.max(Confidence::Syntactic),
+            note: Some(note),
+            value,
+        }
+    }
+
+    /// C family: the server "resolved" a call to the call site itself. clangd
+    /// does this for a function it has no declaration of (missing include
+    /// path, no compile database): C's implicit declaration makes the call
+    /// its own declaration. Not an answer when the syntax index has no
+    /// declaration of that name on that line.
+    fn unresolved_call(
+        &self,
+        language: Language,
+        rel: &RelPath,
+        target: SymbolAt<'_>,
+        found: &[Location],
+    ) -> bool {
+        let SymbolAt::Position(pos) = target else {
+            return false;
+        };
+        if !is_c_family(language)
+            || found.is_empty()
+            || !found
+                .iter()
+                .all(|l| l.path == *rel && l.range.start.line == pos.line)
+        {
+            return false;
+        }
+        let Some(index) = self.syntax.as_ref().and_then(|f| f()) else {
+            return false;
+        };
+        let Some(name) = self.target_name(rel, target) else {
+            return false;
+        };
+        let g = index.graph();
+        let Some(file) = g.files.iter().find(|f| f.path == *rel).map(|f| f.id) else {
+            return false;
+        };
+        let line = pos.line + 1;
+        !g.symbols
+            .iter()
+            .any(|s| s.file == file && s.name == name && s.start_line <= line && line <= s.end_line)
     }
 
     /// A Go interface named by the query in `path`: its implementing types
@@ -226,6 +323,97 @@ impl LiveBackend {
         }
         true
     }
+}
+
+fn is_c_family(language: Language) -> bool {
+    matches!(
+        language,
+        Language::C | Language::Cpp | Language::ObjC | Language::ObjCpp
+    )
+}
+
+fn is_c_header(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, e)| {
+        ["h", "hh", "hpp", "hxx", "h++"]
+            .iter()
+            .any(|x| e.eq_ignore_ascii_case(x))
+    })
+}
+
+/// Files a definition lookup from `origin` should try before the rest of
+/// the repo: `origin`'s header/source partner, the files it includes, and
+/// their partners.
+fn near_files(g: &CodeGraph, origin: &RelPath) -> HashSet<FileId> {
+    let Some(origin) = g.files.iter().find(|f| f.path == *origin).map(|f| f.id) else {
+        return HashSet::new();
+    };
+    let mut near: HashSet<FileId> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Import && e.from == origin.0)
+        .map(|e| FileId(e.to))
+        .collect();
+    near.insert(origin);
+    let partners: Vec<FileId> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Pair)
+        .filter_map(|e| {
+            if near.contains(&FileId(e.from)) {
+                Some(FileId(e.to))
+            } else if near.contains(&FileId(e.to)) {
+                Some(FileId(e.from))
+            } else {
+                None
+            }
+        })
+        .collect();
+    near.extend(partners);
+    near.remove(&origin);
+    near
+}
+
+/// Declarations named `name` in the paired source files of the headers in
+/// `found`, not already in `found`.
+fn paired_definitions(g: &CodeGraph, found: &[Location], name: &str) -> Vec<Location> {
+    let mut out: Vec<Location> = Vec::new();
+    let headers: Vec<FileId> = g
+        .files
+        .iter()
+        .filter(|f| found.iter().any(|l| l.path == f.path))
+        .map(|f| f.id)
+        .collect();
+    let partners: BTreeSet<FileId> = headers
+        .iter()
+        .flat_map(|&h| paired_files(g, h))
+        .filter(|p| !headers.contains(p))
+        .collect();
+    if partners.is_empty() {
+        return out;
+    }
+    for symbol in &g.symbols {
+        if symbol.name != name || !partners.contains(&symbol.file) {
+            continue;
+        }
+        let Some(file) = g.files.iter().find(|f| f.id == symbol.file) else {
+            continue;
+        };
+        let at = Position {
+            line: symbol.start_line.saturating_sub(1),
+            character: 0,
+        };
+        let loc = Location {
+            path: file.path.clone(),
+            range: Range { start: at, end: at },
+        };
+        if !found.contains(&loc) && !out.contains(&loc) {
+            out.push(loc);
+        }
+        if out.len() >= MAX_SYNTACTIC_DEFINITIONS {
+            break;
+        }
+    }
+    out
 }
 
 /// An empty, unknown answer: what a server gives while still importing.
@@ -416,8 +604,9 @@ impl PreciseCapability for LiveBackend {
             (result, server.is_none_or(|s| s.is_busy()))
         }) {
             Ok((result, busy))
-                if result.value.is_empty()
-                    && (!busy || result.confidence == Confidence::Unknown) =>
+                if (result.value.is_empty()
+                    && (!busy || result.confidence == Confidence::Unknown))
+                    || self.unresolved_call(language, &rel, target, &result.value) =>
             {
                 let Some(name) = self.target_name(&rel, target) else {
                     return result;
@@ -426,7 +615,13 @@ impl PreciseCapability for LiveBackend {
                 if hits.is_empty() {
                     return result;
                 }
-                let note = if busy {
+                let note = if !result.value.is_empty() {
+                    format!(
+                        "{}没能解析这个调用（只指回了调用处本身，常见于没有 compile_commands.json 或缺 include 路径）；先给出 tree-sitter 语法索引里的同名声明 {} 处，按头文件/源文件配对和 include 关系排在前面（syntactic：按名字匹配，可能含同名的其他实体）。",
+                        primary_server_name(language),
+                        hits.len()
+                    )
+                } else if busy {
                     warming_note(language, hits.len(), "同名声明")
                 } else {
                     format!("{}先给出 tree-sitter 语法索引里的同名声明 {} 处（syntactic：按名字匹配，可能含同名的其他实体）。", empty_note(language, "定义"), hits.len())
@@ -437,7 +632,7 @@ impl PreciseCapability for LiveBackend {
                     value: hits.into_iter().map(|(loc, _)| loc).collect(),
                 }
             }
-            Ok((result, _)) => result,
+            Ok((result, _)) => self.with_paired_definitions(language, &rel, target, result),
             Err(error) => Precise::unknown(Vec::new(), error.to_string()),
         }
     }
@@ -497,6 +692,261 @@ mod start_failure_tests {
                 .with_server(Language::Kotlin, |s| s.is_none())
                 .is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+    use astrolabe_core::types::{CodeEdge, CodeFile, CodeSymbol, SymbolId, SymbolKind};
+
+    fn graph() -> CodeGraph {
+        let file = |id: u32, path: &str| CodeFile {
+            id: FileId(id),
+            path: RelPath::new(path),
+            language: Some(Language::C),
+            loc: 10,
+            sha: String::new(),
+        };
+        let sym = |id: u32, file: u32, name: &str, line: u32| CodeSymbol {
+            id: SymbolId(id),
+            file: FileId(file),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            signature: String::new(),
+            start_line: line,
+            end_line: line + 3,
+            exported: true,
+        };
+        let edge = |from: u32, to: u32, kind: EdgeKind| CodeEdge {
+            from,
+            to,
+            kind,
+            weight: 1,
+            confidence: Confidence::Scoped,
+        };
+        CodeGraph {
+            files: vec![
+                file(0, "src/sds.h"),
+                file(1, "src/sds.c"),
+                file(2, "src/server.c"),
+                file(3, "deps/other/sds.c"),
+            ],
+            symbols: vec![
+                sym(0, 0, "sdsnew", 10),
+                sym(1, 1, "sdsnew", 80),
+                sym(2, 3, "sdsnew", 5),
+                sym(3, 2, "main", 1),
+            ],
+            edges: vec![edge(2, 0, EdgeKind::Import), edge(0, 1, EdgeKind::Pair)],
+        }
+    }
+
+    #[test]
+    fn header_only_answer_gains_the_paired_source_definition() {
+        let g = graph();
+        let at = |line| Position { line, character: 0 };
+        let found = vec![Location {
+            path: RelPath::new("src/sds.h"),
+            range: Range {
+                start: at(9),
+                end: at(9),
+            },
+        }];
+        let extra = paired_definitions(&g, &found, "sdsnew");
+        // The partner of sds.h only, not the unrelated deps/other/sds.c.
+        assert_eq!(
+            extra,
+            vec![Location {
+                path: RelPath::new("src/sds.c"),
+                range: Range {
+                    start: at(79),
+                    end: at(79),
+                },
+            }]
+        );
+        assert!(paired_definitions(&g, &found, "nothere").is_empty());
+    }
+
+    #[test]
+    fn near_files_follow_includes_and_their_partners() {
+        let g = graph();
+        let near = near_files(&g, &RelPath::new("src/server.c"));
+        assert_eq!(near, HashSet::from([FileId(0), FileId(1)]));
+        let near = near_files(&g, &RelPath::new("src/sds.c"));
+        assert_eq!(near, HashSet::from([FileId(0)]));
+        assert!(near_files(&g, &RelPath::new("missing.c")).is_empty());
+        assert!(is_c_header("a/b.HPP") && !is_c_header("a/b.c") && !is_c_header("h"));
+    }
+
+    /// The old fallback order: origin file first, then by path.
+    fn self_free_syntactic(index: &RepoIndex, origin: &RelPath, name: &str) -> Vec<Location> {
+        let g = index.graph();
+        let mut hits: Vec<(bool, Location)> = g
+            .symbols
+            .iter()
+            .filter(|s| s.name == name)
+            .filter_map(|s| {
+                let f = g.files.iter().find(|f| f.id == s.file)?;
+                let at = Position {
+                    line: s.start_line.saturating_sub(1),
+                    character: 0,
+                };
+                Some((
+                    f.path != *origin,
+                    Location {
+                        path: f.path.clone(),
+                        range: Range { start: at, end: at },
+                    },
+                ))
+            })
+            .collect();
+        hits.sort();
+        hits.into_iter().map(|(_, l)| l).collect()
+    }
+
+    /// Real clangd, no compile database. Ignored: needs
+    /// `ASTROLABE_LSP_C=/path/to/clangd` and `ASTROLABE_TEST_C_REPO=/copy/of/redis`.
+    #[test]
+    #[ignore = "needs clangd and a C repo (ASTROLABE_LSP_C, ASTROLABE_TEST_C_REPO)"]
+    fn live_clangd_definition_hops_from_header_to_source() {
+        let Some(root) = std::env::var_os("ASTROLABE_TEST_C_REPO").map(PathBuf::from) else {
+            return;
+        };
+        let max_cases: usize = std::env::var("PAIR_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let t = std::time::Instant::now();
+        let index = Arc::new(crate::index::build(&root).expect("index"));
+        eprintln!("index {:?}", t.elapsed());
+        let g = index.graph();
+        let pairs: Vec<(FileId, FileId)> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Pair)
+            .map(|e| (FileId(e.from), FileId(e.to)))
+            .collect();
+        eprintln!("pair edges {}", pairs.len());
+        let path_of = |id: FileId| g.files.iter().find(|f| f.id == id).unwrap().path.clone();
+        // Cases: a function with a prototype in header h and a body in its
+        // partner s, called from another .c file.
+        let mut cases: Vec<(RelPath, u32, u32, String, RelPath, u32)> = Vec::new();
+        let c_files: Vec<&CodeFile> = g
+            .files
+            .iter()
+            .filter(|f| f.path.as_str().ends_with(".c"))
+            .collect();
+        'outer: for (h, s) in &pairs {
+            let mut names: Vec<(&str, u32)> = g
+                .symbols
+                .iter()
+                .filter(|x| x.file == *s && x.kind == SymbolKind::Function)
+                .filter(|x| g.symbols.iter().any(|y| y.file == *h && y.name == x.name))
+                .map(|x| (x.name.as_str(), x.start_line))
+                .collect();
+            names.sort();
+            names.dedup_by(|a, b| a.0 == b.0);
+            for (name, def_line) in names.into_iter().take(3) {
+                for f in &c_files {
+                    if f.id == *s {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(root.join(f.path.as_str())) else {
+                        continue;
+                    };
+                    let needle = format!("{name}(");
+                    let hit = text.lines().enumerate().find_map(|(i, l)| {
+                        let c = l.find(&needle)?;
+                        let before = l[..c].chars().last();
+                        (!l.trim_start().starts_with('#')
+                            && !before.is_some_and(|b| b.is_alphanumeric() || b == '_'))
+                        .then_some((i as u32, c as u32))
+                    });
+                    if let Some((line, col)) = hit {
+                        cases.push((
+                            f.path.clone(),
+                            line,
+                            col,
+                            name.to_string(),
+                            path_of(*s),
+                            def_line,
+                        ));
+                        if cases.len() >= max_cases {
+                            break 'outer;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        eprintln!("cases {}", cases.len());
+        let backend = LiveBackend::new(&root).with_syntax_index(Arc::new({
+            let index = Arc::clone(&index);
+            move || Some(Arc::clone(&index))
+        }));
+        let (mut raw_ok, mut raw_header_only, mut after_ok, mut raw_empty, mut old_ok) =
+            (0, 0, 0, 0, 0);
+        let mut hop_time = std::time::Duration::ZERO;
+        for (path, line, col, name, src, def_line) in &cases {
+            let target = SymbolAt::Position(Position {
+                line: *line,
+                character: *col,
+            });
+            let raw = backend
+                .with_server(Language::C, |server| {
+                    goto_definition(server, &root, path, target)
+                })
+                .expect("clangd");
+            let _ = def_line;
+            let hits_def = |locs: &[Location]| locs.iter().any(|l| l.path == *src);
+            if raw.value.is_empty() {
+                raw_empty += 1;
+            }
+            // What the previous code answered: the server's list as is, or
+            // (empty only) the syntactic list in path order.
+            let old: Vec<Location> = if raw.value.is_empty() {
+                let mut v: Vec<Location> = self_free_syntactic(&index, path, name);
+                v.truncate(MAX_SYNTACTIC_DEFINITIONS);
+                v
+            } else {
+                raw.value.clone()
+            };
+            if hits_def(&old) {
+                old_ok += 1;
+            }
+            if hits_def(&raw.value) {
+                raw_ok += 1;
+            }
+            if !raw.value.is_empty() && raw.value.iter().all(|l| is_c_header(l.path.as_str())) {
+                raw_header_only += 1;
+            }
+            let t = std::time::Instant::now();
+            let after = backend.definition(path.as_str(), None, Some(*line), Some(*col));
+            hop_time += t.elapsed();
+            if hits_def(&after.value) {
+                after_ok += 1;
+            } else {
+                eprintln!(
+                    "miss: {} {}:{} -> {:?}",
+                    name,
+                    path.as_str(),
+                    line + 1,
+                    after.value
+                );
+            }
+        }
+        eprintln!(
+            "cases={} old_correct={} raw_correct={} raw_header_only={} raw_empty={} after_correct={} full_definition_total={:?}",
+            cases.len(),
+            old_ok,
+            raw_ok,
+            raw_header_only,
+            raw_empty,
+            after_ok,
+            hop_time
+        );
+        backend.pool.shutdown();
     }
 }
 
