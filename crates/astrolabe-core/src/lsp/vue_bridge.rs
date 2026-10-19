@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -49,23 +49,60 @@ pub(crate) fn spawn_vue(
         )?)),
         Some(_) => Ok(Box::new(start_v2(spec, root, timeout, query_timeout)?)),
         None => {
-            let session = start_v2(spec, root, timeout, query_timeout)?;
-            let reported = session
-                .transport()
+            // Version unknown (a wrapper hides the package). Start the Vue
+            // server once, ready for either major: the relay is installed
+            // before `initialize` (2.x never uses it), the 2.x options are
+            // sent (3.x ignores `hybridMode` and reads `typescript.tsdk`),
+            // and `--tsdk` is passed (2.x ignores unknown flags). If it turns
+            // out to be 3.x, only the TypeScript half is started next to it;
+            // the Vue server is not started twice.
+            let tsdk = tsdk_dir(root, &spec.command);
+            let mut vue_spec = spec.clone();
+            push_tsdk_arg(&mut vue_spec, tsdk.as_deref());
+            let vue_transport = LspTransport::spawn_in(&vue_spec, root, timeout)?;
+            let (tx, rx) = mpsc::channel::<Value>();
+            vue_transport.set_notification_relay("tsserver/request", tx);
+            vue_transport.initialize_with(root, None).inspect_err(|_| {
+                let _ = vue_transport.shutdown();
+            })?;
+            let reported = vue_transport
                 .server_version()
                 .as_deref()
                 .and_then(parse_major);
+            let vue = LspSession::new(vue_transport, root.to_path_buf(), query_timeout);
             if reported.is_some_and(|m| m >= 3) {
-                let _ = session.shutdown();
-                Ok(Box::new(VueBridge::start(
+                Ok(Box::new(VueBridge::attach(
                     spec,
                     root,
                     timeout,
                     query_timeout,
+                    Arc::new(vue),
+                    rx,
                 )?))
             } else {
-                Ok(Box::new(session))
+                Ok(Box::new(vue))
             }
+        }
+    }
+}
+
+/// `--tsdk` / `typescript.tsdk`: the TypeScript next to the found tsserver,
+/// else the workspace's own.
+fn tsdk_dir(root: &Path, command: &Path) -> Option<PathBuf> {
+    find_tsserver(root, command)
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let local = root.join("node_modules/typescript/lib");
+            local.is_dir().then_some(local)
+        })
+}
+
+fn push_tsdk_arg(spec: &mut ServerSpec, tsdk: Option<&Path>) {
+    if let Some(tsdk) = tsdk {
+        if !spec.args.iter().any(|a| a.starts_with("--tsdk")) {
+            spec.args.push(format!("--tsdk={}", tsdk.to_string_lossy()));
         }
     }
 }
@@ -175,66 +212,78 @@ pub struct VueBridge {
     vue: Arc<LspSession>,
 }
 
+/// Everything needed to launch the TypeScript half.
+struct TsHalf {
+    spec: ServerSpec,
+    options: Value,
+    tsserver: Option<PathBuf>,
+}
+
+fn ts_half(spec: &ServerSpec, root: &Path) -> Result<TsHalf, LspError> {
+    let vue_pkg = vue_package_dir(&spec.command);
+    let plugin = find_vue_ts_plugin(root, vue_pkg.as_deref()).ok_or_else(|| {
+        LspError::Startup(
+            Language::Vue,
+            format!(
+                "Volar 3.x needs {VUE_PLUGIN} for its TypeScript half; not found next to \
+                 {VUE_PKG} or in node_modules (set ASTROLABE_VUE_TS_PLUGIN, or \
+                 `npm i -g @vue/language-server @vue/typescript-plugin typescript-language-server typescript`)"
+            ),
+        )
+    })?;
+    let ts_base = super::discovery::discover(Language::TypeScript).map_err(|_| {
+        LspError::Startup(
+            Language::Vue,
+            "Volar 3.x forwards script requests to a TypeScript server; install \
+             typescript-language-server (`npm i -g typescript-language-server typescript`)"
+                .into(),
+        )
+    })?;
+    let tsserver = find_tsserver(root, &ts_base.command).or_else(|| {
+        vue_pkg
+            .as_deref()
+            .and_then(|p| find_tsserver(root, &p.join("bin").join("x")))
+    });
+    // Same launch as for .ts files, but tagged Vue so documents open with
+    // languageId "vue", and with the plugin loaded.
+    let ts_spec = ServerSpec {
+        language: Language::Vue,
+        command: ts_base.command.clone(),
+        args: ts_base.args.clone(),
+        install_hint: ts_base.install_hint.clone(),
+    };
+    let mut options = json!({
+        "plugins": [{
+            "name": VUE_PLUGIN,
+            "location": plugin.to_string_lossy(),
+            "languages": ["vue"],
+        }],
+    });
+    if let Some(t) = &tsserver {
+        options["tsserver"] = json!({ "path": t.to_string_lossy() });
+    }
+    Ok(TsHalf {
+        spec: ts_spec,
+        options,
+        tsserver,
+    })
+}
+
 impl VueBridge {
+    /// Start both halves, concurrently: neither waits on the other's
+    /// `initialize`.
     pub fn start(
         spec: &ServerSpec,
         root: &Path,
         timeout: Duration,
         query_timeout: Duration,
     ) -> Result<Self, LspError> {
-        let vue_pkg = vue_package_dir(&spec.command);
-        let plugin = find_vue_ts_plugin(root, vue_pkg.as_deref()).ok_or_else(|| {
-            LspError::Startup(
-                Language::Vue,
-                format!(
-                    "Volar 3.x needs {VUE_PLUGIN} for its TypeScript half; not found next to \
-                     {VUE_PKG} or in node_modules (set ASTROLABE_VUE_TS_PLUGIN, or \
-                     `npm i -g @vue/language-server @vue/typescript-plugin typescript-language-server typescript`)"
-                ),
-            )
-        })?;
-        let ts_base = super::discovery::discover(Language::TypeScript).map_err(|_| {
-            LspError::Startup(
-                Language::Vue,
-                "Volar 3.x forwards script requests to a TypeScript server; install \
-                 typescript-language-server (`npm i -g typescript-language-server typescript`)"
-                    .into(),
-            )
-        })?;
-        let tsserver = find_tsserver(root, &ts_base.command).or_else(|| {
-            vue_pkg
-                .as_deref()
-                .and_then(|p| find_tsserver(root, &p.join("bin").join("x")))
-        });
-
-        // TS half: same launch as for .ts files, but tagged Vue so documents
-        // open with languageId "vue", and with the plugin loaded.
-        let ts_spec = ServerSpec {
-            language: Language::Vue,
-            command: ts_base.command.clone(),
-            args: ts_base.args.clone(),
-            install_hint: ts_base.install_hint.clone(),
-        };
-        let mut ts_opts = json!({
-            "plugins": [{
-                "name": VUE_PLUGIN,
-                "location": plugin.to_string_lossy(),
-                "languages": ["vue"],
-            }],
-        });
-        if let Some(t) = &tsserver {
-            ts_opts["tsserver"] = json!({ "path": t.to_string_lossy() });
-        }
-        let ts_transport = LspTransport::connect_with(&ts_spec, root, timeout, Some(ts_opts))?;
-        let ts = Arc::new(LspSession::new(
-            ts_transport,
-            root.to_path_buf(),
-            query_timeout,
-        ));
+        let ts_plan = ts_half(spec, root)?;
 
         // Vue half. `--tsdk` picks the TypeScript the server loads itself;
         // without it Volar 3 falls back to `require('typescript')`.
-        let tsdk = tsserver
+        let tsdk = ts_plan
+            .tsserver
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf)
@@ -243,31 +292,93 @@ impl VueBridge {
                 local.is_dir().then_some(local)
             });
         let mut vue_spec = spec.clone();
+        push_tsdk_arg(&mut vue_spec, tsdk.as_deref());
         let mut vue_opts = json!({});
         if let Some(tsdk) = &tsdk {
-            if !vue_spec.args.iter().any(|a| a.starts_with("--tsdk")) {
-                vue_spec
-                    .args
-                    .push(format!("--tsdk={}", tsdk.to_string_lossy()));
-            }
             vue_opts["typescript"] = json!({ "tsdk": tsdk.to_string_lossy() });
         }
-        let vue_transport = LspTransport::spawn_in(&vue_spec, root, timeout)?;
-        // Relay must be installed before `initialize`: Volar may ask for
-        // project info as soon as it has a document.
-        let (tx, rx) = mpsc::channel::<Value>();
-        vue_transport.set_notification_relay("tsserver/request", tx);
-        vue_transport
-            .initialize_with(root, Some(vue_opts))
-            .inspect_err(|_| {
-                let _ = vue_transport.shutdown();
-            })?;
+
+        let (ts_started, vue_started) = thread::scope(|scope| {
+            let ts = scope.spawn(|| {
+                LspTransport::connect_with(
+                    &ts_plan.spec,
+                    root,
+                    timeout,
+                    Some(ts_plan.options.clone()),
+                )
+            });
+            let vue = (|| {
+                let vue_transport = LspTransport::spawn_in(&vue_spec, root, timeout)?;
+                // Relay must be installed before `initialize`: Volar may ask
+                // for project info as soon as it has a document.
+                let (tx, rx) = mpsc::channel::<Value>();
+                vue_transport.set_notification_relay("tsserver/request", tx);
+                vue_transport
+                    .initialize_with(root, Some(vue_opts.clone()))
+                    .inspect_err(|_| {
+                        let _ = vue_transport.shutdown();
+                    })?;
+                Ok::<_, LspError>((vue_transport, rx))
+            })();
+            let ts = ts.join().unwrap_or_else(|_| {
+                Err(LspError::Startup(
+                    Language::Vue,
+                    "TypeScript half panicked while starting".into(),
+                ))
+            });
+            (ts, vue)
+        });
+        let (ts_transport, (vue_transport, rx)) = match (ts_started, vue_started) {
+            (Ok(ts), Ok(vue)) => (ts, vue),
+            (Ok(ts), Err(err)) => {
+                let _ = ts.shutdown();
+                return Err(err);
+            }
+            (Err(err), Ok((vue, _))) => {
+                let _ = vue.shutdown();
+                return Err(err);
+            }
+            (Err(err), Err(_)) => return Err(err),
+        };
+        let ts = Arc::new(LspSession::new(
+            ts_transport,
+            root.to_path_buf(),
+            query_timeout,
+        ));
         let vue = Arc::new(LspSession::new(
             vue_transport,
             root.to_path_buf(),
             query_timeout,
         ));
+        spawn_relay(rx, Arc::downgrade(&ts), Arc::downgrade(&vue));
+        Ok(VueBridge { ts, vue })
+    }
 
+    /// Bridge around a Vue server that is already initialized (version only
+    /// learnt from `initialize`): start just the TypeScript half.
+    fn attach(
+        spec: &ServerSpec,
+        root: &Path,
+        timeout: Duration,
+        query_timeout: Duration,
+        vue: Arc<LspSession>,
+        rx: mpsc::Receiver<Value>,
+    ) -> Result<Self, LspError> {
+        let started = ts_half(spec, root).and_then(|plan| {
+            LspTransport::connect_with(&plan.spec, root, timeout, Some(plan.options))
+        });
+        let ts_transport = match started {
+            Ok(t) => t,
+            Err(err) => {
+                let _ = vue.shutdown();
+                return Err(err);
+            }
+        };
+        let ts = Arc::new(LspSession::new(
+            ts_transport,
+            root.to_path_buf(),
+            query_timeout,
+        ));
         spawn_relay(rx, Arc::downgrade(&ts), Arc::downgrade(&vue));
         Ok(VueBridge { ts, vue })
     }
@@ -278,6 +389,80 @@ impl VueBridge {
     fn vue_fallback<T>(&self, f: impl FnOnce(&LspSession) -> Result<T, LspError>) -> Option<T> {
         f(&self.vue).ok()
     }
+}
+
+/// How long a query waits for the Vue half once the TS half has answered.
+/// The Vue server builds its own project model on first use; its extra
+/// answers are worth a short wait, not the full query timeout.
+const VUE_GRACE: Duration = Duration::from_millis(1500);
+
+impl VueBridge {
+    /// Run `on_ts` here and `on_vue` on a helper thread. The Vue answer is
+    /// taken if it arrives by the time the TS half is done plus
+    /// [`VUE_GRACE`]; a late one is dropped (its thread finishes on its own,
+    /// bounded by the session's query timeout).
+    fn both<T: Send + 'static>(
+        &self,
+        on_vue: impl FnOnce(&LspSession) -> Result<T, LspError> + Send + 'static,
+        on_ts: impl FnOnce(&LspSession) -> Result<T, LspError>,
+    ) -> (Result<T, LspError>, Option<T>) {
+        let (tx, rx) = mpsc::channel();
+        let vue = Arc::clone(&self.vue);
+        let spawned = thread::Builder::new()
+            .name("astrolabe-vue-query".into())
+            .spawn(move || {
+                let _ = tx.send(on_vue(&vue));
+            });
+        let ts = on_ts(&self.ts);
+        let vue = match spawned {
+            Ok(_) => rx.recv_timeout(VUE_GRACE).ok().and_then(Result::ok),
+            Err(_) => None,
+        };
+        (ts, vue)
+    }
+}
+
+/// TS answer plus the Vue half's extra locations, deduplicated. A TS error
+/// is only returned when the Vue half had nothing either.
+fn merge_locations(
+    ts: Result<Vec<Location>, LspError>,
+    vue: Option<Vec<Location>>,
+) -> Result<Vec<Location>, LspError> {
+    let extra = vue.unwrap_or_default();
+    let mut out = match ts {
+        Ok(v) => v,
+        Err(err) if extra.is_empty() => return Err(err),
+        Err(_) => Vec::new(),
+    };
+    for loc in extra {
+        if !out.contains(&loc) {
+            out.push(loc);
+        }
+    }
+    Ok(out)
+}
+
+fn merge_diagnostics(
+    ts: Result<Vec<Diagnostic>, LspError>,
+    vue: Option<Vec<Diagnostic>>,
+) -> Result<Vec<Diagnostic>, LspError> {
+    let extra = vue.unwrap_or_default();
+    let mut out = match ts {
+        Ok(v) => v,
+        Err(err) if extra.is_empty() => return Err(err),
+        Err(_) => Vec::new(),
+    };
+    for d in extra {
+        // Both halves can report the same type error for a template
+        // expression; same range and message is one diagnostic.
+        if !out
+            .iter()
+            .any(|o| o.path == d.path && o.range == d.range && o.message == d.message)
+        {
+            out.push(d);
+        }
+    }
+    Ok(out)
 }
 
 /// Split Volar's `tsserver/request` params into `(id, command, args)`
@@ -319,29 +504,49 @@ fn rel_under(root: &Path, file: &str) -> Option<RelPath> {
     rest.starts_with('/').then(|| RelPath::new(rest))
 }
 
+/// Threads answering Volar's `tsserver/request`s. Bounded: a burst of
+/// requests (Volar fires several per opened document) used to start one
+/// thread each.
+const RELAY_WORKERS: usize = 4;
+
+type RelayJob = (Value, String, Value);
+
 fn spawn_relay(rx: mpsc::Receiver<Value>, ts: Weak<LspSession>, vue: Weak<LspSession>) {
+    let (work_tx, work_rx) = mpsc::channel::<RelayJob>();
+    let work_rx = Arc::new(Mutex::new(work_rx));
+    for _ in 0..RELAY_WORKERS {
+        let work_rx = Arc::clone(&work_rx);
+        let ts = ts.clone();
+        let vue = vue.clone();
+        let _ = thread::Builder::new()
+            .name("astrolabe-vue-tsserver".into())
+            .spawn(move || loop {
+                // Ends once the dispatcher (and with it `work_tx`) is gone.
+                let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                let Ok((id, command, args)) = job else {
+                    return;
+                };
+                let body = match ts.upgrade() {
+                    Some(ts) => forward(&ts, &command, &args),
+                    None => Value::Null,
+                };
+                // Always answer: Volar awaits every id forever.
+                if let Some(vue) = vue.upgrade() {
+                    let _ = vue
+                        .transport()
+                        .notify("tsserver/response", tsserver_response(id, body));
+                }
+            });
+    }
     let _ = thread::Builder::new()
         .name("astrolabe-vue-relay".into())
         .spawn(move || {
             // Ends when the Vue transport (which owns the sender) is dropped.
             while let Ok(params) = rx.recv() {
-                for (id, command, args) in parse_tsserver_requests(&params) {
-                    let ts = ts.clone();
-                    let vue = vue.clone();
-                    let _ = thread::Builder::new()
-                        .name("astrolabe-vue-tsserver".into())
-                        .spawn(move || {
-                            let body = match ts.upgrade() {
-                                Some(ts) => forward(&ts, &command, &args),
-                                None => Value::Null,
-                            };
-                            // Always answer: Volar awaits every id forever.
-                            if let Some(vue) = vue.upgrade() {
-                                let _ = vue
-                                    .transport()
-                                    .notify("tsserver/response", tsserver_response(id, body));
-                            }
-                        });
+                for job in parse_tsserver_requests(&params) {
+                    if work_tx.send(job).is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -398,7 +603,14 @@ impl LanguageServer for VueBridge {
     }
 
     fn references(&self, path: &RelPath, position: Position) -> Result<Vec<Location>, LspError> {
-        self.ts.references(path, position)
+        // Template-only uses (component tags, slot props) are the Vue
+        // server's; script uses are the TS half's. Ask both, merge.
+        let path_c = path.clone();
+        let (ts, vue) = self.both(
+            move |v| v.references(&path_c, position),
+            |t| t.references(path, position),
+        );
+        merge_locations(ts, vue)
     }
 
     fn definition(&self, path: &RelPath, position: Position) -> Result<Vec<Location>, LspError> {
@@ -425,7 +637,11 @@ impl LanguageServer for VueBridge {
     }
 
     fn diagnostics(&self, path: &RelPath) -> Result<Vec<Diagnostic>, LspError> {
-        self.ts.diagnostics(path)
+        // Template syntax / compiler errors come from the Vue server, type
+        // errors from the TS half.
+        let path_c = path.clone();
+        let (ts, vue) = self.both(move |v| v.diagnostics(&path_c), |t| t.diagnostics(path));
+        merge_diagnostics(ts, vue)
     }
 
     fn prepare_rename(
@@ -438,11 +654,16 @@ impl LanguageServer for VueBridge {
     }
 
     fn wait_until_ready(&self, deadline: Duration) -> bool {
-        self.ts.wait_until_ready(deadline)
+        // Both halves index on their own; wait for them side by side.
+        thread::scope(|scope| {
+            let vue = scope.spawn(|| self.vue.wait_until_ready(deadline));
+            let ts = self.ts.wait_until_ready(deadline);
+            ts & vue.join().unwrap_or(false)
+        })
     }
 
     fn is_busy(&self) -> bool {
-        self.ts.is_busy()
+        self.ts.is_busy() || self.vue.is_busy()
     }
 
     fn files_changed(&self, changes: &[FileChange]) {
@@ -458,9 +679,12 @@ impl LanguageServer for VueBridge {
     }
 
     fn shutdown(&self) -> Result<(), LspError> {
-        let a = self.vue.shutdown();
-        let b = self.ts.shutdown();
-        a.and(b)
+        thread::scope(|scope| {
+            let vue = scope.spawn(|| self.vue.shutdown());
+            let ts = self.ts.shutdown();
+            let vue = vue.join().unwrap_or(Ok(()));
+            vue.and(ts)
+        })
     }
 }
 
@@ -553,6 +777,84 @@ mod tests {
         assert_eq!(
             rel_under(win, "C:/w/repo/src/a.vue").map(|r| r.as_str().to_string()),
             Some("src/a.vue".into())
+        );
+    }
+
+    fn loc(path: &str, line: u32) -> Location {
+        let at = Position { line, character: 0 };
+        Location {
+            path: RelPath::new(path),
+            range: super::super::Range { start: at, end: at },
+        }
+    }
+
+    #[test]
+    fn references_merge_adds_vue_only_sites_once() {
+        let ts = Ok(vec![loc("a.vue", 1), loc("b.ts", 0)]);
+        let vue = Some(vec![loc("a.vue", 1), loc("a.vue", 6)]);
+        assert_eq!(
+            merge_locations(ts, vue).unwrap(),
+            vec![loc("a.vue", 1), loc("b.ts", 0), loc("a.vue", 6)]
+        );
+        // TS failed but the Vue half answered: its answer, not the error.
+        let ts: Result<Vec<Location>, LspError> = Err(LspError::Crashed);
+        assert_eq!(
+            merge_locations(ts, Some(vec![loc("a.vue", 6)])).unwrap(),
+            vec![loc("a.vue", 6)]
+        );
+        // Both empty-handed: the TS error stands.
+        let ts: Result<Vec<Location>, LspError> = Err(LspError::Crashed);
+        assert!(merge_locations(ts, None).is_err());
+    }
+
+    #[test]
+    fn diagnostics_merge_keeps_template_errors_and_drops_duplicates() {
+        let d = |line: u32, msg: &str| Diagnostic {
+            path: RelPath::new("a.vue"),
+            range: loc("a.vue", line).range,
+            severity: super::super::Severity::Error,
+            message: msg.into(),
+            code: None,
+        };
+        // tsls pushes nothing for .vue (observed with Volar 3.3.13): the
+        // template compiler errors only come from the Vue half.
+        let ts: Result<Vec<Diagnostic>, LspError> =
+            Err(LspError::Protocol("pull diagnostic unsupported".into()));
+        let key = |v: Vec<Diagnostic>| -> Vec<(u32, String)> {
+            v.into_iter()
+                .map(|d| (d.range.start.line, d.message))
+                .collect()
+        };
+        let got = merge_diagnostics(ts, Some(vec![d(8, "Invalid end tag.")])).unwrap();
+        assert_eq!(key(got), vec![(8, "Invalid end tag.".to_string())]);
+        let got = merge_diagnostics(
+            Ok(vec![d(3, "Type error")]),
+            Some(vec![d(3, "Type error"), d(8, "Invalid end tag.")]),
+        )
+        .unwrap();
+        assert_eq!(
+            key(got),
+            vec![
+                (3, "Type error".to_string()),
+                (8, "Invalid end tag.".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn tsdk_arg_is_added_once() {
+        let mut spec = ServerSpec {
+            language: Language::Vue,
+            command: PathBuf::from("vue-language-server"),
+            args: vec!["--stdio".into()],
+            install_hint: String::new(),
+        };
+        push_tsdk_arg(&mut spec, Some(Path::new("/t/lib")));
+        push_tsdk_arg(&mut spec, Some(Path::new("/other/lib")));
+        push_tsdk_arg(&mut spec, None);
+        assert_eq!(
+            spec.args,
+            vec!["--stdio".to_string(), "--tsdk=/t/lib".into()]
         );
     }
 
