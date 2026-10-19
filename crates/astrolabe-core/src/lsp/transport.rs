@@ -777,6 +777,10 @@ const ROSLYN_PROJECT_INIT_COMPLETE: &str = "workspace/projectInitializationCompl
 
 /// Roslyn asks the client to run `dotnet restore` for these projects.
 const ROSLYN_PROJECT_NEEDS_RESTORE: &str = "workspace/_roslyn_projectNeedsRestore";
+/// `workspace/configuration` section through which Roslyn asks whether to run
+/// a NuGet restore on its own after loading projects (VS Code's
+/// `dotnet.projects.enableAutomaticRestore`). Always answered `false`.
+const ROSLYN_AUTOMATIC_RESTORE_SECTION: &str = "projects.dotnet_enable_automatic_restore";
 
 fn is_roslyn(language: Language) -> bool {
     matches!(language, Language::CSharp | Language::VisualBasic)
@@ -2392,6 +2396,15 @@ fn configuration_section(language: Language, section: Option<&str>) -> Value {
         // `bashIde` after `initialized` and a null answer resets the value
         // passed in initializationOptions back to false.
         (Language::Shell, Some("bashIde")) => shell_settings(),
+        // Roslyn defaults this to true and, right after the project load,
+        // runs a NuGet restore of the whole solution: on serilog it stayed
+        // busy for over 100 s (so the first C# query waits for the readiness
+        // timeout) and wrote `project.assets.json` / `*.nuget.*` into the
+        // user's `obj/`. A read-only query must not restore packages; Roslyn
+        // carries on with whatever is already restored.
+        (language, Some(ROSLYN_AUTOMATIC_RESTORE_SECTION)) if is_roslyn(language) => {
+            Value::Bool(false)
+        }
         _ => Value::Null,
     }
 }
@@ -2779,6 +2792,11 @@ while True:
         send({"jsonrpc": "2.0", "id": "rev-1", "method": "window/workDoneProgress/create", "params": {"token": "t1"}})
         resp = read_msg()
         reply(msg, {"reverse_id": None if resp is None else resp.get("id"), "reverse_result": None if resp is None else resp.get("result")})
+    elif method == "probe-config-items":
+        items = (msg.get("params") or {}).get("items") or []
+        send({"jsonrpc": "2.0", "id": 78, "method": "workspace/configuration", "params": {"items": items}})
+        resp = read_msg()
+        reply(msg, resp)
     elif method == "probe-config":
         send({"jsonrpc": "2.0", "id": 77, "method": "workspace/configuration", "params": {"items": [{"section": "a"}, {"section": "b"}]}})
         resp = read_msg()
@@ -3285,6 +3303,32 @@ while True:
 
         let (py, _tmp) = spawn_fake(false, Duration::from_secs(5));
         assert!(!roslyn_init_pending(&py.shared));
+        py.shutdown().unwrap();
+    }
+
+    /// Roslyn's automatic NuGet restore is switched off through the
+    /// configuration pull; other sections and other servers keep `null`.
+    #[test]
+    fn roslyn_automatic_restore_is_disabled() {
+        let items = json!({"items": [
+            {"section": "projects.dotnet_enable_automatic_restore"},
+            {"section": "projects.dotnet_binary_log_path"},
+            {"section": "navigation.dotnet_navigate_to_decompiled_sources"},
+        ]});
+        for lang in [Language::CSharp, Language::VisualBasic] {
+            let (t, _tmp) = spawn_fake_as(lang, false, Duration::from_secs(5));
+            let resp = t.request("probe-config-items", items.clone()).unwrap();
+            assert_eq!(resp["id"], json!(78));
+            assert_eq!(
+                resp["result"],
+                json!([false, null, null]),
+                "{lang:?}: {resp}"
+            );
+            t.shutdown().unwrap();
+        }
+        let (py, _tmp) = spawn_fake(false, Duration::from_secs(5));
+        let resp = py.request("probe-config-items", items).unwrap();
+        assert_eq!(resp["result"], json!([null, null, null]), "{resp}");
         py.shutdown().unwrap();
     }
 

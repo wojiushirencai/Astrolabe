@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### 修复
+
+- **关闭 Roslyn 自动 NuGet 还原**：对 `workspace/configuration` 的 `projects.dotnet_enable_automatic_restore` 回答 `false`（C#/VB），`_roslyn_projectNeedsRestore` 仍空回复、从不还原。serilog 实测：加载后不再出现持续 >100 s 的 "Restore" 进度，就绪 3.8 s；不再往 `obj/` 写 `project.assets.json`、`*.nuget.*`（Roslyn 设计时构建仍会写 `obj/Debug/*`）。
+
 ## [0.14.0] - 2026-10-19
 
 自 v0.13.0 以来的 PR：#76、#77（文档与分发）、#78、#79（审计修复两批）、#80（`get_languages` 覆盖重做、`resolve_context` 分页）、#81（第 4 批）、#82（第 5 批）。工具目录仍为 7 个，`tools/list` 7,185 B（Linux 实测，上限测试 7,500 B）。`EXTRACTOR_VERSION` 2 → 5：升级后首次启动会重新解析一遍。完整说明与 A/B 数据见 GitHub Release。
