@@ -53,7 +53,14 @@ Codex, Windsurf and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-clie
 | `find_references` | Compiler-grade references via the language server; `dry_run_rename=<new name>` lists per-file edit locations without writing anything. |
 | `goto_definition` | Jump to the real definition through the language server. |
 | `get_diagnostics` | Syntax and type errors for a file. |
-| `get_languages` | Languages, file counts, lines of code, language-server status. |
+| `get_languages` | Languages, file counts, lines of code, language-server status, and index coverage (see below). |
+
+**Index coverage.** Every file of a supported language is indexed, including files with syntax or compile errors: the symbols that parse are kept, but symbols inside the broken region may be missing. `get_languages` reports:
+- files *not* in the index, as counts by reason (over the size cap, read failure, parser timeout);
+- files with syntax errors: listed inline when there are 10 or fewer; otherwise only the count plus the absolute path of a Markdown report (`<repo>/.astrolabe/coverage-report.md`, self-gitignored; temp dir if that is not writable) with path, language and first error line for each file, capped at 1,000 entries per section;
+- unsupported-language files, summarised by extension (top 8, the rest folded into one count), never per file.
+
+Other tools append one short line (`注意：N 个文件…；详见 get_languages。`) only when such gaps exist.
 
 ## Evidence: what we measured, and what we did not
 

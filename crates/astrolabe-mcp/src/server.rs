@@ -4016,7 +4016,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "统计仓库语言分布、代码规模及各语言 LSP 服务就绪状态 (Ready / needs_install / AST-only)。"
+        description = "语言分布、代码规模、LSP 就绪 (Ready/needs_install/AST-only)、索引缺口与语法错误文件。"
     )]
     pub(crate) fn get_languages(
         &self,
