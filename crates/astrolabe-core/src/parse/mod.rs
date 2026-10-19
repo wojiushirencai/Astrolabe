@@ -40,6 +40,7 @@ pub use objc::header_language as objc_header_language;
 mod ruby;
 mod shell;
 mod swift;
+mod ts_variance;
 
 pub(crate) use razor::extract_razor_csharp;
 
@@ -232,7 +233,19 @@ impl ParserPool {
         // the retry only if it parses cleanly. Dynamic `import()` calls are
         // never touched (see `normalize_import_types`).
         if parsed.partial && matches!(lang, Language::TypeScript | Language::Tsx) {
-            if let Some(fixed) = normalize_import_types(source) {
+            // TS 4.7 variance (`interface I<in T, out U>`): same-length blank
+            // of the keywords, kept only when the retry is clean. Also the
+            // base for the import-type retry so both fixes can combine.
+            let variance = ts_variance::normalize_variance(source);
+            if let Some(fixed) = &variance {
+                if let Ok(retry) = self.parse_raw(lang, path, fixed) {
+                    if !retry.partial {
+                        return Ok(retry);
+                    }
+                }
+            }
+            let base = variance.as_deref().unwrap_or(source);
+            if let Some(fixed) = normalize_import_types(base) {
                 if let Ok(retry) = self.parse_raw(lang, path, &fixed) {
                     if !retry.partial {
                         return Ok(retry);
