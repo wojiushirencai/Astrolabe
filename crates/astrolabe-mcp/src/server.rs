@@ -2849,7 +2849,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点。Pass include_body=true to retrieve full function/class implementations in indexed languages. Paging via offset=next_offset."
+        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点；query 也可为文件路径输出大纲。Pass include_body=true to retrieve full function/class implementations in indexed languages. Paging via offset=next_offset."
     )]
     pub(crate) fn find_symbol(
         &self,
