@@ -265,7 +265,22 @@ fn symbol_hits(
     let threshold = GENERIC_MIN_DF.max(g.symbols.len() / GENERIC_DF_DIVISOR);
     let generic = |w: &str| STOP_WORDS.contains(&w) || df.get(w).copied().unwrap_or(0) >= threshold;
     let mut hits = Vec::new();
+    // When every task word is frequent in this repo, the df test would leave
+    // nothing; fall back to symbols that carry two (or all) of the task's
+    // non-stop words, at the weakest strength.
+    let mut fallback = Vec::new();
     for c in cands {
+        let content = c
+            .matched
+            .iter()
+            .filter(|w| !STOP_WORDS.contains(&w.as_str()))
+            .count();
+        if content >= 1 && content >= c.meaningful.min(2) {
+            fallback.push(SymHit {
+                idx: c.idx,
+                strength: STRENGTH_WEAK,
+            });
+        }
         let specific = c.matched.iter().filter(|w| !generic(w)).count();
         // A plain word (`call`, `answer`) equal to a symbol name is common
         // English, not an identifier the task spells out: only camelCase /
@@ -294,6 +309,9 @@ fn symbol_hits(
             idx: c.idx,
             strength,
         });
+    }
+    if hits.is_empty() {
+        return fallback;
     }
     hits
 }
@@ -1107,7 +1125,10 @@ mod tests {
         let m = match_task(&g, "how does the channel spending limit work");
         let files: BTreeSet<FileId> = m.symbols.iter().map(|&i| g.symbols[i].file).collect();
         assert!(files.contains(&FileId(1)), "{files:?}");
-        assert!(!files.contains(&FileId(0)), "generic channel matched: {files:?}");
+        assert!(
+            !files.contains(&FileId(0)),
+            "generic channel matched: {files:?}"
+        );
         // Stop words never match on their own, even in a tiny repo.
         let g = named_graph(&["a.go"], &[(0, "theHow")]);
         assert!(match_task(&g, "how does the thing work").symbols.is_empty());
@@ -1116,7 +1137,12 @@ mod tests {
     #[test]
     fn callers_and_sibling_tests_of_an_exact_identifier_form_the_next_tier() {
         let mut g = named_graph(
-            &["svc/quiet.go", "svc/quiet_test.go", "api/use.go", "api/other.go"],
+            &[
+                "svc/quiet.go",
+                "svc/quiet_test.go",
+                "api/use.go",
+                "api/other.go",
+            ],
             &[
                 (0, "ViaQuietDropped"),
                 (1, "TestThing"),
