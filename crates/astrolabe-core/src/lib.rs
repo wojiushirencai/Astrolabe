@@ -37,6 +37,15 @@ pub use types::{
 };
 pub use watch::{ChangeKind, ChangeSet, WatchConfig, WatchHandle, Watcher};
 
+/// `IndexReport::partial_parses` reason of a file that parsed with syntax
+/// errors.
+pub const PARTIAL_PARSE_REASON: &str = "partial parse: syntax errors in file";
+/// Same, for a C / C++ file whose indexed parse is that of the length-
+/// preserving macro/preprocessor rewrite (`ParsedFile::c_family_rewrite`):
+/// diagnose it with `parse::diagnose_indexed_syntax(.., true)`.
+pub const PARTIAL_PARSE_REWRITE_REASON: &str =
+    "partial parse: syntax errors in file (C/C++ rewrite kept)";
+
 /// Outcome of an index run. Every file that failed is named — a partial index
 /// that looks complete is worse than one that admits its gaps.
 #[derive(Debug, Default)]
@@ -45,6 +54,9 @@ pub struct IndexReport {
     pub files_parsed: usize,
     /// `(path, reason)` for every file that could not be parsed.
     pub parse_failures: Vec<(RelPath, String)>,
+    /// Files that parsed with syntax errors. They ARE in the index (symbols
+    /// found are kept) but may be incomplete; not a coverage failure.
+    pub partial_parses: Vec<(RelPath, String)>,
     /// Source files skipped by the scanner for exceeding the size cap.
     pub too_large: Vec<RelPath>,
     /// Import specifiers that pointed inside the repo but did not resolve.

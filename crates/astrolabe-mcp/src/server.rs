@@ -12,9 +12,9 @@ use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
     cache::{FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
     graph::{cached_centrality, rank_and_match},
-    render::{confidence_note, symbol_line},
+    render::symbol_line,
     types::RelPath,
-    CodeSymbol, Confidence, FileId,
+    CodeSymbol, FileId,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -1443,14 +1443,22 @@ pub(crate) struct ResolveContextParams {
     #[serde(default)]
     #[schemars(description = "Multi-repo workspace: sub-repo name or absolute path.")]
     pub root: Option<String>,
-    #[schemars(description = "Natural-language coding task description.")]
+    #[schemars(description = "Coding task.")]
     pub task_description: String,
     #[serde(default = "default_budget")]
-    #[schemars(description = "Maximum approximate token budget.")]
+    #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
     #[serde(default)]
-    #[schemars(description = "false: resend full result for a repeated identical call.")]
+    #[schemars(description = "false: resend a repeated call.")]
     pub dedup: Option<bool>,
+    #[serde(default)]
+    #[schemars(description = "Next-page offset.")]
+    pub offset: usize,
+    // Repo-relative path substring, same as find_symbol's. No schema
+    // description: the tools/list size cap (7500 B) has no room for it, and
+    // the result text says how to use it.
+    #[serde(default)]
+    pub path_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1691,6 +1699,8 @@ pub struct AstrolabeServer {
     /// Index generation each `find_symbol` query (offset and budget aside) was
     /// last served at, so a later page can say the index changed in between.
     symbol_page_generations: Arc<Mutex<HashMap<String, u64>>>,
+    /// Same for `resolve_context` pages.
+    context_page_generations: Arc<Mutex<HashMap<String, u64>>>,
     call_seq: Arc<AtomicU64>,
 }
 
@@ -1810,6 +1820,7 @@ impl AstrolabeServer {
             sent_ranges: Arc::new(Mutex::new(HashMap::new())),
             search_digests: Arc::new(Mutex::new(HashMap::new())),
             symbol_page_generations: Arc::new(Mutex::new(HashMap::new())),
+            context_page_generations: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -2017,12 +2028,15 @@ impl AstrolabeServer {
         )
     }
 
-    fn with_index(
+    /// Index access without a write barrier and without the per-query
+    /// coverage note: for `get_languages`, whose own body already carries the
+    /// full coverage block.
+    fn with_index_without_coverage_note(
         &self,
         hint: &str,
         f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
     ) -> CallToolResult {
-        self.with_index_barrier(hint, false, f)
+        self.with_index_barrier(hint, false, false, f)
     }
 
     fn with_fresh_index(
@@ -2030,13 +2044,14 @@ impl AstrolabeServer {
         hint: &str,
         f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
     ) -> CallToolResult {
-        self.with_index_barrier(hint, true, f)
+        self.with_index_barrier(hint, true, true, f)
     }
 
     fn with_index_barrier(
         &self,
         hint: &str,
         barrier: bool,
+        coverage_note: bool,
         f: impl FnOnce(&RootSession, &RepoIndex) -> CallToolResult,
     ) -> CallToolResult {
         if cancel::is_cancelled() {
@@ -2075,7 +2090,7 @@ impl AstrolabeServer {
             ),
             Snap::Ready(index) => {
                 let result = f(&session, &index);
-                match index.coverage_note() {
+                match coverage_note.then(|| index.coverage_note()).flatten() {
                     Some(note) if result.is_error != Some(true) => append_stale_note(result, &note),
                     _ => result,
                 }
@@ -2298,33 +2313,6 @@ impl AstrolabeServer {
             result.structured_content = Some(structured);
             self.finish_at(root, result)
         }
-    }
-
-    fn ranked_files(
-        &self,
-        index: &RepoIndex,
-        ids: impl IntoIterator<Item = FileId>,
-        budget: usize,
-        confidence: Confidence,
-    ) -> String {
-        let items: Vec<_> = ids.into_iter().filter_map(|id| index.file(id)).collect();
-        let (kept, omitted) = truncate_ranked(&items, budget, |file| {
-            format!("@{}:1 ({} LOC)\n", file.path, file.loc)
-        });
-        let mut text = format!(
-            "confidence: {:?} {}\n",
-            confidence,
-            confidence_note(confidence)
-        );
-        for file in kept {
-            text.push_str(&format!("@{}:1 ({} LOC)\n", file.path, file.loc));
-        }
-        if omitted > 0 {
-            text.push_str(&format!(
-                "{omitted} 个较低排名结果因 budget_tokens 被省略。\n"
-            ));
-        }
-        text
     }
 }
 
@@ -2585,21 +2573,21 @@ fn format_find_symbol_unindexed_hint(
 
 #[tool_router]
 impl AstrolabeServer {
-    #[tool(
-        description = "主入口：根据编码任务聚合最相关文件、骨架符号与依赖图谱。Ranks relevant files and symbols for a given task."
-    )]
+    #[tool(description = "主入口：按任务分页给出相关文件与符号。Task-ranked files/symbols.")]
     pub(crate) fn resolve_context(
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
     ) -> CallToolResult {
         let route = match self.resolve_route(
             params.root.as_deref(),
-            None,
+            params.path_filter.as_deref(),
             Some(&params.task_description),
         ) {
             Ok(route) => route,
             Err(err) => return err,
         };
+        let mut params = params;
+        params.path_filter = route.path.clone();
         let result = self.resolve_context_inner(params, &route.hint);
         Self::with_route_note(result, &route.note)
     }
@@ -2617,17 +2605,18 @@ impl AstrolabeServer {
             } else {
                 params.budget_tokens
             };
-            let (file_cap, symbol_cap) = if compact_task { (6, 6) } else { (20, 24) };
 
             // Repeat call with the same arguments on an unchanged index:
             // short pointer instead of resending the whole map.
             let dedup_on = session_dedup_enabled(params.dedup);
             let call = self.call_seq.fetch_add(1, Ordering::Relaxed) + 1;
             let key = format!(
-                "{}|resolve|{}|{}",
+                "{}|resolve|{}|{}|{}|{}",
                 session.root.display(),
                 params.task_description,
-                params.budget_tokens
+                params.budget_tokens,
+                params.offset,
+                params.path_filter.as_deref().unwrap_or("")
             );
             let generation = index.generation();
             if dedup_on {
@@ -2665,89 +2654,27 @@ impl AstrolabeServer {
 
             let base = cached_centrality(graph);
             let (ranked, matched) = rank_and_match(graph, &params.task_description, &base);
-            let mut ids: Vec<_> = graph.files.iter().map(|file| file.id).collect();
-            ids.sort_by(|a, b| {
-                ranked
-                    .by_file
-                    .get(b)
-                    .copied()
-                    .unwrap_or_default()
-                    .partial_cmp(&ranked.by_file.get(a).copied().unwrap_or_default())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.cmp(b))
-            });
-            // Symbols by file, in source order, built once.
-            let mut by_file: HashMap<FileId, Vec<usize>> = HashMap::new();
-            for (idx, symbol) in graph.symbols.iter().enumerate() {
-                by_file.entry(symbol.file).or_default().push(idx);
-            }
-            let relevant: BTreeSet<FileId> = matched
-                .files
-                .iter()
-                .copied()
-                .chain(matched.symbols.iter().map(|&i| graph.symbols[i].file))
-                .collect();
-
-            let mut body;
-            let mut omitted_symbols = 0;
-            let mut shown_symbols = 0;
-            if matched.is_empty() {
-                let top: Vec<FileId> = ids.iter().copied().take(5).collect();
-                body = self.ranked_files(index, top.iter().copied(), budget, Confidence::Unknown);
-                body.push_str(
-                    "未匹配到与任务相关的符号或文件：任务词没有命中任何文件名或符号名。上面 5 个只是仓库里依赖关系最中心的文件，与任务无关，不要据此判断相关性。\n建议：字面量/文案用 search_code，已知名字用 find_symbol。\n",
-                );
-            } else {
-                let shown: Vec<FileId> = ids
-                    .iter()
-                    .copied()
-                    .filter(|id| relevant.contains(id))
-                    .take(file_cap)
-                    .collect();
-                body = self.ranked_files(index, shown.iter().copied(), budget, Confidence::Scoped);
-            }
-            body.push_str(&format!(
+            let index_line = format!(
                 "index: scanned={}, parsed={}, parse_failures={}, unresolved_imports={}\n",
                 index.report().files_scanned,
                 index.report().files_parsed,
                 index.report().parse_failures.len(),
                 index.report().unresolved_imports.len()
-            ));
-            let mut top_files: Vec<String> = Vec::new();
-            if !matched.is_empty() {
-                let mut remaining =
-                    TokenBudget::new(budget.saturating_sub(estimate_tokens(&body)));
-                for id in ids.iter().copied().filter(|id| relevant.contains(id)).take(12) {
-                    let Some(file) = index.file(id) else { continue };
-                    if top_files.len() < 5 {
-                        top_files.push(file.path.to_string());
-                    }
-                    let all = by_file.get(&id).map(Vec::as_slice).unwrap_or_default();
-                    let mut picked: Vec<usize> = all
-                        .iter()
-                        .copied()
-                        .filter(|i| matched.symbols.contains(i))
-                        .collect();
-                    if picked.is_empty() {
-                        // Matched by file name only: a short skeleton.
-                        picked = all.iter().copied().take(2).collect();
-                    }
-                    for idx in picked.into_iter().take(4) {
-                        let line = format!("{}\n", symbol_line(&graph.symbols[idx], &file.path));
-                        if shown_symbols < symbol_cap && remaining.try_add(&line) {
-                            body.push_str(&line);
-                            shown_symbols += 1;
-                        } else {
-                            omitted_symbols += 1;
-                        }
-                    }
-                }
-            }
-            if omitted_symbols > 0 {
-                body.push_str(&format!(
-                    "{omitted_symbols} 个符号因 budget_tokens 或数量上限被省略。\n"
-                ));
-            }
+            );
+            let generation_note = self.context_page_drift_note(&params, generation);
+            let page = crate::context_page::build_page(&crate::context_page::PageRequest {
+                graph,
+                ranked: &ranked,
+                matched: &matched,
+                offset: params.offset,
+                budget,
+                compact: compact_task,
+                path_filter: params.path_filter.as_deref(),
+                index_line: &index_line,
+                generation_note: generation_note.as_deref(),
+            });
+            let mut body = page.body;
+            let top_files = page.top_files;
             body.push_str(next_step_hint(&params.task_description));
             if dedup_on {
                 let digest = if top_files.is_empty() {
@@ -2760,12 +2687,12 @@ impl AstrolabeServer {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key, digest);
             }
-            let conf_label = if matched.is_empty() { "unknown" } else { "scoped" };
+            let conf_label = if page.unmatched { "unknown" } else { "scoped" };
             self.result_on(
                 &session.root,
                 "resolve_context",
                 body,
-                json!({"confidence":conf_label,"matched":!matched.is_empty(),"budget_tokens":budget}),
+                json!({"confidence":conf_label,"matched":!page.unmatched,"budget_tokens":budget,"offset":params.offset,"total":page.total}),
                 Some(budget),
             )
         })
@@ -2873,6 +2800,29 @@ impl AstrolabeServer {
         let previous = map.insert(key, generation);
         (params.offset > 0 && previous.is_some_and(|g| g != generation)).then(|| {
             "注意：索引在翻页期间已更新（文件有改动并重新索引），本页边界可能与上一页错位（漏项或重复）；需要完整结果请用 offset=0 重新查询。\n".to_string()
+        })
+    }
+
+    /// `resolve_context` pages are cut from a ranking recomputed per call; see
+    /// `symbol_page_drift_note`.
+    fn context_page_drift_note(
+        &self,
+        params: &ResolveContextParams,
+        generation: u64,
+    ) -> Option<String> {
+        let key = format!(
+            "{}|{}|{}",
+            params.root.as_deref().unwrap_or(""),
+            params.task_description,
+            params.path_filter.as_deref().unwrap_or("")
+        );
+        let mut map = self.context_page_generations.lock().ok()?;
+        if map.len() > 256 {
+            map.clear();
+        }
+        let previous = map.insert(key, generation);
+        (params.offset > 0 && previous.is_some_and(|g| g != generation)).then(|| {
+            "注意：索引在翻页期间已更新，本页边界可能与上一页错位（漏项或重复）；需要完整结果请用 offset=0 重新查询。\n".to_string()
         })
     }
 
@@ -4016,7 +3966,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "统计仓库语言分布、代码规模及各语言 LSP 服务就绪状态 (Ready / needs_install / AST-only)。"
+        description = "语言分布、代码规模、LSP 就绪 (Ready/needs_install/AST-only)、索引缺口与语法错误文件。"
     )]
     pub(crate) fn get_languages(
         &self,
@@ -4031,7 +3981,7 @@ impl AstrolabeServer {
     }
 
     fn get_languages_inner(&self, params: BudgetOnly, hint: &str) -> CallToolResult {
-        self.with_index(hint, |session, index| {
+        self.with_index_without_coverage_note(hint, |session, index| {
             let mut totals: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
             for file in &index.graph().files {
                 if let Some(language) = file.language {
@@ -4087,35 +4037,21 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 种语言因 budget_tokens 被省略。\n"));
             }
-            body.push_str(&index.coverage_detail(50));
+            body.push_str(&index.coverage_detail());
             let unindexed = index.unindexed_code_exts(None);
             let excluded = index.excluded_source_paths();
             if !excluded.is_empty() {
-                let sample = excluded
-                    .iter()
-                    .take(3)
-                    .map(|p| p.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 body.push_str(&format!(
-                    "build-output-excluded source files: {} (e.g. {sample}; 被构建输出排除规则排除，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
+                    "build-output-excluded source files: {} (被构建输出排除规则排除，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
                     excluded.len()
                 ));
             }
-            if unindexed.is_empty() && excluded.is_empty() {
-                body.push_str("unindexed source files: none\n");
-            } else if unindexed.is_empty() {
-                body.push_str("unindexed source files: none in unsupported languages\n");
+            if unindexed.is_empty() {
+                body.push_str("unsupported-language source files: none\n");
             } else {
-                let mut list: Vec<(&String, &u32)> = unindexed.iter().collect();
-                list.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-                let items_str = list
-                    .into_iter()
-                    .map(|(ext, count)| format!(".{ext}×{count}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 body.push_str(&format!(
-                    "unindexed source files: {items_str} (语言暂不支持；这些文件不在符号/import 索引内，search_code/find_symbol 对其不可见，请用 Grep/Read)\n"
+                    "unsupported-language source files by type: {} (不在符号/import 索引内，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
+                    crate::coverage::unsupported_by_type(&unindexed)
                 ));
             }
             self.result_on(
@@ -4736,7 +4672,7 @@ mod tests {
             IndexState::Ready(i) => Arc::clone(i),
             _ => panic!("ready"),
         };
-        let result = server.with_index("", |_, _| {
+        let result = server.with_index_without_coverage_note("", |_, _| {
             // A watcher publishing a new index must not wait for this tool.
             let s2 = Arc::clone(&session);
             let handle = std::thread::spawn(move || {
@@ -4945,6 +4881,8 @@ mod tests {
             task_description: "alpha".into(),
             budget_tokens: 100,
             dedup: None,
+            offset: 0,
+            path_filter: None,
         })));
         assert_first_text(server.find_symbol(Parameters(QueryParams {
             root: None,
@@ -6170,6 +6108,8 @@ mod tests {
             task_description: "rename alpha".into(),
             budget_tokens: 2000,
             dedup: None,
+            offset: 0,
+            path_filter: None,
         }));
         let text = text_of(&result);
         let last = text.trim_end().lines().last().unwrap_or_default();
@@ -6182,6 +6122,8 @@ mod tests {
             task_description: task.into(),
             budget_tokens: budget,
             dedup,
+            offset: 0,
+            path_filter: None,
         }
     }
 
@@ -6203,6 +6145,54 @@ mod tests {
         let refs: Vec<(&str, String)> =
             files.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
         smart_server(&refs)
+    }
+
+    #[test]
+    fn resolve_context_pages_via_offset_and_warns_when_index_changed() {
+        let files: Vec<(String, String)> = (0..80)
+            .map(|i| {
+                (
+                    format!("pkg{}/mod{i}.py", i % 4),
+                    format!("def widget_handler_{i}():\n    return {i}\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let task = "fix the widget handler";
+        let page = |offset: usize| {
+            let mut p = rc(task, 2500, Some(false));
+            p.offset = offset;
+            text_of(&server.resolve_context(Parameters(p)))
+        };
+        let first = page(0);
+        assert!(first.contains("匹配 80 个文件"), "{first}");
+        assert!(first.contains("（offset=25）"), "{first}");
+        assert!(!first.contains("翻页期间"), "{first}");
+        let second = page(25);
+        assert!(second.contains("本页第 26–50"), "{second}");
+        assert!(!second.contains("翻页期间"), "{second}");
+        let p1: BTreeSet<&str> = first.lines().filter(|l| l.starts_with('@')).collect();
+        assert!(second
+            .lines()
+            .filter(|l| l.starts_with('@'))
+            .all(|l| !p1.contains(l)));
+        *server.primary.state.write().unwrap() =
+            IndexState::Ready(Arc::new(crate::index::build(&dir).expect("index")));
+        let drifted = page(50);
+        assert!(drifted.contains("翻页期间"), "{drifted}");
+        assert!(!page(50).contains("翻页期间"));
+        // path_filter narrows instead of paging.
+        let mut p = rc(task, 2500, Some(false));
+        p.path_filter = Some("pkg1/".into());
+        let narrowed = text_of(&server.resolve_context(Parameters(p)));
+        assert!(narrowed.contains("匹配 20 个文件"), "{narrowed}");
+        assert!(narrowed
+            .lines()
+            .filter(|l| l.starts_with('@'))
+            .all(|l| l.starts_with("@pkg1/")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6410,6 +6400,38 @@ mod tests {
             DEFAULT_MEMORY_BUDGET_BYTES
         );
         assert_eq!(parse_cache_budget_mb(Some("0")), 0);
+    }
+
+    #[test]
+    fn get_languages_does_not_repeat_the_per_query_coverage_note() {
+        let (server, dir) = smart_server(&[
+            ("ok.py", "def fine():\n    return 1\n".to_string()),
+            ("bad.py", "def broken(:\n    pass\n".to_string()),
+        ]);
+        let note = {
+            let state = server.primary.state.read().unwrap();
+            let IndexState::Ready(index) = &*state else {
+                panic!("index not ready")
+            };
+            index.coverage_note().expect("partial parse yields a note")
+        };
+        let languages = server.get_languages(Parameters(BudgetOnly {
+            root: None,
+            budget_tokens: 1000,
+        }));
+        let text = languages.content[0].as_text().unwrap().text.as_str();
+        assert!(text.contains("syntax/compile errors: 1"), "{text}");
+        assert!(
+            !text.contains(&note),
+            "note duplicated in get_languages: {text}"
+        );
+        let search = server.search_code(Parameters(search("fine")));
+        let search_text = search.content[0].as_text().unwrap().text.as_str();
+        assert!(
+            search_text.contains(&note),
+            "other tools keep the note: {search_text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8270,11 +8292,11 @@ mod tests {
             "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, visualbasic, kotlin, shell, ruby, lua"
         );
         assert!(
-            langs_text.contains("unindexed source files: .scala×3"),
+            langs_text.contains("unsupported-language source files by type: .scala×3"),
             "{langs_text}"
         );
         assert!(
-            langs_text.contains("语言暂不支持；这些文件不在符号/import 索引内"),
+            langs_text.contains("不在符号/import 索引内，search_code/find_symbol 对其不可见"),
             "{langs_text}"
         );
 
@@ -8530,7 +8552,7 @@ mod tests {
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
         assert!(
-            langs_text.contains("unindexed source files: .scala×2"),
+            langs_text.contains("unsupported-language source files by type: .scala×2"),
             "{langs_text}"
         );
 
@@ -8553,7 +8575,7 @@ mod tests {
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
         assert!(
-            langs_text.contains("unindexed source files: none"),
+            langs_text.contains("unsupported-language source files: none"),
             "{langs_text}"
         );
 
@@ -8794,6 +8816,8 @@ mod mcp_routing_tests {
             task_description: "set up a web server".into(),
             budget_tokens: 400,
             dedup: None,
+            offset: 0,
+            path_filter: None,
         })));
         assert!(prose.contains("无法路由"), "{prose}");
         // A distinctive name routes, and the result says it was a guess.
@@ -8803,6 +8827,8 @@ mod mcp_routing_tests {
                 task_description: "fix the invoice rounding in billing".into(),
                 budget_tokens: 400,
                 dedup: None,
+                offset: 0,
+                path_filter: None,
             }))
         });
         assert!(

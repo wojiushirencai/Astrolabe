@@ -568,7 +568,7 @@ impl Store {
 /// same bytes (new captures, different anchors/kinds). The parse cache is
 /// keyed by content hash, so without this an upgraded binary keeps serving
 /// symbols extracted by the old version until each file is edited.
-pub const EXTRACTOR_VERSION: u32 = 3;
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// Cache key for a parsed file: extractor version, crate version, language
 /// and content hash.
@@ -726,6 +726,14 @@ struct ParsedWire {
     symbols: Vec<SymbolWire>,
     imports: Vec<String>,
     calls: Vec<(String, u32)>,
+    /// Parsed with syntax errors (still in the index). Cached like a clean
+    /// parse so a file that stays broken is not re-parsed on every start;
+    /// the flag rides along so the coverage report survives a cache hit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    partial: bool,
+    /// C / C++ parse of the `cfamily` rewrite (see `ParsedFile`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    c_family_rewrite: bool,
 }
 
 impl From<&crate::parse::ParsedFile> for ParsedWire {
@@ -734,6 +742,8 @@ impl From<&crate::parse::ParsedFile> for ParsedWire {
             symbols: parsed.symbols.iter().map(SymbolWire::from).collect(),
             imports: parsed.imports.clone(),
             calls: parsed.calls.clone(),
+            partial: parsed.partial,
+            c_family_rewrite: parsed.c_family_rewrite,
         }
     }
 }
@@ -744,8 +754,8 @@ impl From<ParsedWire> for crate::parse::ParsedFile {
             symbols: parsed.symbols.into_iter().map(CodeSymbol::from).collect(),
             imports: parsed.imports,
             calls: parsed.calls,
-            // Partial parses are never cached (see index::parse_one).
-            partial: false,
+            partial: parsed.partial,
+            c_family_rewrite: parsed.c_family_rewrite,
         }
     }
 }
@@ -1099,6 +1109,7 @@ mod tests {
             imports: vec!["fmt".into()],
             calls: vec![("Println".into(), 2)],
             partial: false,
+            c_family_rewrite: false,
         };
         let bytes = encode_parsed(&parsed).unwrap();
         let key = parse_cache_key(Language::Go, "abc");
@@ -1109,6 +1120,26 @@ mod tests {
         assert_eq!(loaded.symbols[0].name, "Hello");
         assert_eq!(loaded.symbols[0].kind, SymbolKind::Function);
         assert!(loaded.symbols[0].exported);
+    }
+
+    #[test]
+    fn partial_flag_round_trips_and_defaults_to_clean() {
+        let mut parsed = crate::parse::ParsedFile {
+            symbols: vec![],
+            imports: vec![],
+            calls: vec![],
+            partial: true,
+            c_family_rewrite: false,
+        };
+        let bytes = encode_parsed(&parsed).unwrap();
+        assert!(decode_parsed(&bytes).unwrap().partial);
+        parsed.partial = false;
+        let clean = encode_parsed(&parsed).unwrap();
+        assert!(!decode_parsed(&clean).unwrap().partial);
+        // Clean payloads do not carry the field at all.
+        assert!(!String::from_utf8_lossy(&clean).contains("partial"));
+        let legacy = br#"{"symbols":[],"imports":[],"calls":[]}"#;
+        assert!(!decode_parsed(legacy).unwrap().partial);
     }
 
     #[test]

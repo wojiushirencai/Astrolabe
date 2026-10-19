@@ -30,6 +30,9 @@ use tree_sitter::{Parser, Query, QueryCursor, QueryCursorOptions, StreamingItera
 pub mod queries;
 mod razor;
 mod vue;
+
+mod cfamily;
+mod csharp_pp;
 // lang-batch-8 per-language hooks (one file per worker).
 mod dart;
 mod decor;
@@ -37,9 +40,12 @@ mod kotlin;
 mod lua;
 mod objc;
 pub use objc::header_language as objc_header_language;
+mod diag;
 mod ruby;
 mod shell;
 mod swift;
+pub use diag::{diagnose_indexed_syntax, diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
+mod ts_variance;
 
 pub(crate) use razor::extract_razor_csharp;
 
@@ -91,8 +97,14 @@ pub struct ParsedFile {
     pub calls: Vec<(String, u32)>,
     /// The syntax tree contained ERROR / MISSING nodes, so `symbols`,
     /// `imports` and `calls` may be incomplete. The result is still usable;
-    /// the indexer reports it in `parse_failures` and does not cache it.
+    /// the indexer reports it in `partial_parses` (not `parse_failures`);
+    /// it is cached like a clean parse, flag included.
     pub partial: bool,
+    /// C / C++: this result is the parse of the `cfamily.rs` rewrite of the
+    /// source (same bytes per line), not of the raw text. Diagnostics of a
+    /// still-partial file must then look at that rewrite
+    /// ([`diagnose_indexed_syntax`]).
+    pub c_family_rewrite: bool,
 }
 
 /// Parser pool. Holds reusable `Parser`s per language.
@@ -174,6 +186,14 @@ impl ParserPool {
         path: &RelPath,
         source: &str,
     ) -> Result<ParsedFile, ParseError> {
+        // A preprocessor directive on the last line without a trailing
+        // newline (`#pragma warning restore 618<EOF>`) makes the C-family
+        // grammars flag the whole file as erroneous although every symbol is
+        // extracted. Terminate it; offsets and lines are unchanged.
+        if needs_eof_newline(lang, source) {
+            let fixed = format!("{source}\n");
+            return self.parse(lang, path, &fixed);
+        }
         // Vue SFCs: embedded <script> extraction (no tree-sitter-vue on ABI 0.27).
         if lang == Language::Vue {
             return vue::parse_sfc(self, path, source);
@@ -217,6 +237,37 @@ impl ParserPool {
             }
         }
         let parsed = self.parse_raw(lang, path, source)?;
+        // C / C++: only when the first pass has errors, retry after
+        // length-preserving rewrites (comments in multi-line `#define`,
+        // `__has_include(<x>)`, `__cplusplus`-guarded `extern "C"` braces,
+        // well-known library macros). See `cfamily.rs`.
+        if parsed.partial && matches!(lang, Language::C | Language::Cpp) {
+            if let Some(mut retry) =
+                cfamily::retry(lang, source, &parsed, |s| self.parse_raw(lang, path, s))
+            {
+                retry.c_family_rewrite = true;
+                return Ok(retry);
+            }
+        }
+        // C# / VB: `#if` that splits a declaration, and .NET 10 `#:` lines,
+        // are ERROR nodes. Only on a partial first pass, blank inactive
+        // branches and `#:` lines (same length) and keep the retry if it is
+        // clean. Blanked branches' `using`s stay (import edges are a union).
+        if parsed.partial && matches!(lang, Language::CSharp | Language::VisualBasic) {
+            let fixed = if lang == Language::CSharp {
+                csharp_pp::blank_inactive(source)
+            } else {
+                csharp_pp::blank_inactive_vb(source)
+            };
+            if let Some(fixed) = fixed {
+                if let Ok(mut retry) = self.parse_raw(lang, path, &fixed) {
+                    if !retry.partial {
+                        retry.imports = csharp_pp::union_imports(parsed.imports, retry.imports);
+                        return Ok(retry);
+                    }
+                }
+            }
+        }
         // TS import types in generics (`f<typeof import('x')>()`,
         // `Ref<import('vue').Ref<T>>`) make tree-sitter-typescript emit ERROR
         // nodes. Only when the first pass is partial, blank those
@@ -224,7 +275,19 @@ impl ParserPool {
         // the retry only if it parses cleanly. Dynamic `import()` calls are
         // never touched (see `normalize_import_types`).
         if parsed.partial && matches!(lang, Language::TypeScript | Language::Tsx) {
-            if let Some(fixed) = normalize_import_types(source) {
+            // TS 4.7 variance (`interface I<in T, out U>`): same-length blank
+            // of the keywords, kept only when the retry is clean. Also the
+            // base for the import-type retry so both fixes can combine.
+            let variance = ts_variance::normalize_variance(source);
+            if let Some(fixed) = &variance {
+                if let Ok(retry) = self.parse_raw(lang, path, fixed) {
+                    if !retry.partial {
+                        return Ok(retry);
+                    }
+                }
+            }
+            let base = variance.as_deref().unwrap_or(source);
+            if let Some(fixed) = normalize_import_types(base) {
                 if let Ok(retry) = self.parse_raw(lang, path, &fixed) {
                     if !retry.partial {
                         return Ok(retry);
@@ -308,6 +371,7 @@ impl ParserPool {
             imports,
             calls,
             partial,
+            c_family_rewrite: false,
         })
     }
 }
@@ -519,6 +583,32 @@ fn configured_parser(lang: Language) -> Result<Parser, ParseError> {
         .set_language(&language)
         .map_err(|_| ParseError::NoGrammar(lang))?;
     Ok(parser)
+}
+
+/// True when `source` ends in a C-family preprocessor line with no newline.
+fn needs_eof_newline(lang: Language, source: &str) -> bool {
+    matches!(
+        lang,
+        Language::C
+            | Language::Cpp
+            | Language::ObjC
+            | Language::ObjCpp
+            | Language::CSharp
+            | Language::VisualBasic
+    ) && !source.is_empty()
+        && !source.ends_with('\n')
+        && source
+            .rsplit('\n')
+            .next()
+            .is_some_and(|last| last.trim_start().starts_with('#'))
+}
+
+/// Locate the first syntax error of `source` for diagnostics: `(1-based line,
+/// description)`. Best effort, see [`diagnose_syntax`] (which also gives the
+/// error kind): `None` for languages without a plain grammar (Vue) or when
+/// the raw parse is clean.
+pub fn first_syntax_error(lang: Language, source: &str) -> Option<(u32, String)> {
+    diagnose_syntax(lang, source).map(|d| (d.line, d.what))
 }
 
 fn query_error(error: tree_sitter::QueryError) -> ParseError {
@@ -1816,6 +1906,32 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             );
             assert!(!p.symbols.iter().any(|s| s.name == "j"), "{lang:?}");
         }
+    }
+
+    #[test]
+    fn trailing_directive_without_newline_is_not_partial() {
+        let pool = ParserPool::new();
+        let src = "#pragma warning disable 618\nnamespace N {\n    public class C { public void M() {} }\n}\n#pragma warning restore 618";
+        let parsed = pool
+            .parse(Language::CSharp, &RelPath::new("C.cs"), src)
+            .unwrap();
+        assert!(!parsed.partial, "EOF directive flagged the file partial");
+        assert!(parsed.symbols.iter().any(|s| s.name == "M"));
+        assert_eq!(first_syntax_error(Language::CSharp, src), None);
+        let c = "int f(void) { return 0; }\n#endif";
+        assert!(!needs_eof_newline(Language::Python, "x = 1\n# c"));
+        assert!(needs_eof_newline(Language::C, c));
+    }
+
+    #[test]
+    fn first_syntax_error_reports_line() {
+        let (line, what) = first_syntax_error(Language::Python, "def a():\n    pass\n\ndef b(:\n")
+            .expect("error located");
+        assert_eq!(line, 4, "{what}");
+        assert_eq!(
+            first_syntax_error(Language::Python, "def a():\n    pass\n"),
+            None
+        );
     }
 
     #[test]

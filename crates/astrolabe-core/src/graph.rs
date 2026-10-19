@@ -21,7 +21,7 @@
 
 use crate::types::{CodeEdge, CodeFile, CodeSymbol, EdgeKind, FileId};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const PAGERANK_DAMPING: f64 = 0.85;
 pub const PAGERANK_ITERATIONS: usize = 40;
@@ -69,44 +69,153 @@ pub fn compute_centrality(g: &CodeGraph) -> Centrality {
 /// centrality. A file path mentioned in `task` is treated as already being in
 /// context, because the public API intentionally has no separate context list.
 pub fn rank_for_task(g: &CodeGraph, task: &str, base: &Centrality) -> Centrality {
-    let files = sorted_files(g);
-    let n = files.len();
-    if n == 0 {
-        return Centrality::default();
-    }
-
-    let task_words = split_words(task);
-    let task_compact: String = compact_lower(task);
-    let hits = symbol_hits(g, &task_words, &task_compact);
-    rank_with_hits(g, task, base, &task_words, &task_compact, &hits)
+    rank_and_match(g, task, base).0
 }
 
 /// `rank_for_task` and `match_task` in one pass over the symbols.
 pub fn rank_and_match(g: &CodeGraph, task: &str, base: &Centrality) -> (Centrality, TaskMatch) {
     let task_words = split_words(task);
     let task_compact = compact_lower(task);
-    let hits = symbol_hits(g, &task_words, &task_compact);
+    let hits = symbol_hits(g, task, &task_words, &task_compact);
     let ranked = rank_with_hits(g, task, base, &task_words, &task_compact, &hits);
-    let mut m = match_task_files(g, task, &task_words, &task_compact);
-    for h in &hits {
-        if (h.explicit && h.compact_len >= 4) || h.split {
-            m.symbols.insert(h.idx);
-        }
-    }
+    let m = task_match(g, task, &task_words, &task_compact, &hits);
     (ranked, m)
 }
 
-/// One symbol that matches the task (explicit with min len 3, or split).
-struct SymHit {
-    idx: usize,
-    compact_len: usize,
-    explicit: bool,
-    split: bool,
+fn task_match(
+    g: &CodeGraph,
+    task: &str,
+    task_words: &BTreeSet<String>,
+    task_compact: &str,
+    hits: &[SymHit],
+) -> TaskMatch {
+    let mut m = match_task_files(g, task, task_words, task_compact);
+    let mut exact_ids: HashSet<u32> = HashSet::new();
+    for h in hits {
+        m.symbols.insert(h.idx);
+        if h.strength >= STRENGTH_EXACT {
+            m.exact_files.insert(g.symbols[h.idx].file);
+            exact_ids.insert(g.symbols[h.idx].id.0);
+        }
+    }
+    if !m.exact_files.is_empty() {
+        // The test file next to a file the task names (`quiet.go` ->
+        // `quiet_test.go`, `a.ts` -> `a.test.ts`) is where its behaviour is
+        // pinned down: same tier as callers.
+        let keys: HashSet<(&str, String)> = g
+            .files
+            .iter()
+            .filter(|f| m.exact_files.contains(&f.id))
+            .map(|f| (f.path.dir(), stem_lower(f)))
+            .collect();
+        for f in &g.files {
+            if m.exact_files.contains(&f.id) {
+                continue;
+            }
+            let stem = stem_lower(f);
+            let base = test_base(&stem);
+            if base.is_some_and(|b| keys.contains(&(f.path.dir(), b.to_string()))) {
+                m.caller_files.insert(f.id);
+            }
+        }
+    }
+    if !exact_ids.is_empty() {
+        // Name-matched call edges into the identifier the task spells out:
+        // their files are where "call sites of X" live.
+        let callers: HashSet<u32> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Call && exact_ids.contains(&e.to))
+            .map(|e| e.from)
+            .collect();
+        if !callers.is_empty() {
+            for (idx, symbol) in g.symbols.iter().enumerate() {
+                if callers.contains(&symbol.id.0) && !m.exact_files.contains(&symbol.file) {
+                    m.caller_files.insert(symbol.file);
+                    m.caller_symbols.insert(idx);
+                }
+            }
+        }
+    }
+    m
 }
 
-fn symbol_hits(g: &CodeGraph, task_words: &BTreeSet<String>, task_compact: &str) -> Vec<SymHit> {
+/// A sub-word that names at least this share of all symbols (and at least
+/// `GENERIC_MIN_DF` of them) cannot select a symbol on its own: in a repo
+/// where `channel` occurs in thousands of names it says nothing.
+const GENERIC_MIN_DF: usize = 40;
+const GENERIC_DF_DIVISOR: usize = 64;
+/// A one-word symbol (`Form`, `call`) matching one task word is only a strong
+/// hit when that word is this rare among symbol names.
+const RARE_DF: usize = 8;
+/// Function words of a task description. Backs up the df test on small repos,
+/// where no word reaches `GENERIC_MIN_DF`.
+const STOP_WORDS: &[&str] = &[
+    "the", "how", "does", "what", "where", "when", "which", "that", "this", "with", "from", "into",
+    "and", "for", "are", "was", "not", "all", "any", "can", "should", "would", "could", "there",
+    "their", "about", "have", "has", "been", "will", "you", "why", "who", "get", "set", "use",
+    "add", "make", "new", "fix", "need", "want", "work", "works", "code", "file", "files",
+];
+
+/// Hit strengths. A file's boost is `10^strength` of its strongest symbol (not
+/// a product over symbols: a file with seven weak hits must not outrank the
+/// file that defines the identifier the task spells out).
+const STRENGTH_WEAK: f64 = 1.0;
+const STRENGTH_SPLIT: f64 = 2.0;
+const STRENGTH_EXPLICIT: f64 = 3.0;
+const STRENGTH_EXACT: f64 = 4.0;
+
+/// One symbol that matches the task.
+struct SymHit {
+    idx: usize,
+    strength: f64,
+}
+
+fn word_set_has(words: &BTreeSet<String>, w: &str) -> bool {
+    words.contains(w)
+}
+
+/// Identifier-looking tokens of the raw task (`processChannelError`,
+/// `snake_case`) vs plain words, compacted and lowercased. The flag says the
+/// token is identifier-shaped (camel/snake), so an exact name match counts even
+/// when its sub-words are common.
+fn task_tokens(task: &str) -> HashMap<String, bool> {
+    let mut out: HashMap<String, bool> = HashMap::new();
+    for tok in task.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let compact = compact_lower(tok);
+        if compact.len() < 4 {
+            continue;
+        }
+        let chars: Vec<char> = tok.chars().collect();
+        let shaped = tok.contains('_')
+            || chars
+                .windows(2)
+                .any(|w| w[0].is_lowercase() && w[1].is_uppercase());
+        let e = out.entry(compact).or_insert(false);
+        *e |= shaped;
+    }
+    out
+}
+
+fn symbol_hits(
+    g: &CodeGraph,
+    task: &str,
+    task_words: &BTreeSet<String>,
+    task_compact: &str,
+) -> Vec<SymHit> {
+    struct Cand {
+        idx: usize,
+        compact_len: usize,
+        explicit: bool,
+        exact: Option<bool>,
+        /// Sub-words of the name (>= 3 bytes) that the task also contains.
+        matched: Vec<String>,
+        meaningful: usize,
+    }
+    let tokens = task_tokens(task);
     let mut buf = String::new();
-    let mut hits = Vec::new();
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut df: HashMap<String, usize> = HashMap::new();
     for (idx, symbol) in g.symbols.iter().enumerate() {
         buf.clear();
         buf.extend(
@@ -116,15 +225,93 @@ fn symbol_hits(g: &CodeGraph, task_words: &BTreeSet<String>, task_compact: &str)
                 .filter(|c| c.is_alphanumeric())
                 .flat_map(char::to_lowercase),
         );
-        let (explicit, split) = symbol_matches(&symbol.name, &buf, task_words, task_compact, 3);
-        if explicit || split {
-            hits.push(SymHit {
-                idx,
-                compact_len: buf.len(),
-                explicit,
-                split,
+        let explicit = buf.len() >= 3 && task_compact.contains(buf.as_str());
+        let exact = tokens.get(buf.as_str()).copied();
+        // Every name word is a contiguous run of `buf`, so a task word that
+        // is not a substring of it cannot match; skip the allocation-heavy
+        // `split_words` for the vast majority of symbols (ASCII only, so
+        // lowercase folding is identical).
+        if buf.is_ascii()
+            && !explicit
+            && exact.is_none()
+            && !task_words
+                .iter()
+                .any(|w| w.len() >= 3 && buf.contains(w.as_str()))
+        {
+            continue;
+        }
+        let words = split_words(&symbol.name);
+        let meaningful: Vec<&String> = words.iter().filter(|w| w.len() >= 3).collect();
+        let matched: Vec<String> = meaningful
+            .iter()
+            .filter(|w| word_set_has(task_words, w))
+            .map(|w| (*w).clone())
+            .collect();
+        for w in &matched {
+            *df.entry(w.clone()).or_default() += 1;
+        }
+        if !explicit && exact.is_none() && matched.is_empty() {
+            continue;
+        }
+        cands.push(Cand {
+            idx,
+            compact_len: buf.len(),
+            explicit,
+            exact,
+            matched,
+            meaningful: meaningful.len(),
+        });
+    }
+    let threshold = GENERIC_MIN_DF.max(g.symbols.len() / GENERIC_DF_DIVISOR);
+    let generic = |w: &str| STOP_WORDS.contains(&w) || df.get(w).copied().unwrap_or(0) >= threshold;
+    let mut hits = Vec::new();
+    // When every task word is frequent in this repo, the df test would leave
+    // nothing; fall back to symbols that carry two (or all) of the task's
+    // non-stop words, at the weakest strength.
+    let mut fallback = Vec::new();
+    for c in cands {
+        let content = c
+            .matched
+            .iter()
+            .filter(|w| !STOP_WORDS.contains(&w.as_str()))
+            .count();
+        if content >= 1 && content >= c.meaningful.min(2) {
+            fallback.push(SymHit {
+                idx: c.idx,
+                strength: STRENGTH_WEAK,
             });
         }
+        let specific = c.matched.iter().filter(|w| !generic(w)).count();
+        // A plain word (`call`, `answer`) equal to a symbol name is common
+        // English, not an identifier the task spells out: only camelCase /
+        // snake_case tokens get the exact tier.
+        let strength = if c.exact == Some(true) {
+            STRENGTH_EXACT
+        } else if c.explicit
+            && c.compact_len >= 4
+            && (specific > 0 || (c.matched.is_empty() && c.meaningful >= 2))
+        {
+            STRENGTH_EXPLICIT
+        } else if specific >= 2
+            || (specific == 1
+                && c.meaningful == 1
+                && c.matched
+                    .iter()
+                    .any(|w| df.get(w).copied().unwrap_or(0) <= RARE_DF))
+        {
+            STRENGTH_SPLIT
+        } else if specific >= 1 {
+            STRENGTH_WEAK
+        } else {
+            continue;
+        };
+        hits.push(SymHit {
+            idx: c.idx,
+            strength,
+        });
+    }
+    if hits.is_empty() {
+        return fallback;
     }
     hits
 }
@@ -144,32 +331,19 @@ fn rank_with_hits(
     }
     let mut boosts = vec![1.0; n];
     let positions = file_positions(&files);
-    // Only matching symbols touch `boosts`; sort just those, in the same
-    // (file, line, name, id) order as before.
-    let mut matched: Vec<(&CodeSymbol, usize)> = hits
-        .iter()
-        .map(|h| (&g.symbols[h.idx], h.compact_len))
-        .collect();
-    matched.sort_by(|(a, _), (b, _)| {
-        a.file
-            .cmp(&b.file)
-            .then_with(|| a.start_line.cmp(&b.start_line))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    for (symbol, compact_len) in matched {
-        let Some(&i) = positions.get(&symbol.file) else {
+    // Per file: its strongest hit sets the boost; the number of hits adds a
+    // small logarithmic bonus. Never a product over symbols.
+    let mut best: Vec<(f64, usize)> = vec![(0.0, 0); n];
+    for h in hits {
+        let Some(&i) = positions.get(&g.symbols[h.idx].file) else {
             continue;
         };
-        boosts[i] *= 10.0;
-        if compact_len >= 12
-            || split_words(&symbol.name)
-                .iter()
-                .filter(|word| word.len() >= 3)
-                .count()
-                >= 3
-        {
-            boosts[i] *= 10.0;
+        best[i].0 = best[i].0.max(h.strength);
+        best[i].1 += 1;
+    }
+    for (i, &(strength, count)) in best.iter().enumerate() {
+        if count > 0 {
+            boosts[i] = 10f64.powf(strength) * (1.0 + (count as f64).ln());
         }
     }
 
@@ -329,40 +503,6 @@ fn compact_lower(text: &str) -> String {
         .collect()
 }
 
-/// `(explicit, split)` name-vs-task matches for one symbol. `explicit` means
-/// the whole compacted name (>= `min_explicit_len` chars) occurs in the task;
-/// `split` means the name's words occur among the task's words.
-fn symbol_matches(
-    name: &str,
-    compact: &str,
-    task_words: &BTreeSet<String>,
-    task_compact: &str,
-    min_explicit_len: usize,
-) -> (bool, bool) {
-    let explicit_match = compact.len() >= min_explicit_len && task_compact.contains(compact);
-    // A split match needs at least one task word (>= 3 bytes) inside the
-    // name; every name word is a contiguous run of `compact`. Skipping the
-    // allocation-heavy `split_words` for the vast majority of symbols keeps
-    // resolve_context fast on large graphs. ASCII names only, so lowercase
-    // folding is identical.
-    if compact.is_ascii()
-        && !task_words
-            .iter()
-            .any(|w| w.len() >= 3 && compact.contains(w.as_str()))
-    {
-        return (explicit_match, false);
-    }
-    let words = split_words(name);
-    let meaningful: Vec<&String> = words.iter().filter(|word| word.len() >= 3).collect();
-    let split_match = !meaningful.is_empty()
-        && meaningful
-            .iter()
-            .filter(|word| task_words.contains((*word).as_str()))
-            .count()
-            >= meaningful.len().min(2);
-    (explicit_match, split_match)
-}
-
 fn is_path_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
 }
@@ -413,6 +553,20 @@ fn stem_matches(file: &CodeFile, task_words: &BTreeSet<String>, task_compact: &s
     words_hit || (compact.len() >= 6 && task_compact.contains(&compact))
 }
 
+fn stem_lower(f: &CodeFile) -> String {
+    let name = f.path.file_name();
+    name.split('.').next().unwrap_or(name).to_lowercase()
+}
+
+/// `quiet_test` / `quiet.test` (first segment `quiet`) / `test_quiet` /
+/// `QuietTest` -> `quiet`.
+fn test_base(stem: &str) -> Option<&str> {
+    stem.strip_suffix("_test")
+        .or_else(|| stem.strip_suffix("test"))
+        .or_else(|| stem.strip_prefix("test_"))
+        .filter(|b| !b.is_empty())
+}
+
 /// Files and symbols that the task text actually names (strict predicates:
 /// path/name boundary match, file-stem words, whole-name symbol hits). Empty
 /// result means the task matched nothing and any ranking is pure centrality.
@@ -421,6 +575,13 @@ pub struct TaskMatch {
     pub files: BTreeSet<FileId>,
     /// Indexes into `CodeGraph::symbols`.
     pub symbols: BTreeSet<usize>,
+    /// Files that define a symbol named exactly as an identifier in the task,
+    /// or that the task names by path: they lead every ranking.
+    pub exact_files: BTreeSet<FileId>,
+    /// Files with a (name-matched) call into one of those symbols.
+    pub caller_files: BTreeSet<FileId>,
+    /// The calling symbols themselves (indexes into `CodeGraph::symbols`).
+    pub caller_symbols: BTreeSet<usize>,
 }
 
 impl TaskMatch {
@@ -438,8 +599,13 @@ fn match_task_files(
     let task_lower = task.to_lowercase();
     let mut out = TaskMatch::default();
     for file in &g.files {
-        if file_mentioned(&task_lower, file) || stem_matches(file, task_words, task_compact) {
+        let mentioned = file_mentioned(&task_lower, file);
+        if mentioned || stem_matches(file, task_words, task_compact) {
             out.files.insert(file.id);
+        }
+        // Only a full path is unambiguous (`provider.go` may name ten files).
+        if mentioned && mentions_path(&task_lower, &file.path.as_str().to_lowercase()) {
+            out.exact_files.insert(file.id);
         }
     }
     out
@@ -448,13 +614,8 @@ fn match_task_files(
 pub fn match_task(g: &CodeGraph, task: &str) -> TaskMatch {
     let task_words = split_words(task);
     let task_compact = compact_lower(task);
-    let mut m = match_task_files(g, task, &task_words, &task_compact);
-    for h in symbol_hits(g, &task_words, &task_compact) {
-        if (h.explicit && h.compact_len >= 4) || h.split {
-            m.symbols.insert(h.idx);
-        }
-    }
-    m
+    let hits = symbol_hits(g, task, &task_words, &task_compact);
+    task_match(g, task, &task_words, &task_compact, &hits)
 }
 
 fn split_words(text: &str) -> BTreeSet<String> {
@@ -826,49 +987,6 @@ mod tests {
     }
 
     #[test]
-    fn symbol_matches_prefilter_keeps_results() {
-        // Reference: the unfiltered definition.
-        fn reference(name: &str, tw: &BTreeSet<String>, tc: &str, min: usize) -> (bool, bool) {
-            let words = split_words(name);
-            let meaningful: Vec<&String> = words.iter().filter(|w| w.len() >= 3).collect();
-            let split = !meaningful.is_empty()
-                && meaningful
-                    .iter()
-                    .filter(|w| tw.contains((*w).as_str()))
-                    .count()
-                    >= meaningful.len().min(2);
-            let c = compact_lower(name);
-            (c.len() >= min && tc.contains(&c), split)
-        }
-        let task = "how does the JsonSerializer handle errors in redis cluster";
-        let tw = split_words(task);
-        let tc = compact_lower(task);
-        for name in [
-            "JsonSerializer",
-            "serialize",
-            "ErrorHandler",
-            "handle",
-            "RedisCluster",
-            "cluster",
-            "x",
-            "run",
-            "HTTPServer",
-            "is_json",
-            "Json",
-            "errors",
-            "Zzz",
-            "über_cluster",
-        ] {
-            let c = compact_lower(name);
-            assert_eq!(
-                symbol_matches(name, &c, &tw, &tc, 4),
-                reference(name, &tw, &tc, 4),
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
     fn rank_and_match_equals_separate_rank_and_match_passes() {
         let mut g = graph(vec![import(0, 1), import(2, 1), import(0, 2)]);
         let names = [
@@ -923,5 +1041,131 @@ mod tests {
         assert!(none.is_empty());
         let (_, some) = rank_and_match(&g, "fix the stripe webhook processing", &base);
         assert!(!some.symbols.is_empty());
+    }
+
+    fn sym(i: u32, file: u32, name: &str) -> CodeSymbol {
+        CodeSymbol {
+            id: SymbolId(i),
+            file: FileId(file),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            signature: String::new(),
+            start_line: i + 1,
+            end_line: i + 1,
+            exported: true,
+        }
+    }
+
+    fn named_graph(paths: &[&str], symbols: &[(u32, &str)]) -> CodeGraph {
+        CodeGraph {
+            files: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| file(i as u32, p))
+                .collect(),
+            symbols: symbols
+                .iter()
+                .enumerate()
+                .map(|(i, (f, n))| sym(i as u32, *f, n))
+                .collect(),
+            edges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn many_weak_hits_do_not_outrank_the_exact_identifier_file() {
+        // channel.go has seven symbols that only share common sub-words with
+        // the task; relay.go defines the identifier the task spells out.
+        let mut syms: Vec<(u32, &str)> = vec![
+            (0, "ChannelError"),
+            (0, "channelErrorCode"),
+            (0, "processChannel"),
+            (0, "ErrorChannel"),
+            (0, "channelProcess"),
+            (0, "processError"),
+            (0, "errorProcessChannel"),
+            (1, "processChannelError"),
+            (1, "relayHelper"),
+        ];
+        syms.push((2, "unrelated"));
+        let task = "find call sites of processChannelError";
+        let g = named_graph(&["x.go", "relay.go", "z.go"], &syms);
+        let base = compute_centrality(&g);
+        let (ranked, m) = rank_and_match(&g, task, &base);
+        assert_eq!(super::tests::ranked(&ranked)[0], FileId(1), "{ranked:?}");
+        assert!(m.exact_files.contains(&FileId(1)));
+        assert!(!m.exact_files.contains(&FileId(0)));
+        // Not a product over symbols: doubling the weak hits in x.go moves
+        // its score by a logarithmic bonus, not by another 10^7.
+        let mut more = syms.clone();
+        more.extend(syms[..7].iter().copied());
+        let g2 = named_graph(&["x.go", "relay.go", "z.go"], &more);
+        let (ranked2, _) = rank_and_match(&g2, task, &compute_centrality(&g2));
+        let r1 = ranked.by_file[&FileId(0)] / ranked.by_file[&FileId(1)];
+        let r2 = ranked2.by_file[&FileId(0)] / ranked2.by_file[&FileId(1)];
+        assert!(r2 / r1 < 1.5, "{r1} -> {r2}");
+        assert_eq!(super::tests::ranked(&ranked2)[0], FileId(1));
+    }
+
+    #[test]
+    fn plain_word_equal_to_a_symbol_name_is_not_the_exact_tier() {
+        let g = named_graph(&["a.go", "b.go"], &[(0, "call"), (1, "loadConfig")]);
+        let m = match_task(&g, "where is the call to loadConfig");
+        assert!(m.exact_files.contains(&FileId(1)));
+        assert!(!m.exact_files.contains(&FileId(0)), "{:?}", m.exact_files);
+    }
+
+    #[test]
+    fn frequent_sub_word_alone_does_not_select_a_symbol() {
+        // `channel` names 60 symbols (>= GENERIC_MIN_DF): it says nothing.
+        let names: Vec<String> = (0..60).map(|i| format!("channel{i}Thing")).collect();
+        let mut syms: Vec<(u32, &str)> = names.iter().map(|n| (0, n.as_str())).collect();
+        syms.push((1, "grokSpendingLimit"));
+        let g = named_graph(&["noise.go", "limit.go"], &syms);
+        let m = match_task(&g, "how does the channel spending limit work");
+        let files: BTreeSet<FileId> = m.symbols.iter().map(|&i| g.symbols[i].file).collect();
+        assert!(files.contains(&FileId(1)), "{files:?}");
+        assert!(
+            !files.contains(&FileId(0)),
+            "generic channel matched: {files:?}"
+        );
+        // Stop words never match on their own, even in a tiny repo.
+        let g = named_graph(&["a.go"], &[(0, "theHow")]);
+        assert!(match_task(&g, "how does the thing work").symbols.is_empty());
+    }
+
+    #[test]
+    fn callers_and_sibling_tests_of_an_exact_identifier_form_the_next_tier() {
+        let mut g = named_graph(
+            &[
+                "svc/quiet.go",
+                "svc/quiet_test.go",
+                "api/use.go",
+                "api/other.go",
+            ],
+            &[
+                (0, "ViaQuietDropped"),
+                (1, "TestThing"),
+                (2, "handler"),
+                (3, "other"),
+            ],
+        );
+        g.edges.push(CodeEdge {
+            from: 2,
+            to: 0,
+            kind: EdgeKind::Call,
+            weight: 1,
+            confidence: Confidence::Syntactic,
+        });
+        let m = match_task(&g, "rename ViaQuietDropped");
+        assert_eq!(m.exact_files, BTreeSet::from([FileId(0)]));
+        assert_eq!(m.caller_files, BTreeSet::from([FileId(1), FileId(2)]));
+        assert!(m.caller_symbols.contains(&2));
+        // A file named by full path is exact; a bare file name is not
+        // (it may name many files).
+        let m = match_task(&g, "look at svc/quiet.go");
+        assert!(m.exact_files.contains(&FileId(0)));
+        let m = match_task(&g, "look at other.go");
+        assert!(m.files.contains(&FileId(3)) && m.exact_files.is_empty());
     }
 }

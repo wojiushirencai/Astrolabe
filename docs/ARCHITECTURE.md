@@ -208,7 +208,7 @@ Workspace：`astrolabe-core`（图谱库）← `astrolabe-mcp`（stdio MCP）。
 | 工具 | 走哪一层 | 标注 |
 |---|---|---|
 | `resolve_context` | 任务个性化 PageRank + 邻域符号 | `scoped` |
-| `get_languages` | 图上的语言/LOC 计数 | `exact` |
+| `get_languages` | 图上的语言/LOC 计数；覆盖缺口（按原因计数）、语法错误文件（≤10 列出，否则写 `.astrolabe/coverage-report.md`）、不支持语言按扩展名汇总 | `exact` |
 | `search_code` | 磁盘源码字面匹配 | `exact` |
 | `find_symbol` | 符号名子串 | `syntactic` |
 | `find_references` | 语言服务器引用 | `exact`；缺服务器 `unknown` |

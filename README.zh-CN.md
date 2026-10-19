@@ -47,12 +47,23 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 | 工具 | 用途 |
 |---|---|
 | `search_code` | 字面量/正则检索，支持路径过滤；结果分组并标注定义/使用/注释；末尾有可核验的汇总（如“23/23 处，无截断”）。统计：`aggregate=top\|dir\|file`（按顶层目录/目录/文件给出命中数和文件数）、`count_only`、`skip_comments`、`exclude`（如 `_test.go`、`vendor`）。 |
-| `resolve_context` | 给一句任务描述，聚合相关文件与代码骨架，并提示下一步该用哪个工具。 |
+| `resolve_context` | 给一句任务描述，按相关度分页返回相关文件与符号（`offset` 翻页、`path_filter` 缩小范围），页头写明共匹配多少、剩余在哪些目录，并提示下一步该用哪个工具。 |
 | `find_symbol` | 按名字或子串找函数、类、类型。 |
 | `find_references` | 经语言服务器的编译器级引用；`dry_run_rename=新名` 只读列出每个文件要改的位置，不写盘。 |
 | `goto_definition` | 经语言服务器跳到真实定义。 |
 | `get_diagnostics` | 文件的语法与类型错误。 |
-| `get_languages` | 语言、文件数、代码行数、语言服务器状态。 |
+| `get_languages` | 语言、文件数、代码行数、语言服务器状态，以及索引覆盖情况（见下）。 |
+
+**索引覆盖。** 支持语言的文件全部进入索引，包括有语法或编译错误的文件：能解析的符号会保留，出错区域里的符号可能缺失。`get_languages` 报告：
+- 未进入索引的文件：按原因计数（超过大小上限、读取失败、解析超时）；
+- 有语法错误的文件，按类别分别计数：
+  - **其他语法错误**，标注为 `has syntax errors, index may be incomplete (symbols may be missing)`（有语法错误，索引可能不完整）；
+  - **预处理/宏导致**（只用于 C、C++、Objective-C），标注为 `macro/preprocessor syntax errors, symbols mostly intact`（预处理/宏导致的语法错误，符号基本完整）：错误紧挨着预处理指令或宏写法，比如 `#if` 切开声明、`LUAI_FUNC int f()`、`TEST_CASE("x")`、`NAMESPACE_BEGIN`、`foreach(x) {`。没有构建配置，任何语法解析器都展开不了宏，但错误恢复会保住符号名，只是出错位置附近的符号范围可能不准。这是启发式判断，拿不准时归为其他语法错误。
+
+  不超过 10 个时逐个列出（路径、类别标注、首个错误的行号和该行片段）；超过 10 个时只给各类数量和一份 Markdown 报告的绝对路径（`<仓库>/.astrolabe/coverage-report.md`，该目录自带 `.gitignore`，不可写时退到系统临时目录），报告里每个文件有路径、语言、类别和首个错误，其他语法错误排在前面，每节最多 1000 条；
+- 不支持语言的文件：只按扩展名汇总（前 8 种，其余合并为一项），不列具体文件。
+
+其它工具只在存在这些缺口时，在结果末尾附一行简短提示，指向 `get_languages`。
 
 ## 证据：测了什么，没测什么
 
