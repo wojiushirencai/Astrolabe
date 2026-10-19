@@ -47,12 +47,25 @@ fn score(ranked: &Centrality, id: FileId) -> f64 {
     ranked.by_file.get(&id).copied().unwrap_or_default()
 }
 
+/// Score rounded to 9 significant digits: PageRank scores that differ only
+/// in float noise count as equal, so the tie-break (task words covered,
+/// symbol kind) decides between them. A key, not an epsilon comparison, so
+/// the sort order stays total.
+fn rank_key(score: f64) -> f64 {
+    if score == 0.0 || !score.is_finite() {
+        return score;
+    }
+    let scale = 10f64.powi(8 - score.abs().log10().floor() as i32);
+    (score * scale).round() / scale
+}
+
 fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or(".", |(d, _)| d)
 }
 
 /// All files the task selects, most relevant first: exact identifier / path
-/// files, then by task-personalised PageRank, then id (stable).
+/// files, then by task-personalised PageRank, then (equal score) more task
+/// words matched and function > type > const, then id (stable).
 pub(crate) fn ordered_files(req: &PageRequest) -> (Vec<FileId>, usize, bool) {
     let g = req.graph;
     let keep = |f: &CodeFile| {
@@ -86,13 +99,15 @@ pub(crate) fn ordered_files(req: &PageRequest) -> (Vec<FileId>, usize, bool) {
                     3
                 }
             };
+            let tie = |id: &FileId| req.matched.ties.get(id).copied().unwrap_or_default();
             tier(a)
                 .cmp(&tier(b))
                 .then_with(|| {
-                    score(req.ranked, *b)
-                        .partial_cmp(&score(req.ranked, *a))
+                    rank_key(score(req.ranked, *b))
+                        .partial_cmp(&rank_key(score(req.ranked, *a)))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
+                .then_with(|| tie(a).order(&tie(b)))
                 .then_with(|| a.cmp(b))
         });
     };
@@ -354,6 +369,53 @@ mod tests {
             .next()?
             .parse()
             .ok()
+    }
+
+    /// Equal-score files (same hit strength and count, no import edges) are
+    /// ordered by task words covered, then function > type > const, not by
+    /// file id.
+    #[test]
+    fn equal_scores_break_ties_by_words_then_kind() {
+        let mut g = CodeGraph::default();
+        let specs = [
+            ("a_const.go", "VALUE_CONFIG", SymbolKind::Const),
+            ("b_func.go", "parse_value", SymbolKind::Function),
+            ("c_three.go", "value_config_parse", SymbolKind::Function),
+            ("d_type.go", "ConfigValueX", SymbolKind::Struct),
+        ];
+        for (i, (path, name, kind)) in specs.iter().enumerate() {
+            g.files.push(CodeFile {
+                id: FileId(i as u32),
+                path: RelPath::new(*path),
+                language: Some(Language::Go),
+                loc: 10,
+                sha: String::new(),
+            });
+            g.symbols.push(CodeSymbol {
+                id: SymbolId(i as u32),
+                file: FileId(i as u32),
+                name: (*name).to_string(),
+                kind: *kind,
+                signature: String::new(),
+                start_line: 1,
+                end_line: 2,
+                exported: true,
+            });
+        }
+        let body = page(&g, "parse config value", 0, None).body;
+        assert_eq!(
+            files(&body),
+            ["c_three.go", "b_func.go", "d_type.go", "a_const.go"],
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn rank_key_merges_float_noise_only() {
+        let a = 0.123_456_789_012_f64;
+        assert_eq!(rank_key(a), rank_key(a + 1e-15));
+        assert!(rank_key(a) > rank_key(a * 0.999));
+        assert_eq!(rank_key(0.0), 0.0);
     }
 
     #[test]

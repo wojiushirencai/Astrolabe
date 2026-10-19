@@ -195,7 +195,49 @@ fn task_match(
         }
     }
     package_siblings(g, &mut m);
+    m.ties = tie_keys(g, hits);
     m
+}
+
+/// Kind prior for equal-score files: a function or method that matches the
+/// task is usually where the work happens, then the type, then a constant.
+fn kind_prior(kind: SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Function | SymbolKind::Method => 0,
+        SymbolKind::Class
+        | SymbolKind::Interface
+        | SymbolKind::Struct
+        | SymbolKind::Enum
+        | SymbolKind::Trait
+        | SymbolKind::Type => 1,
+        SymbolKind::Const => 2,
+        _ => 3,
+    }
+}
+
+/// Per file: distinct task words its matching symbols cover, and the best
+/// kind prior among them.
+fn tie_keys(g: &CodeGraph, hits: &[SymHit]) -> BTreeMap<FileId, TieKey> {
+    let mut acc: BTreeMap<FileId, (BTreeSet<&str>, u8)> = BTreeMap::new();
+    for h in hits {
+        let symbol = &g.symbols[h.idx];
+        let entry = acc
+            .entry(symbol.file)
+            .or_insert_with(|| (BTreeSet::new(), u8::MAX));
+        entry.0.extend(h.words.iter().map(String::as_str));
+        entry.1 = entry.1.min(kind_prior(symbol.kind));
+    }
+    acc.into_iter()
+        .map(|(file, (words, kind))| {
+            (
+                file,
+                TieKey {
+                    words: words.len(),
+                    kind,
+                },
+            )
+        })
+        .collect()
 }
 
 /// A Go package (directory) with at most this many files is read as a unit:
@@ -264,6 +306,8 @@ const STRENGTH_EXACT: f64 = 4.0;
 struct SymHit {
     idx: usize,
     strength: f64,
+    /// Non-stop task words in the symbol name (for the tie-break).
+    words: Vec<String>,
 }
 
 fn word_set_has(words: &BTreeSet<String>, w: &str) -> bool {
@@ -365,15 +409,17 @@ fn symbol_hits(
     // non-stop words, at the weakest strength.
     let mut fallback = Vec::new();
     for c in cands {
-        let content = c
+        let content: Vec<String> = c
             .matched
             .iter()
             .filter(|w| !STOP_WORDS.contains(&w.as_str()))
-            .count();
-        if content >= 1 && content >= c.meaningful.min(2) {
+            .cloned()
+            .collect();
+        if !content.is_empty() && content.len() >= c.meaningful.min(2) {
             fallback.push(SymHit {
                 idx: c.idx,
                 strength: STRENGTH_WEAK,
+                words: content.clone(),
             });
         }
         let specific = c.matched.iter().filter(|w| !generic(w)).count();
@@ -403,6 +449,7 @@ fn symbol_hits(
         hits.push(SymHit {
             idx: c.idx,
             strength,
+            words: content,
         });
     }
     if hits.is_empty() {
@@ -702,6 +749,35 @@ pub struct TaskMatch {
     /// The rest of a small Go package that holds an exact file (package doc,
     /// shared types, registry): ranked right after the callers.
     pub package_files: BTreeSet<FileId>,
+    /// Tie-break keys for files whose ranking scores are equal.
+    pub ties: BTreeMap<FileId, TieKey>,
+}
+
+/// Secondary order among equal-score files: more distinct task words
+/// matched first, then by [`kind_prior`] (function < type < const).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TieKey {
+    pub words: usize,
+    pub kind: u8,
+}
+
+impl Default for TieKey {
+    fn default() -> Self {
+        Self {
+            words: 0,
+            kind: u8::MAX,
+        }
+    }
+}
+
+impl TieKey {
+    /// `Less` sorts first.
+    pub fn order(&self, other: &Self) -> Ordering {
+        other
+            .words
+            .cmp(&self.words)
+            .then_with(|| self.kind.cmp(&other.kind))
+    }
 }
 
 impl TaskMatch {

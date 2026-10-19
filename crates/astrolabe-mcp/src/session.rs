@@ -79,6 +79,10 @@ pub(crate) struct RootSession {
     /// Full builds (cold or background rebuild) currently running for this
     /// session; [`RootSession::wait_builds_idle`] waits for it to reach 0.
     pub builds_active: Arc<std::sync::atomic::AtomicUsize>,
+    /// Last coverage note ("N 个文件有语法错误…") shown in full in this
+    /// session. The note is repeated only when it changes, a result is
+    /// empty, or a hit lands in an error file.
+    pub coverage_note_shown: Arc<Mutex<Option<String>>>,
     pub knobs: McpKnobs,
 }
 
@@ -122,6 +126,7 @@ impl RootSession {
             rebuild_journal: Arc::new(Mutex::new(ChangeSet::default())),
             closed: Arc::new(AtomicBool::new(false)),
             builds_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            coverage_note_shown: Arc::new(Mutex::new(None)),
             knobs,
         })
     }
