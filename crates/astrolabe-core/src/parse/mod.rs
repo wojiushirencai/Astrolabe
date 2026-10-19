@@ -40,9 +40,11 @@ mod kotlin;
 mod lua;
 mod objc;
 pub use objc::header_language as objc_header_language;
+mod diag;
 mod ruby;
 mod shell;
 mod swift;
+pub use diag::{diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
 mod ts_variance;
 
 pub(crate) use razor::extract_razor_csharp;
@@ -594,56 +596,11 @@ fn needs_eof_newline(lang: Language, source: &str) -> bool {
 }
 
 /// Locate the first syntax error of `source` for diagnostics: `(1-based line,
-/// description)`. Re-parses with the raw grammar (no per-language pre-pass), so
-/// it is best effort: `None` for languages without a plain grammar (Vue) or
-/// when the raw parse is clean.
+/// description)`. Best effort, see [`diagnose_syntax`] (which also gives the
+/// error kind): `None` for languages without a plain grammar (Vue) or when
+/// the raw parse is clean.
 pub fn first_syntax_error(lang: Language, source: &str) -> Option<(u32, String)> {
-    if needs_eof_newline(lang, source) {
-        return first_syntax_error(lang, &format!("{source}\n"));
-    }
-    let mut parser = configured_parser(lang).ok()?;
-    let tree = parser.parse(source, None)?;
-    let root = tree.root_node();
-    if !root.has_error() {
-        return None;
-    }
-    // Full pre-order walk: `has_error` on an inner node does not always
-    // propagate to the child that holds the ERROR / MISSING node.
-    let mut cursor = root.walk();
-    loop {
-        let node = cursor.node();
-        if node.is_error() || node.is_missing() {
-            let line = node.start_position().row as u32 + 1;
-            let what = if node.is_missing() {
-                format!("missing `{}`", node.kind())
-            } else {
-                let text = source
-                    .get(node.start_byte()..node.end_byte().min(node.start_byte() + 40))
-                    .unwrap_or("")
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim();
-                if text.is_empty() {
-                    "unexpected syntax".to_owned()
-                } else {
-                    format!("unexpected `{text}`")
-                }
-            };
-            return Some((line, what));
-        }
-        if cursor.goto_first_child() || cursor.goto_next_sibling() {
-            continue;
-        }
-        loop {
-            if !cursor.goto_parent() {
-                return None;
-            }
-            if cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
+    diagnose_syntax(lang, source).map(|d| (d.line, d.what))
 }
 
 fn query_error(error: tree_sitter::QueryError) -> ParseError {
