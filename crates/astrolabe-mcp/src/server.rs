@@ -1843,6 +1843,30 @@ impl AstrolabeServer {
         }
     }
 
+    /// Server shutdown: close every session — which cancels in-flight cold
+    /// builds and background rebuilds, stops watchers and releases indexer
+    /// locks — then wait up to `timeout` for the cancelled builds to reach
+    /// their safe point (no store writes after cancel). Returns `true` when
+    /// every build stopped in time.
+    pub fn shutdown_indexing(&self, timeout: std::time::Duration) -> bool {
+        let mut sessions = vec![Arc::clone(&self.primary)];
+        if let Some(dispatch) = &self.dispatch {
+            sessions.extend(
+                dispatch
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .cloned(),
+            );
+        }
+        self.stop_watching();
+        let deadline = std::time::Instant::now() + timeout;
+        sessions.iter().all(|session| {
+            session.wait_builds_idle(deadline.saturating_duration_since(std::time::Instant::now()))
+        })
+    }
+
     fn session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
         match &self.dispatch {
             None => Ok(Arc::clone(&self.primary)),

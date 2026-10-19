@@ -345,6 +345,8 @@ pub(crate) fn build(root: &Path) -> anyhow::Result<RepoIndex> {
     build_with_options(root, true, astrolabe_core::index::DEFAULT_PARSE_CACHE_BYTES)
 }
 
+/// Uncancellable build; the server itself uses [`build_cancellable`].
+#[cfg(test)]
 pub(crate) fn build_with_options(
     root: &Path,
     persist: bool,
@@ -353,6 +355,19 @@ pub(crate) fn build_with_options(
     let opts = mcp_index_options(persist, parse_cache_bytes);
     let incremental = IncrementalIndex::build(root, &opts);
     Ok(RepoIndex::from_incremental(root.to_path_buf(), incremental))
+}
+
+/// [`build_with_options`] that returns `None` once `cancel` is set (see
+/// [`IncrementalIndex::build_cancellable`]).
+pub(crate) fn build_cancellable(
+    root: &Path,
+    persist: bool,
+    parse_cache_bytes: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<RepoIndex> {
+    let opts = mcp_index_options(persist, parse_cache_bytes);
+    let incremental = IncrementalIndex::build_cancellable(root, &opts, cancel)?;
+    Some(RepoIndex::from_incremental(root.to_path_buf(), incremental))
 }
 
 #[cfg(test)]

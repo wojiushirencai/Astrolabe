@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moka::sync::Cache;
@@ -890,6 +890,26 @@ fn parse_paths(
     full_scan: bool,
     keep_encoded: bool,
 ) -> ParseOutcome {
+    parse_paths_cancellable(root, paths, opts, full_scan, keep_encoded, None)
+        .expect("parse without a cancel token always completes")
+}
+
+/// [`parse_paths`] that stops early once `cancel` is set (session closed,
+/// root evicted, server shutting down). Workers skip every file not yet
+/// started, and a cancelled run writes **nothing more** to the store: no
+/// pending parse batch, no file stamps and, above all, no prune — a prune
+/// keyed on a partial live set would delete valid entries. Batches already
+/// flushed mid-run are content-addressed (`sha` key) and committed in their
+/// own transactions, so the store stays consistent. Returns `None` when
+/// cancelled.
+fn parse_paths_cancellable(
+    root: &Path,
+    paths: &[RelPath],
+    opts: &IndexOptions,
+    full_scan: bool,
+    keep_encoded: bool,
+    cancel: Option<&AtomicBool>,
+) -> Option<ParseOutcome> {
     let pool = ParserPool::new();
     let store = open_store(root, opts);
     let side = ParseSide::new(store.as_ref(), full_scan);
@@ -899,6 +919,9 @@ fn parse_paths(
     let parsed: Vec<ParsedRow> = paths
         .par_iter()
         .filter_map(|path| {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return None;
+            }
             parse_one(
                 root,
                 path,
@@ -912,6 +935,9 @@ fn parse_paths(
             )
         })
         .collect();
+    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return None;
+    }
     persist_cache_writes(
         root,
         store.as_ref(),
@@ -922,7 +948,7 @@ fn parse_paths(
     );
     let mut failures = failures.into_inner().expect("failure list poisoned");
     failures.sort();
-    ParseOutcome { parsed, failures }
+    Some(ParseOutcome { parsed, failures })
 }
 
 struct ParseOutcome {
@@ -1396,19 +1422,52 @@ impl std::fmt::Debug for IncrementalIndex {
 impl IncrementalIndex {
     /// Full index, retaining parse products for later [`Self::apply_changeset`].
     pub fn build(root: &Path, opts: &IndexOptions) -> Self {
+        Self::build_inner(root, opts, None).expect("build without a cancel token always completes")
+    }
+
+    /// [`Self::build`] that gives up once `cancel` is set, returning `None`.
+    ///
+    /// Checked between phases (scan / resolver detect, parse, graph
+    /// assembly) and before every file inside the parallel parse, so a
+    /// cancelled cold build stops within roughly one file parse per worker.
+    /// A cancelled build writes no file stamps and never prunes the parse
+    /// cache (see [`parse_paths_cancellable`]); a later build reuses
+    /// whatever complete batches it had already committed.
+    pub fn build_cancellable(
+        root: &Path,
+        opts: &IndexOptions,
+        cancel: &AtomicBool,
+    ) -> Option<Self> {
+        Self::build_inner(root, opts, Some(cancel))
+    }
+
+    fn build_inner(root: &Path, opts: &IndexOptions, cancel: Option<&AtomicBool>) -> Option<Self> {
+        let cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+        if cancelled() {
+            return None;
+        }
         let (scanned, files, resolvers, excluded_sources) = discover(root, opts);
+        if cancelled() {
+            return None;
+        }
         let mut report = IndexReport {
             files_scanned: scanned.files.len(),
             too_large: too_large_sources(root, &scanned),
             ..IndexReport::default()
         };
-        let outcome = parse_paths(root, &scanned.files, opts, true, true);
+        let outcome = parse_paths_cancellable(root, &scanned.files, opts, true, true, cancel)?;
         let failures = outcome.failures.clone();
         (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
+        if cancelled() {
+            return None;
+        }
         let (graph, report, resolutions) =
             assemble_graph_with(outcome.parsed, &files, &resolvers, opts, report, None, true);
-        Self {
+        if cancelled() {
+            return None;
+        }
+        Some(Self {
             graph,
             report,
             files: scanned.files,
@@ -1418,7 +1477,7 @@ impl IncrementalIndex {
             failure_retries: HashMap::new(),
             resolvers: Arc::new(resolvers),
             resolutions: Arc::new(resolutions.unwrap_or_default()),
-        }
+        })
     }
 
     /// Apply a watcher changeset. Only `added`/`modified` source files are
@@ -3675,5 +3734,118 @@ mod incremental_resolve_tests {
         let mods: BTreeSet<RelPath> = [RelPath::new("App/Lib2.cs")].into();
         let (_, changed) = inc.resolvers.redetect(&files, &mods);
         assert_eq!(changed, vec![Language::CSharp]);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "astrolabe-cancel-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Write with an mtime an hour back, so the stamp is trusted (a fresh
+    /// mtime is inside the precision window and never stamped).
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::write(&path, body).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+
+    fn store_len(root: &Path) -> u64 {
+        Store::open_read_only(&store_path(root))
+            .unwrap()
+            .expect("store exists")
+            .parse_cache_len()
+            .unwrap()
+    }
+
+    fn has_stamp(root: &Path, rel: &str) -> bool {
+        Store::open_read_only(&store_path(root))
+            .unwrap()
+            .expect("store exists")
+            .file_stamp(rel)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn cancelled_parse_writes_nothing_and_never_prunes() {
+        let root = scratch("parse");
+        write(&root, "a.go", "package p\nfunc A() {}\n");
+        write(&root, "b.go", "package p\nfunc B() {}\n");
+        let opts = IndexOptions::default();
+        let _ = IncrementalIndex::build(&root, &opts);
+        let before = store_len(&root);
+        assert_eq!(before, 2);
+
+        // b.go is gone and c.go is new: a completed full-scan parse would
+        // prune b's entry and store c's. A cancelled one must do neither —
+        // a prune keyed on a partial live set deletes valid entries.
+        std::fs::remove_file(root.join("b.go")).unwrap();
+        write(&root, "c.go", "package p\nfunc C() {}\n");
+        let paths = vec![RelPath::new("a.go"), RelPath::new("c.go")];
+        let cancel = AtomicBool::new(true);
+        assert!(parse_paths_cancellable(&root, &paths, &opts, true, true, Some(&cancel)).is_none());
+        assert_eq!(
+            store_len(&root),
+            before,
+            "cancelled parse touched the store"
+        );
+        assert!(!has_stamp(&root, "c.go"), "cancelled parse wrote a stamp");
+
+        // Control: the same parse, not cancelled, prunes b and stores c.
+        let done = parse_paths(&root, &paths, &opts, true, true);
+        assert_eq!(done.parsed.len(), 2);
+        assert_eq!(store_len(&root), 2);
+        assert!(has_stamp(&root, "c.go"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn build_cancellable_matches_build_and_honours_cancel() {
+        let root = scratch("build");
+        write(&root, "go.mod", "module example.com/p\n");
+        write(&root, "a.go", "package p\nfunc A() { B() }\n");
+        write(&root, "b.go", "package p\nfunc B() {}\n");
+        let opts = IndexOptions {
+            persist: false,
+            ..IndexOptions::default()
+        };
+        let cancel = AtomicBool::new(true);
+        assert!(IncrementalIndex::build_cancellable(&root, &opts, &cancel).is_none());
+        assert!(
+            !store_path(&root).exists(),
+            "a build cancelled up front must not create a store"
+        );
+
+        cancel.store(false, Ordering::SeqCst);
+        let a = IncrementalIndex::build_cancellable(&root, &opts, &cancel).expect("not cancelled");
+        let b = IncrementalIndex::build(&root, &opts);
+        let names = |i: &IncrementalIndex| {
+            i.graph
+                .symbols
+                .iter()
+                .map(|s| (s.name.clone(), s.start_line))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&a), names(&b));
+        assert_eq!(a.graph.files.len(), b.graph.files.len());
+        std::fs::remove_dir_all(&root).ok();
     }
 }
