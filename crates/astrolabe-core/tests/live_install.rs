@@ -44,7 +44,10 @@ fn probe_answers_at_once_while_clangd_downloads_then_finds_it() {
             "install failed: {}",
             p.install_hint
         );
-        assert!(t0.elapsed() < Duration::from_secs(600), "install took too long");
+        assert!(
+            t0.elapsed() < Duration::from_secs(600),
+            "install took too long"
+        );
     };
     eprintln!(
         "installed after {:?} ({probes} probes, slowest probe {slowest:?}): {}",

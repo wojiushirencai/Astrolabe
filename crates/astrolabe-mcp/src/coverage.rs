@@ -367,8 +367,6 @@ impl RepoIndex {
     }
 }
 
-/// Write the report atomically (temp file + rename) into `<root>/.astrolabe/`
-/// (the self-ignoring cache dir), falling back to the OS temp dir.
 /// Sidecar of syntax diagnoses next to the index cache.
 const DIAG_CACHE_FILE: &str = "syntax-diagnoses.json";
 
@@ -472,6 +470,12 @@ impl DiagCache {
         if !dir.is_dir() {
             return;
         }
+        // The index cache creates this too; never leave the sidecar visible
+        // to git if the dir came from elsewhere.
+        let ignore = dir.join(".gitignore");
+        if !ignore.exists() {
+            let _ = std::fs::write(&ignore, "# Created by Astrolabe. Ignores itself.\n*\n");
+        }
         let cache = DiagCache {
             format: Self::format(),
             entries,
@@ -487,6 +491,8 @@ impl DiagCache {
     }
 }
 
+/// Write the report atomically (temp file + rename) into `<root>/.astrolabe/`
+/// (the self-ignoring cache dir), falling back to the OS temp dir.
 fn write_report(root: &Path, body: &str) -> Option<PathBuf> {
     let primary = root.join(".astrolabe");
     if let Some(path) = write_atomic(&primary, body) {
@@ -590,6 +596,9 @@ mod tests {
         let mut cache: DiagCache = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(cache.format, DiagCache::format());
         assert_eq!(cache.entries.len(), 3);
+        // The sidecar sits in the self-ignoring cache dir, never in git status.
+        let ignore = std::fs::read_to_string(path.parent().unwrap().join(".gitignore")).unwrap();
+        assert!(ignore.lines().any(|l| l.trim() == "*"), "{ignore:?}");
 
         // Same bytes after a restart: the cached diagnosis is used as is.
         let again = crate::index::build_with_options(&dir, true, 1 << 20).unwrap();
