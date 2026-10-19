@@ -91,7 +91,7 @@ pub struct ParsedFile {
     pub calls: Vec<(String, u32)>,
     /// The syntax tree contained ERROR / MISSING nodes, so `symbols`,
     /// `imports` and `calls` may be incomplete. The result is still usable;
-    /// the indexer reports it in `parse_failures` and does not cache it.
+    /// the indexer reports it in `partial_parses` (not `parse_failures`) and does not cache it.
     pub partial: bool,
 }
 
@@ -519,6 +519,49 @@ fn configured_parser(lang: Language) -> Result<Parser, ParseError> {
         .set_language(&language)
         .map_err(|_| ParseError::NoGrammar(lang))?;
     Ok(parser)
+}
+
+/// Locate the first syntax error of `source` for diagnostics: `(1-based line,
+/// description)`. Re-parses with the raw grammar (no per-language pre-pass), so
+/// it is best effort: `None` for languages without a plain grammar (Vue) or
+/// when the raw parse is clean.
+pub fn first_syntax_error(lang: Language, source: &str) -> Option<(u32, String)> {
+    let mut parser = configured_parser(lang).ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    if !root.has_error() {
+        return None;
+    }
+    let mut node = root;
+    loop {
+        if node.is_error() || node.is_missing() {
+            let line = node.start_position().row as u32 + 1;
+            let what = if node.is_missing() {
+                format!("missing `{}`", node.kind())
+            } else {
+                let text = source
+                    .get(node.start_byte()..node.end_byte().min(node.start_byte() + 40))
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if text.is_empty() {
+                    "unexpected syntax".to_owned()
+                } else {
+                    format!("unexpected `{text}`")
+                }
+            };
+            return Some((line, what));
+        }
+        // Descend into the first child that contains an error.
+        let mut cursor = node.walk();
+        let next = node.children(&mut cursor).find(|c| c.has_error());
+        match next {
+            Some(child) => node = child,
+            None => return None,
+        }
+    }
 }
 
 fn query_error(error: tree_sitter::QueryError) -> ParseError {

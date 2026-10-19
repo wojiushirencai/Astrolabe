@@ -10,6 +10,7 @@
 mod cli;
 mod code_mask;
 mod context;
+mod coverage;
 mod ensure_ls;
 mod explain;
 mod knobs;

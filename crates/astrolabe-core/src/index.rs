@@ -560,6 +560,19 @@ fn stamp_hit(
     })
 }
 
+/// Reason string carried through the failure list for a file that parsed with
+/// syntax errors. Such a file is still in the index (its symbols are kept), so
+/// [`split_partial`] moves it out of `parse_failures` into `partial_parses`.
+const PARTIAL_PARSE_REASON: &str = "partial parse: syntax errors in file";
+
+/// Split a raw failure list into real failures (not in the index) and partial
+/// parses (in the index, possibly incomplete).
+fn split_partial(raw: &[(RelPath, String)]) -> (Vec<(RelPath, String)>, Vec<(RelPath, String)>) {
+    raw.iter()
+        .cloned()
+        .partition(|(_, reason)| reason != PARTIAL_PARSE_REASON)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_one(
     root: &Path,
@@ -661,10 +674,10 @@ fn parse_one(
                 // Syntax errors: symbols/imports/calls may be incomplete.
                 // Keep what was extracted but surface it, and do not cache
                 // it so the signal is not lost on the next (cache-hit) run.
-                failures.lock().expect("failure list poisoned").push((
-                    path.clone(),
-                    "partial parse: syntax errors in file".to_owned(),
-                ));
+                failures
+                    .lock()
+                    .expect("failure list poisoned")
+                    .push((path.clone(), PARTIAL_PARSE_REASON.to_owned()));
             } else if store.is_some() || keep_encoded {
                 match store::encode_parsed(&parsed) {
                     Ok(bytes) => {
@@ -1297,7 +1310,7 @@ pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) 
         ..IndexReport::default()
     };
     let outcome = parse_paths(root, &scanned.files, opts, true, false);
-    report.parse_failures = outcome.failures;
+    (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
     assemble_graph(outcome.parsed, &files, &resolvers, opts, report)
 }
 
@@ -1361,7 +1374,7 @@ impl IncrementalIndex {
         };
         let outcome = parse_paths(root, &scanned.files, opts, true, true);
         let failures = outcome.failures.clone();
-        report.parse_failures = outcome.failures;
+        (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
         let (graph, report, resolutions) =
             assemble_graph_with(outcome.parsed, &files, &resolvers, opts, report, None, true);
@@ -1530,6 +1543,12 @@ pub fn index_repo_incremental(
         if let Some(product) = previous.products.get(path) {
             match row_from_product(path.clone(), &product) {
                 Ok(row) => {
+                    // A partial parse keeps its product but is not cached on
+                    // disk; carry its flag so the report stays stable.
+                    if previous_failures.get(path).map(|r| r.as_str()) == Some(PARTIAL_PARSE_REASON)
+                    {
+                        failures.push((path.clone(), PARTIAL_PARSE_REASON.to_owned()));
+                    }
                     reused_products.push((path.clone(), product));
                     reused.push(row);
                 }
@@ -1571,7 +1590,7 @@ pub fn index_repo_incremental(
     }
     failures.extend(outcome.failures);
     failures.sort();
-    report.parse_failures = failures.clone();
+    (report.parse_failures, report.partial_parses) = split_partial(&failures);
 
     tracing::info!(
         added = changes.added.len(),
@@ -1968,17 +1987,47 @@ mod tests {
         // A syntax-error file is still parsed (partial symbols kept) AND
         // reported, so incompleteness is never silent.
         assert_eq!(report.files_parsed, 1);
+        // Partial parses are in the index, so they are NOT parse failures.
+        assert!(
+            report.parse_failures.is_empty(),
+            "{:?}",
+            report.parse_failures
+        );
         assert_eq!(
-            report.parse_failures.len(),
+            report.partial_parses.len(),
             1,
             "{:?}",
-            report.parse_failures
+            report.partial_parses
         );
+        assert_eq!(report.partial_parses[0].0.as_str(), "broken.go");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_parse_keeps_symbols_and_survives_incremental_apply() {
+        let root = scratch("partial_inc");
+        write(&root, "broken.py", "def kept():\n    pass\n\ndef oops(:\n");
+        write(&root, "ok.py", "def fine():\n    pass\n");
+        let opts = IndexOptions::default();
+        let inc = IncrementalIndex::build(&root, &opts);
+        assert!(inc.report.parse_failures.is_empty());
+        assert_eq!(inc.report.partial_parses.len(), 1);
         assert!(
-            report.parse_failures[0].1.starts_with("partial parse"),
-            "{:?}",
-            report.parse_failures
+            inc.graph.symbols.iter().any(|s| s.name == "kept"),
+            "symbols of a syntax-error file stay in the index"
         );
+        // Touch only the clean file: the partial flag of the other file must
+        // not disappear from the report.
+        write(&root, "ok.py", "def fine():\n    return 1\n");
+        let changes = ChangeSet {
+            modified: vec![RelPath::new("ok.py")],
+            ..ChangeSet::default()
+        };
+        let next = index_repo_incremental(&root, &inc, &changes, &opts);
+        assert_eq!(next.report.partial_parses.len(), 1, "{:?}", next.report);
+        assert_eq!(next.report.partial_parses[0].0.as_str(), "broken.py");
+        assert!(next.report.parse_failures.is_empty());
+        assert!(next.graph.symbols.iter().any(|s| s.name == "kept"));
         std::fs::remove_dir_all(&root).ok();
     }
 

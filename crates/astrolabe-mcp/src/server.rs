@@ -4087,35 +4087,23 @@ impl AstrolabeServer {
             if omitted > 0 {
                 body.push_str(&format!("{omitted} 种语言因 budget_tokens 被省略。\n"));
             }
-            body.push_str(&index.coverage_detail(50));
+            body.push_str(&index.coverage_detail());
             let unindexed = index.unindexed_code_exts(None);
             let excluded = index.excluded_source_paths();
             if !excluded.is_empty() {
-                let sample = excluded
-                    .iter()
-                    .take(3)
-                    .map(|p| p.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 body.push_str(&format!(
-                    "build-output-excluded source files: {} (e.g. {sample}; 被构建输出排除规则排除，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
+                    "build-output-excluded source files: {} (被构建输出排除规则排除，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
                     excluded.len()
                 ));
             }
             if unindexed.is_empty() && excluded.is_empty() {
-                body.push_str("unindexed source files: none\n");
+                body.push_str("unsupported-language source files: none\n");
             } else if unindexed.is_empty() {
-                body.push_str("unindexed source files: none in unsupported languages\n");
+                body.push_str("unsupported-language source files: none\n");
             } else {
-                let mut list: Vec<(&String, &u32)> = unindexed.iter().collect();
-                list.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-                let items_str = list
-                    .into_iter()
-                    .map(|(ext, count)| format!(".{ext}×{count}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 body.push_str(&format!(
-                    "unindexed source files: {items_str} (语言暂不支持；这些文件不在符号/import 索引内，search_code/find_symbol 对其不可见，请用 Grep/Read)\n"
+                    "unsupported-language source files by type: {} (不在符号/import 索引内，search_code/find_symbol 对其不可见，请用 Grep/Read)\n",
+                    crate::coverage::unsupported_by_type(&unindexed)
                 ));
             }
             self.result_on(
@@ -8270,11 +8258,11 @@ mod tests {
             "supported languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, visualbasic, kotlin, shell, ruby, lua"
         );
         assert!(
-            langs_text.contains("unindexed source files: .scala×3"),
+            langs_text.contains("unsupported-language source files by type: .scala×3"),
             "{langs_text}"
         );
         assert!(
-            langs_text.contains("语言暂不支持；这些文件不在符号/import 索引内"),
+            langs_text.contains("不在符号/import 索引内，search_code/find_symbol 对其不可见"),
             "{langs_text}"
         );
 
@@ -8530,7 +8518,7 @@ mod tests {
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
         assert!(
-            langs_text.contains("unindexed source files: .scala×2"),
+            langs_text.contains("unsupported-language source files by type: .scala×2"),
             "{langs_text}"
         );
 
@@ -8553,7 +8541,7 @@ mod tests {
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
         assert!(
-            langs_text.contains("unindexed source files: none"),
+            langs_text.contains("unsupported-language source files: none"),
             "{langs_text}"
         );
 

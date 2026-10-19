@@ -45,6 +45,9 @@ pub struct IndexReport {
     pub files_parsed: usize,
     /// `(path, reason)` for every file that could not be parsed.
     pub parse_failures: Vec<(RelPath, String)>,
+    /// Files that parsed with syntax errors. They ARE in the index (symbols
+    /// found are kept) but may be incomplete; not a coverage failure.
+    pub partial_parses: Vec<(RelPath, String)>,
     /// Source files skipped by the scanner for exceeding the size cap.
     pub too_large: Vec<RelPath>,
     /// Import specifiers that pointed inside the repo but did not resolve.
