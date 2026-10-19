@@ -12,6 +12,7 @@
 //! - `ASTROLABE_OFFLINE=1` refuses network downloads.
 //! - `ASTROLABE_MIRROR_GITHUB` rewrites `https://github.com/` URLs.
 
+mod background;
 mod extract;
 mod fetch;
 mod lock;
@@ -25,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::types::Language;
 
+pub use background::{BackgroundInstall, Installs, INSTALL_PENDING, RETRY_FAILED_AFTER};
 pub use extract::ArchiveFormat;
 pub use fetch::{Fetcher, UreqFetcher};
 

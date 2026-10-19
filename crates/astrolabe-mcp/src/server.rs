@@ -342,6 +342,10 @@ fn rank_broad_hits<'a>(index: &RepoIndex, hits: &'a [SearchHit]) -> Vec<&'a Sear
 }
 
 const BROAD_PREVIEW_HITS: usize = 12;
+/// `find_symbol`: interfaces per page whose Go implementors are listed, and
+/// implementors listed per interface.
+const GO_IMPLEMENTOR_IFACES: usize = 3;
+const GO_IMPLEMENTORS_LISTED: usize = 12;
 
 fn name_tokens(name: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -380,18 +384,51 @@ fn closest_symbols(
         return Vec::new();
     }
     let q_tokens = name_tokens(query);
+    let q_chars = q.chars().count();
+    let max_distance = (q.len() / 5).clamp(1, 2);
+    // Word tokens that can count toward `shared` (len >= 3).
+    let long_tokens: Vec<&String> = q_tokens.iter().filter(|t| t.len() >= 3).collect();
+    let names = index.names();
+    let lower_names = names.lower();
+    // The path filter only depends on the file, so check it once per file
+    // and before any per-name scoring.
+    let mut file_ok: HashMap<FileId, bool> = HashMap::new();
     let mut scored: Vec<(u32, String)> = Vec::new();
-    for sym in &index.graph().symbols {
-        let name = sym.name.to_lowercase();
+    for (pos, sym) in index.graph().symbols.iter().enumerate() {
+        if let Some(f) = path_filter {
+            let ok = *file_ok.entry(sym.file).or_insert_with(|| {
+                index
+                    .file(sym.file)
+                    .is_some_and(|file| file.path.as_str().contains(f))
+            });
+            if !ok {
+                continue;
+            }
+        }
+        let name = lower_names[pos].as_str();
         let score = if name == q {
             0
-        } else if name.starts_with(&q) || q.starts_with(&name) && name.len() >= 4 {
+        } else if name.starts_with(&q) || q.starts_with(name) && name.len() >= 4 {
             1
-        } else if name.contains(&q) || q.contains(&name) && name.len() >= 4 {
+        } else if name.contains(&q) || q.contains(name) && name.len() >= 4 {
             2
-        } else if edit_distance(&name, &q) <= (q.len() / 5).clamp(1, 2) {
+        } else if (if name.is_ascii() {
+            name.len()
+        } else {
+            name.chars().count()
+        })
+        .abs_diff(q_chars)
+            <= max_distance
+            && edit_distance(name, &q) <= max_distance
+        {
             3
         } else {
+            // An ASCII name's tokens are substrings of its lowercase form,
+            // so a name containing none of the query's long tokens cannot
+            // share one; skip tokenising it.
+            if sym.name.is_ascii() && !long_tokens.iter().any(|t| name.contains(t.as_str())) {
+                continue;
+            }
             let shared = name_tokens(&sym.name)
                 .iter()
                 .filter(|t| t.len() >= 3 && q_tokens.contains(t))
@@ -1843,6 +1880,30 @@ impl AstrolabeServer {
         }
     }
 
+    /// Server shutdown: close every session — which cancels in-flight cold
+    /// builds and background rebuilds, stops watchers and releases indexer
+    /// locks — then wait up to `timeout` for the cancelled builds to reach
+    /// their safe point (no store writes after cancel). Returns `true` when
+    /// every build stopped in time.
+    pub fn shutdown_indexing(&self, timeout: std::time::Duration) -> bool {
+        let mut sessions = vec![Arc::clone(&self.primary)];
+        if let Some(dispatch) = &self.dispatch {
+            sessions.extend(
+                dispatch
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .cloned(),
+            );
+        }
+        self.stop_watching();
+        let deadline = std::time::Instant::now() + timeout;
+        sessions.iter().all(|session| {
+            session.wait_builds_idle(deadline.saturating_duration_since(std::time::Instant::now()))
+        })
+    }
+
     fn session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
         match &self.dispatch {
             None => Ok(Arc::clone(&self.primary)),
@@ -2851,7 +2912,7 @@ impl AstrolabeServer {
             let literal = params.query.trim();
             let literal_hit = normalized.query != literal
                 && !literal.contains('/')
-                && index.names().exact.contains(literal);
+                && index.names().has_exact(&index.graph().symbols, literal);
             if normalized.query.contains('/') && !literal_hit {
                 let mut params = params.clone();
                 params.query = normalized.query;
@@ -2908,16 +2969,11 @@ impl AstrolabeServer {
             };
             if exact_only {
                 // Exact names only: O(1) map lookup instead of a full scan.
-                for &idx in names
-                    .by_lower
-                    .get(&needle)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-                {
+                for &idx in names.by_lower(&needle) {
                     consider(idx as usize, 0);
                 }
             } else {
-                for (idx, lower) in names.lower.iter().enumerate() {
+                for (idx, lower) in names.lower().iter().enumerate() {
                     if let Some(tier) = name_match_tier(lower, &needle) {
                         consider(idx, tier);
                     }
@@ -2976,6 +3032,30 @@ impl AstrolabeServer {
             for line in &kept {
                 body.push_str(line);
                 body.push('\n');
+            }
+            // Go interfaces on this page: their implementing types (implicit
+            // satisfaction is invisible to a name search), within budget.
+            let shown_ifaces: std::collections::HashSet<u32> = hits[offset..offset + kept_count]
+                .iter()
+                .map(|(_, idx)| &symbols[*idx])
+                .filter(|s| s.kind == astrolabe_core::SymbolKind::Interface)
+                .map(|s| s.id.0)
+                .take(GO_IMPLEMENTOR_IFACES)
+                .collect();
+            if !shown_ifaces.is_empty() {
+                let graph = index.graph();
+                let by = astrolabe_core::go_iface::implementors_of(graph, &shown_ifaces);
+                for (iface, impls) in &by {
+                    let line = astrolabe_core::go_iface::render_implementors(
+                        graph,
+                        *iface,
+                        impls,
+                        GO_IMPLEMENTORS_LISTED,
+                    );
+                    if estimate_tokens(&body) + estimate_tokens(&line) <= params.budget_tokens {
+                        body.push_str(&line);
+                    }
+                }
             }
             // 零命中时显式声明（对齐 find_references 空结果约定），并跳过
             // include_body 附加，避免误导性的"无可提取的符号体"。
@@ -3819,7 +3899,10 @@ impl AstrolabeServer {
                 .collect();
             if let [.., parent, last] = segments.as_slice() {
                 let mut impl_sources = std::collections::HashMap::new();
-                for symbol in symbols {
+                // Equal ignoring ASCII case implies equal lowercase names, so
+                // the name table's group is a superset (in symbol order).
+                let candidates = index.names().by_lower(&last.to_lowercase());
+                for symbol in candidates.iter().map(|&i| &symbols[i as usize]) {
                     if !symbol.name.eq_ignore_ascii_case(last)
                         || kind.is_some_and(|k| symbol.kind != k)
                     {
@@ -4549,17 +4632,37 @@ fn symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
         return String::new();
     }
     let prefix: String = needle.chars().take(4).collect();
+    let prefix_ok = prefix.chars().count() >= 4;
+    let needle_chars = needle.chars().count();
     let mut scored: BTreeMap<(usize, String), ()> = BTreeMap::new();
-    let mut seen = std::collections::HashSet::new();
-    for symbol in &index.graph().symbols {
-        let lower = symbol.name.to_lowercase();
-        if !seen.insert(lower.clone()) {
-            continue;
-        }
-        let distance = edit_distance(&lower, needle);
-        if distance <= 2 || (prefix.chars().count() >= 4 && lower.starts_with(&prefix)) {
-            scored.insert((distance, symbol.name.clone()), ());
-        }
+    let symbols = &index.graph().symbols;
+    let names = index.names();
+    let lower_names = names.lower();
+    // One candidate per distinct lowercase name, named after its first
+    // occurrence (as the old first-seen scan did).
+    for group in names.name_groups() {
+        let first = group[0] as usize;
+        let lower = &lower_names[first];
+        let distance = if prefix_ok && lower.starts_with(&prefix) {
+            edit_distance(lower, needle)
+        } else {
+            // Edit distance is at least the length difference: skip the
+            // quadratic DP for names that cannot be within 2.
+            let len = if lower.is_ascii() {
+                lower.len()
+            } else {
+                lower.chars().count()
+            };
+            if len.abs_diff(needle_chars) > 2 {
+                continue;
+            }
+            let distance = edit_distance(lower, needle);
+            if distance > 2 {
+                continue;
+            }
+            distance
+        };
+        scored.insert((distance, symbols[first].name.clone()), ());
     }
     if scored.is_empty() {
         return "建议：确认名字拼写；带限定的写法可用 Type/method、Type.method 或 A::b；也可改用 search_code 做全文检索。\n".to_string();
@@ -4663,6 +4766,223 @@ mod tests {
     };
     use std::collections::HashSet;
     use std::time::Duration;
+
+    /// Pre-change `symbol_suggestions` (first-seen scan, full edit distance
+    /// for every distinct name), kept as the oracle for the pruned version.
+    fn reference_symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
+        if needle.is_empty() {
+            return String::new();
+        }
+        let prefix: String = needle.chars().take(4).collect();
+        let mut scored: BTreeMap<(usize, String), ()> = BTreeMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for symbol in &index.graph().symbols {
+            let lower = symbol.name.to_lowercase();
+            if !seen.insert(lower.clone()) {
+                continue;
+            }
+            let distance = edit_distance(&lower, needle);
+            if distance <= 2 || (prefix.chars().count() >= 4 && lower.starts_with(&prefix)) {
+                scored.insert((distance, symbol.name.clone()), ());
+            }
+        }
+        if scored.is_empty() {
+            return "建议：确认名字拼写；带限定的写法可用 Type/method、Type.method 或 A::b；也可改用 search_code 做全文检索。\n".to_string();
+        }
+        let names: Vec<String> = scored.into_keys().take(5).map(|(_, name)| name).collect();
+        format!(
+            "相近的符号名：{}（可直接用这些名字重查，或改用 search_code）\n",
+            names.join(", ")
+        )
+    }
+
+    /// Pre-change `closest_symbols` (path filter after scoring, every name
+    /// tokenised), kept as the oracle for the pruned version.
+    fn reference_closest_symbols(
+        index: &RepoIndex,
+        query: &str,
+        path_filter: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
+        let q = query.trim().to_lowercase();
+        if q.len() < 3 || q.len() > 80 {
+            return Vec::new();
+        }
+        let q_tokens = name_tokens(query);
+        let mut scored: Vec<(u32, String)> = Vec::new();
+        for sym in &index.graph().symbols {
+            let name = sym.name.to_lowercase();
+            let score = if name == q {
+                0
+            } else if name.starts_with(&q) || q.starts_with(&name) && name.len() >= 4 {
+                1
+            } else if name.contains(&q) || q.contains(&name) && name.len() >= 4 {
+                2
+            } else if edit_distance(&name, &q) <= (q.len() / 5).clamp(1, 2) {
+                3
+            } else {
+                let shared = name_tokens(&sym.name)
+                    .iter()
+                    .filter(|t| t.len() >= 3 && q_tokens.contains(t))
+                    .count();
+                if shared >= 1 && shared >= q_tokens.len().min(2) {
+                    4
+                } else {
+                    continue;
+                }
+            };
+            let Some(file) = index.file(sym.file) else {
+                continue;
+            };
+            if let Some(f) = path_filter {
+                if !file.path.as_str().contains(f) {
+                    continue;
+                }
+            }
+            let line = symbol_line(sym, &file.path);
+            let line = match line.rsplit_once("  @") {
+                Some((sig, loc)) => format!("{sig}  {loc}"),
+                None => line,
+            };
+            scored.push((score, line));
+        }
+        scored.sort();
+        scored.dedup_by(|a, b| a.1 == b.1);
+        scored.into_iter().take(limit).map(|(_, l)| l).collect()
+    }
+
+    fn suggestion_fixture() -> RepoIndex {
+        let names = [
+            "Serialize",
+            "serialize",
+            "SERIALIZE",
+            "Serializer",
+            "SerializeObject",
+            "deserialize",
+            "JsonSerializer",
+            "parse_json",
+            "ParseJson",
+            "handle",
+            "Handler",
+            "handle_request",
+            "HTTPServer",
+            "http_server",
+            "Ärger",
+            "ärgern",
+            "İd",
+            "straße",
+            "STRASSE",
+            "x",
+            "ab",
+            "abc",
+            "abcd",
+            "serialise",
+            "seriali",
+            "Config",
+            "ConfigBuilder",
+            "configure",
+            "load_config_file",
+            "ConfigFileLoader",
+            "über_config",
+            "日本語名",
+            "名前",
+        ];
+        let mut files = Vec::new();
+        let mut symbols = Vec::new();
+        for f in 0..3u32 {
+            files.push(CodeFile {
+                id: FileId(f),
+                path: RelPath::new(format!("dir{f}/m{f}.rs")),
+                language: Some(Language::Rust),
+                loc: 10,
+                sha: String::new(),
+            });
+            for (i, name) in names.iter().enumerate() {
+                if (i as u32 + f).is_multiple_of(3) && f > 0 {
+                    continue;
+                }
+                symbols.push(CodeSymbol {
+                    id: SymbolId(symbols.len() as u32),
+                    file: FileId(f),
+                    name: (*name).to_string(),
+                    kind: SymbolKind::Function,
+                    signature: format!("fn {name}()"),
+                    start_line: i as u32 + 1,
+                    end_line: i as u32 + 1,
+                    exported: true,
+                });
+            }
+        }
+        // A symbol whose file is not in the graph is skipped by both.
+        symbols.push(CodeSymbol {
+            id: SymbolId(symbols.len() as u32),
+            file: FileId(99),
+            name: "Serialize".into(),
+            kind: SymbolKind::Function,
+            signature: "fn Serialize()".into(),
+            start_line: 1,
+            end_line: 1,
+            exported: true,
+        });
+        let graph = CodeGraph {
+            files,
+            symbols,
+            edges: vec![],
+        };
+        RepoIndex::from_graph(PathBuf::from("."), graph, Default::default())
+    }
+
+    /// The pruned zero-hit suggestions (distinct-name groups, length bound,
+    /// token pre-check, path filter first) must equal the old full scan.
+    #[test]
+    fn zero_hit_suggestions_match_reference_scan() {
+        let index = suggestion_fixture();
+        let needles = [
+            "serialize",
+            "serialzer",
+            "serial",
+            "seri",
+            "ser",
+            "jsonserializer",
+            "handel",
+            "httpserver",
+            "ärger",
+            "arger",
+            "i̇d",
+            "strasse",
+            "straße",
+            "x",
+            "ab",
+            "abcde",
+            "zzz_nope",
+            "configfile",
+            "config_loader",
+            "load_config",
+            "über",
+            "日本語",
+            "名前x",
+            "",
+            "serializeobjectinternalx",
+            "parsejson",
+            "parse_json_x",
+        ];
+        for needle in needles {
+            assert_eq!(
+                symbol_suggestions(&index, needle),
+                reference_symbol_suggestions(&index, needle),
+                "needle {needle:?}"
+            );
+            for filter in [None, Some("dir1/"), Some("dir2"), Some("nomatch")] {
+                for raw in [needle.to_string(), needle.to_uppercase()] {
+                    assert_eq!(
+                        closest_symbols(&index, &raw, filter, 8),
+                        reference_closest_symbols(&index, &raw, filter, 8),
+                        "query {raw:?} filter {filter:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn index_read_lock_is_released_while_a_tool_runs() {
@@ -6192,6 +6512,74 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with('@'))
             .all(|l| l.starts_with("@pkg1/")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn go_iface_repo() -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = vec![
+            ("go.mod".into(), "module example.com/m\n".into()),
+            (
+                "oauth/provider.go".into(),
+                "package oauth\n\ntype Provider interface {\n\tGetName() string\n\tLogin(code string) error\n}\n".into(),
+            ),
+            (
+                "oauth/github.go".into(),
+                "package oauth\n\ntype GitHubProvider struct{}\n\nfunc (p *GitHubProvider) GetName() string { return \"gh\" }\nfunc (p *GitHubProvider) Login(code string) error { return nil }\n".into(),
+            ),
+            (
+                "oauth/types.go".into(),
+                "package oauth\n\ntype Token struct {\n\tValue string\n}\n".into(),
+            ),
+        ];
+        // Enough noise that page 1 is ranked, not the whole repo.
+        for i in 0..70 {
+            files.push((
+                format!("svc{}/f{i}.go", i % 7),
+                format!(
+                    "package svc{}\n\nfunc ProviderInterfaceHelper{i}() int {{ return {i} }}\n",
+                    i % 7
+                ),
+            ));
+        }
+        files
+    }
+
+    #[test]
+    fn resolve_context_lists_go_implementors_and_package_after_the_interface() {
+        let files = go_iface_repo();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let text = text_of(&server.resolve_context(Parameters(rc(
+            "which types implement the `Provider` interface in oauth/provider.go?",
+            2500,
+            Some(false),
+        ))));
+        let order: Vec<&str> = text.lines().filter(|l| l.starts_with('@')).collect();
+        let pos = |p: &str| order.iter().position(|l| l.starts_with(p));
+        assert_eq!(pos("@oauth/provider.go"), Some(0), "{text}");
+        assert_eq!(pos("@oauth/github.go"), Some(1), "{text}");
+        assert_eq!(pos("@oauth/types.go"), Some(2), "{text}");
+        assert!(text.contains("GitHubProvider struct"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_lists_go_implementors_of_a_shown_interface() {
+        let files = go_iface_repo();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (server, dir) = server_on_files(&refs);
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("Provider"))));
+        assert!(
+            text.contains("Go 隐式实现方") && text.contains("GitHubProvider @oauth/github.go:3"),
+            "{text}"
+        );
+        // A struct hit lists nothing extra.
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("Token"))));
+        assert!(!text.contains("Go 隐式实现方"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -568,7 +568,7 @@ impl Store {
 /// same bytes (new captures, different anchors/kinds). The parse cache is
 /// keyed by content hash, so without this an upgraded binary keeps serving
 /// symbols extracted by the old version until each file is edited.
-pub const EXTRACTOR_VERSION: u32 = 4;
+pub const EXTRACTOR_VERSION: u32 = 5;
 
 /// Cache key for a parsed file: extractor version, crate version, language
 /// and content hash.
@@ -658,6 +658,7 @@ fn edge_kind_to_u8(kind: EdgeKind) -> u8 {
         EdgeKind::Call => 1,
         EdgeKind::Inherit => 2,
         EdgeKind::Namespace => 3,
+        EdgeKind::Pair => 4,
     }
 }
 
@@ -900,6 +901,7 @@ impl From<EdgeWire> for CodeEdge {
                 1 => EdgeKind::Call,
                 2 => EdgeKind::Inherit,
                 3 => EdgeKind::Namespace,
+                4 => EdgeKind::Pair,
                 // Unknown future tags stay Call so an older reader does not
                 // invent Import edges. Namespace is tag 3, append-only.
                 _ => EdgeKind::Call,

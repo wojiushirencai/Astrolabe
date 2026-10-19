@@ -17,6 +17,7 @@ pub mod budget;
 pub mod cache;
 pub mod elect;
 pub mod freshness;
+pub mod go_iface;
 pub mod graph;
 pub mod index;
 pub mod lsp;

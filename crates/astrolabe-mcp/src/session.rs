@@ -71,8 +71,14 @@ pub(crate) struct RootSession {
     /// replayed onto the rebuilt index so the rebuild cannot erase them.
     pub rebuild_journal: Arc<Mutex<ChangeSet>>,
     /// Set by [`RootSession::teardown`]; a bootstrap that races with an
-    /// eviction checks it so it never leaves a watcher running.
+    /// eviction checks it so it never leaves a watcher running. It is also
+    /// the cancel token of this session's cold build and background
+    /// rebuilds: an evicted root or a shutting-down server stops parsing
+    /// instead of finishing a build nobody will serve.
     pub closed: Arc<AtomicBool>,
+    /// Full builds (cold or background rebuild) currently running for this
+    /// session; [`RootSession::wait_builds_idle`] waits for it to reach 0.
+    pub builds_active: Arc<std::sync::atomic::AtomicUsize>,
     pub knobs: McpKnobs,
 }
 
@@ -115,8 +121,25 @@ impl RootSession {
             rebuild_inflight: Arc::new(AtomicBool::new(false)),
             rebuild_journal: Arc::new(Mutex::new(ChangeSet::default())),
             closed: Arc::new(AtomicBool::new(false)),
+            builds_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             knobs,
         })
+    }
+
+    /// Wait (bounded) until no full build of this session is running.
+    /// Returns `true` when idle. Used after [`Self::teardown`] at shutdown so
+    /// a cancelled build reaches its safe point before the process exits.
+    pub(crate) fn wait_builds_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.builds_active.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Stop the watcher and drop the indexer lock. Store files stay on disk.
@@ -160,7 +183,53 @@ impl DispatchState {
     }
 }
 
+/// Counts one running full build in [`RootSession::builds_active`].
+struct BuildActive(Arc<std::sync::atomic::AtomicUsize>);
+
+impl BuildActive {
+    fn enter(session: &RootSession) -> Self {
+        session.builds_active.fetch_add(1, Ordering::SeqCst);
+        BuildActive(Arc::clone(&session.builds_active))
+    }
+}
+
+impl Drop for BuildActive {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Full build for `session` that stops early once the session is closed
+/// (teardown on eviction / shutdown). `None` = cancelled; nothing to publish.
+pub(crate) fn build_session_index(session: &RootSession, persist: bool) -> Option<IndexState> {
+    let _active = BuildActive::enter(session);
+    let started = Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        index::build_cancellable(
+            &session.root,
+            persist,
+            session.knobs.parse_cache_bytes,
+            &session.closed,
+        )
+    }));
+    let state = match outcome {
+        Err(_) => IndexState::Failed("底层索引能力尚未实现或发生 panic".to_string()),
+        Ok(None) => {
+            tracing::info!(
+                root = %session.root.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "index build cancelled (session closed)"
+            );
+            return None;
+        }
+        Ok(Some(index)) => IndexState::Ready(Arc::new(index)),
+    };
+    Some(state)
+}
+
 /// Index once, converting a panic in the engine into a reportable failure.
+/// Production paths use the cancellable [`build_session_index`].
+#[cfg(test)]
 pub(crate) fn build_index(root: &Path, persist: bool, parse_cache_bytes: u64) -> IndexState {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         index::build_with_options(root, persist, parse_cache_bytes)
@@ -206,7 +275,11 @@ fn bootstrap_root(session: Arc<RootSession>) {
         session.teardown();
         return;
     }
-    let outcome = build_index(&session.root, persist, session.knobs.parse_cache_bytes);
+    // Cancelled when the session closes mid-build (eviction / shutdown).
+    let Some(outcome) = build_session_index(&session, persist) else {
+        session.teardown();
+        return;
+    };
     publish_ready(&session, outcome);
 }
 
@@ -329,6 +402,9 @@ fn publish_ready(session: &RootSession, mut outcome: IndexState) {
         session.teardown();
         return;
     }
+    if let IndexState::Ready(index) = &outcome {
+        index.prewarm(true);
+    }
     *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
 }
 
@@ -354,6 +430,7 @@ fn apply_pending(session: &RootSession, pending: &mut ChangeSet) {
                 session.root.clone(),
                 inc,
             ));
+            next.prewarm(false);
             *session.state.write().unwrap_or_else(|e| e.into_inner()) = IndexState::Ready(next);
             if session.rebuild_inflight.load(Ordering::SeqCst) {
                 session
@@ -394,7 +471,7 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
     let max_inline = session.knobs.barrier_max;
     let decision = barrier_decision(
         watermark_age,
-        fresh_window_for(&session.knobs),
+        fresh_window_for(&session.knobs, log.poll_cycle()),
         distrusted,
         &suspects,
         max_inline,
@@ -449,7 +526,22 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
 /// arrives as a suspect, so an idle watermark older than `FRESH_WINDOW` does
 /// not need a full-tree verification per query (M1). In that mode the window
 /// is the safety interval plus slack; otherwise it is `FRESH_WINDOW`.
-pub(crate) fn fresh_window_for(knobs: &crate::knobs::McpKnobs) -> Duration {
+///
+/// `poll_cycle` is the watcher's published polling cycle (forced polling, or
+/// events that fell back to polling at runtime). A poller advances the
+/// watermark once per cycle and records every change it finds as a suspect,
+/// so the window is that cycle plus slack: a fixed 5 s window made every
+/// query in the second half of a 10 s cycle force an extra full scan (and
+/// a 2 s wait / stale note on big trees), while a 30 min events window after
+/// a fallback would never notice a stalled poller. The barrier still forces a
+/// verification once the poller is overdue.
+pub(crate) fn fresh_window_for(
+    knobs: &crate::knobs::McpKnobs,
+    poll_cycle: Option<Duration>,
+) -> Duration {
+    if let Some(cycle) = poll_cycle {
+        return (cycle + (cycle / 4).max(Duration::from_secs(1))).max(FRESH_WINDOW);
+    }
     match knobs.watch_mode {
         Some(crate::knobs::WatchMode::Events) if !knobs.safety_interval.is_zero() => {
             (knobs.safety_interval + Duration::from_secs(60)).max(FRESH_WINDOW)
@@ -520,8 +612,8 @@ pub(crate) fn trigger_background_rebuild_arc(session: &Arc<RootSession>) {
         .spawn(move || {
             let started = Instant::now();
             let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
-            let outcome = build_index(&session.root, persist, session.knobs.parse_cache_bytes);
-            if matches!(outcome, IndexState::Ready(_)) {
+            let outcome = build_session_index(&session, persist);
+            if let Some(outcome @ IndexState::Ready(_)) = outcome {
                 publish_rebuilt(&session, outcome);
                 // The rebuilt index covers every suspect noted before it began.
                 let log = session
@@ -562,6 +654,9 @@ fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
                 )));
             }
         }
+    }
+    if let IndexState::Ready(index) = &outcome {
+        index.prewarm(true);
     }
     *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
 }
@@ -716,12 +811,92 @@ mod tests {
     #[test]
     fn fresh_window_wide_only_for_events_with_safety_scan() {
         let mut k = McpKnobs::default();
-        assert_eq!(fresh_window_for(&k), Duration::from_secs(1860));
+        assert_eq!(fresh_window_for(&k, None), Duration::from_secs(1860));
         k.safety_interval = Duration::ZERO;
-        assert_eq!(fresh_window_for(&k), FRESH_WINDOW);
+        assert_eq!(fresh_window_for(&k, None), FRESH_WINDOW);
         k.safety_interval = Duration::from_secs(1800);
         k.watch_mode = Some(crate::knobs::WatchMode::Poll(Duration::from_secs(10)));
-        assert_eq!(fresh_window_for(&k), FRESH_WINDOW);
+        assert_eq!(fresh_window_for(&k, None), FRESH_WINDOW);
+    }
+
+    #[test]
+    fn fresh_window_follows_the_published_poll_cycle() {
+        let mut k = McpKnobs {
+            watch_mode: Some(crate::knobs::WatchMode::Poll(Duration::from_secs(10))),
+            ..McpKnobs::default()
+        };
+        // 10 s cycle + 2.5 s slack: no forced verification inside a cycle.
+        assert_eq!(
+            fresh_window_for(&k, Some(Duration::from_millis(10_100))),
+            Duration::from_millis(12_625)
+        );
+        // Backed-off poller on a huge tree: the window grows with it.
+        assert_eq!(
+            fresh_window_for(&k, Some(Duration::from_secs(40))),
+            Duration::from_secs(50)
+        );
+        // Short cycles never drop below the default window.
+        assert_eq!(
+            fresh_window_for(&k, Some(Duration::from_millis(200))),
+            FRESH_WINDOW
+        );
+        // Events mode that fell back to polling: the poller's cycle wins over
+        // the 30 min events window.
+        k.watch_mode = Some(crate::knobs::WatchMode::Events);
+        assert_eq!(
+            fresh_window_for(&k, Some(Duration::from_secs(10))),
+            Duration::from_millis(12_500)
+        );
+    }
+
+    #[test]
+    fn poll_mode_barrier_does_not_force_scans_inside_a_cycle() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let knobs = McpKnobs {
+            watch_mode: Some(crate::knobs::WatchMode::Poll(Duration::from_secs(8))),
+            parse_cache_bytes: DEFAULT_PARSE_CACHE_BYTES,
+            ..McpKnobs::default()
+        };
+        let session = RootSession::new(dir.clone(), knobs, 8 * 1024 * 1024);
+        start_root_indexing(Arc::clone(&session));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !matches!(&*session.state.read().unwrap(), IndexState::Ready(_)) {
+            assert!(Instant::now() < deadline, "index never ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let log = session.freshness.lock().unwrap().clone().expect("log");
+        // Age the watermark past the old fixed 5 s window, still inside the
+        // 8 s cycle (the poller rescans at ~8 s).
+        let wm = log.watermark();
+        while wm.elapsed() < FRESH_WINDOW + Duration::from_millis(300) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if log.watermark() == wm && wm.elapsed() < Duration::from_secs(7) {
+            assert!(matches!(run_barrier(&session), BarrierEffect::None));
+            assert_eq!(
+                log.watermark(),
+                wm,
+                "a query inside the poll cycle must not force a full scan"
+            );
+        }
+        // A real edit is still caught by the next poll and repaired inline.
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let _ = run_barrier(&session);
+            let found = match &*session.state.read().unwrap() {
+                IndexState::Ready(index) => index.graph().symbols.iter().any(|s| s.name == "beta"),
+                _ => false,
+            };
+            if found {
+                break;
+            }
+            assert!(Instant::now() < deadline, "poller never surfaced b.py");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        session.teardown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -958,6 +1133,108 @@ mod tests {
             *session.state.read().unwrap(),
             IndexState::Building
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repo big enough that a debug cold build takes a while.
+    fn write_many_py(dir: &Path, n: usize) {
+        for i in 0..n {
+            let sub = dir.join(format!("pkg{}", i % 40));
+            std::fs::create_dir_all(&sub).unwrap();
+            let mut body = String::new();
+            for j in 0..12 {
+                body.push_str(&format!(
+                    "def f{i}_{j}(x):\n    return g{i}_{j}(x) + {j}\n\n\nclass C{i}_{j}:\n    def m(self):\n        return f{i}_{j}(1)\n\n\n"
+                ));
+            }
+            std::fs::write(sub.join(format!("m{i}.py")), body).unwrap();
+        }
+    }
+
+    #[test]
+    fn teardown_cancels_an_in_flight_cold_build() {
+        let dir = unique_temp_dir();
+        write_many_py(&dir, 1500);
+        // Control: how long the full build takes on this machine.
+        let t = Instant::now();
+        let _ = build_index(&dir, false, DEFAULT_PARSE_CACHE_BYTES);
+        let full = t.elapsed();
+
+        let knobs = McpKnobs {
+            watch_mode: None,
+            parse_cache_bytes: DEFAULT_PARSE_CACHE_BYTES,
+            ..McpKnobs::default()
+        };
+        let session = RootSession::new(dir.clone(), knobs, 8 * 1024 * 1024);
+        start_root_indexing(Arc::clone(&session));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.builds_active.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "cold build never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(full / 10);
+        let asked = Instant::now();
+        session.teardown();
+        assert!(
+            session.wait_builds_idle(Duration::from_secs(30)),
+            "cancelled build never stopped"
+        );
+        let latency = asked.elapsed();
+        assert!(
+            latency < full / 2,
+            "cancel took {latency:?}, a full build takes {full:?}"
+        );
+        assert!(
+            matches!(*session.state.read().unwrap(), IndexState::Building),
+            "a cancelled build must not be published"
+        );
+        // Cancelled before the parse finished: no stamps were committed (the
+        // repo is far below the 32 MB mid-run flush).
+        if let Ok(Some(store)) = astrolabe_core::store::Store::open_read_only(
+            &astrolabe_core::index::store_path(&session.root),
+        ) {
+            assert!(store.file_stamp("pkg0/m0.py").unwrap().is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_background_rebuild_does_not_publish() {
+        let dir = unique_temp_dir();
+        write_many_py(&dir, 1500);
+        let knobs = McpKnobs {
+            watch_mode: None,
+            parse_cache_bytes: DEFAULT_PARSE_CACHE_BYTES,
+            ..McpKnobs::default()
+        };
+        let session = RootSession::new(dir.clone(), knobs, 8 * 1024 * 1024);
+        let cold = build_index(&session.root, false, session.knobs.parse_cache_bytes);
+        let IndexState::Ready(before) = cold else {
+            panic!("cold build failed");
+        };
+        *session.state.write().unwrap() = IndexState::Ready(Arc::clone(&before));
+        trigger_background_rebuild_arc(&session);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.builds_active.load(Ordering::SeqCst) == 0
+            && session.rebuild_inflight.load(Ordering::SeqCst)
+        {
+            assert!(Instant::now() < deadline, "rebuild never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        session.teardown();
+        assert!(session.wait_builds_idle(Duration::from_secs(30)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.rebuild_inflight.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "rebuild flag never cleared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        match &*session.state.read().unwrap() {
+            IndexState::Ready(now) => assert!(
+                Arc::ptr_eq(now, &before),
+                "a rebuild cancelled by teardown must not replace the index"
+            ),
+            other => panic!("unexpected state {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -100,9 +100,12 @@ pub fn match_name_path_with(
     if query.whole.contains('/') {
         let any_named = |text: &str| {
             let lowered = lower_once(text);
-            symbols
-                .iter()
-                .any(|s| name_matches(&s.name, &lowered, substring))
+            match &index.names {
+                Some(table) => table.any_matches(&lowered, substring),
+                None => symbols
+                    .iter()
+                    .any(|s| name_matches(&s.name, &lowered, substring)),
+            }
         };
         if any_named(&query.whole) {
             query = Query {
@@ -143,10 +146,19 @@ pub fn match_name_path_with(
 
     // 1) 候选 = 最后一段的名字匹配者；2) 向上验证祖先链与绝对路径约束。
     let mut matched: Vec<SymbolId> = Vec::new();
-    for sym in symbols {
-        if !name_matches(&sym.name, last, substring) {
-            continue;
-        }
+    // Candidates come in `symbols` order either way: from the name table
+    // (exact last segment: one binary search instead of a full scan) or
+    // from the full scan when no table was built.
+    let candidates: Vec<usize> = match &index.names {
+        Some(table) => table.matching(last, substring),
+        None => symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| name_matches(&s.name, last, substring))
+            .map(|(i, _)| i)
+            .collect(),
+    };
+    for sym in candidates.into_iter().map(|i| &symbols[i]) {
         if lowered.len() == 1 {
             // 绝对路径的单段查询：命中者必须是文件顶层。
             if query.absolute && !ctx.ancestors_within_file(sym).is_empty() {
@@ -338,12 +350,14 @@ struct Ctx<'a> {
     buckets: &'a HashMap<crate::types::FileId, Vec<usize>>,
 }
 
-/// Lookup tables over one symbol table (id → position, per-file buckets).
-/// Immutable-snapshot callers build it once and reuse it across queries.
+/// Lookup tables over one symbol table (id → position, per-file buckets,
+/// and optionally a [`NameTable`]). Immutable-snapshot callers build it once
+/// and reuse it across queries.
 #[derive(Debug, Default)]
 pub struct NamePathIndex {
     by_id: HashMap<SymbolId, usize>,
     buckets: HashMap<crate::types::FileId, Vec<usize>>,
+    names: Option<NameTable>,
 }
 
 impl NamePathIndex {
@@ -355,6 +369,86 @@ impl NamePathIndex {
         NamePathIndex {
             by_id: index_by_id(symbols),
             buckets,
+            names: None,
+        }
+    }
+
+    /// [`Self::new`] plus a [`NameTable`], so the last path segment is looked
+    /// up instead of scanned. Both halves are built in parallel.
+    pub fn with_names(symbols: &[CodeSymbol]) -> Self {
+        let (mut index, names) = rayon::join(|| Self::new(symbols), || NameTable::new(symbols));
+        index.names = Some(names);
+        index
+    }
+
+    /// The name table, when built with [`Self::with_names`].
+    pub fn names(&self) -> Option<&NameTable> {
+        self.names.as_ref()
+    }
+}
+
+/// Lowercased symbol names plus the positions sorted by (lowercase name,
+/// position): an inverted index from a name to its symbols. Exact lookups
+/// are a binary search; each group lists positions in `symbols` order.
+#[derive(Debug, Default)]
+pub struct NameTable {
+    lower: Vec<String>,
+    sorted: Vec<u32>,
+}
+
+impl NameTable {
+    pub fn new(symbols: &[CodeSymbol]) -> Self {
+        use rayon::prelude::*;
+        let lower: Vec<String> = symbols.par_iter().map(|s| s.name.to_lowercase()).collect();
+        let mut sorted: Vec<u32> = (0..symbols.len() as u32).collect();
+        sorted.par_sort_unstable_by(|&a, &b| {
+            lower[a as usize].cmp(&lower[b as usize]).then(a.cmp(&b))
+        });
+        NameTable { lower, sorted }
+    }
+
+    /// `name.to_lowercase()` of every symbol, by position.
+    pub fn lower(&self) -> &[String] {
+        &self.lower
+    }
+
+    /// Positions (ascending) of the symbols whose lowercase name equals
+    /// `lower_name` (which must already be lowercase).
+    pub fn exact(&self, lower_name: &str) -> &[u32] {
+        let key = |i: &u32| self.lower[*i as usize].as_str();
+        let lo = self.sorted.partition_point(|i| key(i) < lower_name);
+        let len = self.sorted[lo..].partition_point(|i| key(i) == lower_name);
+        &self.sorted[lo..lo + len]
+    }
+
+    /// One group per distinct lowercase name (in name order); each group
+    /// lists its positions ascending, so `group[0]` is the first occurrence.
+    pub fn groups(&self) -> impl Iterator<Item = &[u32]> {
+        self.sorted
+            .chunk_by(|a, b| self.lower[*a as usize] == self.lower[*b as usize])
+    }
+
+    /// Positions (ascending) whose name matches `seg_lower` the way
+    /// `name_matches` does: equal ignoring case, or containing it when
+    /// `substring`.
+    fn matching(&self, seg_lower: &str, substring: bool) -> Vec<usize> {
+        if substring {
+            self.lower
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains(seg_lower))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            self.exact(seg_lower).iter().map(|&i| i as usize).collect()
+        }
+    }
+
+    fn any_matches(&self, seg_lower: &str, substring: bool) -> bool {
+        if substring {
+            self.lower.iter().any(|l| l.contains(seg_lower))
+        } else {
+            !self.exact(seg_lower).is_empty()
         }
     }
 }
@@ -852,5 +946,92 @@ mod tests {
             ids(&match_name_path(&s, "OOB", true, all(), 0)),
             vec![(96, 0)]
         );
+    }
+
+    /// The name table (inverted index) must answer every query exactly like
+    /// the full scan: exact/substring last segment, ancestors, absolute and
+    /// trailing-slash forms, names containing `/`, mixed case, non-ASCII.
+    #[test]
+    fn name_table_lookup_matches_full_scan_for_every_query_form() {
+        let mut symbols = fixture();
+        let extra = [
+            (8, 2, "PARSER", SymbolKind::Class, (1, 50)),
+            (9, 2, "Parse", SymbolKind::Method, (2, 10)),
+            (10, 2, "operator /", SymbolKind::Method, (11, 12)),
+            (11, 2, "a/b", SymbolKind::Method, (13, 14)),
+            (12, 3, "Ärger", SymbolKind::Class, (1, 30)),
+            (13, 3, "ärgern", SymbolKind::Method, (2, 9)),
+            (14, 3, "İd", SymbolKind::Function, (10, 11)),
+            (15, 3, "straße", SymbolKind::Function, (12, 13)),
+            (16, 1, "parse", SymbolKind::Method, (21, 22)),
+        ];
+        for (id, file, name, kind, lines) in extra {
+            symbols.push(sym(id, file, name, kind, lines));
+        }
+        let scan = NamePathIndex::new(&symbols);
+        let table = NamePathIndex::with_names(&symbols);
+        assert!(scan.names().is_none() && table.names().is_some());
+        let queries = [
+            "parse",
+            "PARSE",
+            "Parser/parse",
+            "/Parser/parse",
+            "/parse",
+            "Parser/",
+            "Node/serialize",
+            "Parser/Node/serialize",
+            "pars",
+            "Parser/get",
+            "operator /",
+            "PARSER/a/b",
+            "a/b",
+            "ärger",
+            "ÄRGER/ärgern",
+            "Ärger/ÄRG",
+            "i̇d",
+            "İd",
+            "STRASSE",
+            "straße",
+            "x/y/z",
+            "",
+            "/",
+            "count",
+            "Parser/count",
+        ];
+        for q in queries {
+            for substring in [false, true] {
+                for depth in [0, 1, 2] {
+                    for kind in [all(), only(SymbolKind::Method)] {
+                        let a = match_name_path_with(&symbols, &scan, q, substring, kind, depth);
+                        let b = match_name_path_with(&symbols, &table, q, substring, kind, depth);
+                        assert_eq!(
+                            ids(&a),
+                            ids(&b),
+                            "{q:?} substring={substring} depth={depth}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn name_table_exact_and_groups_follow_symbol_order() {
+        let symbols = vec![
+            sym(0, 1, "Foo", SymbolKind::Class, (1, 9)),
+            sym(1, 1, "bar", SymbolKind::Function, (2, 3)),
+            sym(2, 2, "foo", SymbolKind::Function, (1, 2)),
+            sym(3, 2, "FOO", SymbolKind::Function, (3, 4)),
+            sym(4, 2, "Bar", SymbolKind::Function, (5, 6)),
+        ];
+        let table = NameTable::new(&symbols);
+        assert_eq!(table.exact("foo"), &[0, 2, 3]);
+        assert_eq!(table.exact("bar"), &[1, 4]);
+        assert!(table.exact("Foo").is_empty(), "keys are lowercase");
+        assert!(table.exact("fo").is_empty());
+        let groups: Vec<Vec<u32>> = table.groups().map(<[u32]>::to_vec).collect();
+        assert_eq!(groups, vec![vec![1, 4], vec![0, 2, 3]]);
+        assert_eq!(table.lower()[3], "foo");
+        assert!(NameTable::new(&[]).groups().next().is_none());
     }
 }

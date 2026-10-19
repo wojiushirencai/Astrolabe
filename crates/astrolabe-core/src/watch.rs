@@ -190,6 +190,12 @@ pub struct FreshnessLog {
     /// cold build must not start until this is set, or a file created in
     /// the gap is absorbed into the baseline and never emitted.
     seeded: AtomicBool,
+    /// Polling cadence (ms) while the watch thread runs in polling mode
+    /// (forced, or fallen back from events): the configured interval plus
+    /// backoff plus the last scan's duration. `0` while events drive the
+    /// loop. The query barrier sizes its freshness window from this, because
+    /// in polling mode the watermark only advances once per cycle.
+    poll_cycle_ms: AtomicU64,
 }
 
 struct FreshnessInner {
@@ -211,7 +217,29 @@ impl FreshnessLog {
             }),
             verify_requested: AtomicBool::new(false),
             seeded: AtomicBool::new(false),
+            poll_cycle_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Effective polling cycle when the watch thread is polling, `None`
+    /// while native events drive it (or before the loop has started).
+    ///
+    /// In polling mode nothing advances the watermark between scans, so a
+    /// fixed 5 s window would turn every query in the second half of a
+    /// 10 s cycle into an extra full-tree verification. Callers size the
+    /// window from this instead and only verify when the poller is overdue.
+    pub fn poll_cycle(&self) -> Option<Duration> {
+        match self.poll_cycle_ms.load(Ordering::SeqCst) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    fn set_poll_cycle(&self, cycle: Option<Duration>) {
+        let ms = cycle.map_or(0, |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
+        });
+        self.poll_cycle_ms.store(ms, Ordering::SeqCst);
     }
 
     /// Ask the watch loop to run a full verification on the next `STOP_SLICE`.
@@ -286,6 +314,11 @@ impl FreshnessLog {
 
     /// A completed full check: push watermark, clear distrust and suspects.
     ///
+    /// `started` is when the scan began. Suspects noted after that (events
+    /// that arrived while the scan ran off the watch thread) may or may not
+    /// be reflected in what the scan saw, so they are kept and re-stamped
+    /// after the new watermark instead of being cleared.
+    ///
     /// `changes` is the delta this check just produced. It has been sent (or
     /// is about to be) to the reindex consumer but is not applied to the
     /// index yet, so its paths stay suspects *after* the new watermark until
@@ -293,11 +326,18 @@ impl FreshnessLog {
     /// ([`Self::clear_suspects_through`]). Advancing the watermark alone would
     /// make the barrier report "fresh" for an index that does not yet contain
     /// the change.
-    pub(crate) fn note_verified(&self, changes: &ChangeSet) {
+    pub(crate) fn note_verified(&self, changes: &ChangeSet, started: Instant) {
         let mut g = self.lock();
-        g.watermark = Instant::now();
+        let watermark = Instant::now();
+        g.watermark = watermark;
         g.distrusted = false;
-        g.suspects.clear();
+        let after = watermark + Duration::from_nanos(1);
+        let mut kept: Vec<(Instant, RelPath)> = std::mem::take(&mut g.suspects)
+            .into_iter()
+            .filter(|(t, _)| *t > started)
+            .map(|(_, p)| (after, p))
+            .collect();
+        g.suspects.append(&mut kept);
         Self::push_unapplied(&mut g, changes);
         self.seeded.store(true, Ordering::SeqCst);
     }
@@ -450,6 +490,13 @@ fn apply_coalesce(map: &mut BTreeMap<RelPath, ChangeKind>, path: RelPath, next: 
     }
 }
 
+/// A directed check that must degrade to a full [`Watcher::check`]
+/// (`distrust`: storm / root event, so the log is marked distrusted first).
+#[derive(Debug)]
+struct NeedFull {
+    distrust: bool,
+}
+
 #[derive(Clone, Debug)]
 struct FileStamp {
     mtime: SystemTime,
@@ -474,6 +521,10 @@ pub struct Watcher {
     freshness: Arc<FreshnessLog>,
     check_calls: Arc<AtomicU64>,
     check_paths_calls: Arc<AtomicU64>,
+    /// Test hook: stretch every full [`Watcher::check`] (after the tree was
+    /// observed) to simulate a slow scan on a large repository.
+    #[cfg(test)]
+    scan_delay: Duration,
 }
 
 impl Watcher {
@@ -490,6 +541,8 @@ impl Watcher {
             freshness: Arc::new(FreshnessLog::new()),
             check_calls: Arc::new(AtomicU64::new(0)),
             check_paths_calls: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            scan_delay: Duration::ZERO,
         }
     }
 
@@ -556,13 +609,18 @@ impl Watcher {
     /// clears distrust.
     pub fn check(&mut self) -> ChangeSet {
         self.check_calls.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let now = SystemTime::now();
         let observed = observe_tree(&self.root, &self.scan);
+        #[cfg(test)]
+        if !self.scan_delay.is_zero() {
+            thread::sleep(self.scan_delay);
+        }
 
         if !self.seeded {
             self.snapshot = stamps_from_observed(&self.root, &observed, now);
             self.seeded = true;
-            self.freshness.note_verified(&ChangeSet::default());
+            self.freshness.note_verified(&ChangeSet::default(), started);
             return ChangeSet::default();
         }
 
@@ -609,7 +667,7 @@ impl Watcher {
                 "watch changeset"
             );
         }
-        self.freshness.note_verified(&changes);
+        self.freshness.note_verified(&changes, started);
         changes
     }
 
@@ -622,9 +680,24 @@ impl Watcher {
     /// [`scan::path_admission`]. If the unique / expanded set exceeds
     /// [`WatchConfig::storm_paths`], this degrades to [`Self::check`].
     pub fn check_paths(&mut self, paths: &[PathBuf]) -> ChangeSet {
+        match self.directed_check(paths) {
+            Ok(changes) => changes,
+            Err(NeedFull { distrust }) => {
+                if distrust {
+                    self.freshness.note_distrust();
+                }
+                self.check()
+            }
+        }
+    }
+
+    /// [`Self::check_paths`] without the full-check fallback: returns
+    /// `Err(NeedFull)` where `check_paths` would degrade, so the event loop
+    /// can run that full scan off the watch thread (L2) instead of inline.
+    fn directed_check(&mut self, paths: &[PathBuf]) -> Result<ChangeSet, NeedFull> {
         self.check_paths_calls.fetch_add(1, Ordering::Relaxed);
         if !self.seeded {
-            return self.check();
+            return Err(NeedFull { distrust: false });
         }
         let cap = self.config.storm_paths;
         let mut unique = Vec::new();
@@ -640,8 +713,7 @@ impl Watcher {
             }
         }
         if unique.len() > cap {
-            self.freshness.note_distrust();
-            return self.check();
+            return Err(NeedFull { distrust: true });
         }
 
         let extra = &self.scan.extra_excludes;
@@ -653,12 +725,10 @@ impl Watcher {
                 // Root-directory event: treat as a bounded walk of the whole
                 // tree. Hitting `cap` degrades to a full check.
                 if expand_dir_bounded(&self.root, abs, extra, cap, &mut work).is_err() {
-                    self.freshness.note_distrust();
-                    return self.check();
+                    return Err(NeedFull { distrust: true });
                 }
                 if work.len() > cap {
-                    self.freshness.note_distrust();
-                    return self.check();
+                    return Err(NeedFull { distrust: true });
                 }
                 continue;
             }
@@ -676,16 +746,14 @@ impl Watcher {
             }
             if abs.is_dir() {
                 if expand_dir_bounded(&self.root, abs, extra, cap, &mut work).is_err() {
-                    self.freshness.note_distrust();
-                    return self.check();
+                    return Err(NeedFull { distrust: true });
                 }
                 let prefix = rel.as_str();
                 for k in self.snapshot.keys() {
                     if rel_is_under(k, prefix) {
                         work.insert(k.clone());
                         if work.len() > cap {
-                            self.freshness.note_distrust();
-                            return self.check();
+                            return Err(NeedFull { distrust: true });
                         }
                     }
                 }
@@ -697,22 +765,19 @@ impl Watcher {
                         if rel_is_under(k, prefix) {
                             work.insert(k.clone());
                             if work.len() > cap {
-                                self.freshness.note_distrust();
-                                return self.check();
+                                return Err(NeedFull { distrust: true });
                             }
                         }
                     }
                 }
                 if work.len() > cap {
-                    self.freshness.note_distrust();
-                    return self.check();
+                    return Err(NeedFull { distrust: true });
                 }
             }
         }
 
         if work.len() > cap {
-            self.freshness.note_distrust();
-            return self.check();
+            return Err(NeedFull { distrust: true });
         }
 
         let now = SystemTime::now();
@@ -772,7 +837,7 @@ impl Watcher {
             );
         }
         self.freshness.bump_watermark(&changes);
-        changes
+        Ok(changes)
     }
 
     /// Run `check` on a background thread and send debounced changesets.
@@ -817,11 +882,13 @@ impl Watcher {
                 if let Some((feed, guard)) = notify_ctx {
                     let (watcher, ok) =
                         event_loop(self, feed, guard, tx.clone(), Arc::clone(&stop_thread));
-                    if !ok && !stop_thread.load(Ordering::Relaxed) {
-                        tracing::warn!(
-                            "filesystem event watcher encountered an error; falling back to polling"
-                        );
-                        run_loop(watcher, tx, stop_thread);
+                    if let (false, Some(watcher)) = (ok, watcher) {
+                        if !stop_thread.load(Ordering::Relaxed) {
+                            tracing::warn!(
+                                "filesystem event watcher encountered an error; falling back to polling"
+                            );
+                            run_loop(watcher, tx, stop_thread);
+                        }
                     }
                     return;
                 }
@@ -1164,177 +1231,302 @@ fn is_ignore_rule_file(rel: &RelPath) -> bool {
 
 const FOREIGN_EVENT_LIMIT: usize = 64;
 
+/// How often the event loop checks an off-thread full scan for completion
+/// while it keeps draining the event feed.
+const SCAN_POLL: Duration = Duration::from_millis(10);
+
+/// Event-side state of [`event_loop`]: the debounced pending set and the
+/// counters fed by every wake. Holds its own copies of root / scan options /
+/// log so events can still be absorbed while a full scan owns the
+/// [`Watcher`] on another thread.
+struct Intake {
+    root: PathBuf,
+    scan: ScanOptions,
+    freshness: Arc<FreshnessLog>,
+    storm_paths: usize,
+    pending: HashSet<PathBuf>,
+    all_dirty: bool,
+    foreign_events: usize,
+    rooted_events: usize,
+    last_event: Option<Instant>,
+    /// First event of the current debounce burst; bounds the total wait so a
+    /// path that keeps changing (a log file) cannot starve delivery.
+    first_event: Option<Instant>,
+}
+
+impl Intake {
+    fn new(watcher: &Watcher) -> Self {
+        Intake {
+            root: watcher.root.clone(),
+            scan: watcher.scan.clone(),
+            freshness: Arc::clone(&watcher.freshness),
+            storm_paths: watcher.config.storm_paths,
+            pending: HashSet::new(),
+            all_dirty: false,
+            foreign_events: 0,
+            rooted_events: 0,
+            last_event: None,
+            first_event: None,
+        }
+    }
+
+    /// Merge one wake's paths into the pending set and note new suspects.
+    fn absorb(&mut self, paths: Vec<PathBuf>, overflow: bool) {
+        let mut kept = 0usize;
+        let mut noted: Vec<RelPath> = Vec::new();
+        if overflow {
+            self.all_dirty = true;
+            self.freshness.note_distrust();
+        }
+        for p in paths {
+            if p.is_absolute() && !p.starts_with(&self.root) {
+                self.foreign_events += 1;
+            } else {
+                self.rooted_events += 1;
+            }
+            if let Some((abs, rel)) = keep_event_path(&self.root, &self.scan, &p) {
+                if self.pending.insert(abs) {
+                    noted.push(rel);
+                }
+                kept += 1;
+            }
+        }
+        if self.pending.len() > self.storm_paths {
+            self.all_dirty = true;
+            self.freshness.note_distrust();
+        }
+        if !noted.is_empty() {
+            // Ignore-rule files change the admitted set of other paths; only
+            // a full scan can re-evaluate those.
+            if noted.iter().any(is_ignore_rule_file) {
+                self.all_dirty = true;
+            }
+            self.freshness.note_paths(&noted);
+        }
+        if kept > 0 || overflow || self.all_dirty {
+            let now = Instant::now();
+            self.last_event = Some(now);
+            self.first_event.get_or_insert(now);
+        }
+    }
+
+    /// Backend reports paths we can never map under the root (e.g. `\\?\`
+    /// prefix mismatch on Windows): events are useless.
+    fn only_foreign(&self) -> bool {
+        self.rooted_events == 0 && self.foreign_events >= FOREIGN_EVENT_LIMIT
+    }
+
+    /// A full scan is about to start: everything pending so far is covered by
+    /// it. Events that arrive while it runs land in a fresh pending set.
+    fn reset_for_full(&mut self) {
+        self.all_dirty = false;
+        self.pending.clear();
+        self.last_event = None;
+        self.first_event = None;
+    }
+}
+
+/// Wait up to `timeout` for one wake, then drain whatever else is queued so a
+/// bounded channel does not stay full. `Err` = backend error / disconnect /
+/// events that never map under the root → fall back to polling.
+fn drain_feed<F: EventFeed>(
+    feed: &mut F,
+    timeout: Duration,
+    intake: &mut Intake,
+) -> Result<(), ()> {
+    match feed.recv_timeout(timeout) {
+        Ok(FeedWake::Events { paths, overflow }) => {
+            intake.absorb(paths, overflow);
+            loop {
+                match feed.recv_timeout(Duration::ZERO) {
+                    Ok(FeedWake::Events { paths, overflow }) => intake.absorb(paths, overflow),
+                    Ok(FeedWake::Error) => return Err(()),
+                    Err(_) => break,
+                }
+            }
+            if intake.only_foreign() {
+                tracing::warn!("watch events never map under the root; degrading to polling");
+                return Err(());
+            }
+            Ok(())
+        }
+        Ok(FeedWake::Error) | Err(RecvTimeoutError::Disconnected) => Err(()),
+        Err(RecvTimeoutError::Timeout) => Ok(()),
+    }
+}
+
+/// Outcome of [`full_check_draining`].
+enum FullCheck {
+    Done(Box<Watcher>, ChangeSet),
+    /// Stop was requested while the scan ran; the scan thread finishes on its
+    /// own and its result is dropped.
+    Stopped,
+    /// The scan thread died (panic); the snapshot is gone.
+    Lost,
+}
+
+/// Run a full [`Watcher::check`] on a helper thread while this thread keeps
+/// draining the event feed into `intake` (L2). Events that arrive during the
+/// scan stay pending and suspect, and get a directed check after the usual
+/// debounce. Stop is honoured within [`SCAN_POLL`] instead of after the scan.
+/// A feed failure during the scan is recorded in `feed_failed`; the scan is
+/// still awaited so the caller can fall back to polling with its snapshot.
+fn full_check_draining<F: EventFeed>(
+    watcher: Watcher,
+    feed: &mut F,
+    intake: &mut Intake,
+    stop: &AtomicBool,
+    feed_failed: &mut bool,
+) -> FullCheck {
+    let (in_tx, in_rx) = mpsc::channel::<Watcher>();
+    let (out_tx, out_rx) = mpsc::channel::<(Watcher, ChangeSet)>();
+    let spawned = thread::Builder::new()
+        .name("astrolabe-watch-scan".into())
+        .spawn(move || {
+            if let Ok(mut w) = in_rx.recv() {
+                let batch = w.check();
+                let _ = out_tx.send((w, batch));
+            }
+        });
+    let handed_over = match spawned {
+        Ok(_) => in_tx.send(watcher).map_err(|e| e.0),
+        Err(_) => Err(watcher),
+    };
+    if let Err(mut watcher) = handed_over {
+        // Could not start a helper thread: scan inline as before.
+        let batch = watcher.check();
+        return FullCheck::Done(Box::new(watcher), batch);
+    }
+    loop {
+        match out_rx.recv_timeout(SCAN_POLL) {
+            Ok((watcher, batch)) => return FullCheck::Done(Box::new(watcher), batch),
+            Err(RecvTimeoutError::Disconnected) => return FullCheck::Lost,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if stop.load(Ordering::Relaxed) {
+            return FullCheck::Stopped;
+        }
+        if !*feed_failed && drain_feed(feed, Duration::ZERO, intake).is_err() {
+            *feed_failed = true;
+        }
+    }
+}
+
+/// Native-event loop. Returns the watcher (when it still owns it) and `false`
+/// when the caller should fall back to polling.
 fn event_loop<F: EventFeed, G>(
     mut watcher: Watcher,
     mut feed: F,
     guard: G,
     tx: mpsc::Sender<ChangeSet>,
     stop: Arc<AtomicBool>,
-) -> (Watcher, bool) {
+) -> (Option<Watcher>, bool) {
+    watcher.freshness.set_poll_cycle(None);
     let debounce = watcher.config.debounce;
     let storm_paths = watcher.config.storm_paths;
     let safety_interval = watcher.config.safety_interval;
-    let mut last_event: Option<Instant> = None;
-    // First event of the current debounce burst; bounds the total wait so a
-    // path that keeps changing (a log file) cannot starve delivery.
-    let mut first_event: Option<Instant> = None;
     let max_debounce = max_debounce_for(debounce);
     let mut last_safety = initial_last_safety(&watcher.config);
-    let mut pending: HashSet<PathBuf> = HashSet::new();
-    let mut all_dirty = false;
-    let mut foreign_events = 0usize;
-    let mut rooted_events = 0usize;
+    let mut intake = Intake::new(&watcher);
+    let mut feed_failed = false;
 
-    // Seed baseline (!seeded → empty) or emit catch-up delta if already seeded.
-    {
-        let batch = watcher.check();
-        if !batch.is_empty() && tx.send(batch).is_err() {
-            drop(guard);
-            return (watcher, true);
-        }
+    // Full scan off the watch thread; `continue`-style control via macro so
+    // every call site handles stop / panic / feed failure the same way.
+    macro_rules! full_check {
+        () => {{
+            match full_check_draining(watcher, &mut feed, &mut intake, &stop, &mut feed_failed) {
+                FullCheck::Done(w, batch) => {
+                    watcher = *w;
+                    if !batch.is_empty() && tx.send(batch).is_err() {
+                        drop(guard);
+                        return (Some(watcher), true);
+                    }
+                    if feed_failed {
+                        drop(guard);
+                        return (Some(watcher), false);
+                    }
+                }
+                FullCheck::Stopped => {
+                    drop(guard);
+                    return (None, true);
+                }
+                FullCheck::Lost => {
+                    tracing::error!("watch scan thread panicked; file watching stopped");
+                    drop(guard);
+                    return (None, true);
+                }
+            }
+        }};
     }
 
+    // Seed baseline (!seeded → empty) or emit catch-up delta if already seeded.
+    full_check!();
+
     while !stop.load(Ordering::Relaxed) {
-        match feed.recv_timeout(STOP_SLICE) {
-            Ok(FeedWake::Events { paths, overflow }) => {
-                let mut kept = 0usize;
-                let mut noted: Vec<RelPath> = Vec::new();
-                if overflow {
-                    all_dirty = true;
-                    watcher.freshness.note_distrust();
-                }
-                for p in paths {
-                    if p.is_absolute() && !p.starts_with(&watcher.root) {
-                        foreign_events += 1;
-                    } else {
-                        rooted_events += 1;
-                    }
-                    if let Some((abs, rel)) = keep_event_path(&watcher.root, &watcher.scan, &p) {
-                        if pending.insert(abs) {
-                            noted.push(rel);
-                        }
-                        kept += 1;
-                    }
-                }
-                // Drain coalesced events so a bounded channel does not stay full.
-                loop {
-                    match feed.recv_timeout(Duration::ZERO) {
-                        Ok(FeedWake::Events { paths, overflow }) => {
-                            if overflow {
-                                all_dirty = true;
-                                watcher.freshness.note_distrust();
-                            }
-                            for p in paths {
-                                if p.is_absolute() && !p.starts_with(&watcher.root) {
-                                    foreign_events += 1;
-                                } else {
-                                    rooted_events += 1;
-                                }
-                                if let Some((abs, rel)) =
-                                    keep_event_path(&watcher.root, &watcher.scan, &p)
-                                {
-                                    if pending.insert(abs) {
-                                        noted.push(rel);
-                                    }
-                                    kept += 1;
-                                }
-                            }
-                        }
-                        Ok(FeedWake::Error) => {
-                            drop(guard);
-                            return (watcher, false);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                // Backend reports paths we can never map under the root (e.g.
-                // `\\?\` prefix mismatch on Windows): events are useless, so
-                // degrade to polling instead of silently missing edits.
-                if rooted_events == 0 && foreign_events >= FOREIGN_EVENT_LIMIT {
-                    tracing::warn!("watch events never map under the root; degrading to polling");
-                    drop(guard);
-                    return (watcher, false);
-                }
-                if pending.len() > storm_paths {
-                    all_dirty = true;
-                    watcher.freshness.note_distrust();
-                }
-                if !noted.is_empty() {
-                    // Ignore-rule files change the admitted set of other
-                    // paths; only a full scan can re-evaluate those.
-                    if noted.iter().any(is_ignore_rule_file) {
-                        all_dirty = true;
-                    }
-                    watcher.freshness.note_paths(&noted);
-                }
-                if kept > 0 || overflow || all_dirty {
-                    let now = Instant::now();
-                    last_event = Some(now);
-                    first_event.get_or_insert(now);
-                }
-            }
-            Ok(FeedWake::Error) => {
-                drop(guard);
-                return (watcher, false);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                drop(guard);
-                return (watcher, false);
-            }
+        if drain_feed(&mut feed, STOP_SLICE, &mut intake).is_err() {
+            drop(guard);
+            return (Some(watcher), false);
         }
 
         // Query-time Repair([]) asks for a full check so a stale watermark
         // can advance without waiting for the safety interval.
         if watcher.freshness.take_verification_request() {
-            all_dirty = false;
-            pending.clear();
-            last_event = None;
-            first_event = None;
+            intake.reset_for_full();
             last_safety = Instant::now();
-            let batch = watcher.check();
-            if !batch.is_empty() && tx.send(batch).is_err() {
-                break;
-            }
+            full_check!();
         }
 
-        let quiet = last_event.map(|t| t.elapsed() >= debounce).unwrap_or(false)
-            || first_event
+        let quiet = intake
+            .last_event
+            .map(|t| t.elapsed() >= debounce)
+            .unwrap_or(false)
+            || intake
+                .first_event
                 .map(|t| t.elapsed() >= max_debounce)
                 .unwrap_or(false);
         let wait = safety_wait(safety_interval, watcher.freshness.distrusted());
         let safety_due = !wait.is_zero() && last_safety.elapsed() >= wait;
 
         if quiet || safety_due {
-            last_event = None;
-            first_event = None;
+            intake.last_event = None;
+            intake.first_event = None;
             // Safety scans and storm/overflow always take the full-tree path.
             // Directed `check_paths` does not reset the safety clock, so a
             // distrusted log still gets a full scan within the 60 s cap.
-            let storm = all_dirty || pending.len() > storm_paths;
-            let batch = if safety_due || storm {
-                all_dirty = false;
-                pending.clear();
+            let storm = intake.all_dirty || intake.pending.len() > storm_paths;
+            if safety_due || storm {
+                intake.reset_for_full();
                 last_safety = Instant::now();
-                watcher.check()
+                full_check!();
             } else {
-                let paths: Vec<PathBuf> = pending.drain().collect();
-                watcher.check_paths(&paths)
-            };
-            if !batch.is_empty() && tx.send(batch).is_err() {
-                break;
+                let paths: Vec<PathBuf> = intake.pending.drain().collect();
+                match watcher.directed_check(&paths) {
+                    Ok(batch) => {
+                        if !batch.is_empty() && tx.send(batch).is_err() {
+                            break;
+                        }
+                    }
+                    Err(NeedFull { distrust }) => {
+                        if distrust {
+                            watcher.freshness.note_distrust();
+                        }
+                        intake.reset_for_full();
+                        full_check!();
+                    }
+                }
             }
         }
     }
 
     // Flush pending debounce on stop, matching run_loop's pending flush.
-    if last_event.is_some() || !pending.is_empty() || all_dirty {
-        let batch = if all_dirty || pending.len() > storm_paths {
+    // Inline on purpose: the thread is exiting and the caller may join it.
+    if intake.last_event.is_some() || !intake.pending.is_empty() || intake.all_dirty {
+        let batch = if intake.all_dirty || intake.pending.len() > storm_paths {
             watcher.check()
-        } else if pending.is_empty() {
+        } else if intake.pending.is_empty() {
             ChangeSet::default()
         } else {
-            let paths: Vec<PathBuf> = pending.drain().collect();
+            let paths: Vec<PathBuf> = intake.pending.drain().collect();
             watcher.check_paths(&paths)
         };
         if !batch.is_empty() {
@@ -1343,7 +1535,7 @@ fn event_loop<F: EventFeed, G>(
     }
 
     drop(guard);
-    (watcher, true)
+    (Some(watcher), true)
 }
 
 fn run_loop(mut watcher: Watcher, tx: mpsc::Sender<ChangeSet>, stop: Arc<AtomicBool>) {
@@ -1351,6 +1543,7 @@ fn run_loop(mut watcher: Watcher, tx: mpsc::Sender<ChangeSet>, stop: Arc<AtomicB
     let debounce = watcher.config.debounce;
     let mut pending = ChangeSet::default();
     let mut last_activity: Option<Instant> = None;
+    watcher.freshness.set_poll_cycle(Some(poll_interval));
 
     while !stop.load(Ordering::Relaxed) {
         let scan_started = Instant::now();
@@ -1362,6 +1555,10 @@ fn run_loop(mut watcher: Watcher, tx: mpsc::Sender<ChangeSet>, stop: Arc<AtomicB
         } else {
             poll_interval
         };
+        // Watermark-to-watermark distance of this loop: sleep, then scan.
+        watcher
+            .freshness
+            .set_poll_cycle(Some(poll_interval + scan_took));
         if !batch.is_empty() {
             pending.merge(batch);
             last_activity = Some(Instant::now());
@@ -2707,7 +2904,11 @@ mod tests {
             let (watcher, ok) =
                 event_loop(w, feed, dummy_guard, tx.clone(), Arc::clone(&stop_thread));
             assert!(!ok, "event_loop should report failure on backend error");
-            run_loop(watcher, tx, stop_thread);
+            run_loop(
+                watcher.expect("watcher kept on feed error"),
+                tx,
+                stop_thread,
+            );
         });
 
         thread::sleep(Duration::from_millis(50));
@@ -2959,6 +3160,7 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         let (w, _) = thread.join().expect("join event_loop");
+        let w = w.expect("watcher returned on clean stop");
 
         // event_loop always does one full check at start; excluded events
         // must not add another full check or a directed check.
@@ -3134,7 +3336,7 @@ mod tests {
         );
 
         thread::sleep(Duration::from_millis(2));
-        log.note_verified(&ChangeSet::default());
+        log.note_verified(&ChangeSet::default(), Instant::now());
         assert!(log.is_seeded());
         assert!(!log.distrusted());
         assert!(log.watermark() > t0);
@@ -3267,5 +3469,142 @@ mod tests {
             times[times.len() / 2],
             times[times.len() - 1],
         );
+    }
+
+    /// Feed backed by a channel so a test injects events at chosen moments.
+    struct ChanFeed(mpsc::Receiver<Vec<PathBuf>>);
+
+    impl EventFeed for ChanFeed {
+        fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
+            self.0.recv_timeout(timeout).map(|paths| FeedWake::Events {
+                paths,
+                overflow: false,
+            })
+        }
+    }
+
+    #[test]
+    fn note_verified_keeps_suspects_noted_during_the_scan() {
+        let log = FreshnessLog::new();
+        log.note_paths(&[RelPath::new("before.rs")]);
+        thread::sleep(Duration::from_millis(2));
+        let started = Instant::now();
+        thread::sleep(Duration::from_millis(2));
+        // Arrived while the (off-thread) scan was running.
+        log.note_paths(&[RelPath::new("during.rs")]);
+        log.note_verified(&ChangeSet::default(), started);
+        assert_eq!(
+            log.suspect_paths(log.watermark()),
+            vec![RelPath::new("during.rs")],
+            "a suspect noted mid-scan must stay visible after the new watermark; \
+             one noted before the scan began is covered by it"
+        );
+    }
+
+    #[test]
+    fn full_scan_runs_off_thread_and_events_keep_flowing() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir)
+            .safety_interval(Duration::from_secs(3600))
+            .safety_jitter(false)
+            .debounce(Duration::from_millis(100));
+        let _ = w.check();
+        w.scan_delay = Duration::from_millis(1200);
+        let log = Arc::clone(&w.freshness);
+        let wm0 = log.watermark();
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let started = Instant::now();
+        // The loop opens with a full catch-up check, stretched to 1.2 s.
+        let thread = thread::spawn(move || event_loop(w, ChanFeed(ev_rx), (), tx, stop_thread));
+
+        thread::sleep(Duration::from_millis(200));
+        rewrite_and_bump(&dir, "a.rs", "fn a() { 2 }");
+        ev_tx.send(vec![dir.abs("a.rs")]).unwrap();
+        // Before L2 the event sat in the feed until the scan returned.
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while !log.suspect_paths(wm0).contains(&RelPath::new("a.rs")) {
+            assert!(
+                Instant::now() < deadline,
+                "event not absorbed during the scan"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(1100),
+            "suspect must be noted while the full scan is still running"
+        );
+        assert_eq!(log.watermark(), wm0, "scan still in flight");
+
+        // The scan observed the tree before the edit, so the change arrives
+        // through the directed check that follows the debounce.
+        let cs = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("edit made during the full scan is delivered");
+        assert_eq!(cs.modified, vec![RelPath::new("a.rs")]);
+        assert!(log.watermark() > wm0);
+
+        stop.store(true, Ordering::SeqCst);
+        let (w, ok) = thread.join().expect("join event_loop");
+        assert!(ok && w.is_some());
+        drop(ev_tx);
+    }
+
+    #[test]
+    fn stop_is_honoured_during_a_full_scan() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir).safety_jitter(false);
+        let _ = w.check();
+        w.scan_delay = Duration::from_secs(5);
+        let (tx, _rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let thread = thread::spawn(move || event_loop(w, HangFeed, (), tx, stop_thread));
+        thread::sleep(Duration::from_millis(100));
+        let asked = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let (w, ok) = thread.join().expect("join event_loop");
+        let took = asked.elapsed();
+        assert!(ok && w.is_none(), "stop mid-scan abandons the scan");
+        assert!(
+            took < Duration::from_secs(2),
+            "stop took {took:?}; it must not wait out the 5 s scan"
+        );
+    }
+
+    #[test]
+    fn poll_cycle_is_published_only_while_polling() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let (_rx, handle, log) = watcher(&dir)
+            .events(false)
+            .poll_interval(Duration::from_millis(300))
+            .spawn_with_log();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !log.is_seeded() {
+            assert!(Instant::now() < deadline, "never seeded");
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50));
+        let cycle = log.poll_cycle().expect("poll mode publishes its cycle");
+        assert!(cycle >= Duration::from_millis(300), "{cycle:?}");
+        handle.stop();
+
+        let mut w = watcher(&dir).safety_jitter(false);
+        let _ = w.check();
+        let log = Arc::clone(&w.freshness);
+        log.set_poll_cycle(Some(Duration::from_secs(10)));
+        let (tx, _rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let thread = thread::spawn(move || event_loop(w, HangFeed, (), tx, stop_thread));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(log.poll_cycle(), None, "event mode clears the poll cycle");
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
     }
 }

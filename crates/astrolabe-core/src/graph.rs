@@ -19,7 +19,7 @@
 //! TypeScript and 18% on Python. File-level import edges recalled 100%, which
 //! is why file-level questions route here and symbol-level ones do not.
 
-use crate::types::{CodeEdge, CodeFile, CodeSymbol, EdgeKind, FileId};
+use crate::types::{CodeEdge, CodeFile, CodeSymbol, EdgeKind, FileId, SymbolKind};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -119,6 +119,63 @@ fn task_match(
             }
         }
     }
+    if !m.exact_files.is_empty() {
+        // C-family: the header declaring the identifier and the file
+        // implementing it are one unit; whichever of the two the exact match
+        // landed in, the other half joins the caller tier.
+        let pairs: Vec<FileId> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Pair)
+            .filter_map(|e| {
+                let (a, b) = (FileId(e.from), FileId(e.to));
+                match (m.exact_files.contains(&a), m.exact_files.contains(&b)) {
+                    (true, false) => Some(b),
+                    (false, true) => Some(a),
+                    _ => None,
+                }
+            })
+            .collect();
+        m.caller_files.extend(pairs);
+    }
+    // Interfaces the task is about: spelled out exactly, or named in a file
+    // the task gives by path (`Provider` in `oauth/provider.go`). Their
+    // implementing types (Go implicit satisfaction, `EdgeKind::Inherit`)
+    // rank with the callers: "which types implement X" lives there.
+    let mut focal: HashSet<u32> = hits
+        .iter()
+        .filter(|h| h.strength >= STRENGTH_EXACT)
+        .map(|h| &g.symbols[h.idx])
+        .filter(|s| s.kind == SymbolKind::Interface)
+        .map(|s| s.id.0)
+        .collect();
+    if !m.exact_files.is_empty() {
+        let tokens = task_tokens(task);
+        focal.extend(
+            g.symbols
+                .iter()
+                .filter(|s| {
+                    s.kind == SymbolKind::Interface
+                        && m.exact_files.contains(&s.file)
+                        && tokens.contains_key(&compact_lower(&s.name))
+                })
+                .map(|s| s.id.0),
+        );
+    }
+    if !focal.is_empty() {
+        let implementors: HashSet<u32> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherit && focal.contains(&e.to))
+            .map(|e| e.from)
+            .collect();
+        for (idx, symbol) in g.symbols.iter().enumerate() {
+            if implementors.contains(&symbol.id.0) && !m.exact_files.contains(&symbol.file) {
+                m.caller_files.insert(symbol.file);
+                m.caller_symbols.insert(idx);
+            }
+        }
+    }
     if !exact_ids.is_empty() {
         // Name-matched call edges into the identifier the task spells out:
         // their files are where "call sites of X" live.
@@ -137,7 +194,45 @@ fn task_match(
             }
         }
     }
+    package_siblings(g, &mut m);
     m
+}
+
+/// A Go package (directory) with at most this many files is read as a unit:
+/// its other files join an exact file at the package tier. Larger packages
+/// (`controller/` with 165 files) say nothing about any one file.
+const PACKAGE_SIBLING_MAX: usize = 12;
+
+/// Fill `m.package_files`: the other Go files of each small package that
+/// contains an exact file, minus files already ranked higher.
+fn package_siblings(g: &CodeGraph, m: &mut TaskMatch) {
+    let is_go = |f: &CodeFile| f.language == Some(crate::types::Language::Go);
+    let dirs: HashSet<&str> = g
+        .files
+        .iter()
+        .filter(|f| is_go(f) && m.exact_files.contains(&f.id))
+        .map(|f| f.path.dir())
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    let mut members: HashMap<&str, Vec<FileId>> = HashMap::new();
+    for f in g.files.iter().filter(|f| is_go(f)) {
+        let dir = f.path.dir();
+        if dirs.contains(dir) {
+            members.entry(dir).or_default().push(f.id);
+        }
+    }
+    for ids in members
+        .values()
+        .filter(|ids| ids.len() <= PACKAGE_SIBLING_MAX)
+    {
+        for id in ids {
+            if !m.exact_files.contains(id) && !m.caller_files.contains(id) {
+                m.package_files.insert(*id);
+            }
+        }
+    }
 }
 
 /// A sub-word that names at least this share of all symbols (and at least
@@ -410,6 +505,28 @@ pub fn dependencies(g: &CodeGraph, target: FileId) -> Vec<FileId> {
     reachable_imports(g, target, false)
 }
 
+/// The other half of a C-family header/source pair ([`EdgeKind::Pair`],
+/// either direction), sorted. Empty for every other language.
+pub fn paired_files(g: &CodeGraph, file: FileId) -> Vec<FileId> {
+    let mut out: Vec<FileId> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Pair)
+        .filter_map(|e| {
+            if e.from == file.0 {
+                Some(FileId(e.to))
+            } else if e.to == file.0 {
+                Some(FileId(e.from))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn sorted_files(g: &CodeGraph) -> Vec<&CodeFile> {
     let mut files: Vec<&CodeFile> = g.files.iter().collect();
     files.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.id.cmp(&b.id)));
@@ -582,6 +699,9 @@ pub struct TaskMatch {
     pub caller_files: BTreeSet<FileId>,
     /// The calling symbols themselves (indexes into `CodeGraph::symbols`).
     pub caller_symbols: BTreeSet<usize>,
+    /// The rest of a small Go package that holds an exact file (package doc,
+    /// shared types, registry): ranked right after the callers.
+    pub package_files: BTreeSet<FileId>,
 }
 
 impl TaskMatch {
@@ -1167,5 +1287,107 @@ mod tests {
         assert!(m.exact_files.contains(&FileId(0)));
         let m = match_task(&g, "look at other.go");
         assert!(m.files.contains(&FileId(3)) && m.exact_files.is_empty());
+    }
+
+    #[test]
+    fn header_source_pair_of_an_exact_identifier_joins_the_caller_tier() {
+        let mut g = named_graph(
+            &["src/object.h", "src/object.c", "src/other.c"],
+            &[(0, "redisObjectRefcount"), (2, "unrelated")],
+        );
+        g.edges.push(CodeEdge {
+            from: 0,
+            to: 1,
+            kind: EdgeKind::Pair,
+            weight: 1,
+            confidence: Confidence::Syntactic,
+        });
+        let m = match_task(&g, "why does redisObjectRefcount leak");
+        assert_eq!(m.exact_files, BTreeSet::from([FileId(0)]));
+        assert_eq!(m.caller_files, BTreeSet::from([FileId(1)]));
+        assert_eq!(paired_files(&g, FileId(1)), vec![FileId(0)]);
+        assert_eq!(paired_files(&g, FileId(0)), vec![FileId(1)]);
+        assert!(paired_files(&g, FileId(2)).is_empty());
+        // Pair edges are not includes.
+        assert!(dependencies(&g, FileId(1)).is_empty());
+        assert!(dependents(&g, FileId(1)).is_empty());
+    }
+
+    fn go_graph(paths: &[&str], symbols: &[(u32, &str)]) -> CodeGraph {
+        let mut g = named_graph(paths, symbols);
+        for f in &mut g.files {
+            f.language = Some(Language::Go);
+        }
+        g
+    }
+
+    #[test]
+    fn implementors_of_a_named_interface_rank_with_the_callers() {
+        let mut g = go_graph(
+            &[
+                "oauth/provider.go",
+                "oauth/github.go",
+                "other/impl.go",
+                "x/noise.go",
+            ],
+            &[
+                (0, "Provider"),
+                (1, "GitHubProvider"),
+                (2, "OtherImpl"),
+                (3, "noise"),
+            ],
+        );
+        g.symbols[0].kind = SymbolKind::Interface;
+        g.symbols[1].kind = SymbolKind::Struct;
+        g.symbols[2].kind = SymbolKind::Struct;
+        for from in [1, 2] {
+            g.edges.push(CodeEdge {
+                from,
+                to: 0,
+                kind: EdgeKind::Inherit,
+                weight: 1,
+                confidence: Confidence::Syntactic,
+            });
+        }
+        // Named by path: `Provider` in `oauth/provider.go` is the interface.
+        let m = match_task(
+            &g,
+            "which types implement the `Provider` interface in oauth/provider.go?",
+        );
+        assert_eq!(m.exact_files, BTreeSet::from([FileId(0)]));
+        assert!(m.caller_files.contains(&FileId(1)) && m.caller_files.contains(&FileId(2)));
+        assert!(m.caller_symbols.contains(&1) && m.caller_symbols.contains(&2));
+        assert!(!m.caller_files.contains(&FileId(3)));
+        // Without the path (plain word `Provider`, not exact): no implementor tier.
+        let m = match_task(&g, "which types implement Provider");
+        assert!(m.caller_files.is_empty(), "{:?}", m.caller_files);
+    }
+
+    #[test]
+    fn small_go_package_of_an_exact_file_is_the_package_tier() {
+        let mut paths = vec![
+            "push/quiet.go",
+            "push/doc.go",
+            "push/receipt.go",
+            "far/x.go",
+        ];
+        let big: Vec<String> = (0..=PACKAGE_SIBLING_MAX)
+            .map(|i| format!("big/f{i}.go"))
+            .collect();
+        paths.extend(big.iter().map(String::as_str));
+        let mut syms = vec![(0, "ViaQuietDropped"), (2, "ObserveDrop"), (3, "far")];
+        syms.push((4, "BigThing"));
+        let g = go_graph(&paths, &syms);
+        let m = match_task(&g, "rename ViaQuietDropped");
+        assert_eq!(m.package_files, BTreeSet::from([FileId(1), FileId(2)]));
+        // A package over the cap adds nothing.
+        let m = match_task(&g, "rename BigThing");
+        assert_eq!(m.exact_files, BTreeSet::from([FileId(4)]));
+        assert!(m.package_files.is_empty(), "{:?}", m.package_files);
+        // Not Go: no package tier.
+        let g = named_graph(&paths, &syms);
+        assert!(match_task(&g, "rename ViaQuietDropped")
+            .package_files
+            .is_empty());
     }
 }

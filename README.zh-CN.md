@@ -112,4 +112,4 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 
 ## 许可证
 
-MIT OR Apache-2.0，见 [NOTICE](NOTICE)。设计受 [Serena](https://github.com/oraios/serena) 与 [OpenVisio](https://github.com/openvisio/openvisio) 启发，详见 [参考手册](docs/REFERENCE.zh-CN.md#五致谢与技术渊源)。
+MIT OR Apache-2.0，见 [NOTICE](NOTICE)。设计受 [Serena](https://github.com/oraios/serena) 与 [OpenVisio](https://github.com/syntaxPriest/openvisio-oss) 启发，详见 [参考手册](docs/REFERENCE.zh-CN.md#五致谢与技术渊源)。

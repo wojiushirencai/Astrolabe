@@ -68,6 +68,7 @@ pub(crate) fn ordered_files(req: &PageRequest) -> (Vec<FileId>, usize, bool) {
         .copied()
         .chain(req.matched.symbols.iter().map(|&i| g.symbols[i].file))
         .chain(req.matched.caller_files.iter().copied())
+        .chain(req.matched.package_files.iter().copied())
         .filter(|id| by_id.get(id).is_some_and(|f| keep(f)))
         .collect();
     relevant.sort_unstable();
@@ -79,8 +80,10 @@ pub(crate) fn ordered_files(req: &PageRequest) -> (Vec<FileId>, usize, bool) {
                     0
                 } else if req.matched.caller_files.contains(id) {
                     1
-                } else {
+                } else if req.matched.package_files.contains(id) {
                     2
+                } else {
+                    3
                 }
             };
             tier(a)

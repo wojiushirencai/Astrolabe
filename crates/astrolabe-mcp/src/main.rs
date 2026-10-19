@@ -128,6 +128,8 @@ async fn main() -> anyhow::Result<()> {
     // accept loop so handshake-less clients can call tools as soon as the graph
     // is ready rather than waiting for a handshake that may never arrive.
     server.start_indexing();
+    // Kept to cancel in-flight builds on shutdown; clones share all state.
+    let indexing = server.clone();
     // MCP spec 2026-07-28 removed the required `initialize` handshake.
     // `ServiceExt::serve` waits for `initialize` (or a first request carrying
     // complete per-request `_meta`) before entering the request loop. A bare
@@ -148,6 +150,18 @@ async fn main() -> anyhow::Result<()> {
 
     let served = service.waiting().await;
     signal_task.abort();
+    // Session over: cancel any cold build / rebuild still running (it would
+    // otherwise keep parsing until exit) and let it reach its safe point,
+    // concurrently with the language-server shutdown below.
+    let indexing_stop = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let idle = indexing.shutdown_indexing(std::time::Duration::from_secs(2));
+        tracing::info!(
+            idle,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "indexing stopped"
+        );
+    });
     // Client closed stdin, the transport dropped, or SIGINT/SIGTERM: stop the
     // language servers properly (LSP shutdown + exit) so they can persist
     // their state (kotlin-lsp flushes its index), bounded so the client
@@ -162,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "language servers stopped"
     );
+    let _ = indexing_stop.await;
     if signaled.load(std::sync::atomic::Ordering::SeqCst) {
         // The stdio reader is parked in a blocking read of a stdin that is
         // still open; runtime teardown would wait on it forever.

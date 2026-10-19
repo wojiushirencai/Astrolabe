@@ -134,6 +134,14 @@ enum State {
     Block(u32),
     /// Multi-line string: triple quote (the quote byte) or backtick.
     Multi(u8),
+    /// C# raw string `"""…"""` (`quotes` >= 3, closed by as many quotes; no
+    /// escapes) or verbatim string `@"…"` (`quotes` == 0; `""` is a quote).
+    /// Both may span lines. `dollars`: interpolation opens with that many
+    /// `{` (`$$"""…{{x}}…"""`); 0 = not interpolated.
+    CsStr {
+        quotes: usize,
+        dollars: usize,
+    },
     /// Rust `"` string that continued past the end of a line.
     Str(u8),
     /// Raw string / long comment closed by an exact terminator.
@@ -143,6 +151,25 @@ enum State {
     },
     /// Ruby `=begin` … `=end`.
     LineBlock,
+    /// Ruby `%r{…}` / `%w[…]` / `%Q(…)` …: bracket delimiters nest.
+    Percent {
+        open: u8,
+        close: u8,
+        depth: u32,
+        interp: bool,
+    },
+    /// Heredoc bodies still to read, in opener order (Ruby `<<~EOS`, PHP
+    /// `<<<EOT`). Several can open on one line; their bodies follow in turn.
+    Heredoc(Vec<Heredoc>),
+}
+
+#[derive(Clone, PartialEq)]
+struct Heredoc {
+    term: Vec<u8>,
+    /// The terminator may be indented (Ruby `<<~` / `<<-`, PHP 7.3+).
+    indent: bool,
+    interp: bool,
+    php: bool,
 }
 
 /// An open string interpolation (`${ … }`, `#{ … }`, `\( … )`, f-string `{ … }`):
@@ -197,7 +224,12 @@ fn step(lg: Lang, q: u8, fstr: bool, b: &[u8], i: usize) -> Step {
         };
     }
     let dollar = b[i] == b'$' && next == b'{';
+    // PHP `"{$x->y}"`: the brace opens, `$x->y` is code.
+    if lg == Lang::Php && q == b'"' && b[i] == b'{' && next == b'$' {
+        return Step::Open(1, b'{', b'}');
+    }
     let open = match lg {
+        Lang::Php => q == b'"' && dollar,
         Lang::Kotlin => q == b'"' && dollar,
         Lang::Dart => dollar,
         Lang::Js => q == b'`' && dollar,
@@ -251,6 +283,182 @@ fn ruby_regex_allowed(b: &[u8], i: usize) -> bool {
         );
     }
     false
+}
+
+/// Ruby `%` literal at `i`: (opener length, open, close, interpolating).
+/// `a % b` and `x %= 2` stay operators.
+fn ruby_percent_open(b: &[u8], i: usize) -> Option<(usize, u8, u8, bool)> {
+    let mut j = i + 1;
+    let kind = b.get(j).copied().filter(|c| b"qQwWiIrsx".contains(c));
+    if kind.is_some() {
+        j += 1;
+    }
+    let d = *b.get(j)?;
+    if !d.is_ascii_punctuation() || d == b'_' {
+        return None;
+    }
+    // `puts %w[a b]`: a command argument after a space following a method
+    // name. Not after a value (`"%d" %[x]`, `n %(m)` style modulo) and bare
+    // `%` only with bracket-like delimiters.
+    let mut k = i;
+    while k > 0 && matches!(b[k - 1], b' ' | b'\t') {
+        k -= 1;
+    }
+    let mut w = k;
+    while w > 0 && is_ident(b[w - 1]) {
+        w -= 1;
+    }
+    let arg = k < i
+        && w < k
+        && !b[w].is_ascii_digit()
+        && d != b'='
+        && (kind.is_some() || b"([{<|!".contains(&d));
+    if b")]}>".contains(&d) {
+        return None;
+    }
+    if !(ruby_regex_allowed(b, i) || arg) {
+        return None;
+    }
+    let close = match d {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        _ => d,
+    };
+    let interp = !matches!(kind, Some(b'q' | b'w' | b'i' | b's'));
+    Some((j + 1 - i, d, close, interp))
+}
+
+/// Ruby heredoc opener `<<~ID`, `<<-ID`, `<<ID`, `<<~'ID'`, `<<~"ID"` at `i`.
+fn ruby_heredoc_open(b: &[u8], i: usize) -> Option<(usize, Heredoc)> {
+    let mut j = i + 2;
+    let flag = matches!(b.get(j), Some(b'~' | b'-'));
+    if flag {
+        j += 1;
+    }
+    let (term, interp, end) = heredoc_ident(b, j)?;
+    if !flag {
+        // `a <<b` / `x << y` are appends: bare `<<ID` needs an upper-case
+        // identifier and no operand glued right before it.
+        let first = term.first().copied().unwrap_or(0);
+        let prev = if i > 0 { b[i - 1] } else { b' ' };
+        if !(first.is_ascii_uppercase() || b[j] != first) || is_ident(prev) {
+            return None;
+        }
+    }
+    Some((
+        end - i,
+        Heredoc {
+            term,
+            indent: flag,
+            interp,
+            php: false,
+        },
+    ))
+}
+
+/// PHP `<<<ID`, `<<<"ID"`, `<<<'ID'` (nowdoc) at `i`.
+fn php_heredoc_open(b: &[u8], i: usize) -> Option<(usize, Heredoc)> {
+    let mut j = i + 3;
+    while matches!(b.get(j), Some(b' ' | b'\t')) {
+        j += 1;
+    }
+    let (term, interp, end) = heredoc_ident(b, j)?;
+    // The opener must end the line.
+    if b[end..].iter().any(|c| !c.is_ascii_whitespace()) {
+        return None;
+    }
+    Some((
+        end - i,
+        Heredoc {
+            term,
+            indent: true,
+            interp,
+            php: true,
+        },
+    ))
+}
+
+/// Identifier at `j`, optionally quoted: (identifier, interpolating, end).
+fn heredoc_ident(b: &[u8], j: usize) -> Option<(Vec<u8>, bool, usize)> {
+    let q = b
+        .get(j)
+        .copied()
+        .filter(|c| matches!(c, b'\'' | b'"' | b'`'));
+    let s = j + usize::from(q.is_some());
+    let mut e = s;
+    while e < b.len() && is_ident(b[e]) {
+        e += 1;
+    }
+    if e == s || b[s].is_ascii_digit() {
+        return None;
+    }
+    let mut end = e;
+    if let Some(q) = q {
+        if b.get(e) != Some(&q) {
+            return None;
+        }
+        end += 1;
+    }
+    Some((b[s..e].to_vec(), q != Some(b'\''), end))
+}
+
+/// Does `line` close heredoc `h`? Returns the end of the terminator.
+fn heredoc_close(h: &Heredoc, b: &[u8]) -> Option<usize> {
+    let mut s = 0;
+    if h.indent {
+        while s < b.len() && matches!(b[s], b' ' | b'\t') {
+            s += 1;
+        }
+    }
+    let e = s + h.term.len();
+    if b.get(s..e) != Some(h.term.as_slice()) {
+        return None;
+    }
+    let rest = &b[e..];
+    let ok = if h.php {
+        rest.first().is_none_or(|c| !is_ident(*c))
+    } else {
+        rest.iter().all(|c| c.is_ascii_whitespace())
+    };
+    ok.then_some(e)
+}
+
+/// Code ranges inside one heredoc body line: Ruby `#{…}`, PHP `{$…}` / `${…}`.
+fn heredoc_interp(b: &[u8], php: bool) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        let open = if php {
+            (b[i] == b'{' && b[i + 1] == b'$') || (b[i] == b'$' && b[i + 1] == b'{')
+        } else {
+            b[i] == b'#' && b[i + 1] == b'{'
+        };
+        if !open {
+            i += 1;
+            continue;
+        }
+        let s = if php && b[i] == b'{' { i + 1 } else { i + 2 };
+        let mut d = 0u32;
+        let mut j = s;
+        while j < b.len() {
+            match b[j] {
+                b'{' => d += 1,
+                b'}' if d == 0 => break,
+                b'}' => d -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        out.push((s, j));
+        i = j + 1;
+    }
+    out
 }
 
 fn find(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
@@ -327,6 +535,8 @@ pub(crate) fn code_mask(
     // string is an f-string style one.
     let mut frames: Vec<Frame> = Vec::new();
     let mut fs = false;
+    // Heredocs opened on the current line; their bodies start on the next.
+    let mut pending: Vec<Heredoc> = Vec::new();
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         let b = line.as_bytes();
@@ -344,6 +554,35 @@ pub(crate) fn code_mask(
                 }
             }
         };
+        let mut i = 0;
+        if let State::Heredoc(mut queue) = state.clone() {
+            let h = queue.remove(0);
+            if let Some(end) = heredoc_close(&h, b) {
+                string(&mut mask, 0, end);
+                state = if queue.is_empty() {
+                    State::Code
+                } else {
+                    State::Heredoc(queue)
+                };
+                if !h.php || state != State::Code {
+                    out.push(mask);
+                    continue;
+                }
+                // PHP: `EOT;` / `EOT, $x);` — lex the rest of the line.
+                i = end;
+            } else {
+                let mut from = 0;
+                if h.interp {
+                    for (s, e) in heredoc_interp(b, h.php) {
+                        string(&mut mask, from, s);
+                        from = e;
+                    }
+                }
+                string(&mut mask, from, n);
+                out.push(mask);
+                continue;
+            }
+        }
         if lg == Lang::Ruby {
             if state == State::Code && line.starts_with("=begin") {
                 state = State::LineBlock;
@@ -357,10 +596,70 @@ pub(crate) fn code_mask(
                 continue;
             }
         }
-        let mut i = 0;
         while i < n {
             match state.clone() {
-                State::LineBlock => i = n,
+                State::LineBlock | State::Heredoc(_) => i = n,
+                State::Percent {
+                    open,
+                    close,
+                    depth,
+                    interp,
+                } => {
+                    let start = i;
+                    let mut d = depth;
+                    let mut closed = false;
+                    let mut opened = false;
+                    while i < n {
+                        if b[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if interp && b[i] == b'#' && b.get(i + 1) == Some(&b'{') {
+                            opened = true;
+                            break;
+                        }
+                        if open != close && b[i] == open {
+                            d += 1;
+                        } else if b[i] == close {
+                            if d == 0 {
+                                i += 1;
+                                closed = true;
+                                break;
+                            }
+                            d -= 1;
+                        }
+                        i += 1;
+                    }
+                    if opened {
+                        string(&mut mask, start, i + 2);
+                        frames.push(Frame {
+                            depth: 0,
+                            open: b'{',
+                            close: b'}',
+                            resume: State::Percent {
+                                open,
+                                close,
+                                depth: d,
+                                interp,
+                            },
+                            fstr: false,
+                        });
+                        i += 2;
+                        state = State::Code;
+                    } else {
+                        string(&mut mask, start, i);
+                        state = if closed {
+                            State::Code
+                        } else {
+                            State::Percent {
+                                open,
+                                close,
+                                depth: d,
+                                interp,
+                            }
+                        };
+                    }
+                }
                 State::Block(depth) => {
                     let start = i;
                     let mut d = depth;
@@ -399,6 +698,70 @@ pub(crate) fn code_mask(
                     }
                     if closed.is_some() {
                         state = State::Code;
+                    }
+                }
+                State::CsStr { quotes, dollars } => {
+                    let start = i;
+                    let run =
+                        |b: &[u8], i: usize, c: u8| b[i..].iter().take_while(|&&x| x == c).count();
+                    let mut closed = false;
+                    let mut opened = None;
+                    while i < n {
+                        if b[i] == b'"' {
+                            let r = run(b, i, b'"');
+                            if quotes == 0 {
+                                // Verbatim: `""` is an escaped quote.
+                                if r >= 2 {
+                                    i += 2;
+                                    continue;
+                                }
+                                i += 1;
+                                closed = true;
+                                break;
+                            }
+                            i += r;
+                            if r >= quotes {
+                                closed = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        if dollars > 0 && b[i] == b'{' {
+                            let r = run(b, i, b'{');
+                            let need = dollars.max(1);
+                            if quotes == 0 && r >= 2 {
+                                // `{{` is a literal brace in `$@"…"`.
+                                i += 2;
+                                continue;
+                            }
+                            if r >= need {
+                                // Extra leading braces are content.
+                                i += r - need;
+                                opened = Some(need);
+                                break;
+                            }
+                            i += r;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    if let Some(len) = opened {
+                        string(&mut mask, start, i + len);
+                        frames.push(Frame {
+                            depth: 0,
+                            open: b'{',
+                            close: b'}',
+                            resume: State::CsStr { quotes, dollars },
+                            fstr: false,
+                        });
+                        fs = false;
+                        i += len;
+                        state = State::Code;
+                    } else {
+                        string(&mut mask, start, i);
+                        if closed {
+                            state = State::Code;
+                        }
                     }
                 }
                 State::Str(q) => {
@@ -543,6 +906,32 @@ pub(crate) fn code_mask(
                         } else {
                             i += 1;
                         }
+                    } else if lg == Lang::Ruby && c == b'%' && ruby_percent_open(b, i).is_some() {
+                        let (len, open, close, interp) = ruby_percent_open(b, i).expect("checked");
+                        string(&mut mask, i, i + len);
+                        state = State::Percent {
+                            open,
+                            close,
+                            depth: 0,
+                            interp,
+                        };
+                        i += len;
+                    } else if c == b'<'
+                        && next == b'<'
+                        && ((lg == Lang::Ruby && ruby_heredoc_open(b, i).is_some())
+                            || (lg == Lang::Php
+                                && b.get(i + 2) == Some(&b'<')
+                                && php_heredoc_open(b, i).is_some()))
+                    {
+                        let (len, h) = if lg == Lang::Ruby {
+                            ruby_heredoc_open(b, i)
+                        } else {
+                            php_heredoc_open(b, i)
+                        }
+                        .expect("checked");
+                        string(&mut mask, i, i + len);
+                        pending.push(h);
+                        i += len;
                     } else if lg == Lang::Vb && c == b'\'' {
                         comment(&mut mask, i, n);
                         i = n;
@@ -598,6 +987,11 @@ pub(crate) fn code_mask(
                             term,
                             comment: false,
                         };
+                        string(&mut mask, i, i + len);
+                        i += len;
+                    } else if lg == Lang::CSharp && c == b'"' && cs_string_open(b, i).is_some() {
+                        let (quotes, dollars, len) = cs_string_open(b, i).expect("checked");
+                        state = State::CsStr { quotes, dollars };
                         string(&mut mask, i, i + len);
                         i += len;
                     } else if (c == b'"' || c == b'\'')
@@ -677,14 +1071,40 @@ pub(crate) fn code_mask(
                 .position(|f| matches!(f.resume, State::Str(_)))
             {
                 frames.truncate(p);
-                if !matches!(state, State::Multi(_)) {
+                if !matches!(state, State::Multi(_) | State::Percent { .. }) {
                     state = State::Code;
                 }
+            }
+        }
+        if !pending.is_empty() {
+            if state == State::Code {
+                state = State::Heredoc(std::mem::take(&mut pending));
+            } else {
+                pending.clear();
             }
         }
         out.push(mask);
     }
     Some(out)
+}
+
+/// C# raw (`"""`, `$$"""`) or verbatim (`@"`, `$@"`, `@$"`) string opener at
+/// the quote `i`: (quote count, 0 = verbatim; `$` count; opener length from
+/// `i`). `None` for a regular string.
+fn cs_string_open(b: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+    let quotes = b[i..].iter().take_while(|&&x| x == b'"').count();
+    let mut s = i;
+    while s > 0 && matches!(b[s - 1], b'$' | b'@') && i - s < 16 {
+        s -= 1;
+    }
+    if s > 0 && is_ident(b[s - 1]) {
+        return None;
+    }
+    let dollars = b[s..i].iter().filter(|&&x| x == b'$').count();
+    if quotes >= 3 {
+        return Some((quotes, dollars, quotes));
+    }
+    b[s..i].contains(&b'@').then_some((0, dollars.min(1), 1))
 }
 
 /// Rust `r"`, `r#"`, `br#"`, `cr#"`: (hash count, opener length).
@@ -1121,6 +1541,172 @@ mod tests {
             "foo_call",
             false
         ));
+    }
+
+    #[test]
+    fn ruby_percent_literals() {
+        // masked bodies, including nested delimiters and multi-line ones
+        for src in [
+            "x = %r{a{2}#foo_call}",
+            "x = %w[a [foo_call] b]",
+            "x = %q(a (foo_call) b)",
+            "x = %Q<a <foo_call> b>",
+            "x = %i|foo_call|",
+            "puts %(a foo_call)",
+            "x = %w[a\nfoo_call b]",
+        ] {
+            let lines = ls(src);
+            let l = lines.iter().position(|l| l.contains("foo_call")).unwrap();
+            assert!(!is_code("a.rb", src, l, "foo_call", false), "{src}");
+        }
+        // code after the literal (and `#` inside it is not a comment)
+        for src in [
+            "x = %r{#{y}}; foo_call",
+            "x = %w[# not a comment]; foo_call",
+            "x = %q{a {b} c} + foo_call",
+            "x = %w[a\nb]; foo_call",
+            "x = %Q(a #{foo_call} b)",
+            "x = %r{a#{foo_call(1)}b}i",
+        ] {
+            let lines = ls(src);
+            let l = lines.iter().position(|l| l.contains("foo_call")).unwrap();
+            assert!(is_code("a.rb", src, l, "foo_call", false), "{src}");
+        }
+        // `%q` / `%w` do not interpolate
+        assert!(!is_code(
+            "a.rb",
+            "x = %q(#{foo_call})",
+            0,
+            "foo_call",
+            false
+        ));
+        // modulo stays an operator
+        for src in [
+            "y = a % b; foo_call # c",
+            "y = a %b; foo_call",
+            "y = \"%d\" %[n]; foo_call",
+            "y = 10 %(3); foo_call",
+            "x %= 3; foo_call",
+            "y = a%w; foo_call",
+        ] {
+            assert!(is_code("a.rb", src, 0, "foo_call", false), "{src}");
+        }
+        assert!(!is_code(
+            "a.rb",
+            "y = a % b # foo_call",
+            0,
+            "foo_call",
+            false
+        ));
+    }
+
+    #[test]
+    fn ruby_heredocs() {
+        let src = "x = <<~EOS\n  foo_call # not a comment\n  EOS\nrun_g()";
+        assert!(!is_code("a.rb", src, 1, "foo_call", false));
+        assert!(is_code("a.rb", src, 3, "run_g", false));
+        assert!(is_code("a.rb", src, 1, "foo_call", true));
+        // `<<-` and bare `<<EOS`; bare needs the terminator at column 0
+        let src = "x = <<-EOS\nfoo_call\n    EOS\nrun_g()";
+        assert!(!is_code("a.rb", src, 1, "foo_call", false));
+        assert!(is_code("a.rb", src, 3, "run_g", false));
+        let src = "x = <<EOS\nfoo_call\n  EOS\nfoo_call2\nEOS\nrun_g()";
+        assert!(!is_code("a.rb", src, 3, "foo_call2", false));
+        assert!(is_code("a.rb", src, 5, "run_g", false));
+        // quoted terminators; single quotes do not interpolate
+        let src = "x = <<~'EOS'\n  #{foo_call}\nEOS\nrun_g()";
+        assert!(!is_code("a.rb", src, 1, "foo_call", false));
+        assert!(is_code("a.rb", src, 3, "run_g", false));
+        let src = "x = <<~\"EOS\"\n  a #{foo_call(1)} b\nEOS";
+        assert!(is_code("a.rb", src, 1, "foo_call", false));
+        assert!(!is_code("a.rb", src, 1, " b", false));
+        // two heredocs on one line, rest of the opener line is code
+        let src = "f(<<~A, <<~B) + run_g()\n  foo_call\nA\n  foo_call2\nB\nrun_h()";
+        assert!(is_code("a.rb", src, 0, "run_g", false));
+        assert!(!is_code("a.rb", src, 1, "foo_call", false));
+        assert!(!is_code("a.rb", src, 3, "foo_call2", false));
+        assert!(is_code("a.rb", src, 5, "run_h", false));
+        // method call on the opener, and `=begin` inside a body is text
+        let src = "x = <<~SQL.strip\n=begin\nSQL\nrun_g()";
+        assert!(is_code("a.rb", src, 3, "run_g", false));
+        // appends and singleton classes are not heredocs
+        for src in [
+            "a << b; foo_call",
+            "class << self; foo_call",
+            "a <<b; foo_call",
+            "a<<B; foo_call",
+        ] {
+            assert!(is_code("a.rb", src, 0, "foo_call", false), "{src}");
+        }
+        assert!(is_code("a.rb", "a << b\nfoo_call", 1, "foo_call", false));
+    }
+
+    #[test]
+    fn php_interpolation_and_heredocs() {
+        for src in [
+            "$s = \"a {$foo_call->x} b\";",
+            "$s = \"a {$x[foo_call()]} b\";",
+            "$s = \"a ${foo_call} b\";",
+        ] {
+            assert!(is_code("a.php", src, 0, "foo_call", false), "{src}");
+        }
+        for src in [
+            "$s = \"a { $x } foo_call\";",
+            "$s = \"{$x} foo_call\";",
+            "$s = 'a {$foo_call}';",
+        ] {
+            assert!(!is_code("a.php", src, 0, "foo_call", false), "{src}");
+        }
+        let src = "$s = <<<EOT\n  a {$foo_call} // no comment foo_call2\n  EOT;\nrun_g();";
+        assert!(is_code("a.php", src, 1, "foo_call", false));
+        assert!(!is_code("a.php", src, 1, "foo_call2", false));
+        assert!(is_code("a.php", src, 3, "run_g", false));
+        let src = "$s = <<<\"EOT\"\na ${foo_call} b\nEOT;";
+        assert!(is_code("a.php", src, 1, "foo_call", false));
+        // nowdoc: no interpolation; terminator followed by code
+        let src = "f(<<<'EOT'\n{$foo_call}\nEOT, run_g());\nrun_h();";
+        assert!(!is_code("a.php", src, 1, "foo_call", false));
+        assert!(is_code("a.php", src, 2, "run_g", false));
+        assert!(is_code("a.php", src, 3, "run_h", false));
+        // the terminator must not be a prefix of a longer identifier
+        let src = "$s = <<<EOT\nEOTX foo_call\nEOT;\nrun_g();";
+        assert!(!is_code("a.php", src, 1, "foo_call", false));
+        assert!(is_code("a.php", src, 3, "run_g", false));
+    }
+
+    #[test]
+    fn csharp_raw_and_verbatim_strings() {
+        // Raw string over lines, with `""` and a lone `\` inside: all string.
+        let raw = "var s = \"\"\"\n  say \"\"hi\"\" foo_call() \\\n  \"\"\";\nreal();";
+        assert!(!is_code("a.cs", raw, 1, "foo_call", false));
+        assert!(is_code("a.cs", raw, 3, "real", false));
+        // Four quotes: a `"""` inside does not close it.
+        let four = "var s = \"\"\"\"a \"\"\" foo_call()\"\"\"\"; real();";
+        assert!(!is_code("a.cs", four, 0, "foo_call", false));
+        assert!(is_code("a.cs", four, 0, "real", false));
+        // `$$"""`: `{` is content, `{{…}}` is code.
+        let dd = "var j = $$\"\"\"{\"k\": {{foo_call()}}, \"v\": {lit_call()}}\"\"\"; real();";
+        assert!(is_code("a.cs", dd, 0, "foo_call", false));
+        assert!(!is_code("a.cs", dd, 0, "lit_call", false));
+        assert!(is_code("a.cs", dd, 0, "real", false));
+        // `$"""` multi-line with an interpolation on a later line.
+        let d1 = "var s = $\"\"\"\n  a {foo_call()} lit_call()\n  \"\"\"; real();";
+        assert!(is_code("a.cs", d1, 1, "foo_call", false));
+        assert!(!is_code("a.cs", d1, 1, "lit_call", false));
+        assert!(is_code("a.cs", d1, 2, "real", false));
+        // Verbatim: `\` is not an escape, `""` is a quote, lines continue.
+        let v = "var p = @\"C:\\dir\\\"; real();\nvar q = @\"a \"\"lit_call()\"\"\n lit_call() \"; real();";
+        assert!(is_code("a.cs", v, 0, "real", false));
+        assert!(!is_code("a.cs", v, 1, "lit_call", false));
+        assert!(!is_code("a.cs", v, 2, "lit_call", false));
+        assert!(is_code("a.cs", v, 2, "real", false));
+        // `$@"…{{lit}}…{x}"` and `@$"`.
+        let vi = "var s = @$\"{{lit_call()}} {foo_call()}\n\"; real();";
+        assert!(!is_code("a.cs", vi, 0, "lit_call", false));
+        assert!(is_code("a.cs", vi, 0, "foo_call", false));
+        assert!(is_code("a.cs", vi, 1, "real", false));
+        // A normal empty string next to code is untouched.
+        assert!(is_code("a.cs", "var e = \"\" + real();", 0, "real", false));
     }
 
     #[test]

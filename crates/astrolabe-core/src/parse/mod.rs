@@ -44,7 +44,10 @@ mod diag;
 mod ruby;
 mod shell;
 mod swift;
-pub use diag::{diagnose_indexed_syntax, diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
+pub use diag::{
+    diagnose_indexed_syntax, diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind, DIAG_FORMAT_VERSION,
+};
+mod jsx_amp;
 mod ts_variance;
 
 pub(crate) use razor::extract_razor_csharp;
@@ -252,17 +255,48 @@ impl ParserPool {
         // C# / VB: `#if` that splits a declaration, and .NET 10 `#:` lines,
         // are ERROR nodes. Only on a partial first pass, blank inactive
         // branches and `#:` lines (same length) and keep the retry if it is
-        // clean. Blanked branches' `using`s stay (import edges are a union).
+        // clean. Blanked branches' `using`s stay (import edges are a union),
+        // and their declarations come from a last-branch retry. Grammar
+        // gaps fixed in the same retry: VB `Imports` after a blank line, C#
+        // `[method]` collection elements.
         if parsed.partial && matches!(lang, Language::CSharp | Language::VisualBasic) {
-            let fixed = if lang == Language::CSharp {
-                csharp_pp::blank_inactive(source)
+            let vb = lang == Language::VisualBasic;
+            // VB: `Imports` after a blank / comment line, too.
+            let vb_header = |text: Option<String>| match &text {
+                Some(t) => csharp_pp::regroup_vb_header(t).or(text),
+                None => csharp_pp::regroup_vb_header(source),
+            };
+            // C#: `[method]` in a collection expression, too.
+            let cs_targets = |text: Option<String>| match &text {
+                Some(t) => csharp_pp::rename_collection_targets(t).or(text),
+                None => csharp_pp::rename_collection_targets(source),
+            };
+            let fixed = if vb {
+                vb_header(csharp_pp::blank_inactive_vb(source))
             } else {
-                csharp_pp::blank_inactive_vb(source)
+                cs_targets(csharp_pp::blank_inactive(source))
             };
             if let Some(fixed) = fixed {
                 if let Ok(mut retry) = self.parse_raw(lang, path, &fixed) {
                     if !retry.partial {
                         retry.imports = csharp_pp::union_imports(parsed.imports, retry.imports);
+                        // Declarations only in a later branch: from the
+                        // last-branch text, when that parses clean too.
+                        let alt = csharp_pp::blank_alternate(source, vb)
+                            .map(|a| match vb {
+                                true => csharp_pp::regroup_vb_header(&a).unwrap_or(a),
+                                false => csharp_pp::rename_collection_targets(&a).unwrap_or(a),
+                            })
+                            .filter(|alt| *alt != fixed);
+                        if let Some(alt) = alt {
+                            if let Ok(alt_parsed) = self.parse_raw(lang, path, &alt) {
+                                if !alt_parsed.partial {
+                                    csharp_pp::merge_alternate(
+                                        &mut retry, source, &fixed, alt_parsed,
+                                    );
+                                }
+                            }
+                        }
                         return Ok(retry);
                     }
                 }
@@ -274,7 +308,22 @@ impl ParserPool {
         // `import('lit')` spans with an identifier of equal length and keep
         // the retry only if it parses cleanly. Dynamic `import()` calls are
         // never touched (see `normalize_import_types`).
+        // JSX attribute strings with a bare `&` (`href="/?a=1&b=2"`), see
+        // `jsx_amp.rs`: kept only when clean; for TSX also the base of the
+        // TS retries below so the fixes combine.
+        let mut amp = None;
+        if parsed.partial && matches!(lang, Language::JavaScript | Language::Tsx) {
+            if let Some(fixed) = jsx_amp::escape_bare_ampersands(source) {
+                if let Ok(retry) = self.parse_raw(lang, path, &fixed) {
+                    if !retry.partial {
+                        return Ok(retry);
+                    }
+                }
+                amp = Some(fixed);
+            }
+        }
         if parsed.partial && matches!(lang, Language::TypeScript | Language::Tsx) {
+            let source = amp.as_deref().unwrap_or(source);
             // TS 4.7 variance (`interface I<in T, out U>`): same-length blank
             // of the keywords, kept only when the retry is clean. Also the
             // base for the import-type retry so both fixes can combine.
