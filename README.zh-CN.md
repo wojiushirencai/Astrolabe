@@ -56,7 +56,11 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 
 **索引覆盖。** 支持语言的文件全部进入索引，包括有语法或编译错误的文件：能解析的符号会保留，出错区域里的符号可能缺失。`get_languages` 报告：
 - 未进入索引的文件：按原因计数（超过大小上限、读取失败、解析超时）；
-- 有语法错误的文件：不超过 10 个时逐个列出；超过 10 个时只给数量和一份 Markdown 报告的绝对路径（`<仓库>/.astrolabe/coverage-report.md`，该目录自带 `.gitignore`，不可写时退到系统临时目录），报告里每个文件有路径、语言和首个错误行，每节最多 1000 条；
+- 有语法错误的文件，按类别分别计数：
+  - **其他语法错误**，标注为 `has syntax errors, index may be incomplete (symbols may be missing)`（有语法错误，索引可能不完整）；
+  - **预处理/宏导致**（只用于 C、C++、Objective-C），标注为 `macro/preprocessor syntax errors, symbols mostly intact`（预处理/宏导致的语法错误，符号基本完整）：错误紧挨着预处理指令或宏写法，比如 `#if` 切开声明、`LUAI_FUNC int f()`、`TEST_CASE("x")`、`NAMESPACE_BEGIN`、`foreach(x) {`。没有构建配置，任何语法解析器都展开不了宏，但错误恢复会保住符号名，只是出错位置附近的符号范围可能不准。这是启发式判断，拿不准时归为其他语法错误。
+
+  不超过 10 个时逐个列出（路径、类别标注、首个错误的行号和该行片段）；超过 10 个时只给各类数量和一份 Markdown 报告的绝对路径（`<仓库>/.astrolabe/coverage-report.md`，该目录自带 `.gitignore`，不可写时退到系统临时目录），报告里每个文件有路径、语言、类别和首个错误，其他语法错误排在前面，每节最多 1000 条；
 - 不支持语言的文件：只按扩展名汇总（前 8 种，其余合并为一项），不列具体文件。
 
 其它工具只在存在这些缺口时，在结果末尾附一行简短提示，指向 `get_languages`。
