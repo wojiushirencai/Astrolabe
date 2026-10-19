@@ -174,6 +174,14 @@ impl ParserPool {
         path: &RelPath,
         source: &str,
     ) -> Result<ParsedFile, ParseError> {
+        // A preprocessor directive on the last line without a trailing
+        // newline (`#pragma warning restore 618<EOF>`) makes the C-family
+        // grammars flag the whole file as erroneous although every symbol is
+        // extracted. Terminate it; offsets and lines are unchanged.
+        if needs_eof_newline(lang, source) {
+            let fixed = format!("{source}\n");
+            return self.parse(lang, path, &fixed);
+        }
         // Vue SFCs: embedded <script> extraction (no tree-sitter-vue on ABI 0.27).
         if lang == Language::Vue {
             return vue::parse_sfc(self, path, source);
@@ -521,19 +529,43 @@ fn configured_parser(lang: Language) -> Result<Parser, ParseError> {
     Ok(parser)
 }
 
+/// True when `source` ends in a C-family preprocessor line with no newline.
+fn needs_eof_newline(lang: Language, source: &str) -> bool {
+    matches!(
+        lang,
+        Language::C
+            | Language::Cpp
+            | Language::ObjC
+            | Language::ObjCpp
+            | Language::CSharp
+            | Language::VisualBasic
+    ) && !source.is_empty()
+        && !source.ends_with('\n')
+        && source
+            .rsplit('\n')
+            .next()
+            .is_some_and(|last| last.trim_start().starts_with('#'))
+}
+
 /// Locate the first syntax error of `source` for diagnostics: `(1-based line,
 /// description)`. Re-parses with the raw grammar (no per-language pre-pass), so
 /// it is best effort: `None` for languages without a plain grammar (Vue) or
 /// when the raw parse is clean.
 pub fn first_syntax_error(lang: Language, source: &str) -> Option<(u32, String)> {
+    if needs_eof_newline(lang, source) {
+        return first_syntax_error(lang, &format!("{source}\n"));
+    }
     let mut parser = configured_parser(lang).ok()?;
     let tree = parser.parse(source, None)?;
     let root = tree.root_node();
     if !root.has_error() {
         return None;
     }
-    let mut node = root;
+    // Full pre-order walk: `has_error` on an inner node does not always
+    // propagate to the child that holds the ERROR / MISSING node.
+    let mut cursor = root.walk();
     loop {
+        let node = cursor.node();
         if node.is_error() || node.is_missing() {
             let line = node.start_position().row as u32 + 1;
             let what = if node.is_missing() {
@@ -554,12 +586,16 @@ pub fn first_syntax_error(lang: Language, source: &str) -> Option<(u32, String)>
             };
             return Some((line, what));
         }
-        // Descend into the first child that contains an error.
-        let mut cursor = node.walk();
-        let next = node.children(&mut cursor).find(|c| c.has_error());
-        match next {
-            Some(child) => node = child,
-            None => return None,
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                return None;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -1859,6 +1895,32 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
             );
             assert!(!p.symbols.iter().any(|s| s.name == "j"), "{lang:?}");
         }
+    }
+
+    #[test]
+    fn trailing_directive_without_newline_is_not_partial() {
+        let pool = ParserPool::new();
+        let src = "#pragma warning disable 618\nnamespace N {\n    public class C { public void M() {} }\n}\n#pragma warning restore 618";
+        let parsed = pool
+            .parse(Language::CSharp, &RelPath::new("C.cs"), src)
+            .unwrap();
+        assert!(!parsed.partial, "EOF directive flagged the file partial");
+        assert!(parsed.symbols.iter().any(|s| s.name == "M"));
+        assert_eq!(first_syntax_error(Language::CSharp, src), None);
+        let c = "int f(void) { return 0; }\n#endif";
+        assert!(!needs_eof_newline(Language::Python, "x = 1\n# c"));
+        assert!(needs_eof_newline(Language::C, c));
+    }
+
+    #[test]
+    fn first_syntax_error_reports_line() {
+        let (line, what) = first_syntax_error(Language::Python, "def a():\n    pass\n\ndef b(:\n")
+            .expect("error located");
+        assert_eq!(line, 4, "{what}");
+        assert_eq!(
+            first_syntax_error(Language::Python, "def a():\n    pass\n"),
+            None
+        );
     }
 
     #[test]
