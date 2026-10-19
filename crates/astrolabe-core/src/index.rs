@@ -1266,6 +1266,14 @@ fn assemble_graph_with(
         }
     }
 
+    if opts.call_edges {
+        // Go implicit interface satisfaction (type -> interface, syntactic
+        // method-set match). Symbol-level like call edges, so behind the
+        // same switch.
+        let implements = crate::go_iface::implementation_edges(&graph, &edges);
+        edges.extend(implements);
+    }
+
     // Collapse duplicates into weights, with a stable order.
     edges.sort_by_key(|e| (e.from, e.to, e.kind as u8));
     let mut merged: Vec<CodeEdge> = Vec::with_capacity(edges.len());

@@ -342,6 +342,10 @@ fn rank_broad_hits<'a>(index: &RepoIndex, hits: &'a [SearchHit]) -> Vec<&'a Sear
 }
 
 const BROAD_PREVIEW_HITS: usize = 12;
+/// `find_symbol`: interfaces per page whose Go implementors are listed, and
+/// implementors listed per interface.
+const GO_IMPLEMENTOR_IFACES: usize = 3;
+const GO_IMPLEMENTORS_LISTED: usize = 12;
 
 fn name_tokens(name: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -3000,6 +3004,30 @@ impl AstrolabeServer {
             for line in &kept {
                 body.push_str(line);
                 body.push('\n');
+            }
+            // Go interfaces on this page: their implementing types (implicit
+            // satisfaction is invisible to a name search), within budget.
+            let shown_ifaces: std::collections::HashSet<u32> = hits[offset..offset + kept_count]
+                .iter()
+                .map(|(_, idx)| &symbols[*idx])
+                .filter(|s| s.kind == astrolabe_core::SymbolKind::Interface)
+                .map(|s| s.id.0)
+                .take(GO_IMPLEMENTOR_IFACES)
+                .collect();
+            if !shown_ifaces.is_empty() {
+                let graph = index.graph();
+                let by = astrolabe_core::go_iface::implementors_of(graph, &shown_ifaces);
+                for (iface, impls) in &by {
+                    let line = astrolabe_core::go_iface::render_implementors(
+                        graph,
+                        *iface,
+                        impls,
+                        GO_IMPLEMENTORS_LISTED,
+                    );
+                    if estimate_tokens(&body) + estimate_tokens(&line) <= params.budget_tokens {
+                        body.push_str(&line);
+                    }
+                }
             }
             // 零命中时显式声明（对齐 find_references 空结果约定），并跳过
             // include_body 附加，避免误导性的"无可提取的符号体"。
@@ -6216,6 +6244,74 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with('@'))
             .all(|l| l.starts_with("@pkg1/")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn go_iface_repo() -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = vec![
+            ("go.mod".into(), "module example.com/m\n".into()),
+            (
+                "oauth/provider.go".into(),
+                "package oauth\n\ntype Provider interface {\n\tGetName() string\n\tLogin(code string) error\n}\n".into(),
+            ),
+            (
+                "oauth/github.go".into(),
+                "package oauth\n\ntype GitHubProvider struct{}\n\nfunc (p *GitHubProvider) GetName() string { return \"gh\" }\nfunc (p *GitHubProvider) Login(code string) error { return nil }\n".into(),
+            ),
+            (
+                "oauth/types.go".into(),
+                "package oauth\n\ntype Token struct {\n\tValue string\n}\n".into(),
+            ),
+        ];
+        // Enough noise that page 1 is ranked, not the whole repo.
+        for i in 0..70 {
+            files.push((
+                format!("svc{}/f{i}.go", i % 7),
+                format!(
+                    "package svc{}\n\nfunc ProviderInterfaceHelper{i}() int {{ return {i} }}\n",
+                    i % 7
+                ),
+            ));
+        }
+        files
+    }
+
+    #[test]
+    fn resolve_context_lists_go_implementors_and_package_after_the_interface() {
+        let files = go_iface_repo();
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
+        let (server, dir) = smart_server(&refs);
+        let text = text_of(&server.resolve_context(Parameters(rc(
+            "which types implement the `Provider` interface in oauth/provider.go?",
+            2500,
+            Some(false),
+        ))));
+        let order: Vec<&str> = text.lines().filter(|l| l.starts_with('@')).collect();
+        let pos = |p: &str| order.iter().position(|l| l.starts_with(p));
+        assert_eq!(pos("@oauth/provider.go"), Some(0), "{text}");
+        assert_eq!(pos("@oauth/github.go"), Some(1), "{text}");
+        assert_eq!(pos("@oauth/types.go"), Some(2), "{text}");
+        assert!(text.contains("GitHubProvider struct"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_lists_go_implementors_of_a_shown_interface() {
+        let files = go_iface_repo();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (server, dir) = server_on_files(&refs);
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("Provider"))));
+        assert!(
+            text.contains("Go 隐式实现方") && text.contains("GitHubProvider @oauth/github.go:3"),
+            "{text}"
+        );
+        // A struct hit lists nothing extra.
+        let text = fs_text(&server.find_symbol(Parameters(fs_query("Token"))));
+        assert!(!text.contains("Go 隐式实现方"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

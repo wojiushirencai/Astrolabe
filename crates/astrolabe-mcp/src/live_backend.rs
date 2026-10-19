@@ -36,6 +36,8 @@ pub(crate) type SyntaxIndex = Arc<dyn Fn() -> Option<Arc<RepoIndex>> + Send + Sy
 
 /// Cap on syntactic stand-in answers so a common name cannot flood a reply.
 const MAX_SYNTACTIC_DEFINITIONS: usize = 30;
+/// Go implementors listed in a `find_references` note.
+const GO_IMPLEMENTORS_LISTED: usize = 12;
 
 pub(crate) struct LiveBackend {
     root: PathBuf,
@@ -124,6 +126,37 @@ impl LiveBackend {
             .take(MAX_SYNTACTIC_DEFINITIONS)
             .map(|(_, loc, sig)| (loc, sig))
             .collect()
+    }
+
+    /// A Go interface named by the query in `path`: its implementing types
+    /// from the syntax index (references never include them; Go has no
+    /// `implements` clause to refer to).
+    fn go_implementors_line(&self, path: &RelPath, target: SymbolAt<'_>) -> Option<String> {
+        let name = self.target_name(path, target)?;
+        let index = self.syntax.as_ref().and_then(|f| f())?;
+        let graph = index.graph();
+        let file = graph.files.iter().find(|f| f.path == *path)?.id;
+        let ifaces: std::collections::HashSet<u32> = graph
+            .symbols
+            .iter()
+            .filter(|s| {
+                s.file == file && s.name == name && s.kind == astrolabe_core::SymbolKind::Interface
+            })
+            .map(|s| s.id.0)
+            .collect();
+        let by = astrolabe_core::go_iface::implementors_of(graph, &ifaces);
+        let text: String = by
+            .iter()
+            .map(|(iface, impls)| {
+                astrolabe_core::go_iface::render_implementors(
+                    graph,
+                    *iface,
+                    impls,
+                    GO_IMPLEMENTORS_LISTED,
+                )
+            })
+            .collect();
+        (!text.is_empty()).then_some(text)
     }
 
     fn target_name(&self, path: &RelPath, target: SymbolAt<'_>) -> Option<String> {
@@ -344,7 +377,17 @@ impl PreciseCapability for LiveBackend {
         };
         // Swift / ObjC servers without an index answer nothing; fall back to
         // a clearly labelled tree-sitter search instead of an empty Unknown.
-        apple_references_fallback(&self.root, &rel, target, result)
+        let mut result = apple_references_fallback(&self.root, &rel, target, result);
+        if language == Language::Go {
+            if let Some(line) = self.go_implementors_line(&rel, target) {
+                let note = result.note.get_or_insert_with(String::new);
+                if !note.is_empty() && !note.ends_with('\n') {
+                    note.push('\n');
+                }
+                note.push_str(&line);
+            }
+        }
+        result
     }
 
     fn definition(
@@ -454,5 +497,36 @@ mod start_failure_tests {
                 .with_server(Language::Kotlin, |s| s.is_none())
                 .is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod go_implementor_tests {
+    use super::*;
+
+    #[test]
+    fn go_interface_references_note_lists_implementors() {
+        let dir = std::env::temp_dir().join(format!("astrolabe-lb-goiface-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("p")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module example.com/m\n").unwrap();
+        std::fs::write(
+            dir.join("p/i.go"),
+            "package p\n\ntype Shape interface {\n\tArea() float64\n}\n\ntype Sq struct{}\n\nfunc (Sq) Area() float64 { return 1 }\n",
+        )
+        .unwrap();
+        let index =
+            Arc::new(crate::index::build_with_options(&dir, false, 1 << 20).expect("index"));
+        let backend =
+            LiveBackend::new(dir.clone()).with_syntax_index(Arc::new(move || Some(index.clone())));
+        let rel = RelPath::new("p/i.go");
+        let line = backend
+            .go_implementors_line(&rel, SymbolAt::Name("Shape"))
+            .expect("implementors");
+        assert!(line.contains("Shape @p/i.go:3 ← Sq @p/i.go:7"), "{line}");
+        assert!(backend
+            .go_implementors_line(&rel, SymbolAt::Name("Sq"))
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
