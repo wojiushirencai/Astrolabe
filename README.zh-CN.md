@@ -47,7 +47,7 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 | 工具 | 用途 |
 |---|---|
 | `search_code` | 字面量/正则检索，支持路径过滤；结果分组并标注定义/使用/注释；末尾有可核验的汇总（如“23/23 处，无截断”）。统计：`aggregate=top\|dir\|file`（按顶层目录/目录/文件给出命中数和文件数）、`count_only`、`skip_comments`、`exclude`（如 `_test.go`、`vendor`）。 |
-| `resolve_context` | 给一句任务描述，聚合相关文件与代码骨架，并提示下一步该用哪个工具。 |
+| `resolve_context` | 给一句任务描述，按相关度分页返回相关文件与符号（`offset` 翻页、`path_filter` 缩小范围），页头写明共匹配多少、剩余在哪些目录，并提示下一步该用哪个工具。 |
 | `find_symbol` | 按名字或子串找函数、类、类型。 |
 | `find_references` | 经语言服务器的编译器级引用；`dry_run_rename=新名` 只读列出每个文件要改的位置，不写盘。 |
 | `goto_definition` | 经语言服务器跳到真实定义。 |

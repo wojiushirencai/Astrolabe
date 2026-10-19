@@ -48,7 +48,7 @@ Codex, Windsurf and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-clie
 | Tool | Use it for |
 |---|---|
 | `search_code` | Literal/regex search with path filters. Groups hits and labels each as definition / use / comment; ends with a verifiable summary ("23/23 hits, no truncation"). Counting: `aggregate=top\|dir\|file` (hits and files per top-level dir / dir / file), `count_only`, `skip_comments`, `exclude` (e.g. `_test.go`, `vendor`). |
-| `resolve_context` | Give it a task description; it gathers relevant files and code skeletons and hints which tool to use next. |
+| `resolve_context` | Give it a task description; it returns relevant files and symbols ranked by relevance, as pages (`offset`, `path_filter`) whose header says how many matched and where the rest lives, and hints which tool to use next. |
 | `find_symbol` | Find a function, class or type by name or substring. |
 | `find_references` | Compiler-grade references via the language server; `dry_run_rename=<new name>` lists per-file edit locations without writing anything. |
 | `goto_definition` | Jump to the real definition through the language server. |
