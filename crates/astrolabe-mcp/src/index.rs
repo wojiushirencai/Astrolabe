@@ -27,6 +27,8 @@ pub(crate) struct RepoIndex {
     inner: InnerIndex,
     in_graph_paths: OnceLock<HashSet<String>>,
     names: OnceLock<NameIndex>,
+    /// Sub-word index for `find_symbol`'s zero-hit fallback, built on first use.
+    words: OnceLock<crate::word_index::WordIndex>,
     /// Markdown coverage report path, written lazily once per snapshot.
     coverage_report: OnceLock<Option<PathBuf>>,
     /// Per partial-parse file: language, first error and error kind.
@@ -113,6 +115,7 @@ impl RepoIndex {
             inner: InnerIndex::Incremental(incremental),
             in_graph_paths: OnceLock::new(),
             names: OnceLock::new(),
+            words: OnceLock::new(),
             coverage_report: OnceLock::new(),
             partial_diagnoses: OnceLock::new(),
             generation: next_generation(),
@@ -126,6 +129,7 @@ impl RepoIndex {
             inner: InnerIndex::Static { graph, report },
             in_graph_paths: OnceLock::new(),
             names: OnceLock::new(),
+            words: OnceLock::new(),
             coverage_report: OnceLock::new(),
             partial_diagnoses: OnceLock::new(),
             generation: next_generation(),
@@ -159,6 +163,13 @@ impl RepoIndex {
                 file_pos,
             }
         })
+    }
+
+    /// The sub-word index over this snapshot's symbols (built once, lazily:
+    /// only zero-hit multi-word `find_symbol` queries need it).
+    pub(crate) fn words(&self) -> &crate::word_index::WordIndex {
+        self.words
+            .get_or_init(|| crate::word_index::WordIndex::build(self.graph()))
     }
 
     /// Build the per-snapshot lookup tables on a background thread, so the

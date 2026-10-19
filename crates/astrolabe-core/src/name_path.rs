@@ -385,6 +385,11 @@ impl NamePathIndex {
     pub fn names(&self) -> Option<&NameTable> {
         self.names.as_ref()
     }
+
+    /// Positions (ascending, in `symbols` order) of the symbols in `file`.
+    pub fn file_symbols(&self, file: crate::types::FileId) -> &[usize] {
+        self.buckets.get(&file).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Lowercased symbol names plus the positions sorted by (lowercase name,

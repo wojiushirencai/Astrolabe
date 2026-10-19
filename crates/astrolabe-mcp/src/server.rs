@@ -33,6 +33,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::loop_guard::{LoopGuard, Verdict};
+
+mod symbol_outline;
 use crate::{
     context::ClientContext,
     index::RepoIndex,
@@ -1526,10 +1528,10 @@ pub(crate) struct QueryParams {
     #[serde(default)]
     #[schemars(description = "Repo-relative path substring.")]
     pub path_filter: Option<String>,
-    /// 路径查询：展开匹配者的嵌套子符号层数（0=不展开）。
+    /// 展开成员的层数（0=不展开）；query 为文件路径或 `*`+path_filter 时输出文件大纲。
     #[serde(default)]
     #[schemars(
-        description = "Path queries: expansion depth for nested children (0 = matches only)."
+        description = "Member levels to show (0 = none). query=<file path> or '*'+path_filter: file outline."
     )]
     pub depth: u8,
     #[serde(default = "default_budget")]
@@ -2933,6 +2935,17 @@ impl AstrolabeServer {
                     Err(message) => return self.finish_at(&session.root, text_error(message)),
                 },
             };
+            // A file path (or `*` + path_filter) as the query: file outline.
+            if let Some(target) =
+                symbol_outline::outline_target(index, &params.query, params.path_filter.as_deref())
+            {
+                return match target {
+                    Ok(target) => {
+                        self.find_symbol_outline(&session.root, index, &params, kind, target)
+                    }
+                    Err(message) => self.finish_at(&session.root, text_error(message)),
+                };
+            }
             let normalized = normalize_symbol_query(&params.query);
             // "Class/method"（及 Type.method / A::b / pkg.Func）路径查询走层级
             // 匹配器（Serena NamePathMatcher 对应物）。
@@ -3040,12 +3053,12 @@ impl AstrolabeServer {
                     params.budget_tokens,
                     params.offset,
                 ));
-            let (kept, omitted) = paged_symbol_lines(
-                index,
-                &hits,
-                offset,
-                params.budget_tokens.saturating_sub(reserve),
-            );
+            let limit = params.budget_tokens.saturating_sub(reserve);
+            let (kept, omitted) = if params.depth > 0 {
+                symbol_outline::paged_lines_with_children(index, &hits, offset, params.depth, limit)
+            } else {
+                paged_symbol_lines(index, &hits, offset, limit)
+            };
             let kept_count = kept.len();
             let truncated = omitted > 0;
             // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
@@ -3090,7 +3103,17 @@ impl AstrolabeServer {
             // include_body 附加，避免误导性的"无可提取的符号体"。
             if hits.is_empty() {
                 body.push_str("(未找到匹配的符号)\n");
-                body.push_str(&symbol_suggestions(index, &needle));
+                let left = params.budget_tokens.saturating_sub(estimate_tokens(&body));
+                match symbol_outline::word_fallback_block(
+                    index,
+                    &normalized.query,
+                    kind,
+                    params.path_filter.as_deref(),
+                    left,
+                ) {
+                    Some(block) => body.push_str(&block),
+                    None => body.push_str(&symbol_suggestions(index, &needle)),
+                }
                 let unindexed = index.unindexed_code_exts(None);
                 if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
                     body.push_str(&hint);
@@ -4043,7 +4066,17 @@ impl AstrolabeServer {
                 .find(|seg| !seg.is_empty())
                 .unwrap_or_default()
                 .to_lowercase();
-            body.push_str(&symbol_suggestions(index, &last));
+            let left = params.budget_tokens.saturating_sub(estimate_tokens(&body));
+            match symbol_outline::word_fallback_block(
+                index,
+                &params.query.replace('/', " "),
+                kind,
+                params.path_filter.as_deref(),
+                left,
+            ) {
+                Some(block) => body.push_str(&block),
+                None => body.push_str(&symbol_suggestions(index, &last)),
+            }
             let unindexed = index.unindexed_code_exts(None);
             if let Some(hint) = format_find_symbol_unindexed_hint(&unindexed) {
                 body.push_str(&hint);
