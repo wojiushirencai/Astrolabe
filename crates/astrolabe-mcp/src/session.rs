@@ -402,6 +402,9 @@ fn publish_ready(session: &RootSession, mut outcome: IndexState) {
         session.teardown();
         return;
     }
+    if let IndexState::Ready(index) = &outcome {
+        index.prewarm(true);
+    }
     *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
 }
 
@@ -427,6 +430,7 @@ fn apply_pending(session: &RootSession, pending: &mut ChangeSet) {
                 session.root.clone(),
                 inc,
             ));
+            next.prewarm(false);
             *session.state.write().unwrap_or_else(|e| e.into_inner()) = IndexState::Ready(next);
             if session.rebuild_inflight.load(Ordering::SeqCst) {
                 session
@@ -650,6 +654,9 @@ fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
                 )));
             }
         }
+    }
+    if let IndexState::Ready(index) = &outcome {
+        index.prewarm(true);
     }
     *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
 }

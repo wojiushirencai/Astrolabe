@@ -36,16 +36,45 @@ pub(crate) struct RepoIndex {
 }
 
 /// Lookup tables over `graph().symbols`, built once per index snapshot (the
-/// snapshot is immutable, so they never go stale): lowercase names so
-/// `find_symbol` does not allocate per symbol per query, an exact-name set,
-/// a lowercase-name → positions map for exact lookups, and id → position.
+/// snapshot is immutable, so they never go stale): lowercase names and a
+/// name-sorted inverted index (in `name_path.names()`), id → position and
+/// file id → position. Built in parallel, and prewarmed off the query path
+/// right after an index is published ([`RepoIndex::prewarm`]).
 pub(crate) struct NameIndex {
-    pub lower: Vec<String>,
-    pub exact: HashSet<String>,
-    pub by_lower: std::collections::HashMap<String, Vec<u32>>,
     pub by_id: std::collections::HashMap<astrolabe_core::SymbolId, usize>,
     pub name_path: astrolabe_core::name_path::NamePathIndex,
     pub file_pos: std::collections::HashMap<FileId, usize>,
+}
+
+impl NameIndex {
+    fn table(&self) -> &astrolabe_core::name_path::NameTable {
+        self.name_path
+            .names()
+            .expect("NameIndex builds its NamePathIndex with names")
+    }
+
+    /// `name.to_lowercase()` of every symbol, by position.
+    pub fn lower(&self) -> &[String] {
+        self.table().lower()
+    }
+
+    /// Positions of the symbols whose lowercase name is `lower_name`.
+    pub fn by_lower(&self, lower_name: &str) -> &[u32] {
+        self.table().exact(lower_name)
+    }
+
+    /// Some symbol is named exactly `name` (case-sensitive).
+    pub fn has_exact(&self, symbols: &[astrolabe_core::CodeSymbol], name: &str) -> bool {
+        self.by_lower(&name.to_lowercase())
+            .iter()
+            .any(|&i| symbols[i as usize].name == name)
+    }
+
+    /// One group of positions per distinct lowercase name; `group[0]` is
+    /// that name's first occurrence in `graph().symbols`.
+    pub fn name_groups(&self) -> impl Iterator<Item = &[u32]> {
+        self.table().groups()
+    }
 }
 
 enum InnerIndex {
@@ -105,36 +134,51 @@ impl RepoIndex {
 
     pub(crate) fn names(&self) -> &NameIndex {
         self.names.get_or_init(|| {
-            let symbols = &self.graph().symbols;
-            let mut idx = NameIndex {
-                lower: Vec::with_capacity(symbols.len()),
-                exact: HashSet::new(),
-                by_lower: std::collections::HashMap::new(),
-                by_id: std::collections::HashMap::with_capacity(symbols.len()),
-                name_path: astrolabe_core::name_path::NamePathIndex::new(symbols),
-                file_pos: self
-                    .graph()
-                    .files
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .map(|(i, f)| (f.id, i))
-                    .collect(),
-            };
-            for (i, symbol) in symbols.iter().enumerate() {
-                let lower = symbol.name.to_lowercase();
-                idx.by_lower
-                    .entry(lower.clone())
-                    .or_default()
-                    .push(i as u32);
-                idx.lower.push(lower);
-                if !idx.exact.contains(&symbol.name) {
-                    idx.exact.insert(symbol.name.clone());
-                }
-                idx.by_id.entry(symbol.id).or_insert(i);
+            let graph = self.graph();
+            let symbols = &graph.symbols;
+            let (name_path, (by_id, file_pos)) = rayon::join(
+                || astrolabe_core::name_path::NamePathIndex::with_names(symbols),
+                || {
+                    let mut by_id = std::collections::HashMap::with_capacity(symbols.len());
+                    for (i, symbol) in symbols.iter().enumerate() {
+                        by_id.entry(symbol.id).or_insert(i);
+                    }
+                    let file_pos = graph
+                        .files
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(i, f)| (f.id, i))
+                        .collect();
+                    (by_id, file_pos)
+                },
+            );
+            NameIndex {
+                by_id,
+                name_path,
+                file_pos,
             }
-            idx
         })
+    }
+
+    /// Build the per-snapshot lookup tables on a background thread, so the
+    /// first `find_symbol` after a publish does not pay for them. A query
+    /// that arrives first simply builds (or waits for) the same `OnceLock`.
+    ///
+    /// With `coverage`, the syntax-error diagnoses `get_languages` needs (one
+    /// re-parse per partial-parse file) and the coverage report are prepared
+    /// too. Only for a cold build or full rebuild: a watcher apply after
+    /// every save would re-parse all of them each time.
+    pub(crate) fn prewarm(self: &Arc<Self>, coverage: bool) {
+        let index = Arc::clone(self);
+        let _ = std::thread::Builder::new()
+            .name("astrolabe-prewarm".into())
+            .spawn(move || {
+                index.names();
+                if coverage {
+                    index.coverage_detail();
+                }
+            });
     }
 
     pub(crate) fn graph(&self) -> &CodeGraph {
@@ -373,6 +417,51 @@ pub(crate) fn build_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `prewarm` builds the lookup tables off the query path; a query that
+    /// arrives meanwhile gets the same tables from the `OnceLock`.
+    #[test]
+    fn prewarm_builds_name_tables_in_the_background() {
+        use astrolabe_core::{CodeSymbol, Language, SymbolId, SymbolKind};
+        let graph = CodeGraph {
+            files: vec![CodeFile {
+                id: FileId(0),
+                path: RelPath::new("a.rs"),
+                language: Some(Language::Rust),
+                loc: 1,
+                sha: String::new(),
+            }],
+            symbols: vec![CodeSymbol {
+                id: SymbolId(7),
+                file: FileId(0),
+                name: "Alpha".into(),
+                kind: SymbolKind::Function,
+                signature: "fn Alpha()".into(),
+                start_line: 1,
+                end_line: 1,
+                exported: true,
+            }],
+            edges: vec![],
+        };
+        let index = Arc::new(RepoIndex::from_graph(
+            PathBuf::from("."),
+            graph,
+            IndexReport::default(),
+        ));
+        assert!(index.names.get().is_none());
+        index.prewarm(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while index.names.get().is_none() {
+            assert!(std::time::Instant::now() < deadline, "prewarm never ran");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let names = index.names();
+        assert_eq!(names.by_lower("alpha"), &[0]);
+        assert!(names.has_exact(&index.graph().symbols, "Alpha"));
+        assert!(!names.has_exact(&index.graph().symbols, "alpha"));
+        assert_eq!(names.by_id[&SymbolId(7)], 0);
+        assert_eq!(index.file(FileId(0)).map(|f| f.path.as_str()), Some("a.rs"));
+    }
 
     fn unique_temp_dir() -> PathBuf {
         // A timestamp alone is not unique: macOS resolves `SystemTime::now`

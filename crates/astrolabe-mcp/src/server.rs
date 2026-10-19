@@ -384,18 +384,51 @@ fn closest_symbols(
         return Vec::new();
     }
     let q_tokens = name_tokens(query);
+    let q_chars = q.chars().count();
+    let max_distance = (q.len() / 5).clamp(1, 2);
+    // Word tokens that can count toward `shared` (len >= 3).
+    let long_tokens: Vec<&String> = q_tokens.iter().filter(|t| t.len() >= 3).collect();
+    let names = index.names();
+    let lower_names = names.lower();
+    // The path filter only depends on the file, so check it once per file
+    // and before any per-name scoring.
+    let mut file_ok: HashMap<FileId, bool> = HashMap::new();
     let mut scored: Vec<(u32, String)> = Vec::new();
-    for sym in &index.graph().symbols {
-        let name = sym.name.to_lowercase();
+    for (pos, sym) in index.graph().symbols.iter().enumerate() {
+        if let Some(f) = path_filter {
+            let ok = *file_ok.entry(sym.file).or_insert_with(|| {
+                index
+                    .file(sym.file)
+                    .is_some_and(|file| file.path.as_str().contains(f))
+            });
+            if !ok {
+                continue;
+            }
+        }
+        let name = lower_names[pos].as_str();
         let score = if name == q {
             0
-        } else if name.starts_with(&q) || q.starts_with(&name) && name.len() >= 4 {
+        } else if name.starts_with(&q) || q.starts_with(name) && name.len() >= 4 {
             1
-        } else if name.contains(&q) || q.contains(&name) && name.len() >= 4 {
+        } else if name.contains(&q) || q.contains(name) && name.len() >= 4 {
             2
-        } else if edit_distance(&name, &q) <= (q.len() / 5).clamp(1, 2) {
+        } else if (if name.is_ascii() {
+            name.len()
+        } else {
+            name.chars().count()
+        })
+        .abs_diff(q_chars)
+            <= max_distance
+            && edit_distance(name, &q) <= max_distance
+        {
             3
         } else {
+            // An ASCII name's tokens are substrings of its lowercase form,
+            // so a name containing none of the query's long tokens cannot
+            // share one; skip tokenising it.
+            if sym.name.is_ascii() && !long_tokens.iter().any(|t| name.contains(t.as_str())) {
+                continue;
+            }
             let shared = name_tokens(&sym.name)
                 .iter()
                 .filter(|t| t.len() >= 3 && q_tokens.contains(t))
@@ -2879,7 +2912,7 @@ impl AstrolabeServer {
             let literal = params.query.trim();
             let literal_hit = normalized.query != literal
                 && !literal.contains('/')
-                && index.names().exact.contains(literal);
+                && index.names().has_exact(&index.graph().symbols, literal);
             if normalized.query.contains('/') && !literal_hit {
                 let mut params = params.clone();
                 params.query = normalized.query;
@@ -2936,16 +2969,11 @@ impl AstrolabeServer {
             };
             if exact_only {
                 // Exact names only: O(1) map lookup instead of a full scan.
-                for &idx in names
-                    .by_lower
-                    .get(&needle)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-                {
+                for &idx in names.by_lower(&needle) {
                     consider(idx as usize, 0);
                 }
             } else {
-                for (idx, lower) in names.lower.iter().enumerate() {
+                for (idx, lower) in names.lower().iter().enumerate() {
                     if let Some(tier) = name_match_tier(lower, &needle) {
                         consider(idx, tier);
                     }
@@ -3871,7 +3899,10 @@ impl AstrolabeServer {
                 .collect();
             if let [.., parent, last] = segments.as_slice() {
                 let mut impl_sources = std::collections::HashMap::new();
-                for symbol in symbols {
+                // Equal ignoring ASCII case implies equal lowercase names, so
+                // the name table's group is a superset (in symbol order).
+                let candidates = index.names().by_lower(&last.to_lowercase());
+                for symbol in candidates.iter().map(|&i| &symbols[i as usize]) {
                     if !symbol.name.eq_ignore_ascii_case(last)
                         || kind.is_some_and(|k| symbol.kind != k)
                     {
@@ -4601,17 +4632,37 @@ fn symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
         return String::new();
     }
     let prefix: String = needle.chars().take(4).collect();
+    let prefix_ok = prefix.chars().count() >= 4;
+    let needle_chars = needle.chars().count();
     let mut scored: BTreeMap<(usize, String), ()> = BTreeMap::new();
-    let mut seen = std::collections::HashSet::new();
-    for symbol in &index.graph().symbols {
-        let lower = symbol.name.to_lowercase();
-        if !seen.insert(lower.clone()) {
-            continue;
-        }
-        let distance = edit_distance(&lower, needle);
-        if distance <= 2 || (prefix.chars().count() >= 4 && lower.starts_with(&prefix)) {
-            scored.insert((distance, symbol.name.clone()), ());
-        }
+    let symbols = &index.graph().symbols;
+    let names = index.names();
+    let lower_names = names.lower();
+    // One candidate per distinct lowercase name, named after its first
+    // occurrence (as the old first-seen scan did).
+    for group in names.name_groups() {
+        let first = group[0] as usize;
+        let lower = &lower_names[first];
+        let distance = if prefix_ok && lower.starts_with(&prefix) {
+            edit_distance(lower, needle)
+        } else {
+            // Edit distance is at least the length difference: skip the
+            // quadratic DP for names that cannot be within 2.
+            let len = if lower.is_ascii() {
+                lower.len()
+            } else {
+                lower.chars().count()
+            };
+            if len.abs_diff(needle_chars) > 2 {
+                continue;
+            }
+            let distance = edit_distance(lower, needle);
+            if distance > 2 {
+                continue;
+            }
+            distance
+        };
+        scored.insert((distance, symbols[first].name.clone()), ());
     }
     if scored.is_empty() {
         return "建议：确认名字拼写；带限定的写法可用 Type/method、Type.method 或 A::b；也可改用 search_code 做全文检索。\n".to_string();
@@ -4715,6 +4766,223 @@ mod tests {
     };
     use std::collections::HashSet;
     use std::time::Duration;
+
+    /// Pre-change `symbol_suggestions` (first-seen scan, full edit distance
+    /// for every distinct name), kept as the oracle for the pruned version.
+    fn reference_symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
+        if needle.is_empty() {
+            return String::new();
+        }
+        let prefix: String = needle.chars().take(4).collect();
+        let mut scored: BTreeMap<(usize, String), ()> = BTreeMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for symbol in &index.graph().symbols {
+            let lower = symbol.name.to_lowercase();
+            if !seen.insert(lower.clone()) {
+                continue;
+            }
+            let distance = edit_distance(&lower, needle);
+            if distance <= 2 || (prefix.chars().count() >= 4 && lower.starts_with(&prefix)) {
+                scored.insert((distance, symbol.name.clone()), ());
+            }
+        }
+        if scored.is_empty() {
+            return "建议：确认名字拼写；带限定的写法可用 Type/method、Type.method 或 A::b；也可改用 search_code 做全文检索。\n".to_string();
+        }
+        let names: Vec<String> = scored.into_keys().take(5).map(|(_, name)| name).collect();
+        format!(
+            "相近的符号名：{}（可直接用这些名字重查，或改用 search_code）\n",
+            names.join(", ")
+        )
+    }
+
+    /// Pre-change `closest_symbols` (path filter after scoring, every name
+    /// tokenised), kept as the oracle for the pruned version.
+    fn reference_closest_symbols(
+        index: &RepoIndex,
+        query: &str,
+        path_filter: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
+        let q = query.trim().to_lowercase();
+        if q.len() < 3 || q.len() > 80 {
+            return Vec::new();
+        }
+        let q_tokens = name_tokens(query);
+        let mut scored: Vec<(u32, String)> = Vec::new();
+        for sym in &index.graph().symbols {
+            let name = sym.name.to_lowercase();
+            let score = if name == q {
+                0
+            } else if name.starts_with(&q) || q.starts_with(&name) && name.len() >= 4 {
+                1
+            } else if name.contains(&q) || q.contains(&name) && name.len() >= 4 {
+                2
+            } else if edit_distance(&name, &q) <= (q.len() / 5).clamp(1, 2) {
+                3
+            } else {
+                let shared = name_tokens(&sym.name)
+                    .iter()
+                    .filter(|t| t.len() >= 3 && q_tokens.contains(t))
+                    .count();
+                if shared >= 1 && shared >= q_tokens.len().min(2) {
+                    4
+                } else {
+                    continue;
+                }
+            };
+            let Some(file) = index.file(sym.file) else {
+                continue;
+            };
+            if let Some(f) = path_filter {
+                if !file.path.as_str().contains(f) {
+                    continue;
+                }
+            }
+            let line = symbol_line(sym, &file.path);
+            let line = match line.rsplit_once("  @") {
+                Some((sig, loc)) => format!("{sig}  {loc}"),
+                None => line,
+            };
+            scored.push((score, line));
+        }
+        scored.sort();
+        scored.dedup_by(|a, b| a.1 == b.1);
+        scored.into_iter().take(limit).map(|(_, l)| l).collect()
+    }
+
+    fn suggestion_fixture() -> RepoIndex {
+        let names = [
+            "Serialize",
+            "serialize",
+            "SERIALIZE",
+            "Serializer",
+            "SerializeObject",
+            "deserialize",
+            "JsonSerializer",
+            "parse_json",
+            "ParseJson",
+            "handle",
+            "Handler",
+            "handle_request",
+            "HTTPServer",
+            "http_server",
+            "Ärger",
+            "ärgern",
+            "İd",
+            "straße",
+            "STRASSE",
+            "x",
+            "ab",
+            "abc",
+            "abcd",
+            "serialise",
+            "seriali",
+            "Config",
+            "ConfigBuilder",
+            "configure",
+            "load_config_file",
+            "ConfigFileLoader",
+            "über_config",
+            "日本語名",
+            "名前",
+        ];
+        let mut files = Vec::new();
+        let mut symbols = Vec::new();
+        for f in 0..3u32 {
+            files.push(CodeFile {
+                id: FileId(f),
+                path: RelPath::new(format!("dir{f}/m{f}.rs")),
+                language: Some(Language::Rust),
+                loc: 10,
+                sha: String::new(),
+            });
+            for (i, name) in names.iter().enumerate() {
+                if (i as u32 + f).is_multiple_of(3) && f > 0 {
+                    continue;
+                }
+                symbols.push(CodeSymbol {
+                    id: SymbolId(symbols.len() as u32),
+                    file: FileId(f),
+                    name: (*name).to_string(),
+                    kind: SymbolKind::Function,
+                    signature: format!("fn {name}()"),
+                    start_line: i as u32 + 1,
+                    end_line: i as u32 + 1,
+                    exported: true,
+                });
+            }
+        }
+        // A symbol whose file is not in the graph is skipped by both.
+        symbols.push(CodeSymbol {
+            id: SymbolId(symbols.len() as u32),
+            file: FileId(99),
+            name: "Serialize".into(),
+            kind: SymbolKind::Function,
+            signature: "fn Serialize()".into(),
+            start_line: 1,
+            end_line: 1,
+            exported: true,
+        });
+        let graph = CodeGraph {
+            files,
+            symbols,
+            edges: vec![],
+        };
+        RepoIndex::from_graph(PathBuf::from("."), graph, Default::default())
+    }
+
+    /// The pruned zero-hit suggestions (distinct-name groups, length bound,
+    /// token pre-check, path filter first) must equal the old full scan.
+    #[test]
+    fn zero_hit_suggestions_match_reference_scan() {
+        let index = suggestion_fixture();
+        let needles = [
+            "serialize",
+            "serialzer",
+            "serial",
+            "seri",
+            "ser",
+            "jsonserializer",
+            "handel",
+            "httpserver",
+            "ärger",
+            "arger",
+            "i̇d",
+            "strasse",
+            "straße",
+            "x",
+            "ab",
+            "abcde",
+            "zzz_nope",
+            "configfile",
+            "config_loader",
+            "load_config",
+            "über",
+            "日本語",
+            "名前x",
+            "",
+            "serializeobjectinternalx",
+            "parsejson",
+            "parse_json_x",
+        ];
+        for needle in needles {
+            assert_eq!(
+                symbol_suggestions(&index, needle),
+                reference_symbol_suggestions(&index, needle),
+                "needle {needle:?}"
+            );
+            for filter in [None, Some("dir1/"), Some("dir2"), Some("nomatch")] {
+                for raw in [needle.to_string(), needle.to_uppercase()] {
+                    assert_eq!(
+                        closest_symbols(&index, &raw, filter, 8),
+                        reference_closest_symbols(&index, &raw, filter, 8),
+                        "query {raw:?} filter {filter:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn index_read_lock_is_released_while_a_tool_runs() {
