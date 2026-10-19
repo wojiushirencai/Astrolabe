@@ -563,16 +563,36 @@ fn stamp_hit(
 /// Reason string carried through the failure list for a file that parsed with
 /// syntax errors. Such a file is still in the index (its symbols are kept), so
 /// [`split_partial`] moves it out of `parse_failures` into `partial_parses`.
-const PARTIAL_PARSE_REASON: &str = "partial parse: syntax errors in file";
+use crate::{PARTIAL_PARSE_REASON, PARTIAL_PARSE_REWRITE_REASON};
+
+fn is_partial_reason(reason: &str) -> bool {
+    reason == PARTIAL_PARSE_REASON || reason == PARTIAL_PARSE_REWRITE_REASON
+}
+
+fn partial_reason(parsed: &ParsedFile) -> &'static str {
+    if parsed.c_family_rewrite {
+        PARTIAL_PARSE_REWRITE_REASON
+    } else {
+        PARTIAL_PARSE_REASON
+    }
+}
 
 type FailureList = Vec<(RelPath, String)>;
+
+/// Record that `path` is in the index with syntax errors.
+fn note_partial(failures: &Mutex<Vec<(RelPath, String)>>, path: &RelPath, parsed: &ParsedFile) {
+    failures
+        .lock()
+        .expect("failure list poisoned")
+        .push((path.clone(), partial_reason(parsed).to_owned()));
+}
 
 /// Split a raw failure list into real failures (not in the index) and partial
 /// parses (in the index, possibly incomplete).
 fn split_partial(raw: &[(RelPath, String)]) -> (FailureList, FailureList) {
     raw.iter()
         .cloned()
-        .partition(|(_, reason)| reason != PARTIAL_PARSE_REASON)
+        .partition(|(_, reason)| !is_partial_reason(reason))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -608,6 +628,9 @@ fn parse_one(
             if !keep_encoded {
                 row.encoded = None;
             }
+            if row.parsed.partial {
+                note_partial(failures, path, &row.parsed);
+            }
             return Some(row);
         }
     }
@@ -640,6 +663,9 @@ fn parse_one(
             Ok(Some(bytes)) => match store::decode_parsed(&bytes) {
                 Ok(parsed) => {
                     cache_hits.fetch_add(1, Ordering::Relaxed);
+                    if parsed.partial {
+                        note_partial(failures, path, &parsed);
+                    }
                     side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
                     return Some(ParsedRow {
                         path: path.clone(),
@@ -674,13 +700,15 @@ fn parse_one(
             let mut encoded = None;
             if parsed.partial {
                 // Syntax errors: symbols/imports/calls may be incomplete.
-                // Keep what was extracted but surface it, and do not cache
-                // it so the signal is not lost on the next (cache-hit) run.
-                failures
-                    .lock()
-                    .expect("failure list poisoned")
-                    .push((path.clone(), PARTIAL_PARSE_REASON.to_owned()));
-            } else if store.is_some() || keep_encoded {
+                // Keep what was extracted and surface it. The product is
+                // cached like a clean one (the `partial` flag is part of the
+                // cached payload, so a cache hit reports it again): a file
+                // that stays broken must not pay the parse, plus the C-family
+                // / C# / TS retry pass, on every start. Timeouts and other
+                // parse errors are `Err` below and are never cached.
+                note_partial(failures, path, &parsed);
+            }
+            if store.is_some() || keep_encoded {
                 match store::encode_parsed(&parsed) {
                     Ok(bytes) => {
                         let bytes: Arc<[u8]> = Arc::from(bytes);
@@ -904,7 +932,7 @@ struct ParseOutcome {
 
 fn insert_product(cache: &ParseProductCache, row: &ParsedRow) {
     // Reuse the encoding made on the parse thread; encode only when absent
-    // (partial parses are never encoded, nor are encode failures).
+    // (no store and no product requested, or an encode failure).
     let encoded = match &row.encoded {
         Some(bytes) => Ok(Arc::clone(bytes)),
         None => store::encode_parsed(&row.parsed).map(Arc::from),
@@ -1545,11 +1573,16 @@ pub fn index_repo_incremental(
         if let Some(product) = previous.products.get(path) {
             match row_from_product(path.clone(), &product) {
                 Ok(row) => {
-                    // A partial parse keeps its product but is not cached on
-                    // disk; carry its flag so the report stays stable.
-                    if previous_failures.get(path).map(|r| r.as_str()) == Some(PARTIAL_PARSE_REASON)
-                    {
-                        failures.push((path.clone(), PARTIAL_PARSE_REASON.to_owned()));
+                    // A partial parse keeps its product (the flag travels in
+                    // the encoded payload); carry it so the report stays stable.
+                    let previous_reason = previous_failures
+                        .get(path)
+                        .map(|r| r.as_str())
+                        .filter(|r| is_partial_reason(r));
+                    if row.parsed.partial {
+                        failures.push((path.clone(), partial_reason(&row.parsed).to_owned()));
+                    } else if let Some(reason) = previous_reason {
+                        failures.push((path.clone(), reason.to_owned()));
                     }
                     reused_products.push((path.clone(), product));
                     reused.push(row);
@@ -2206,6 +2239,112 @@ mod tests {
             let held = inc.products.get(&f.path).expect("product");
             assert_eq!(&stored[..], &held.encoded[..]);
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_parse_is_cached_and_still_reported_on_cache_hit() {
+        let root = scratch("partial-cache");
+        let src = "def kept():\n    pass\n\ndef oops(:\n";
+        write(&root, "broken.py", src);
+        let (g1, r1) = index_repo(&root, &IndexOptions::default());
+        assert_eq!(r1.partial_parses.len(), 1, "{r1:?}");
+        let file = &g1.files[0];
+        let key = store::parse_cache_key(file.language.unwrap(), &file.sha);
+        {
+            let store = Store::open(&store_path(&root)).unwrap();
+            let bytes = store
+                .cached_parse(&key)
+                .unwrap()
+                .expect("a partial parse is cached like a clean one");
+            let cached = store::decode_parsed(&bytes).unwrap();
+            assert!(cached.partial, "the partial flag is part of the payload");
+            // Mark the entry so a hit is distinguishable from a re-parse.
+            let mut marked = cached;
+            marked.symbols[0].name = "from_cache".into();
+            store
+                .put_cached_parse(&key, &store::encode_parsed(&marked).unwrap())
+                .unwrap();
+        }
+        // Second start: served from the cache (stamp or content hash), still partial.
+        let (g2, r2) = index_repo(&root, &IndexOptions::default());
+        assert!(
+            g2.symbols.iter().any(|s| s.name == "from_cache"),
+            "not re-parsed"
+        );
+        assert_eq!(r2.partial_parses.len(), 1, "{r2:?}");
+        assert!(r2.parse_failures.is_empty(), "{r2:?}");
+        // Same bytes, new mtime (content-hash lookup): same.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&root, "broken.py", src);
+        let (g3, r3) = index_repo(&root, &IndexOptions::default());
+        assert!(g3.symbols.iter().any(|s| s.name == "from_cache"));
+        assert_eq!(r3.partial_parses.len(), 1, "{r3:?}");
+        // Incremental build from the cache keeps the flag too.
+        let inc = IncrementalIndex::build(&root, &IndexOptions::default());
+        assert_eq!(inc.report.partial_parses.len(), 1, "{:?}", inc.report);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kept_c_family_rewrite_is_reported_and_cached_as_such() {
+        let root = scratch("cfam-rewrite");
+        let src = "#define B { \\\n  /* c */ \\\n  0 \\\n}\nint ok(void);\nint bad( { ;\n";
+        write(&root, "a.c", src);
+        for run in 0..2 {
+            let (_, report) = index_repo(&root, &IndexOptions::default());
+            assert_eq!(
+                report.partial_parses,
+                vec![(
+                    RelPath::new("a.c"),
+                    crate::PARTIAL_PARSE_REWRITE_REASON.to_owned()
+                )],
+                "run {run}"
+            );
+        }
+        let inc = IncrementalIndex::build(&root, &IndexOptions::default());
+        assert_eq!(
+            inc.report.partial_parses[0].1,
+            crate::PARTIAL_PARSE_REWRITE_REASON
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn previous_extractor_version_cache_is_never_served() {
+        let root = scratch("extractor-bump");
+        write(&root, "a.py", "def real():\n    pass\n");
+        let (g1, _) = index_repo(&root, &IndexOptions::default());
+        let file = &g1.files[0];
+        let key = store::parse_cache_key(file.language.unwrap(), &file.sha);
+        let old_key = key.replacen(
+            &format!("x{}-", store::EXTRACTOR_VERSION),
+            &format!("x{}-", store::EXTRACTOR_VERSION - 1),
+            1,
+        );
+        assert_ne!(old_key, key);
+        {
+            // Simulate a cache written by the previous extractor: a stale
+            // payload under the old key and no entry under the current one.
+            // (A stamp naming an old-prefix key is rejected by `stamp_hit`.)
+            let store = Store::open(&store_path(&root)).unwrap();
+            let mut stale =
+                store::decode_parsed(&store.cached_parse(&key).unwrap().unwrap()).unwrap();
+            stale.symbols[0].name = "stale".into();
+            store
+                .put_cached_parse(&old_key, &store::encode_parsed(&stale).unwrap())
+                .unwrap();
+            store
+                .prune_parse_cache(
+                    &HashSet::from([old_key.clone()]),
+                    &HashSet::from(["a.py".to_owned()]),
+                )
+                .unwrap();
+            assert!(store.cached_parse(&key).unwrap().is_none());
+        }
+        let (g2, _) = index_repo(&root, &IndexOptions::default());
+        assert!(g2.symbols.iter().any(|s| s.name == "real"), "re-parsed");
+        assert!(!g2.symbols.iter().any(|s| s.name == "stale"));
         std::fs::remove_dir_all(&root).ok();
     }
 

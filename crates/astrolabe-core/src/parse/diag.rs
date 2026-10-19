@@ -16,11 +16,14 @@
 //!   match clean files on recall against ctags). Everything else is
 //!   [`SyntaxErrorKind::Syntax`].
 //!
-//! Re-parses with the raw grammar (no per-language pre-pass). The pre-pass
-//! retries of C# and TypeScript are kept only when they parse clean, so for
-//! a file that is still partial the raw tree is the one that was indexed.
-//! C / C++ may keep a still-partial retry that recovers more symbols; the
-//! reported location can then be an error that rewrite already fixed.
+//! Re-parses with the raw grammar. The pre-pass retries of C# and TypeScript
+//! are kept only when they parse clean, so for a file that is still partial
+//! the raw tree is the one that was indexed. C / C++ may keep a still-partial
+//! retry that recovers more symbols (`cfamily.rs`, recorded as
+//! `ParsedFile::c_family_rewrite`); [`diagnose_indexed_syntax`] then
+//! diagnoses that rewritten text, which has the same bytes per line, so an
+//! error the rewrite already fixed is never reported. Snippets, tokens and
+//! the macro test still quote the original source.
 
 use std::collections::HashSet;
 
@@ -67,14 +70,30 @@ struct Site {
     token: String,
 }
 
-/// Diagnose `source`; `None` when the raw parse is clean or the language has
-/// no plain grammar (Vue).
+/// Diagnose `source` with the raw grammar; `None` when the raw parse is
+/// clean or the language has no plain grammar (Vue).
 pub fn diagnose_syntax(lang: Language, source: &str) -> Option<SyntaxDiagnosis> {
+    diagnose_indexed_syntax(lang, source, false)
+}
+
+/// Diagnose the text whose parse is in the index: the `cfamily` rewrite of
+/// `source` when `c_family_rewrite` (C / C++ only; see
+/// `ParsedFile::c_family_rewrite`), else the raw source. Lines, snippets and
+/// tokens refer to `source` (the rewrite keeps every byte offset).
+pub fn diagnose_indexed_syntax(
+    lang: Language,
+    source: &str,
+    c_family_rewrite: bool,
+) -> Option<SyntaxDiagnosis> {
     if super::needs_eof_newline(lang, source) {
-        return diagnose_syntax(lang, &format!("{source}\n"));
+        return diagnose_indexed_syntax(lang, &format!("{source}\n"), c_family_rewrite);
     }
+    let fixed = (c_family_rewrite && matches!(lang, Language::C | Language::Cpp))
+        .then(|| super::cfamily::rewrite(lang, source))
+        .flatten()
+        .filter(|fixed| fixed.len() == source.len());
     let mut parser = super::configured_parser(lang).ok()?;
-    let tree = parser.parse(source, None)?;
+    let tree = parser.parse(fixed.as_deref().unwrap_or(source), None)?;
     let root = tree.root_node();
     if !root.has_error() {
         return None;
@@ -694,6 +713,43 @@ mod tests {
     }
 
     #[test]
+    fn c_family_diagnoses_the_kept_rewrite_not_errors_it_fixed() {
+        // Line 1-4: a comment in a multi-line `#define` (tree-sitter-c #319),
+        // fixed by the cfamily rewrite. Line 6: a real error it cannot fix.
+        // The retry is still partial but keeps every symbol, so it is the
+        // indexed parse and the diagnosis must point at line 6.
+        let src = "#define B { \\\n  /* c */ \\\n  0 \\\n}\nint ok(void);\nint bad( { ;\nint after(void);\n";
+        for lang in [Language::C, Language::Cpp] {
+            let raw = diagnose_syntax(lang, src).expect("raw partial");
+            assert!(
+                raw.line < 6,
+                "{lang:?}: the raw tree errs before line 6 ({raw:?}), else the test proves nothing"
+            );
+            let path = crate::types::RelPath::new("a.h");
+            let indexed = super::super::ParserPool::new()
+                .parse(lang, &path, src)
+                .unwrap();
+            assert!(
+                indexed.partial && indexed.c_family_rewrite,
+                "{lang:?}: still-partial retry kept"
+            );
+            let d = diagnose_indexed_syntax(lang, src, true).expect("still partial");
+            assert_eq!(d.line, 6, "{lang:?}: {d:?}");
+            assert!(
+                d.what.contains("int bad("),
+                "original text is quoted: {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_family_clean_after_rewrite_has_no_diagnosis() {
+        let src = "#define B { \\\n  /* c */ \\\n  0 \\\n}\nint ok(void);\n";
+        assert!(diagnose_syntax(Language::C, src).is_some(), "raw text errs");
+        assert!(diagnose_indexed_syntax(Language::C, src, true).is_none());
+    }
+
+    #[test]
     fn clean_source_has_no_diagnosis() {
         assert_eq!(
             diagnose_syntax(Language::C, "int main(void) { return 0; }\n"),
@@ -708,14 +764,34 @@ mod tests {
             "static redisAtomic size_t used = 0;\nint ok(void) { return 1; }\n",
             // statement macro
             "void f(void) {\n    ql_foreach(x, &list, link) {\n        use(x);\n    }\n}\n",
-            // ALL_CAPS namespace macro
-            "NLOHMANN_JSON_NAMESPACE_BEGIN\nclass basic_json {};\nNLOHMANN_JSON_NAMESPACE_END\n",
-            // directive splitting a brace
-            "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint api(void);\n#ifdef __cplusplus\n}\n#endif\n",
+            // ALL_CAPS namespace macro (not in the cfamily macro table)
+            "MYLIB_NAMESPACE_BEGIN\nclass basic_json {};\nMYLIB_NAMESPACE_END\n",
+            // directive splitting a brace (not an `extern "C"` guard)
+            "#ifdef USE_NS\nnamespace x {\n#endif\nint api(void);\n#ifdef USE_NS\n}\n#endif\n",
         ] {
-            let lang = if src.contains("class") { Language::Cpp } else { Language::C };
+            let lang = if src.contains("class") || src.contains("namespace") {
+                Language::Cpp
+            } else {
+                Language::C
+            };
             let d = diagnose_syntax(lang, src).expect("partial");
             assert_eq!(d.kind, SyntaxErrorKind::Preprocessor, "{src}\n{d:?}");
+        }
+        // Fixed by the cfamily rewrite (table macro, `extern "C"` guard): the
+        // raw text is still classified, the indexed (rewritten) parse is clean.
+        for (lang, src) in [
+            (
+                Language::Cpp,
+                "NLOHMANN_JSON_NAMESPACE_BEGIN\nclass basic_json {};\nNLOHMANN_JSON_NAMESPACE_END\n",
+            ),
+            (
+                Language::C,
+                "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint api(void);\n#ifdef __cplusplus\n}\n#endif\n",
+            ),
+        ] {
+            let d = diagnose_syntax(lang, src).expect("raw partial");
+            assert_eq!(d.kind, SyntaxErrorKind::Preprocessor, "{src}\n{d:?}");
+            assert_eq!(diagnose_indexed_syntax(lang, src, true), None, "{src}");
         }
     }
 

@@ -46,9 +46,21 @@ pub(super) fn retry(
     first: &ParsedFile,
     parse: impl FnOnce(&str) -> Result<ParsedFile, ParseError>,
 ) -> Option<ParsedFile> {
+    kept_rewrite(lang, source, first, parse).map(|(_, parsed)| parsed)
+}
+
+/// [`retry`] that also returns the rewritten text the kept parse came from
+/// (same byte length and lines as `source`), so diagnostics can look at the
+/// tree that was actually indexed.
+pub(super) fn kept_rewrite(
+    lang: Language,
+    source: &str,
+    first: &ParsedFile,
+    parse: impl FnOnce(&str) -> Result<ParsedFile, ParseError>,
+) -> Option<(String, ParsedFile)> {
     let fixed = rewrite(lang, source)?;
     let second = parse(&fixed).ok()?;
-    better(first, &second).then_some(second)
+    better(first, &second).then_some((fixed, second))
 }
 
 fn better(first: &ParsedFile, second: &ParsedFile) -> bool {

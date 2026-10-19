@@ -44,7 +44,7 @@ mod diag;
 mod ruby;
 mod shell;
 mod swift;
-pub use diag::{diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
+pub use diag::{diagnose_indexed_syntax, diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
 mod ts_variance;
 
 pub(crate) use razor::extract_razor_csharp;
@@ -97,8 +97,14 @@ pub struct ParsedFile {
     pub calls: Vec<(String, u32)>,
     /// The syntax tree contained ERROR / MISSING nodes, so `symbols`,
     /// `imports` and `calls` may be incomplete. The result is still usable;
-    /// the indexer reports it in `partial_parses` (not `parse_failures`) and does not cache it.
+    /// the indexer reports it in `partial_parses` (not `parse_failures`);
+    /// it is cached like a clean parse, flag included.
     pub partial: bool,
+    /// C / C++: this result is the parse of the `cfamily.rs` rewrite of the
+    /// source (same bytes per line), not of the raw text. Diagnostics of a
+    /// still-partial file must then look at that rewrite
+    /// ([`diagnose_indexed_syntax`]).
+    pub c_family_rewrite: bool,
 }
 
 /// Parser pool. Holds reusable `Parser`s per language.
@@ -236,9 +242,10 @@ impl ParserPool {
         // `__has_include(<x>)`, `__cplusplus`-guarded `extern "C"` braces,
         // well-known library macros). See `cfamily.rs`.
         if parsed.partial && matches!(lang, Language::C | Language::Cpp) {
-            if let Some(retry) =
+            if let Some(mut retry) =
                 cfamily::retry(lang, source, &parsed, |s| self.parse_raw(lang, path, s))
             {
+                retry.c_family_rewrite = true;
                 return Ok(retry);
             }
         }
@@ -364,6 +371,7 @@ impl ParserPool {
             imports,
             calls,
             partial,
+            c_family_rewrite: false,
         })
     }
 }

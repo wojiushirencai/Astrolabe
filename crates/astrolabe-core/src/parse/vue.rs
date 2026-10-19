@@ -49,6 +49,7 @@ pub(crate) fn parse_sfc(
             imports,
             calls,
             partial: false,
+            c_family_rewrite: false,
         });
     }
 
@@ -100,6 +101,7 @@ pub(crate) fn parse_sfc(
         imports,
         calls,
         partial,
+        c_family_rewrite: false,
     })
 }
 

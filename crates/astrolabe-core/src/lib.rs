@@ -37,6 +37,15 @@ pub use types::{
 };
 pub use watch::{ChangeKind, ChangeSet, WatchConfig, WatchHandle, Watcher};
 
+/// `IndexReport::partial_parses` reason of a file that parsed with syntax
+/// errors.
+pub const PARTIAL_PARSE_REASON: &str = "partial parse: syntax errors in file";
+/// Same, for a C / C++ file whose indexed parse is that of the length-
+/// preserving macro/preprocessor rewrite (`ParsedFile::c_family_rewrite`):
+/// diagnose it with `parse::diagnose_indexed_syntax(.., true)`.
+pub const PARTIAL_PARSE_REWRITE_REASON: &str =
+    "partial parse: syntax errors in file (C/C++ rewrite kept)";
+
 /// Outcome of an index run. Every file that failed is named — a partial index
 /// that looks complete is worse than one that admits its gaps.
 #[derive(Debug, Default)]

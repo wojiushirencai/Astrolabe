@@ -7,7 +7,7 @@
 //!   errors. Two kinds: C-family errors attributable to macros / preprocessor
 //!   directives (symbols mostly intact: tree-sitter's recovery keeps the
 //!   names), and other syntax errors (symbols in the broken region may be
-//!   missing). See `astrolabe_core::parse::diagnose_syntax`.
+//!   missing). See `astrolabe_core::parse::diagnose_indexed_syntax`.
 //!
 //! Unsupported files are only ever summarised by extension. When more than
 //! [`INLINE_LIMIT`] files have problems the details go to a Markdown report
@@ -17,7 +17,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use astrolabe_core::parse::{diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
+use astrolabe_core::parse::{diagnose_indexed_syntax, SyntaxDiagnosis, SyntaxErrorKind};
 use astrolabe_core::{Language, RelPath};
 use rayon::prelude::*;
 
@@ -145,6 +145,15 @@ impl RepoIndex {
                 .iter()
                 .map(|f| (&f.path, f.language))
                 .collect();
+            // C / C++ files whose indexed parse is the macro rewrite are
+            // diagnosed on that rewrite, not on errors it already fixed.
+            let rewritten: std::collections::HashSet<&RelPath> = self
+                .report()
+                .partial_parses
+                .iter()
+                .filter(|(_, why)| why == astrolabe_core::PARTIAL_PARSE_REWRITE_REASON)
+                .map(|(p, _)| p)
+                .collect();
             let paths = self.partial_files();
             paths
                 .par_iter()
@@ -158,7 +167,7 @@ impl RepoIndex {
                             let source =
                                 astrolabe_core::text::read_source(&self.root.join(path.as_str()))
                                     .ok()?;
-                            diagnose_syntax(lang, &source)
+                            diagnose_indexed_syntax(lang, &source, rewritten.contains(path))
                         });
                     PartialEntry {
                         path: path.clone(),
