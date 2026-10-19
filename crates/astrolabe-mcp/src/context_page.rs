@@ -448,4 +448,119 @@ mod tests {
         assert!(files(&p.body).len() <= NO_MATCH_FILES);
         assert!(next_offset(&p.body).is_none(), "{}", p.body);
     }
+
+    /// Recall gate on two fixture repos shaped like the RECALL_CHECK.md
+    /// failures: page 1 must carry the files the agent needed.
+    fn indexed(files: &[(String, String)]) -> (crate::index::RepoIndex, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "astrolabe-recall-{}-{}",
+            std::process::id(),
+            files.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let p = dir.join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        (crate::index::build(&dir).expect("index"), dir)
+    }
+
+    fn page_one(index: &crate::index::RepoIndex, task: &str, compact: bool) -> Vec<String> {
+        let g = index.graph();
+        let (ranked, matched) = rank_and_match(g, task, &compute_centrality(g));
+        let p = build_page(&PageRequest {
+            graph: g,
+            ranked: &ranked,
+            matched: &matched,
+            offset: 0,
+            budget: if compact { 700 } else { 2_500 },
+            compact,
+            path_filter: None,
+            index_line: "",
+            generation_note: None,
+        });
+        files(&p.body)
+    }
+
+    #[test]
+    fn recall_large_repo_exact_identifier_and_its_callers_on_page_one() {
+        // aiproxy H1 in miniature: 120 files full of `channel`/`error` names,
+        // the identifier defined once and called from two files.
+        let mut files: Vec<(String, String)> = (0..120)
+            .map(|i| {
+                (
+                    format!("pkg{}/chan{i}.go", i % 6),
+                    format!(
+                        "package pkg\n\nfunc ChannelError{i}() {{}}\nfunc processChannel{i}() {{}}\nfunc errorChannel{i}() {{}}\nfunc channelProcessError{i}x() {{}}\n"
+                    ),
+                )
+            })
+            .collect();
+        files.push((
+            "controller/relay.go".into(),
+            "package controller\n\nfunc processChannelError(c int) {}\n".into(),
+        ));
+        files.push((
+            "controller/channel-test.go".into(),
+            "package controller\n\nfunc testChannel() {\n\tprocessChannelError(1)\n}\n".into(),
+        ));
+        files.push((
+            "service/retry.go".into(),
+            "package service\n\nfunc retryLoop() {\n\tprocessChannelError(2)\n}\n".into(),
+        ));
+        let (index, dir) = indexed(&files);
+        for (task, compact) in [
+            ("find definition and call sites of processChannelError", true),
+            (
+                "In this Go repository: find every non-test call site of processChannelError and the enclosing function",
+                true,
+            ),
+            ("how does processChannelError disable a channel", false),
+        ] {
+            let got = page_one(&index, task, compact);
+            assert_eq!(got.first().map(String::as_str), Some("controller/relay.go"), "{task}: {got:?}");
+            for need in ["controller/channel-test.go", "service/retry.go"] {
+                assert!(got.iter().any(|f| f == need), "{task}: {need} not on page 1: {got:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_small_repo_page_one_keeps_files_without_task_words() {
+        // cobra N6 in miniature: the needed `args.go` / `cobra.go` share no
+        // sub-word with the task; a 36-file repo lists them anyway.
+        let mut files: Vec<(String, String)> = (0..33)
+            .map(|i| {
+                (
+                    format!("doc{i}_test.go"),
+                    format!("package cobra\n\nfunc TestExactArgsWithInvalidCount{i}() {{}}\n"),
+                )
+            })
+            .collect();
+        files.push((
+            "args.go".into(),
+            "package cobra\n\nfunc ExactArgs(n int) {}\n".into(),
+        ));
+        files.push((
+            "cobra.go".into(),
+            "package cobra\n\nfunc OnInitialize() {}\n".into(),
+        ));
+        files.push((
+            "command.go".into(),
+            "package cobra\n\ntype Command struct{}\nfunc (c *Command) ValidateArgs() {}\n".into(),
+        ));
+        let (index, dir) = indexed(&files);
+        let got = page_one(
+            &index,
+            "how many positional args validators count invalid",
+            true,
+        );
+        for need in ["args.go", "cobra.go", "command.go"] {
+            assert!(got.iter().any(|f| f == need), "{need}: {got:?}");
+        }
+        assert_eq!(got.len(), 36);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
