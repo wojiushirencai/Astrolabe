@@ -4,7 +4,10 @@
 //! * **hard gaps** — supported-language files that are NOT in the index (over
 //!   the size cap, unreadable, parser timeout / no tree);
 //! * **partial parses** — files that ARE in the index but have syntax/compile
-//!   errors, so some symbols may be missing.
+//!   errors. Two kinds: C-family errors attributable to macros / preprocessor
+//!   directives (symbols mostly intact: tree-sitter's recovery keeps the
+//!   names), and other syntax errors (symbols in the broken region may be
+//!   missing). See `astrolabe_core::parse::diagnose_syntax`.
 //!
 //! Unsupported files are only ever summarised by extension. When more than
 //! [`INLINE_LIMIT`] files have problems the details go to a Markdown report
@@ -14,7 +17,9 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use astrolabe_core::parse::{diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind};
 use astrolabe_core::{Language, RelPath};
+use rayon::prelude::*;
 
 use crate::index::RepoIndex;
 
@@ -28,7 +33,40 @@ const REPORT_MAX_ENTRIES: usize = 1000;
 const REPORT_MAX_BYTES: usize = 192 * 1024;
 const REPORT_FILE: &str = "coverage-report.md";
 
-pub(crate) const PARTIAL_LABEL: &str = "has errors, index incomplete (symbols may be missing)";
+/// Partial-parse files diagnosed (re-parsed) per snapshot; beyond this the
+/// rest are counted as unclassified so a huge broken tree stays cheap.
+const DIAG_MAX: usize = 2000;
+
+/// Label of an ordinary syntax error.
+pub(crate) const PARTIAL_LABEL: &str =
+    "has syntax errors, index may be incomplete (symbols may be missing)";
+/// Label of a C-family error attributable to macros / preprocessor.
+pub(crate) const PREPROC_LABEL: &str = "macro/preprocessor syntax errors, symbols mostly intact";
+
+/// One file that is in the index but parsed with errors.
+#[derive(Clone, Debug)]
+pub(crate) struct PartialEntry {
+    pub path: RelPath,
+    pub language: Option<Language>,
+    /// `None` when not diagnosed (over [`DIAG_MAX`], unreadable, clean raw
+    /// re-parse).
+    pub diag: Option<SyntaxDiagnosis>,
+}
+
+impl PartialEntry {
+    pub(crate) fn kind(&self) -> SyntaxErrorKind {
+        self.diag
+            .as_ref()
+            .map_or(SyntaxErrorKind::Syntax, |d| d.kind)
+    }
+
+    fn label(&self) -> &'static str {
+        match self.kind() {
+            SyntaxErrorKind::Preprocessor => PREPROC_LABEL,
+            SyntaxErrorKind::Syntax => PARTIAL_LABEL,
+        }
+    }
+}
 
 /// Short reason bucket for a hard gap.
 fn gap_kind(reason: &str) -> &'static str {
@@ -89,7 +127,7 @@ impl RepoIndex {
             parts.push(format!("{hard} 个文件未进入索引"));
         }
         if partial > 0 {
-            parts.push(format!("{partial} 个文件有语法错误(符号可能不全)"));
+            parts.push(format!("{partial} 个文件有语法错误"));
         }
         Some(format!(
             "注意：{}，结果可能遗漏；详见 get_languages。",
@@ -97,18 +135,49 @@ impl RepoIndex {
         ))
     }
 
-    fn language_of(&self, path: &RelPath) -> Option<Language> {
-        self.graph()
-            .files
-            .iter()
-            .find(|f| &f.path == path)
-            .and_then(|f| f.language)
+    /// Diagnosis of every partial-parse file (first error, kind), computed
+    /// once per snapshot in parallel. Sorted by path.
+    pub(crate) fn partial_entries(&self) -> &[PartialEntry] {
+        self.partial_diagnoses_cell().get_or_init(|| {
+            let langs: std::collections::HashMap<&RelPath, Option<Language>> = self
+                .graph()
+                .files
+                .iter()
+                .map(|f| (&f.path, f.language))
+                .collect();
+            let paths = self.partial_files();
+            paths
+                .par_iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    let language = langs.get(path).copied().flatten();
+                    let diag = (i < DIAG_MAX)
+                        .then_some(language)
+                        .flatten()
+                        .and_then(|lang| {
+                            let source =
+                                astrolabe_core::text::read_source(&self.root.join(path.as_str()))
+                                    .ok()?;
+                            diagnose_syntax(lang, &source)
+                        });
+                    PartialEntry {
+                        path: path.clone(),
+                        language,
+                        diag,
+                    }
+                })
+                .collect()
+        })
     }
 
-    fn first_error_of(&self, path: &RelPath) -> Option<(u32, String)> {
-        let lang = self.language_of(path)?;
-        let source = astrolabe_core::text::read_source(&self.root.join(path.as_str())).ok()?;
-        astrolabe_core::parse::first_syntax_error(lang, &source)
+    /// `(macro/preprocessor, other)` counts of partial-parse files.
+    fn partial_kind_counts(&self) -> (usize, usize) {
+        let entries = self.partial_entries();
+        let pre = entries
+            .iter()
+            .filter(|e| e.kind() == SyntaxErrorKind::Preprocessor)
+            .count();
+        (pre, entries.len() - pre)
     }
 
     /// The coverage block of `get_languages`.
@@ -138,19 +207,25 @@ impl RepoIndex {
             }
         }
         if !partial.is_empty() {
+            let (pre, other) = self.partial_kind_counts();
             let _ = writeln!(
                 out,
-                "files with syntax/compile errors: {} (in the index, but symbols may be missing)",
+                "files with syntax/compile errors: {} (indexed) — other syntax errors: {other} (symbols may be missing), macro/preprocessor: {pre} (symbols mostly intact)",
                 partial.len()
             );
             if partial.len() <= INLINE_LIMIT {
-                for path in &partial {
-                    match self.first_error_of(path) {
-                        Some((line, what)) => {
-                            let _ = writeln!(out, "  {path}: {PARTIAL_LABEL}; line {line}: {what}");
+                for entry in self.partial_entries() {
+                    let label = entry.label();
+                    match &entry.diag {
+                        Some(d) => {
+                            let _ = writeln!(
+                                out,
+                                "  {}: {label}; line {}: {}",
+                                entry.path, d.line, d.what
+                            );
                         }
                         None => {
-                            let _ = writeln!(out, "  {path}: {PARTIAL_LABEL}");
+                            let _ = writeln!(out, "  {}: {label}", entry.path);
                         }
                     }
                 }
@@ -161,7 +236,7 @@ impl RepoIndex {
                 Some(path) => {
                     let _ = writeln!(
                         out,
-                        "details for all affected files (path, language, first error): Read {}",
+                        "details for all affected files (path, language, kind, first error): Read {}",
                         path.display()
                     );
                 }
@@ -191,14 +266,20 @@ impl RepoIndex {
         md.push_str("# Astrolabe index coverage report\n\n");
         let _ = writeln!(md, "- repository: `{}`", self.root.display());
         let _ = writeln!(md, "- files not in the index: {}", hard.len());
-        let _ = writeln!(
-            md,
-            "- files with syntax/compile errors: {}\n",
-            partial.len()
-        );
+        let _ = writeln!(md, "- files with syntax/compile errors: {}", partial.len());
+        if !partial.is_empty() {
+            let (pre, other) = self.partial_kind_counts();
+            let _ = writeln!(md, "  - other syntax errors: {other} ({PARTIAL_LABEL})");
+            let _ = writeln!(md, "  - macro/preprocessor: {pre} ({PREPROC_LABEL})");
+        }
+        md.push('\n');
         md.push_str(
-            "Files with syntax errors are still indexed; symbols inside the broken region \
-             may be missing. Use `Read`/`search_code` on them when a symbol seems absent.\n\n",
+            "Files with syntax errors are still indexed. **other syntax errors**: symbols \
+             inside the broken region may be missing; use `Read`/`search_code` on them when a \
+             symbol seems absent. **macro/preprocessor** (C, C++, Objective-C): the grammar \
+             cannot expand macros or pick `#if` branches without a build configuration, \
+             but error recovery keeps the symbol names; symbol ranges or nesting near the \
+             reported line may be off. Other syntax errors are listed first.\n\n",
         );
         let mut truncated = false;
         if !hard.is_empty() {
@@ -221,23 +302,27 @@ impl RepoIndex {
         }
         if !partial.is_empty() {
             md.push_str(
-                "## Syntax/compile errors (indexed, possibly incomplete)\n\n\
-                 | path | language | first error |\n|---|---|---|\n",
+                "## Syntax/compile errors (indexed)\n\n\
+                 | path | language | kind | first error |\n|---|---|---|---|\n",
             );
-            for path in partial.iter().take(REPORT_MAX_ENTRIES) {
+            let mut entries: Vec<&PartialEntry> = self.partial_entries().iter().collect();
+            // Other syntax errors first (stable: path order within a kind).
+            entries.sort_by_key(|e| e.kind() == SyntaxErrorKind::Preprocessor);
+            for entry in entries.iter().take(REPORT_MAX_ENTRIES) {
                 if md.len() > REPORT_MAX_BYTES {
                     truncated = true;
                     break;
                 }
-                let lang = self
-                    .language_of(path)
-                    .map(|l| l.name())
-                    .unwrap_or("unknown");
-                let err = match self.first_error_of(path) {
-                    Some((line, what)) => format!("line {line}: {}", what.replace('|', "/")),
+                let lang = entry.language.map(|l| l.name()).unwrap_or("unknown");
+                let kind = match entry.kind() {
+                    SyntaxErrorKind::Preprocessor => "macro/preprocessor",
+                    SyntaxErrorKind::Syntax => "syntax",
+                };
+                let err = match &entry.diag {
+                    Some(d) => format!("line {}: {}", d.line, d.what.replace('|', "/")),
                     None => "syntax errors (location not determined)".to_string(),
                 };
-                let _ = writeln!(md, "| {path} | {lang} | {err} |");
+                let _ = writeln!(md, "| {} | {lang} | {kind} | {err} |", entry.path);
             }
             if partial.len() > REPORT_MAX_ENTRIES {
                 truncated = true;
@@ -246,7 +331,7 @@ impl RepoIndex {
         }
         if truncated {
             md.push_str(
-                "_Report truncated: only the first entries (sorted by path) are listed._\n",
+                "_Report truncated: only the first entries (other syntax errors first, then by path) are listed._\n",
             );
         }
         md
@@ -391,6 +476,94 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(path.parent().unwrap().join(".gitignore").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn macro_errors_are_labelled_apart_from_other_syntax_errors() {
+        let dir = temp_dir("kinds");
+        // C: attribute macro the grammar cannot know.
+        std::fs::write(
+            dir.join("atomic.c"),
+            "static redisAtomic size_t used = 0;\nint keep_c(void) { return 1; }\n",
+        )
+        .unwrap();
+        // Python: a real syntax error.
+        std::fs::write(
+            dir.join("bad.py"),
+            "def keep_py():\n    pass\n\ndef oops(:\n",
+        )
+        .unwrap();
+        let index = crate::index::build_with_options(&dir, false, 1 << 20).unwrap();
+        assert_eq!(index.partial_files().len(), 2);
+        let detail = index.coverage_detail();
+        assert!(
+            detail.contains("other syntax errors: 1") && detail.contains("macro/preprocessor: 1"),
+            "{detail}"
+        );
+        let line_of = |name: &str| {
+            detail
+                .lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line_of("atomic.c").contains(PREPROC_LABEL), "{detail}");
+        assert!(line_of("atomic.c").contains("line 1"), "{detail}");
+        assert!(line_of("bad.py").contains(PARTIAL_LABEL), "{detail}");
+        assert!(line_of("bad.py").contains("line 4"), "{detail}");
+        assert!(
+            line_of("bad.py").contains("def oops(:"),
+            "snippet: {detail}"
+        );
+        // Symbols of both stay indexed.
+        let names: Vec<&str> = index
+            .graph()
+            .symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"keep_c") && names.contains(&"keep_py"),
+            "{names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_lists_kind_with_other_syntax_errors_first() {
+        let dir = temp_dir("kindrep");
+        for i in 0..8 {
+            std::fs::write(
+                dir.join(format!("a{i:02}.c")),
+                format!(
+                    "static redisAtomic size_t used{i} = 0;\nint keep{i}(void) {{ return 1; }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        broken(&dir, 4);
+        let index = crate::index::build_with_options(&dir, false, 1 << 20).unwrap();
+        let detail = index.coverage_detail();
+        assert!(detail.contains("syntax/compile errors: 12"), "{detail}");
+        assert!(detail.contains("other syntax errors: 4"), "{detail}");
+        assert!(detail.contains("macro/preprocessor: 8"), "{detail}");
+        let md = index.render_report();
+        assert!(
+            md.contains("| path | language | kind | first error |"),
+            "{md}"
+        );
+        let first_py = md.find("bad00.py").unwrap();
+        let first_c = md.find("a00.c").unwrap();
+        assert!(first_py < first_c, "other syntax errors first:\n{md}");
+        assert!(
+            md.contains("| a00.c | c | macro/preprocessor | line 1: "),
+            "{md}"
+        );
+        assert!(
+            md.contains("| bad00.py | python | syntax | line 4: "),
+            "{md}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

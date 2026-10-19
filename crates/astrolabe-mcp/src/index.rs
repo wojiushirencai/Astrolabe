@@ -29,6 +29,8 @@ pub(crate) struct RepoIndex {
     names: OnceLock<NameIndex>,
     /// Markdown coverage report path, written lazily once per snapshot.
     coverage_report: OnceLock<Option<PathBuf>>,
+    /// Per partial-parse file: language, first error and error kind.
+    partial_diagnoses: OnceLock<Vec<crate::coverage::PartialEntry>>,
     /// Process-unique stamp; every index replacement (edit, rebuild) gets a new one.
     generation: u64,
 }
@@ -83,6 +85,7 @@ impl RepoIndex {
             in_graph_paths: OnceLock::new(),
             names: OnceLock::new(),
             coverage_report: OnceLock::new(),
+            partial_diagnoses: OnceLock::new(),
             generation: next_generation(),
         }
     }
@@ -95,6 +98,7 @@ impl RepoIndex {
             in_graph_paths: OnceLock::new(),
             names: OnceLock::new(),
             coverage_report: OnceLock::new(),
+            partial_diagnoses: OnceLock::new(),
             generation: next_generation(),
         }
     }
@@ -151,6 +155,10 @@ impl RepoIndex {
 
     pub(crate) fn coverage_report_cell(&self) -> &OnceLock<Option<PathBuf>> {
         &self.coverage_report
+    }
+
+    pub(crate) fn partial_diagnoses_cell(&self) -> &OnceLock<Vec<crate::coverage::PartialEntry>> {
+        &self.partial_diagnoses
     }
 
     pub(crate) fn incremental(&self) -> Option<&IncrementalIndex> {
