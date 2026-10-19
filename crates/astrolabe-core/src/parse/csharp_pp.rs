@@ -297,6 +297,45 @@ pub(super) fn regroup_vb_header(source: &str) -> Option<String> {
     Some(out)
 }
 
+/// Attribute-target keywords that tree-sitter-c-sharp 0.23 also takes for
+/// a target inside a collection expression (`Invoke(this, [method])` is an
+/// ERROR).
+const ATTRIBUTE_TARGETS: &[&str] = &[
+    "assembly", "event", "field", "method", "module", "param", "property", "return", "type",
+    "typevar",
+];
+
+/// `[method]` / `[field, x]`: a target keyword alone as a collection
+/// element (no `:` after it, so not an attribute). Its first letter becomes
+/// `_` (same length, still an identifier). `None` when there is none.
+pub(super) fn rename_collection_targets(source: &str) -> Option<String> {
+    if !source.contains('[') {
+        return None;
+    }
+    let b = source.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    for (open, _) in source.match_indices('[') {
+        let mut i = open + 1;
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_lowercase() {
+            i += 1;
+        }
+        if !ATTRIBUTE_TARGETS.contains(&&source[start..i]) {
+            continue;
+        }
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if matches!(b.get(i), Some(b']' | b',')) {
+            out.get_or_insert_with(|| b.to_vec())[start] = b'_';
+        }
+    }
+    out.and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 /// Imports of the original (partial) parse in source order, then those only
 /// the retry found. The blanked branches' `using`s are real dependencies of
 /// some build configuration, so dropping them would lose import edges.
@@ -569,6 +608,24 @@ mod tests {
             )
             .is_none());
             assert!(super::super::regroup_vb_header("Module M\nEnd Module\n").is_none());
+        }
+
+        #[test]
+        fn collection_element_named_like_attribute_target() {
+            let src = "class T {\n  void Run(System.Reflection.MethodInfo m, object method) {\n    m.Invoke(this, [method]);\n    Use([method, field ]);\n  }\n  [method: Obsolete] void Old() {}\n}\n";
+            let p = parse("T.cs", src);
+            assert!(!p.partial);
+            assert!(has(&p, "Method", "Run").is_some());
+            assert!(has(&p, "Method", "Old").is_some());
+            assert!(
+                p.calls.iter().any(|(n, l)| n == "Use" && *l == 4),
+                "{:?}",
+                p.calls
+            );
+            let out = super::super::rename_collection_targets(src).unwrap();
+            assert_eq!(out.len(), src.len());
+            assert!(out.contains("[_ethod]") && out.contains("[_ethod, field ]"));
+            assert!(out.contains("[method: Obsolete]"), "attribute untouched");
         }
 
         #[test]
