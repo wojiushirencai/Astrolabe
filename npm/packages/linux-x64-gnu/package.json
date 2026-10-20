@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe-ai/linux-x64-gnu",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "The Linux x86_64 glibc binary for Astrolabe AI (x86_64-unknown-linux-gnu)",
   "license": "MIT OR Apache-2.0",
   "repository": {

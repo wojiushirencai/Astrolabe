@@ -3,7 +3,7 @@
 # release's SHA256SUMS, and installs the `astrolabe` binary. Nothing else is touched (no PATH or config edits).
 #
 #   curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
-#   ASTROLABE_VERSION=0.14.0 ASTROLABE_INSTALL_DIR=$HOME/bin sh install.sh
+#   ASTROLABE_VERSION=0.15.0 ASTROLABE_INSTALL_DIR=$HOME/bin sh install.sh
 #
 # Env: ASTROLABE_VERSION (default: latest release), ASTROLABE_INSTALL_DIR (default: $HOME/.local/bin),
 #      ASTROLABE_LIBC=musl|gnu (Linux x64 only; default: musl if ldd reports musl, else gnu)
