@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-20
+
+自 v0.14.0 以来的 PR：#84（关闭 Roslyn 自动 NuGet 还原）、#85（第 6 批）。工具目录仍为 7 个，`tools/list` 7,307 B（Linux 实测，上限测试 7,500 B）。完整说明与 A/B 数据见 GitHub Release。
+
 ### 行为变化（升级时请留意）
 
 - `EXTRACTOR_VERSION` 5 → 6：升级后首次启动会重新解析一遍。

@@ -7,13 +7,13 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 
 > **Not to be confused with** the npm packages `astrolabe` (a 2014 Protractor page-object library) and `astrolabe-ai` (an unrelated resume tool), or other MCP servers named "astrolabe". This project lives at `github.com/wojiushirencai/Astrolabe`; the binary is `astrolabe`.
 
-## Fact card (as of 2026-10-19)
+## Fact card (as of 2026-10-20)
 
 | | |
 |---|---|
-| Latest release | [v0.14.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.14.0), published 2026-10-19 |
+| Latest release | [v0.15.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.15.0), published 2026-10-20 |
 | What it exposes | 7 MCP tools: `resolve_context`, `search_code`, `find_symbol`, `find_references`, `goto_definition`, `get_diagnostics`, `get_languages` |
-| `tools/list` size | about 7.2 KB compact JSON (7,185 B measured on Linux for v0.14.0; not re-measured on macOS) |
+| `tools/list` size | about 7.3 KB compact JSON (7,307 B measured on Linux for v0.15.0; not re-measured on macOS) |
 | Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |
 | Platforms | macOS arm64/x64, Linux x64 (glibc/musl), Linux arm64, Windows x64 |
 | Languages | 17 matrix rows incl. Python, Go, Rust, Java, TypeScript/JavaScript, C/C++, Swift, Objective-C, PHP, Vue, Dart, C#, VB.NET, Kotlin, Shell, Ruby, Lua ([details](docs/REFERENCE.zh-CN.md)) |
