@@ -2961,7 +2961,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "精确引用查询（语言服务器驱动）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis. dry_run_rename=NewName: read-only per-file rename checklist."
+        description = "精确引用查询（索引优先，语言服务器兜底）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis. Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist."
     )]
     pub(crate) fn find_references(
         &self,
