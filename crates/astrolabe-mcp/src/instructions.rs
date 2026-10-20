@@ -18,7 +18,7 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
          当前索引根 index_root: {}。每条工具结果第一行会重复该绝对路径；\
          若与你正在编辑的仓库不符，不要用这些路径读文件。\
          统计/计数（每个目录有多少处调用）用 search_code aggregate=top|dir|file，可加 skip_comments、exclude，不必写脚本。先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
-         scoped 来自 import 图，syntactic 来自名字匹配且需要核验。\
+         scoped 来自 import 图，syntactic 来自名字匹配。\
          精确工具 Unavailable 时请在本机安装对应语言服务器，并用 get_languages 查看状态。\
          其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read。",
         root.display()

@@ -412,7 +412,20 @@ pub fn implementors_of(
     out
 }
 
-/// One line per interface: `实现方（…）：I @a.go:3 ← T @b.go:9；…`, at most
+/// A Go type that is a test double: declared in a `_test.go` file or a
+/// mock/fake/testdata package, or named `Mock…` / `Fake…` / `Stub…`.
+pub fn is_test_double(path: &str, name: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    lower.ends_with("_test.go")
+        || lower.split('/').any(|seg| {
+            seg.contains("mock") || seg.contains("fake") || seg == "testdata" || seg == "testutil"
+        })
+        || ["mock", "fake", "stub"].iter().any(|p| n.starts_with(p))
+}
+
+/// One line per interface: `Go 隐式实现方（方法 N/N 全匹配…）：I @a.go:3 ← T
+/// @b.go:9；…`, production types first, test doubles tagged `[测试]`, at most
 /// `max` implementors listed. Empty when the interface has none.
 pub fn render_implementors(g: &CodeGraph, iface: u32, impls: &[u32], max: usize) -> String {
     let sym = |id: u32| g.symbols.get(id as usize).filter(|s| s.id.0 == id);
@@ -425,20 +438,48 @@ pub fn render_implementors(g: &CodeGraph, iface: u32, impls: &[u32], max: usize)
     let (Some(i), false) = (sym(iface), impls.is_empty()) else {
         return String::new();
     };
-    let listed: Vec<String> = impls
+    // Direct method declarations inside the interface body; an embedded
+    // interface adds methods we do not count one by one.
+    let members = g
+        .symbols
+        .iter()
+        .filter(|s| s.file == i.file && s.start_line > i.start_line && s.end_line <= i.end_line);
+    let (mut methods, mut embeds) = (0usize, false);
+    for m in members {
+        match m.kind {
+            SymbolKind::Method => methods += 1,
+            SymbolKind::Field | SymbolKind::Interface | SymbolKind::Type => embeds = true,
+            _ => {}
+        }
+    }
+    let mut ordered: Vec<(&CodeSymbol, bool)> = impls
         .iter()
         .filter_map(|&id| sym(id))
-        .take(max)
-        .map(|s| format!("{} @{}:{}", s.name, path(s), s.start_line))
+        .map(|s| (s, is_test_double(path(s), &s.name)))
         .collect();
-    let more = impls.len().saturating_sub(listed.len());
+    // Stable: production first, then test doubles, each in path/line order.
+    ordered.sort_by_key(|(_, test)| *test);
+    let listed: Vec<String> = ordered
+        .iter()
+        .take(max)
+        .map(|(s, test)| {
+            let tag = if *test { " [测试]" } else { "" };
+            format!("{} @{}:{}{tag}", s.name, path(s), s.start_line)
+        })
+        .collect();
+    let more = ordered.len().saturating_sub(listed.len());
     let tail = if more > 0 {
         format!("；另有 {more} 个")
     } else {
         String::new()
     };
+    let rule = match (methods, embeds) {
+        (0, _) => "方法集全匹配".to_string(),
+        (n, false) => format!("方法 {n}/{n} 全匹配"),
+        (n, true) => format!("方法 {n}/{n} 及内嵌接口全匹配"),
+    };
     format!(
-        "Go 隐式实现方（按方法名与参数个数做语法匹配，可能有误报或遗漏）：{} @{}:{} ← {}{tail}\n",
+        "Go 隐式实现方（{rule}，按方法名与参数个数）：{} @{}:{} ← {}{tail}\n",
         i.name,
         path(i),
         i.start_line,
@@ -643,6 +684,49 @@ mod tests {
         assert!(line.contains("Provider @oauth/provider.go:"), "{line}");
         assert!(line.contains("Ext @impls/ext.go:"), "{line}");
         assert!(line.ends_with("另有 1 个\n"), "{line}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The implementors line states the matching rule and the method count
+    /// instead of "may have false positives", lists production types before
+    /// test doubles and tags the doubles.
+    #[test]
+    fn implementors_line_counts_methods_and_tags_test_doubles() {
+        let root = scratch("doubles");
+        write(&root, "go.mod", "module example.com/d\n");
+        write(
+            &root,
+            "p/provider.go",
+            "package p\n\ntype Provider interface {\n\tName() string\n\tLogin(code string) error\n\tLogout()\n}\n",
+        );
+        write(
+            &root,
+            "p/a_test.go",
+            "package p\n\ntype aFake struct{}\n\nfunc (aFake) Name() string { return \"\" }\nfunc (aFake) Login(code string) error { return nil }\nfunc (aFake) Logout() {}\n",
+        );
+        write(
+            &root,
+            "p/zgithub.go",
+            "package p\n\ntype GitHub struct{}\n\nfunc (GitHub) Name() string { return \"\" }\nfunc (GitHub) Login(code string) error { return nil }\nfunc (GitHub) Logout() {}\n",
+        );
+        let g = index(&root);
+        let provider = g
+            .symbols
+            .iter()
+            .find(|s| s.name == "Provider" && s.kind == SymbolKind::Interface)
+            .unwrap()
+            .id
+            .0;
+        let by = super::implementors_of(&g, &HashSet::from([provider]));
+        let line = render_implementors(&g, provider, &by[&provider], 5);
+        assert!(line.contains("方法 3/3 全匹配"), "{line}");
+        assert!(!line.contains("误报"), "{line}");
+        let gh = line.find("GitHub @p/zgithub.go:3").expect(&line);
+        let fake = line.find("aFake @p/a_test.go:3 [测试]").expect(&line);
+        assert!(gh < fake, "production first: {line}");
+        assert!(is_test_double("mocks/x.go", "X"));
+        assert!(is_test_double("a/b.go", "MockStore"));
+        assert!(!is_test_double("oauth/github.go", "GitHubProvider"));
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -415,7 +415,19 @@ impl AstrolabeServer {
         }
         let total = lines.len();
         let offset = params.offset.min(total);
-        let limit = limit_for(&head);
+        // Go interfaces in the outlined files: their implementing types.
+        let implementors = super::search_shape::implementors_block(
+            index,
+            index
+                .graph()
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| files.contains(&s.file))
+                .map(|(i, _)| i),
+            params.budget_tokens / 3,
+        );
+        let limit = limit_for(&head).saturating_sub(estimate_tokens(&implementors));
         let (kept, omitted) = truncate_ranked(&lines[offset..], limit, |l| format!("{l}\n"));
         let kept_count = kept.len();
         let truncated = omitted > 0;
@@ -443,6 +455,7 @@ impl AstrolabeServer {
             body.push_str(line);
             body.push('\n');
         }
+        body.push_str(&implementors);
         if total == 0 {
             body.push_str(if kind.is_some() {
                 "(该文件没有此类型的符号)\n"
