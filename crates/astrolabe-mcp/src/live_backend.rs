@@ -70,7 +70,7 @@ impl LiveBackend {
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let pool = LspPool::from_discovery_and_transport(
-            Discovery::from_process(),
+            Discovery::from_process().with_project_root(&root),
             StdioSpawn::new(&root),
             root.clone(),
             LspPoolConfig::default(),
