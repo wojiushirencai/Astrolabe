@@ -568,7 +568,7 @@ impl Store {
 /// same bytes (new captures, different anchors/kinds). The parse cache is
 /// keyed by content hash, so without this an upgraded binary keeps serving
 /// symbols extracted by the old version until each file is edited.
-pub const EXTRACTOR_VERSION: u32 = 5;
+pub const EXTRACTOR_VERSION: u32 = 6;
 
 /// Cache key for a parsed file: extractor version, crate version, language
 /// and content hash.

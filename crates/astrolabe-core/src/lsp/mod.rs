@@ -40,6 +40,7 @@ pub mod kotlin;
 pub mod pool;
 pub mod queries;
 pub mod router;
+mod rustup_proxy;
 pub mod transport;
 pub mod vue_bridge;
 

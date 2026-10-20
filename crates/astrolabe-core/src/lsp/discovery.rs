@@ -78,6 +78,9 @@ pub struct Discovery {
     /// How long a probe waits for a background auto-install before answering
     /// "in progress". Zero (default): never wait inside the probe.
     install_wait: std::time::Duration,
+    /// Working directory for the rustup-proxy check (`rust-toolchain.toml`
+    /// is resolved there); `None` uses the process cwd.
+    project_root: Option<PathBuf>,
 }
 
 /// Registry key of one artifact install.
@@ -392,6 +395,7 @@ impl Discovery {
                 cfg!(windows),
             ),
             install_wait: std::time::Duration::ZERO,
+            project_root: None,
         }
     }
 
@@ -407,6 +411,7 @@ impl Discovery {
             auto_install: AutoInstallMode::Off,
             kotlin_roots: Vec::new(),
             install_wait: std::time::Duration::ZERO,
+            project_root: None,
         }
     }
 
@@ -414,6 +419,20 @@ impl Discovery {
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
         self
+    }
+
+    /// Project root used as the cwd when checking a rustup proxy.
+    pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.project_root = Some(root.into());
+        self
+    }
+
+    /// `Some(hint)` when `command` (found for `language`) is a rustup proxy
+    /// that cannot run, see `rustup_proxy.rs`. Rust only.
+    fn broken_proxy(&self, language: Language, command: &Path) -> Option<String> {
+        (language == Language::Rust)
+            .then(|| super::rustup_proxy::proxy_problem(command, self.project_root.as_deref()))
+            .flatten()
     }
 
     /// Add an install root searched for a kotlin-lsp distribution.
@@ -472,6 +491,9 @@ impl Discovery {
             });
             match resolved {
                 Some(command) => {
+                    if let Some(hint) = self.broken_proxy(language, &command) {
+                        return self.unavailable(language, hint);
+                    }
                     let spec = spec_for_resolved(language, command);
                     let spec = self.kotlin_upgrade(spec);
                     let install_hint = spec.install_hint.clone();
@@ -492,6 +514,9 @@ impl Discovery {
             }
         }
 
+        // A rustup proxy that cannot run: keep looking (cache, install), and
+        // say why if nothing else is found.
+        let mut proxy_hint = None;
         for candidate in candidates(language) {
             if candidate.bin == "kotlin-language-server" {
                 // Unpacked JetBrains distributions beat the fwcd fallback.
@@ -500,6 +525,10 @@ impl Discovery {
                 }
             }
             if let Some(command) = self.find_on_path(candidate.bin) {
+                if let Some(hint) = self.broken_proxy(language, &command) {
+                    proxy_hint = Some(hint);
+                    continue;
+                }
                 let spec = spec_from_candidate(language, command, candidate);
                 let spec = self.kotlin_upgrade(spec);
                 let install_hint = spec.install_hint.clone();
@@ -590,7 +619,8 @@ impl Discovery {
             }
         }
 
-        self.unavailable(language, self.missing_hint(language))
+        let hint = proxy_hint.unwrap_or_else(|| self.missing_hint(language));
+        self.unavailable(language, hint)
     }
 
     /// Poll (or start) the background install of `spec` under `cache_root`.
@@ -1362,6 +1392,46 @@ mod tests {
             LspError::Unavailable(lang, hint) => (lang, hint),
             other => panic!("expected Unavailable, got {other}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_rustup_proxy_is_not_ready() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        let rustup = dir.0.join("rustup");
+        fs::write(
+            &rustup,
+            "#!/bin/sh\necho \"error: rustup could not choose a version of rust-analyzer to run, because one wasn't specified explicitly, and no default is configured.\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&rustup, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::hard_link(&rustup, dir.0.join("rust-analyzer")).unwrap();
+        let probe = discovery_with_dirs(&[&dir.0]).probe(Language::Rust);
+        assert!(!probe.available(), "{probe:?}");
+        assert!(
+            probe.install_hint.contains("rustup default stable"),
+            "{}",
+            probe.install_hint
+        );
+        assert!(probe.needs_install.is_some());
+        let err = discovery_with_dirs(&[&dir.0])
+            .discover(Language::Rust)
+            .unwrap_err();
+        assert!(err.to_string().contains("rustup proxy"), "{err}");
+        // Explicit override pointing at the proxy: same answer.
+        let probe = Discovery::new("")
+            .with_env(
+                "ASTROLABE_LSP_RUST",
+                dir.0.join("rust-analyzer").display().to_string(),
+            )
+            .probe(Language::Rust);
+        assert!(!probe.available());
+        // Other languages are not affected by the check.
+        fake_bin(&dir.0, "gopls");
+        assert!(discovery_with_dirs(&[&dir.0])
+            .probe(Language::Go)
+            .available());
     }
 
     #[test]

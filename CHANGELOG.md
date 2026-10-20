@@ -6,8 +6,21 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### 行为变化（升级时请留意）
+
+- `EXTRACTOR_VERSION` 5 → 6：升级后首次启动会重新解析一遍。
+- `find_references`（Go）改为索引优先：全仓只有一处定义的名字直接用索引作答（同包 + import 了该包的文件，排除注释、字符串和经其他包导入名的选择子），不再启动 gopls；有多处定义的名字和 `dry_run_rename` 仍走语言服务器。TS/JS/Python 仍是语言服务器优先。召回测量见 `docs/find-references-graph-first.md`。
+- `find_references` 同时给了 `symbol` 和 `line`/`character` 但对不上时，以 `symbol` 为准（在该行 ±2 行内对齐，找不到就按名字查）；`goto_definition` 同样处理。`path` 缺失、不存在或不含该符号时，索引里只有一个定义文件就自动改用它，多个则列出候选。
+- `find_references` 每条命中带源码行、所在函数及行范围、`[声明]`、`[注释]` / `[字符串]`；非测试在前、测试在后，按文件分组；超过 150 处时先给按文件的计数，传 `offset` 再逐条列。
+- `find_symbol`：类型排在字段前、精确大小写优先；有精确命中时，只是名字包含查询词的结果折叠成一行计数。Go 隐式实现方给出方法 N/N 计数，测试替身标 `[测试]`，截断页也保留。
+- `search_code`：重叠的上下文窗口合并；分组命中首次出现标 `in 函数@起-止`；测试文件每文件最多 2 处；含大写的字面量查询区分大小写；`path_filter` 零命中时报告过滤范围外的命中数。
+- 输出里去掉"可能有误报或遗漏""请用锚点核验""需要核验"等措辞；图例/页脚每会话一次。
+
 ### 修复
 
+- **三类假语法错误**：TS 调用类型实参里换行的索引签名（`useState<{ id: number\n [key: string]: unknown }>`）、Bash heredoc 正文行以结束符开头、JSX 元素正文裸 `&`。aiproxy、aicon 语料不再报语法错误，`search_code` 不再带语法错误脚注。
+- **rust-analyzer 只是 rustup 代理壳时不再报 Ready**：探测时带 `RUSTUP_AUTO_INSTALL=0` 跑一次 `--version`（5 秒超时，缓存 30 秒），失败则标需要安装，并给出 `rustup default stable` / `rustup component add rust-analyzer` 等具体修法。
+- `find_references` 空结果提示按语言给出，只有 Kotlin 才提 Kotlin / Android；discovery 已给出安装命令时不再追加通用安装提示。
 - **关闭 Roslyn 自动 NuGet 还原**：对 `workspace/configuration` 的 `projects.dotnet_enable_automatic_restore` 回答 `false`（C#/VB），`_roslyn_projectNeedsRestore` 仍空回复、从不还原。serilog 实测：加载后不再出现持续 >100 s 的 "Restore" 进度，就绪 3.8 s；不再往 `obj/` 写 `project.assets.json`、`*.nuget.*`（Roslyn 设计时构建仍会写 `obj/Debug/*`）。
 
 ## [0.14.0] - 2026-10-19

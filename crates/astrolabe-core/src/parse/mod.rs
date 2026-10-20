@@ -48,6 +48,7 @@ pub use diag::{
     diagnose_indexed_syntax, diagnose_syntax, SyntaxDiagnosis, SyntaxErrorKind, DIAG_FORMAT_VERSION,
 };
 mod jsx_amp;
+mod ts_index_sig;
 mod ts_variance;
 
 pub(crate) use razor::extract_razor_csharp;
@@ -220,15 +221,32 @@ impl ParserPool {
         // Shell: zsh-only syntax and `.bats` `@test` blocks are rewritten
         // (line-preserving) for the bash grammar; nvm-style `\. file` source
         // lines are normalized (same length) on every parse pass.
+        // Heredoc bodies with a line that starts with the delimiter
+        // (`BLOCKER (…)` in `<<'BLOCKER'`) end early in tree-sitter-bash;
+        // on a partial parse retry with those bodies neutralized (same
+        // length), kept only when clean. See `neutralize_heredoc_bodies`.
         if lang == Language::Shell {
-            return shell::parse_with(
-                path.as_str(),
-                source,
-                |s| match shell::normalize_backslash_dot(s) {
-                    Some(fixed) => self.parse_raw(lang, path, &fixed),
-                    None => self.parse_raw(lang, path, s),
-                },
-            );
+            let run = |text: &str| {
+                shell::parse_with(
+                    path.as_str(),
+                    text,
+                    |s| match shell::normalize_backslash_dot(s) {
+                        Some(fixed) => self.parse_raw(lang, path, &fixed),
+                        None => self.parse_raw(lang, path, s),
+                    },
+                )
+            };
+            let parsed = run(source)?;
+            if parsed.partial {
+                if let Some(fixed) = shell::neutralize_heredoc_bodies(source) {
+                    if let Ok(retry) = run(&fixed) {
+                        if !retry.partial {
+                            return Ok(retry);
+                        }
+                    }
+                }
+            }
+            return Ok(parsed);
         }
         // TypeScript 5.0 `export type * from './x'` is unknown to
         // tree-sitter-typescript 0.23 (ERROR node, whole file flagged partial).
@@ -313,14 +331,25 @@ impl ParserPool {
         // TS retries below so the fixes combine.
         let mut amp = None;
         if parsed.partial && matches!(lang, Language::JavaScript | Language::Tsx) {
-            if let Some(fixed) = jsx_amp::escape_bare_ampersands(source) {
-                if let Ok(retry) = self.parse_raw(lang, path, &fixed) {
+            let attr = jsx_amp::escape_bare_ampersands(source);
+            if let Some(fixed) = &attr {
+                if let Ok(retry) = self.parse_raw(lang, path, fixed) {
                     if !retry.partial {
                         return Ok(retry);
                     }
                 }
-                amp = Some(fixed);
             }
+            // Bare `&` in element text (`<span>A & B</span>`), on top.
+            let base = attr.as_deref().unwrap_or(source);
+            let text = jsx_amp::escape_text_ampersands(lang, base);
+            if let Some(fixed) = &text {
+                if let Ok(retry) = self.parse_raw(lang, path, fixed) {
+                    if !retry.partial {
+                        return Ok(retry);
+                    }
+                }
+            }
+            amp = text.or(attr);
         }
         if parsed.partial && matches!(lang, Language::TypeScript | Language::Tsx) {
             let source = amp.as_deref().unwrap_or(source);
@@ -336,6 +365,18 @@ impl ParserPool {
                 }
             }
             let base = variance.as_deref().unwrap_or(source);
+            // Line-leading index signature in a call's type argument
+            // (`useState<{ id: number\n [key: string]: unknown }>`), see
+            // `ts_index_sig.rs`; combines with the fixes before and after.
+            let sig = ts_index_sig::separate_index_signatures(base);
+            if let Some(fixed) = &sig {
+                if let Ok(retry) = self.parse_raw(lang, path, fixed) {
+                    if !retry.partial {
+                        return Ok(retry);
+                    }
+                }
+            }
+            let base = sig.as_deref().unwrap_or(base);
             if let Some(fixed) = normalize_import_types(base) {
                 if let Ok(retry) = self.parse_raw(lang, path, &fixed) {
                     if !retry.partial {

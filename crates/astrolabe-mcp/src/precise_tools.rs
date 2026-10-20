@@ -23,6 +23,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::refs_graph::{HitInfo, HitKind};
+
 const DEFAULT_BUDGET: usize = 2_500;
 
 const SEARCH_CODE_FALLBACK: &str =
@@ -149,12 +151,21 @@ pub(crate) struct GetDiagnosticsParams {
 /// Production uses `LiveBackend` (on-demand language-server pool). Tests
 /// inject fakes for the missing-server path.
 pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
+    /// References of `symbol`. `exact`: a compiler-grade answer is required
+    /// (rename preview), so the index-first shortcut is skipped.
     fn references(
         &self,
         symbol: &str,
         path: Option<&str>,
         position: Option<Position>,
+        exact: bool,
     ) -> Precise<Vec<Location>>;
+    /// Per-hit source line, enclosing function, declaration / comment /
+    /// string / test flags. Empty when the backend cannot tell; the list
+    /// then renders as bare coordinates.
+    fn annotate(&self, _symbol: &str, _locations: &[Location]) -> Vec<HitInfo> {
+        Vec::new()
+    }
     fn definition(
         &self,
         path: &str,
@@ -183,6 +194,7 @@ impl PreciseCapability for Unwired {
         symbol: &str,
         path: Option<&str>,
         _position: Option<Position>,
+        _exact: bool,
     ) -> Precise<Vec<Location>> {
         Precise::unknown(
             Vec::new(),
@@ -236,7 +248,7 @@ impl PreciseTools {
 #[tool_router]
 impl PreciseTools {
     #[tool(
-        description = "精确引用查询（语言服务器）。LSP-resolved call sites and usages across repository. Required for renames and caller analysis. dry_run_rename=NewName: read-only per-file rename checklist.",
+        description = "精确引用查询（索引优先，语言服务器兜底）。LSP-resolved call sites and usages across repository. Required for renames and caller analysis. Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.",
         annotations(title = "精确引用", read_only_hint = true)
     )]
     pub(crate) fn find_references(
@@ -289,9 +301,14 @@ pub(crate) fn run_find_references(
         (Some(line), Some(character)) => Some(Position { line, character }),
         _ => None,
     };
-    let result = backend.references(&params.symbol, params.path.as_deref(), position);
-    // Order is the backend's: queried file first, then path and position, so
-    // budget truncation drops the least local hits last.
+    let result = backend.references(
+        &params.symbol,
+        params.path.as_deref(),
+        position,
+        params.dry_run_rename.is_some(),
+    );
+    // Order is the backend's: queried file first, then path and position;
+    // rendering moves test hits after non-test ones (stable).
     let locations = result.value;
 
     // Keep the preamble out of ranked truncation so a zero budget still
@@ -312,12 +329,52 @@ pub(crate) fn run_find_references(
         header
     };
 
+    let mut infos = if locations.is_empty() {
+        Vec::new()
+    } else {
+        backend.annotate(&params.symbol, &locations)
+    };
+    if infos.len() != locations.len() {
+        infos = vec![HitInfo::default(); locations.len()];
+    }
+    let hits = RefHits::new(&locations, &infos);
+    let wide = params.offset.is_none()
+        && params.dry_run_rename.is_none()
+        && locations.len() > WIDE_REFERENCES;
+    if wide {
+        let mut body = preamble;
+        body.push_str(&hits.summary_line());
+        body.push_str(&hits.wide_summary());
+        return text_result(
+            body,
+            json!({
+                "confidence": confidence_json(result.confidence),
+                "budget_tokens": params.budget_tokens,
+                "matches": locations.len(),
+                "offset": 0,
+                "returned": 0,
+                "omitted": locations.len(),
+                "truncated": true,
+                "next_offset": 0,
+                "wide": true,
+                "dry_run_rename": false,
+                "rename_files": 0,
+            }),
+        );
+    }
+
     let offset = params.offset.unwrap_or(0);
-    let items: Vec<String> = locations.iter().map(render_location).collect();
-    // The header (confidence, note, coordinate line, truncation marker) is
-    // part of the output, so it is charged to the budget before the list.
+    let items = hits.items();
+    let summary = if locations.is_empty() {
+        String::new()
+    } else {
+        hits.summary_line()
+    };
+    // The header (confidence, note, summary, coordinate line, truncation
+    // marker) is part of the output, so it is charged to the budget first.
     let overhead = estimate_tokens(&preamble)
-        + estimate_tokens(COORD_NOTE)
+        + estimate_tokens(&summary)
+        + estimate_tokens(REF_COORD_NOTE)
         + estimate_tokens(&omitted_line(items.len(), items.len()));
     let (kept, omitted) = page(
         &items,
@@ -326,11 +383,15 @@ pub(crate) fn run_find_references(
     );
 
     let mut body = preamble;
+    body.push_str(&summary);
     if !kept.is_empty() {
-        body.push_str(COORD_NOTE);
+        body.push_str(REF_COORD_NOTE);
     }
     if offset > 0 && offset >= items.len() && !items.is_empty() {
         body.push_str(&format!("offset={offset} 超出结果总数 {}。\n", items.len()));
+    }
+    if !kept.is_empty() {
+        body.push_str(&hits.continuation_headers(offset));
     }
     for line in &kept {
         body.push_str(line);
@@ -375,6 +436,225 @@ pub(crate) fn run_find_references(
             "rename_files": preview_files,
         }),
     )
+}
+
+/// Above this many hits (and no explicit `offset`), `find_references`
+/// answers with per-file counts first, like search_code's wide mode.
+const WIDE_REFERENCES: usize = 150;
+
+/// Coordinate legend for the reference list.
+const REF_COORD_NOTE: &str =
+    "坐标 L行:列 均从 1 起（列按 UTF-16）；作 line/character 入参时各减 1。\n";
+
+/// A reference list in display order: non-test hits first (backend order
+/// kept within each group), then test hits.
+struct RefHits<'a> {
+    locations: &'a [Location],
+    infos: &'a [HitInfo],
+    order: Vec<usize>,
+}
+
+impl<'a> RefHits<'a> {
+    fn new(locations: &'a [Location], infos: &'a [HitInfo]) -> Self {
+        let mut order: Vec<usize> = (0..locations.len()).collect();
+        // Stable: files stay contiguous inside each group.
+        order.sort_by_key(|&i| infos[i].test);
+        Self {
+            locations,
+            infos,
+            order,
+        }
+    }
+
+    fn group_counts(&self, test: bool) -> (usize, usize) {
+        let mut files: Vec<&str> = Vec::new();
+        let mut n = 0;
+        for &i in &self.order {
+            if self.infos[i].test == test {
+                n += 1;
+                let p = self.locations[i].path.as_str();
+                if files.last() != Some(&p) && !files.contains(&p) {
+                    files.push(p);
+                }
+            }
+        }
+        (n, files.len())
+    }
+
+    fn file_count(&self, path: &str, test: bool) -> usize {
+        self.order
+            .iter()
+            .filter(|&&i| self.infos[i].test == test && self.locations[i].path.as_str() == path)
+            .count()
+    }
+
+    fn summary_line(&self) -> String {
+        let (prod, prod_files) = self.group_counts(false);
+        let (test, test_files) = self.group_counts(true);
+        let files: std::collections::HashSet<&str> =
+            self.locations.iter().map(|l| l.path.as_str()).collect();
+        let decl = self.infos.iter().filter(|h| h.declaration).count();
+        let noncode = self
+            .infos
+            .iter()
+            .filter(|h| h.kind != HitKind::Code)
+            .count();
+        let mut out = format!("共 {} 处 / {} 个文件", self.locations.len(), files.len());
+        let mut parts: Vec<String> = Vec::new();
+        if prod > 0 && test > 0 {
+            parts.push(format!(
+                "非测试 {prod} 处 / {prod_files} 个文件，测试 {test} 处 / {test_files} 个文件"
+            ));
+        } else if test > 0 {
+            parts.push("全部在测试代码".to_string());
+        }
+        if decl > 0 {
+            parts.push(format!("[声明] {decl} 处"));
+        }
+        if noncode > 0 {
+            parts.push(format!("注释/字符串 {noncode} 处，已标注"));
+        }
+        if !parts.is_empty() {
+            out.push_str(&format!("（{}）", parts.join("；")));
+        }
+        out.push_str("。\n");
+        out
+    }
+
+    fn mixed(&self) -> bool {
+        self.infos.iter().any(|h| h.test) && self.infos.iter().any(|h| !h.test)
+    }
+
+    fn section_header(&self, test: bool) -> String {
+        if !self.mixed() {
+            return String::new();
+        }
+        let (n, files) = self.group_counts(test);
+        let title = if test { "测试" } else { "非测试" };
+        format!("## {title}（{n} 处 / {files} 个文件）\n")
+    }
+
+    fn file_header(&self, path: &str, test: bool) -> String {
+        format!("{path} ({})\n", self.file_count(path, test))
+    }
+
+    fn hit_line(&self, i: usize) -> String {
+        let loc = &self.locations[i];
+        let info = &self.infos[i];
+        let mut line = format!(
+            "  L{}:{}",
+            loc.range.start.line.saturating_add(1),
+            loc.range.start.character.saturating_add(1)
+        );
+        if info.declaration {
+            line.push_str(" [声明]");
+        }
+        match info.kind {
+            HitKind::Comment => line.push_str(" [注释]"),
+            HitKind::Str => line.push_str(" [字符串]"),
+            HitKind::Code => {}
+        }
+        if let Some((name, start, end)) = &info.enclosing {
+            line.push_str(&format!(" in {name}[{start}-{end}]"));
+        }
+        if let Some(text) = info.text.as_deref().filter(|t| !t.is_empty()) {
+            line.push_str(": ");
+            line.push_str(text);
+        }
+        line
+    }
+
+    /// One string per hit in display order; the first hit of a group or
+    /// file carries the group / file header, so the budget charges it.
+    fn items(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.order.len());
+        let mut prev: Option<(bool, &str)> = None;
+        for &i in &self.order {
+            let test = self.infos[i].test;
+            let path = self.locations[i].path.as_str();
+            let mut item = String::new();
+            if prev.is_none_or(|(t, _)| t != test) {
+                item.push_str(&self.section_header(test));
+            }
+            if prev != Some((test, path)) {
+                item.push_str(&self.file_header(path, test));
+            }
+            item.push_str(&self.hit_line(i));
+            prev = Some((test, path));
+            out.push(item);
+        }
+        out
+    }
+
+    /// Group / file headers for a page that starts mid-file.
+    fn continuation_headers(&self, offset: usize) -> String {
+        if offset == 0 || offset >= self.order.len() {
+            return String::new();
+        }
+        let i = self.order[offset];
+        let p = self.order[offset - 1];
+        let (test, path) = (self.infos[i].test, self.locations[i].path.as_str());
+        let mut out = String::new();
+        if self.infos[p].test == test {
+            out.push_str(&self.section_header(test));
+            if self.locations[p].path.as_str() == path {
+                out.push_str(&self.file_header(path, test));
+            }
+        }
+        out
+    }
+
+    /// Wide result: declarations, then per-file counts (non-test first).
+    fn wide_summary(&self) -> String {
+        let mut out = format!(
+            "超过 {WIDE_REFERENCES} 处，先给按文件计数（不是逐条列表）；逐条列出请传 offset=0（按 budget_tokens 分页，非测试在前）。\n"
+        );
+        let decls: Vec<usize> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&i| self.infos[i].declaration)
+            .take(5)
+            .collect();
+        if !decls.is_empty() {
+            out.push_str("[声明]：\n");
+            for i in decls {
+                out.push_str(&format!(
+                    "  {} {}\n",
+                    self.locations[i].path.as_str(),
+                    self.hit_line(i).trim_start()
+                ));
+            }
+        }
+        for (test, cap) in [(false, 25usize), (true, 15usize)] {
+            let mut files: Vec<(&str, usize)> = Vec::new();
+            for &i in &self.order {
+                if self.infos[i].test != test {
+                    continue;
+                }
+                let p = self.locations[i].path.as_str();
+                match files.iter_mut().find(|(f, _)| *f == p) {
+                    Some((_, n)) => *n += 1,
+                    None => files.push((p, 1)),
+                }
+            }
+            if files.is_empty() {
+                continue;
+            }
+            files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            let (n, nf) = self.group_counts(test);
+            let title = if test { "测试" } else { "非测试" };
+            out.push_str(&format!("## {title}（{n} 处 / {nf} 个文件），按文件：\n"));
+            for (f, n) in files.iter().take(cap) {
+                out.push_str(&format!("  {n:>5}  {f}\n"));
+            }
+            if files.len() > cap {
+                let rest: usize = files[cap..].iter().map(|(_, n)| n).sum();
+                out.push_str(&format!("  …其余 {} 个文件 {rest} 处\n", files.len() - cap));
+            }
+        }
+        out
+    }
 }
 
 /// Read-only rename preview: per-file checklist of the sites that hold the
@@ -689,8 +969,12 @@ fn unknown_preamble(note: Option<&str>, path: Option<&str>, suggest_search: bool
     }
     if server_missing(note) {
         body.push_str(&unavailable_ensure_gate(language_of(path)));
-        body.push_str("安装提示：\n");
-        body.push_str(&install_hint(language_of(path)));
+        // Discovery's own message (e.g. a rustup proxy without a toolchain)
+        // already says what to run; a generic hint would contradict it.
+        if !note_has_install_command(note) {
+            body.push_str("安装提示：\n");
+            body.push_str(&install_hint(language_of(path)));
+        }
     }
     if suggest_search {
         body.push_str(SEARCH_CODE_FALLBACK);
@@ -710,8 +994,12 @@ fn unknown_preamble_definition(note: Option<&str>, path: Option<&str>) -> String
     }
     if server_missing(note) {
         body.push_str(&unavailable_ensure_gate(language_of(path)));
-        body.push_str("安装提示：\n");
-        body.push_str(&install_hint(language_of(path)));
+        // Discovery's own message (e.g. a rustup proxy without a toolchain)
+        // already says what to run; a generic hint would contradict it.
+        if !note_has_install_command(note) {
+            body.push_str("安装提示：\n");
+            body.push_str(&install_hint(language_of(path)));
+        }
     }
     body.push_str(DEFINITION_FALLBACK);
     body.push('\n');
@@ -735,6 +1023,23 @@ fn server_missing(note: Option<&str>) -> bool {
     ]
     .iter()
     .any(|m| note.contains(m))
+}
+
+/// True when the note already carries a concrete command to run.
+fn note_has_install_command(note: Option<&str>) -> bool {
+    let Some(note) = note else { return false };
+    note.contains('`')
+        || [
+            "rustup ",
+            "go install",
+            "npm i",
+            "brew install",
+            "pip install",
+            "apt-get install",
+            "gem install",
+        ]
+        .iter()
+        .any(|m| note.contains(m))
 }
 
 /// Prompt contract when a precise tool hits Unavailable: tell the model to
@@ -933,6 +1238,7 @@ mod tests {
             _symbol: &str,
             _path: Option<&str>,
             _position: Option<Position>,
+            _exact: bool,
         ) -> Precise<Vec<Location>> {
             self.references.clone()
         }
@@ -1216,11 +1522,11 @@ mod tests {
         })));
         let text = first_text(&result);
         assert!(text.contains("confidence: Exact"), "{text}");
-        assert!(text.contains("@src/a.rs:3"), "{text}");
-        assert!(text.contains("@src/b.rs:10"), "{text}");
+        assert!(text.contains("src/a.rs (1)\n  L3:1"), "{text}");
+        assert!(text.contains("src/b.rs (1)\n  L10:5"), "{text}");
         // Backend order is kept (origin file first), not re-sorted by path.
-        let a = text.find("@src/a.rs:3").unwrap();
-        let b = text.find("@src/b.rs:10").unwrap();
+        let a = text.find("src/a.rs (1)").unwrap();
+        let b = text.find("src/b.rs (1)").unwrap();
         assert!(b < a, "backend order must be preserved: {text}");
     }
 
@@ -1531,7 +1837,7 @@ mod tests {
         let tools = fake_refs(Precise::exact(v));
         let r = tools.find_references(Parameters(refs_params(8, None, None)));
         let text = first_text(&r);
-        assert!(text.contains("@zzz.go:1"), "{text}");
+        assert!(text.contains("zzz.go (1)\n  L1:1"), "{text}");
     }
 
     #[test]
@@ -1586,8 +1892,10 @@ mod tests {
         assert!(t1.contains(&format!("offset={next}")), "{t1}");
         let second = tools.find_references(Parameters(refs_params(60, Some(next), None)));
         let t2 = first_text(&second);
-        assert!(t2.contains(&format!("@src/lib.rs:{}", next + 1)), "{t2}");
-        assert!(!t2.contains("@src/lib.rs:1 "), "{t2}");
+        assert!(t2.contains(&format!("\n  L{}:1", next + 1)), "{t2}");
+        assert!(!t2.contains("\n  L1:1\n"), "{t2}");
+        // A page that starts mid-file repeats the file header.
+        assert!(t2.contains("src/lib.rs (40)\n"), "{t2}");
         // Zero budget still advances.
         let z = tools.find_references(Parameters(refs_params(0, Some(3), None)));
         assert_eq!(z.structured_content.unwrap()["next_offset"], json!(4));
@@ -1630,7 +1938,7 @@ mod tests {
         let tools = fake_refs(Precise::exact(vec![loc("a.go", 5, 11)]));
         let r = tools.find_references(Parameters(refs_params(800, None, Some("Go"))));
         let text = first_text(&r);
-        assert!(text.contains("@a.go:6  col 12"), "{text}");
+        assert!(text.contains("a.go (1)\n  L6:12"), "{text}");
         assert!(text.contains("L6:12"), "{text}");
         assert!(text.contains("UTF-16"), "{text}");
     }
@@ -1646,5 +1954,176 @@ mod tests {
         assert!(text.contains("not found in a.go"), "{text}");
         assert!(!text.contains("go install"), "{text}");
         assert!(!text.contains("语言服务器不可用"), "{text}");
+    }
+
+    #[derive(Debug)]
+    struct Annotated {
+        refs: Vec<Location>,
+        infos: Vec<HitInfo>,
+    }
+
+    impl PreciseCapability for Annotated {
+        fn references(
+            &self,
+            _symbol: &str,
+            _path: Option<&str>,
+            _position: Option<Position>,
+            _exact: bool,
+        ) -> Precise<Vec<Location>> {
+            Precise::exact(self.refs.clone())
+        }
+        fn annotate(&self, _symbol: &str, _locations: &[Location]) -> Vec<HitInfo> {
+            self.infos.clone()
+        }
+        fn definition(
+            &self,
+            _path: &str,
+            _symbol: Option<&str>,
+            _line: Option<u32>,
+            _character: Option<u32>,
+        ) -> Precise<Vec<Location>> {
+            Precise::exact(Vec::new())
+        }
+        fn diagnostics(&self, _path: &str) -> Precise<Vec<Diagnostic>> {
+            Precise::exact(Vec::new())
+        }
+    }
+
+    fn info(
+        text: &str,
+        func: Option<(&str, u32, u32)>,
+        decl: bool,
+        kind: HitKind,
+        test: bool,
+    ) -> HitInfo {
+        HitInfo {
+            text: Some(text.into()),
+            enclosing: func.map(|(n, a, b)| (n.to_string(), a, b)),
+            declaration: decl,
+            kind,
+            test,
+        }
+    }
+
+    #[test]
+    fn reference_hits_are_self_contained_and_tests_come_last() {
+        let tools = PreciseTools::with_backend(Arc::new(Annotated {
+            refs: vec![
+                loc("command_test.go", 40, 5),
+                loc("command.go", 1069, 17),
+                loc("command.go", 1147, 8),
+                loc("command.go", 200, 3),
+            ],
+            infos: vec![
+                info(
+                    "c.Execute()",
+                    Some(("TestX", 30, 50)),
+                    false,
+                    HitKind::Code,
+                    true,
+                ),
+                info(
+                    "func (c *Command) Execute() error {",
+                    Some(("Execute", 1070, 1074)),
+                    true,
+                    HitKind::Code,
+                    false,
+                ),
+                info(
+                    "err = cmd.Execute(flags)",
+                    Some(("ExecuteC", 1076, 1200)),
+                    false,
+                    HitKind::Code,
+                    false,
+                ),
+                info("// Execute runs it", None, false, HitKind::Comment, false),
+            ],
+        }));
+        let r = tools.find_references(Parameters(refs_params(2_000, None, None)));
+        let text = first_text(&r);
+        assert!(text.contains("共 4 处 / 2 个文件（非测试 3 处 / 1 个文件，测试 1 处 / 1 个文件；[声明] 1 处；注释/字符串 1 处，已标注）"), "{text}");
+        assert!(
+            text.contains(
+                "  L1070:18 [声明] in Execute[1070-1074]: func (c *Command) Execute() error {"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  L1148:9 in ExecuteC[1076-1200]: err = cmd.Execute(flags)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  L201:4 [注释]: // Execute runs it"),
+            "{text}"
+        );
+        let prod = text.find("## 非测试（3 处 / 1 个文件）").expect(text);
+        let test = text.find("## 测试（1 处 / 1 个文件）").expect(text);
+        assert!(
+            prod < test && text.find("command_test.go (1)").unwrap() > test,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn very_large_reference_lists_start_with_per_file_counts() {
+        let mut refs = Vec::new();
+        let mut infos = Vec::new();
+        for i in 0..120 {
+            refs.push(loc("x_test.go", i, 1));
+            infos.push(info("x", None, false, HitKind::Code, true));
+        }
+        refs.push(loc("a.go", 2, 5));
+        infos.push(info(
+            "func Run() {",
+            Some(("Run", 3, 9)),
+            true,
+            HitKind::Code,
+            false,
+        ));
+        for i in 0..60 {
+            refs.push(loc("b.go", i, 1));
+            infos.push(info("Run()", None, false, HitKind::Code, false));
+        }
+        let tools = PreciseTools::with_backend(Arc::new(Annotated { refs, infos }));
+        let r = tools.find_references(Parameters(refs_params(2_500, None, None)));
+        let text = first_text(&r);
+        assert!(text.contains("共 181 处 / 3 个文件"), "{text}");
+        assert!(text.contains("逐条列出请传 offset=0"), "{text}");
+        assert!(
+            text.contains("  a.go L3:6 [声明] in Run[3-9]: func Run() {"),
+            "{text}"
+        );
+        let prod = text
+            .find("## 非测试（61 处 / 2 个文件），按文件：\n     60  b.go\n      1  a.go")
+            .expect(text);
+        let test = text
+            .find("## 测试（120 处 / 1 个文件），按文件：\n    120  x_test.go")
+            .expect(text);
+        assert!(prod < test, "{text}");
+        assert!(text.len() < 1_200, "{}", text.len());
+        let s = r.structured_content.unwrap();
+        assert_eq!(s["wide"], json!(true));
+        assert_eq!(s["next_offset"], json!(0));
+        // offset=0 lists hits, non-test first.
+        let tools2 = PreciseTools::with_backend(Arc::new(Annotated {
+            refs: (0..200).map(|i| loc("b.go", i, 1)).collect(),
+            infos: vec![HitInfo::default(); 200],
+        }));
+        let r = tools2.find_references(Parameters(refs_params(500, Some(0), None)));
+        let text = first_text(&r);
+        assert!(text.contains("b.go (200)\n  L1:2\n"), "{text}");
+    }
+
+    #[test]
+    fn discovery_hint_is_not_followed_by_a_generic_one() {
+        let note = "no language server available for rust: rust-analyzer at ~/.cargo/bin is a rustup proxy with no toolchain; run `rustup default stable`";
+        let text = unknown_preamble(Some(note), Some("src/lib.rs"), false);
+        assert!(text.contains("rustup default stable"), "{text}");
+        assert!(!text.contains("安装提示"), "{text}");
+        let text = unknown_preamble(Some("gopls is not installed"), Some("a.go"), false);
+        assert!(
+            text.contains("安装提示") && text.contains("go install"),
+            "{text}"
+        );
     }
 }

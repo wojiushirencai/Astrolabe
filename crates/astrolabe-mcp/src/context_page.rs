@@ -22,6 +22,8 @@ const SYMBOL_FILES: usize = 8;
 const SYMBOLS_PER_FILE: usize = 4;
 const COMPACT_SYMBOLS: usize = 6;
 const NO_MATCH_FILES: usize = 5;
+/// Leads the one-line list of small-repo files that did not match the task.
+pub(crate) const PADDING_PREFIX: &str = "未匹配任务词的其余文件（小仓库，仅列路径）：";
 
 pub(crate) struct PageRequest<'a> {
     pub graph: &'a CodeGraph,
@@ -171,18 +173,34 @@ pub(crate) fn build_page(req: &PageRequest) -> Page {
             end
         ));
     }
-    let mut boundary_marked = false;
     let mut top_files = Vec::new();
+    // Small-repo padding (files that did not match the task): one line of
+    // bare paths, test files only counted. 12 of 182 padded files were used
+    // in the S6 sessions, but the floor keeps recall when task words miss.
+    let mut padding: Vec<&str> = Vec::new();
+    let mut padded_tests = 0usize;
     for (k, id) in page.iter().enumerate() {
         let Some(file) = by_id.get(id) else { continue };
-        if !unmatched && !boundary_marked && offset + k >= matched_count {
-            body.push_str("—— 以下按依赖中心度补足（小仓库保底），未直接匹配任务 ——\n");
-            boundary_marked = true;
+        if !unmatched && offset + k >= matched_count {
+            if crate::explain::is_test_caller(file.path.as_str(), "") {
+                padded_tests += 1;
+            } else {
+                padding.push(file.path.as_str());
+            }
+            continue;
         }
         body.push_str(&format!("@{}:1 ({} LOC)\n", file.path, file.loc));
         if top_files.len() < 5 {
             top_files.push(file.path.to_string());
         }
+    }
+    if !padding.is_empty() || padded_tests > 0 {
+        let tests = if padded_tests > 0 {
+            format!("；另有测试文件 {padded_tests} 个")
+        } else {
+            String::new()
+        };
+        body.push_str(&format!("{PADDING_PREFIX}{}{tests}\n", padding.join("  ")));
     }
     if unmatched {
         body.push_str(&format!(
@@ -347,6 +365,16 @@ mod tests {
             .collect()
     }
 
+    /// Bare paths on the small-repo padding line.
+    fn padded(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|l| l.strip_prefix(PADDING_PREFIX))
+            .flat_map(|l| l.split('；').next().unwrap_or_default().split("  "))
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     fn next_offset(body: &str) -> Option<usize> {
         let at = body.find("（offset=")?;
         body[at + "（offset=".len()..]
@@ -418,10 +446,14 @@ mod tests {
         let g = repo(3, 17);
         let p = page(&g, "fix the widget handler", 0, None);
         let got = files(&p.body);
-        assert_eq!(got.len(), 20, "{}", p.body);
-        assert!(got.len() >= 12);
-        assert!(p.body.contains("小仓库保底"), "{}", p.body);
-        let boundary = p.body.find("小仓库保底").unwrap();
+        assert_eq!(got.len(), 3, "matched files as anchors: {}", p.body);
+        assert_eq!(
+            padded(&p.body).len(),
+            17,
+            "padding as bare paths: {}",
+            p.body
+        );
+        let boundary = p.body.find(PADDING_PREFIX).unwrap();
         for i in 0..3 {
             let at = p.body.find(&format!("@dir{}/file{i}.go", i % 3)).unwrap();
             assert!(at < boundary, "matched file{i} after padding");
@@ -483,7 +515,9 @@ mod tests {
             index_line: "",
             generation_note: None,
         });
-        files(&p.body)
+        let mut got = files(&p.body);
+        got.extend(padded(&p.body));
+        got
     }
 
     #[test]
@@ -563,7 +597,6 @@ mod tests {
         for need in ["args.go", "cobra.go", "command.go"] {
             assert!(got.iter().any(|f| f == need), "{need}: {got:?}");
         }
-        assert_eq!(got.len(), 36);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

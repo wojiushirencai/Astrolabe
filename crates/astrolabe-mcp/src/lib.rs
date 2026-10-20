@@ -25,6 +25,7 @@ mod live_backend;
 mod loop_guard;
 mod openai_schema;
 mod precise_tools;
+mod refs_graph;
 mod reindex;
 mod root;
 pub mod roots;

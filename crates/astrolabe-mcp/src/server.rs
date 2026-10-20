@@ -34,6 +34,7 @@ use serde_json::{json, Value};
 
 use crate::loop_guard::{LoopGuard, Verdict};
 
+mod search_shape;
 mod symbol_outline;
 use crate::{
     context::ClientContext,
@@ -461,14 +462,6 @@ fn closest_symbols(
     scored.into_iter().take(limit).map(|(_, l)| l).collect()
 }
 
-/// Parent of the first path segment run of a filter: `a/b/c` -> `a/b`.
-fn loosened_filter(filter: &str) -> Option<String> {
-    let trimmed = filter.trim_end_matches('/');
-    trimmed
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.to_string())
-}
-
 /// Role of a hit line. Tests: assertion vs plain reference; code: load/read,
 /// definition, or other use. Heuristic, text-based.
 fn hit_role(is_test: bool, text: &str) -> &'static str {
@@ -677,6 +670,7 @@ fn is_definition_line(text: &str) -> bool {
 const GROUP_FULL_HITS: usize = 40;
 
 /// Closing line of a hit listing: totals and whether the listing is complete.
+/// A cut listing leads with a ready `path_filter` value for what is left.
 fn closure_line(hits: &[SearchHit], shown: usize, offset: usize, broad: bool) -> String {
     let files = hits
         .iter()
@@ -686,25 +680,31 @@ fn closure_line(hits: &[SearchHit], shown: usize, offset: usize, broad: bool) ->
     let total = hits.len();
     let listed = offset + shown;
     if listed >= total {
-        format!(
-            "汇总：{total}/{total} 行命中 / {files} 个文件，无截断，已全部列出（结果完整，无需重查）。\n"
-        )
+        format!("汇总：{total} 行 / {files} 个文件，已全列。\n")
     } else {
-        let cont = if broad {
-            format!("page=true 再 offset={listed} 逐页")
+        let rest = if broad {
+            hits
         } else {
-            format!("offset={listed} 继续")
+            &hits[listed.min(total)..]
+        };
+        let narrow = search_shape::suggest_path_filter(rest.iter().map(|h| h.path.as_str()))
+            .map(|p| format!("path_filter=\"{p}\" 收窄，"))
+            .unwrap_or_default();
+        let cont = if broad {
+            format!("或 page=true 再 offset={listed} 逐页")
+        } else {
+            format!("或 offset={listed} 继续")
         };
         format!(
-            "汇总：已列 {listed}/{total} 行命中 / {files} 个文件，有截断，未列全（不完整；{cont}，或用 path_filter/exclude/aggregate 收窄）。\n"
+            "汇总：已列 {listed}/{total} 行 / {files} 个文件，未列全：{narrow}{cont}（也可 exclude/aggregate）。\n"
         )
     }
 }
 
 /// Closing line of a `group=true` page. Grouped output is not a prefix of the
 /// hit list, so a truncated page must not suggest `offset=` (which would not
-/// continue it).
-fn grouped_closure_line(hits: &[SearchHit], shown: usize) -> String {
+/// continue it). `folded_tests`: test rows counted per file instead of listed.
+fn grouped_closure_line(hits: &[SearchHit], shown: usize, folded_tests: usize) -> String {
     let total = hits.len();
     if shown >= total {
         return closure_line(hits, shown, 0, false);
@@ -714,8 +714,16 @@ fn grouped_closure_line(hits: &[SearchHit], shown: usize) -> String {
         .map(|h| h.path.as_str())
         .collect::<BTreeSet<_>>()
         .len();
+    if shown + folded_tests >= total {
+        return format!(
+            "汇总：{total} 行 / {files} 个文件；测试文件各列 {GROUP_TEST_ROWS} 处，其余 {folded_tests} 处已按文件计数（path_filter=该文件 可看全）。\n"
+        );
+    }
+    let narrow = search_shape::suggest_path_filter(hits.iter().map(|h| h.path.as_str()))
+        .map(|p| format!("path_filter=\"{p}\" 收窄，"))
+        .unwrap_or_default();
     format!(
-        "汇总：已列 {shown}/{total} 行命中 / {files} 个文件，有截断，未列全（不完整；分组视图不能用 offset 翻页：用 group=false 再 offset={shown} 逐页，或用 path_filter/exclude/aggregate 收窄）。\n"
+        "汇总：已列 {shown}/{total} 行 / {files} 个文件，未列全：{narrow}或 group=false 再 offset={shown} 逐页（分组视图不能用 offset 翻页；也可 exclude/aggregate）。\n"
     )
 }
 
@@ -1012,17 +1020,28 @@ fn next_step_hint(task: &str) -> &'static str {
     }
 }
 
-/// `group=true`: hits grouped per file, production first then tests.
+/// Test-file rows listed per file in grouped mode when production hits
+/// exist; the rest are counted with their test names.
+const GROUP_TEST_ROWS: usize = 2;
+
+/// `group=true`: hits grouped per file, production first then tests. Each
+/// row names its enclosing symbol with its line range on first mention in a
+/// file (`in Relay@89-437`). With production hits present, test files list
+/// [`GROUP_TEST_ROWS`] rows and count the rest. `legend` adds the role-tag
+/// legend (once per session). Returns the text, rows shown, and test rows
+/// folded into counts.
 fn render_grouped_hits(
     index: &RepoIndex,
     cache: &FileCache,
     hits: &[SearchHit],
     limit: usize,
-) -> (String, usize) {
+    legend: bool,
+) -> (String, usize, usize) {
     struct Row {
         line: usize,
         role: &'static str,
         sym: String,
+        range: Option<(u32, u32)>,
         text: String,
     }
     let mut files: BTreeMap<&str, Vec<Row>> = BTreeMap::new();
@@ -1032,11 +1051,11 @@ fn render_grouped_hits(
         } else {
             enclosing_symbol(index, &hit.path, hit.line)
         };
-        let sym_name = sym.as_ref().map(|s| s.name.clone()).unwrap_or_default();
         files.entry(hit.path.as_str()).or_default().push(Row {
             line: hit.line,
             role: "",
-            sym: sym_name,
+            sym: sym.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+            range: sym.as_ref().map(|s| (s.start_line, s.end_line)),
             text: hit.text.clone(),
         });
     }
@@ -1076,14 +1095,18 @@ fn render_grouped_hits(
     tests.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     docs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     let mut out = format!(
-        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个，文档 {} 个）。命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]，字符串内 [字符串]，文档 [文档]。\n",
+        "分组：{} 处命中，{} 个文件（生产代码 {} 个，测试 {} 个，文档 {} 个）。\n",
         hits.len(),
         prod.len() + tests.len() + docs.len(),
         prod.len(),
         tests.len(),
         docs.len()
     );
+    if legend {
+        out.push_str("命中行标注：测试 [断言]/[引用]，代码 [加载]/[定义]/[使用]，注释行 [注释]，字符串内 [字符串]，文档 [文档]；`in 函数@起-止` 为所在函数及其行范围。\n");
+    }
     let mut shown = 0usize;
+    let mut folded_tests = 0usize;
     let mut stopped = false;
     // Few hits: show every row of every file (nothing hidden to re-query).
     let row_cap = if hits.len() <= GROUP_FULL_HITS {
@@ -1091,34 +1114,70 @@ fn render_grouped_hits(
     } else {
         6
     };
+    let cap_tests = !prod.is_empty();
     for (title, group) in [("生产代码", &prod), ("测试", &tests), ("文档", &docs)] {
         if group.is_empty() {
             continue;
         }
         let n: usize = group.iter().map(|(_, r)| r.len()).sum();
         out.push_str(&format!("## {title}（{n} 处 / {} 个文件）\n", group.len()));
+        let is_tests = title == "测试";
+        let cap = if is_tests && cap_tests {
+            row_cap.min(GROUP_TEST_ROWS)
+        } else {
+            row_cap
+        };
         for (path, rows) in group {
             let mut block = format!("{path} ({})\n", rows.len());
-            for r in rows.iter().take(row_cap) {
-                let sym = if r.sym.is_empty() {
-                    String::new()
-                } else {
-                    format!(" in {}", r.sym)
+            let mut named: Vec<&str> = Vec::new();
+            for r in rows.iter().take(cap) {
+                let sym = match r.range {
+                    _ if r.sym.is_empty() => String::new(),
+                    Some((a, b)) if !named.contains(&r.sym.as_str()) => {
+                        format!(" in {}@{a}-{b}", r.sym)
+                    }
+                    _ => format!(" in {}", r.sym),
                 };
+                if !r.sym.is_empty() {
+                    named.push(r.sym.as_str());
+                }
                 let text: String = r.text.trim().chars().take(140).collect();
                 block.push_str(&format!("  L{} [{}]{sym}: {text}\n", r.line, r.role));
             }
-            if rows.len() > row_cap {
-                block.push_str(&format!(
-                    "  （本文件还有 {} 处未列出；path_filter=\"{path}\" 可看全）\n",
-                    rows.len() - row_cap
-                ));
+            if rows.len() > cap {
+                let rest = rows.len() - cap;
+                if is_tests && cap_tests && cap == GROUP_TEST_ROWS {
+                    let mut names: Vec<&str> = Vec::new();
+                    for r in rows.iter().skip(cap) {
+                        if !r.sym.is_empty() && !names.contains(&r.sym.as_str()) {
+                            names.push(r.sym.as_str());
+                        }
+                    }
+                    let more = if names.len() > 3 { " …" } else { "" };
+                    let names: Vec<&str> = names.into_iter().take(3).collect();
+                    let within = if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!("，在 {}{more}", names.join("、"))
+                    };
+                    block.push_str(&format!(
+                        "  （测试另有 {rest} 处{within}；path_filter=\"{path}\" 可看全）\n"
+                    ));
+                } else {
+                    block.push_str(&format!(
+                        "  （本文件还有 {rest} 处未列出；path_filter=\"{path}\" 可看全）\n"
+                    ));
+                }
             }
             if estimate_tokens(&out) + estimate_tokens(&block) > limit {
                 stopped = true;
                 break;
             }
-            shown += rows.len().min(row_cap);
+            let listed = rows.len().min(cap);
+            shown += listed;
+            if is_tests && cap_tests && row_cap == usize::MAX {
+                folded_tests += rows.len() - listed;
+            }
             out.push_str(&block);
         }
         if stopped {
@@ -1130,7 +1189,7 @@ fn render_grouped_hits(
             "（不完整）其余文件因 budget_tokens 未列出；用 path_filter/exclude 收窄或加大 budget_tokens。\n",
         );
     }
-    (out, shown)
+    (out, shown, folded_tests)
 }
 
 /// Per-file and per-directory hit counts for a broad query.
@@ -1170,7 +1229,10 @@ fn render_search_summary(hits: &[SearchHit], path_filter: Option<&str>) -> Strin
         out.push_str(&format!("  …其余 {} 个文件\n", files.len() - 15));
     }
     if let Some((dir, _)) = dirs.first() {
-        let suggest = if path_filter.is_some_and(|f| dir.starts_with(f) && dir.len() <= f.len()) {
+        // `.` (repo root) matches every path: suggest the top file instead.
+        let suggest = if dir == "."
+            || path_filter.is_some_and(|f| dir.starts_with(f) && dir.len() <= f.len())
+        {
             files
                 .first()
                 .map(|(f, _)| f.to_string())
@@ -1198,15 +1260,52 @@ fn render_symbol_hits(
 ) -> Option<(String, bool)> {
     let mut out = String::new();
     let mut used_symbol = false;
+    let found: Vec<Option<CodeSymbol>> = hits
+        .iter()
+        .map(|h| if h.text_only { None } else { enclosing(h) })
+        .collect();
+    let usable = |k: usize| {
+        found[k]
+            .as_ref()
+            .filter(|s| s.end_line - s.start_line < SMART_BODY_MAX_LINES)
+    };
     let mut i = 0;
     while i < hits.len() {
         let hit = &hits[i];
-        let symbol = if hit.text_only { None } else { enclosing(hit) }
-            .filter(|s| s.end_line - s.start_line < SMART_BODY_MAX_LINES);
-        let Some(symbol) = symbol else {
-            let (text, _) = render_search_hits(&hits[i..=i], fallback, usize::MAX, file_lines);
+        let Some(symbol) = usable(i).cloned() else {
+            // A run of hits without a printable body renders in one pass, so
+            // overlapping windows merge (each line once, `…` between gaps).
+            let mut j = i + 1;
+            while j < hits.len() && usable(j).is_none() {
+                j += 1;
+            }
+            // Bodies too long to print: still say where they start and end,
+            // so nobody pages backwards to find the function header.
+            let mut long: Vec<String> = Vec::new();
+            for k in i..j {
+                if let Some(s) = &found[k] {
+                    let label = format!(
+                        "{} {} · {}:{}-{}",
+                        format!("{:?}", s.kind).to_lowercase(),
+                        s.name,
+                        hits[k].path,
+                        s.start_line,
+                        s.end_line
+                    );
+                    if !long.contains(&label) {
+                        long.push(label);
+                    }
+                }
+            }
+            if !long.is_empty() {
+                out.push_str(&format!(
+                    "（所在函数/类型过长，只列命中前后几行：{}）\n",
+                    long.join("；")
+                ));
+            }
+            let (text, _) = render_search_hits(&hits[i..j], fallback, usize::MAX, file_lines);
             out.push_str(&text);
-            i += 1;
+            i = j;
             continue;
         };
         let (start, end) = (symbol.start_line as usize, symbol.end_line as usize);
@@ -1350,6 +1449,28 @@ fn render_search_page_status(
     budget_tokens: usize,
     requested_offset: usize,
 ) -> String {
+    render_search_page_status_narrow(
+        total,
+        offset,
+        shown,
+        omitted,
+        budget_tokens,
+        requested_offset,
+        None,
+    )
+}
+
+/// [`render_search_page_status`] whose "not complete" hint leads with a
+/// ready `path_filter` value for the unshown rest when one is given.
+fn render_search_page_status_narrow(
+    total: usize,
+    offset: usize,
+    shown: usize,
+    omitted: usize,
+    budget_tokens: usize,
+    requested_offset: usize,
+    narrow: Option<&str>,
+) -> String {
     let truncated = omitted > 0;
     let mut status = format!(
         "shown={shown} omitted={omitted} truncated={truncated} total={total} offset={offset}\n"
@@ -1373,8 +1494,11 @@ fn render_search_page_status(
                 "这不是全集：剩余 {omitted} 条中首条结果单项超过 budget_tokens={budget_tokens} 被省略。加大 budget_tokens 或收紧 path_filter 后再查。\n"
             ));
         } else {
+            let lead = narrow
+                .map(|p| format!("收窄：path_filter=\"{p}\"；或"))
+                .unwrap_or_default();
             status.push_str(&format!(
-                "这不是全集：还有 {omitted} 条未显示。用相同参数加 offset={next} 获取下一页（next_offset={next}）。\n"
+                "这不是全集：还有 {omitted} 条未显示。{lead}用相同参数加 offset={next} 获取下一页（next_offset={next}）。\n"
             ));
         }
     }
@@ -1574,9 +1698,7 @@ pub(crate) struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(
-        description = "Search string (case-insensitive literal, or regex when regex=true)."
-    )]
+    #[schemars(description = "Search string (literal; regex when regex=true).")]
     pub query: String,
     #[serde(default)]
     #[schemars(description = "Default false. Set true to treat query as a regular expression.")]
@@ -1588,7 +1710,7 @@ pub(crate) struct SearchParams {
     pub path_filter: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Override default case matching (literal=insensitive, regex=sensitive)."
+        description = "Override case matching (default: literal sensitive iff query has uppercase; regex sensitive)."
     )]
     pub case_sensitive: Option<bool>,
     #[serde(default = "default_budget")]
@@ -1737,6 +1859,9 @@ pub struct AstrolabeServer {
     /// Same for `resolve_context` pages.
     context_page_generations: Arc<Mutex<HashMap<String, u64>>>,
     call_seq: Arc<AtomicU64>,
+    /// Fixed legends and footers already shown this MCP session (each is
+    /// printed once, like the syntax-error footnote).
+    shown_once: Arc<Mutex<std::collections::HashSet<&'static str>>>,
 }
 
 impl AstrolabeServer {
@@ -1857,7 +1982,26 @@ impl AstrolabeServer {
             symbol_page_generations: Arc::new(Mutex::new(HashMap::new())),
             context_page_generations: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
+            shown_once: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// The many-hits next-step footer, once per session.
+    fn many_hits_once(&self, total: usize) -> String {
+        if total > GROUP_FULL_HITS && self.once("search_code.many_hits") {
+            many_hits_hint(total)
+        } else {
+            String::new()
+        }
+    }
+
+    /// `true` the first time `key` is asked for in this MCP session: fixed
+    /// legends and footers are printed once, not on every result.
+    pub(crate) fn once(&self, key: &'static str) -> bool {
+        self.shown_once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key)
     }
 
     pub fn start_indexing(&self) {
@@ -2001,8 +2145,12 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         const MAX_SHOWN: usize = 60;
         const MAX_SECONDS: u64 = 20;
-        let matcher = match build_search_matcher(&params.query, params.regex, params.case_sensitive)
-        {
+        let sensitive = search_shape::literal_case_sensitive(
+            &params.query,
+            params.regex,
+            params.case_sensitive,
+        );
+        let matcher = match build_search_matcher(&params.query, params.regex, Some(sensitive)) {
             Ok(matcher) => matcher,
             Err(error) => return text_error(format!("无效正则表达式：{error}")),
         };
@@ -2767,6 +2915,21 @@ impl AstrolabeServer {
             });
             let mut body = page.body;
             let top_files = page.top_files;
+            // A Go interface the task names: list its implementing types
+            // (implicit satisfaction is not visible in the file map).
+            if !page.unmatched {
+                let words: std::collections::HashSet<&str> = params
+                    .task_description
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                let named = matched.symbols.iter().copied().filter(|&i| {
+                    let s = &graph.symbols[i];
+                    s.kind == astrolabe_core::SymbolKind::Interface
+                        && words.contains(s.name.as_str())
+                });
+                body.push_str(&search_shape::implementors_block(index, named, budget / 4));
+            }
             body.push_str(next_step_hint(&params.task_description));
             if dedup_on {
                 let digest = if top_files.is_empty() {
@@ -2798,7 +2961,7 @@ impl AstrolabeServer {
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
     #[tool(
-        description = "精确引用查询（语言服务器驱动）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis. dry_run_rename=NewName: read-only per-file rename checklist."
+        description = "精确引用查询（索引优先，语言服务器兜底）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis. Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist."
     )]
     pub(crate) fn find_references(
         &self,
@@ -2976,9 +3139,15 @@ impl AstrolabeServer {
             // 排序：精确名 > 前缀 > 子串，同档再按锚点行——避免真正的定义
             // 因按路径排序排在后面而被 budget 截掉。
             let exact_only = params.substring == Some(false);
-            // 排序键：(档, 测试路径靠后, exported 优先, path, start_line)；
-            // 末位 idx 保证全序。不再按渲染后的签名文本排序。
-            type RankKey<'a> = (u8, bool, bool, &'a str, u32);
+            // The query as typed (case kept): an exact-case name ranks first.
+            let typed = if literal_hit {
+                literal
+            } else {
+                normalized.query.as_str()
+            };
+            // 排序键：(档, 大小写不同, 类型优先, 测试路径靠后, exported 优先,
+            // path, start_line)；末位 idx 保证全序。
+            type RankKey<'a> = (u8, bool, u8, bool, bool, &'a str, u32);
             let names = index.names();
             let symbols = &index.graph().symbols;
             let mut ranked: Vec<(RankKey, usize)> = Vec::new();
@@ -3001,6 +3170,8 @@ impl AstrolabeServer {
                         .or_insert_with(|| is_test_path(file.path.as_str()));
                     let key = (
                         tier,
+                        !symbol.name.contains(typed),
+                        search_shape::kind_rank(symbol.kind),
                         is_test,
                         !symbol.exported,
                         file.path.as_str(),
@@ -3022,6 +3193,19 @@ impl AstrolabeServer {
                 }
             }
             ranked.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+            // An exact name exists: list it, count the prefix/substring rest
+            // in one line (`ld` → 1 row, not 26) unless substring=true.
+            let exact_count = ranked.iter().take_while(|(k, _)| k.0 == 0).count();
+            let folded: Vec<usize> =
+                if params.substring.is_none() && exact_count > 0 && exact_count < ranked.len() {
+                    ranked
+                        .split_off(exact_count)
+                        .into_iter()
+                        .map(|(_, i)| i)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let hits: Vec<(String, usize)> = ranked
                 .into_iter()
                 .map(|(_, idx)| {
@@ -3035,7 +3219,11 @@ impl AstrolabeServer {
                 .collect();
             let total = hits.len();
             let offset = params.offset.min(total);
-            let mut body = "confidence: syntactic (符号名称匹配；请用锚点核验)\n".to_string();
+            let mut body = if self.once("find_symbol.confidence") {
+                "confidence: syntactic (符号名称匹配)\n".to_string()
+            } else {
+                "confidence: syntactic\n".to_string()
+            };
             let generation = index.generation();
             if let Some(note) = self.symbol_page_drift_note(&params, generation) {
                 body.push_str(&note);
@@ -3043,8 +3231,19 @@ impl AstrolabeServer {
             if let Some(ignored) = &normalized.ignored {
                 body.push_str(&format!("注意：已忽略查询中的关键字 {ignored}\n"));
             }
+            let folded_note = search_shape::folded_note(symbols, &folded, typed);
+            // Go interfaces among the hits: their implementing types (implicit
+            // satisfaction is invisible to a name search). Budget is reserved
+            // up front so a truncated page still carries the line.
+            let implementors = search_shape::implementors_block(
+                index,
+                hits[offset..].iter().map(|(_, idx)| *idx),
+                params.budget_tokens / 3,
+            );
             // 头部与状态行也计入预算：按"最长的截断态状态行"预留。
             let reserve = estimate_tokens(&body)
+                + estimate_tokens(&folded_note)
+                + estimate_tokens(&implementors)
                 + estimate_tokens(&render_search_page_status(
                     total,
                     offset,
@@ -3063,46 +3262,33 @@ impl AstrolabeServer {
             let truncated = omitted > 0;
             // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
             let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
-            body.push_str(&render_search_page_status(
+            let narrow = truncated
+                .then(|| search_shape::suggest_symbol_filter(index, &hits[offset + kept_count..]))
+                .flatten();
+            body.push_str(&render_search_page_status_narrow(
                 total,
                 offset,
                 kept_count,
                 omitted,
                 params.budget_tokens,
                 params.offset,
+                narrow.as_deref(),
             ));
             for line in &kept {
                 body.push_str(line);
                 body.push('\n');
             }
-            // Go interfaces on this page: their implementing types (implicit
-            // satisfaction is invisible to a name search), within budget.
-            let shown_ifaces: std::collections::HashSet<u32> = hits[offset..offset + kept_count]
-                .iter()
-                .map(|(_, idx)| &symbols[*idx])
-                .filter(|s| s.kind == astrolabe_core::SymbolKind::Interface)
-                .map(|s| s.id.0)
-                .take(GO_IMPLEMENTOR_IFACES)
-                .collect();
-            if !shown_ifaces.is_empty() {
-                let graph = index.graph();
-                let by = astrolabe_core::go_iface::implementors_of(graph, &shown_ifaces);
-                for (iface, impls) in &by {
-                    let line = astrolabe_core::go_iface::render_implementors(
-                        graph,
-                        *iface,
-                        impls,
-                        GO_IMPLEMENTORS_LISTED,
-                    );
-                    if estimate_tokens(&body) + estimate_tokens(&line) <= params.budget_tokens {
-                        body.push_str(&line);
-                    }
-                }
-            }
+            body.push_str(&implementors);
+            body.push_str(&folded_note);
             // 零命中时显式声明（对齐 find_references 空结果约定），并跳过
             // include_body 附加，避免误导性的"无可提取的符号体"。
             if hits.is_empty() {
                 body.push_str("(未找到匹配的符号)\n");
+                if let Some(filter) = params.path_filter.as_deref() {
+                    body.push_str(&search_shape::symbol_hits_outside_filter(
+                        index, &needle, kind, filter,
+                    ));
+                }
                 let left = params.budget_tokens.saturating_sub(estimate_tokens(&body));
                 match symbol_outline::word_fallback_block(
                     index,
@@ -3148,7 +3334,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Count hits (统计/计数每个目录有多少处调用): aggregate=top|dir|file gives N matching lines / M files per dir + total (counts lines, not occurrences: a line matching twice counts once); combine with skip_comments, exclude=[\"_test.go\",\"vendor\"], count_only. Also exhaustive code & text search: literal case-insensitive (regex=true for regex), hits come with context; group=true groups per file; other text files tagged [text-only]; page with offset=next_offset."
+        description = "Count hits (统计/计数每个目录有多少处调用): aggregate=top|dir|file gives N matching lines / M files per dir + total (counts lines, not occurrences: a line matching twice counts once); combine with skip_comments, exclude=[\"_test.go\",\"vendor\"], count_only. Also exhaustive code & text search: literal, case-sensitive only if query has uppercase (regex=true for regex), hits come with context; group=true groups per file; other text files tagged [text-only]; page with offset=next_offset."
     )]
     pub(crate) fn search_code(
         &self,
@@ -3197,10 +3383,26 @@ impl AstrolabeServer {
                         return text_error(message);
                     }
                 }
-                let matcher = match build_search_matcher(
+                // Smart case: a literal with an uppercase letter matches its
+                // case exactly; case-only variants are counted in a footnote.
+                let sensitive = search_shape::literal_case_sensitive(
                     &params.query,
                     params.regex,
                     params.case_sensitive,
+                );
+                let variant_matcher = if search_shape::smart_case_applied(
+                    &params.query,
+                    params.regex,
+                    params.case_sensitive,
+                ) {
+                    build_search_matcher(&params.query, false, Some(false)).ok()
+                } else {
+                    None
+                };
+                let matcher = match build_search_matcher(
+                    &params.query,
+                    params.regex,
+                    Some(sensitive),
                 ) {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(format!("无效正则表达式：{error}")),
@@ -3223,7 +3425,7 @@ impl AstrolabeServer {
                 let text_matcher = match astrolabe_core::text_search::build_matcher(
                     &params.query,
                     params.regex,
-                    params.case_sensitive.unwrap_or(params.regex),
+                    sensitive,
                 ) {
                     Ok(m) => m,
                     Err(error) => {
@@ -3237,6 +3439,11 @@ impl AstrolabeServer {
                     Err(message) => return text_error(message),
                 };
                 let excluded = |path: &str| exclude_set.as_ref().is_some_and(|set| set.is_match(path));
+                let conf = if self.once("search_code.confidence") {
+                    "confidence: exact (磁盘源码字面匹配)\n"
+                } else {
+                    "confidence: exact\n"
+                };
                 let mut dedup_key: Option<String> = None;
                 // Ordinal taken by this search call (set when session dedup is on).
                 let mut search_call: Option<u64> = None;
@@ -3272,7 +3479,7 @@ impl AstrolabeServer {
                             .map(|d| format!("首次结果摘要：{d}\n"))
                             .unwrap_or_default();
                         let body = format!(
-                            "confidence: exact (磁盘源码字面匹配)\n{}同一查询已在本会话第 {c} 次工具调用返回（文件未改动），不再重发全文。\n{digest}若你没看到那份结果（如子任务或上下文已压缩后丢失），传 dedup=false 重新取全文。\n",
+                            "{conf}{}同一查询已在本会话第 {c} 次工具调用返回（文件未改动），不再重发全文。\n{digest}若你没看到那份结果（如子任务或上下文已压缩后丢失），传 dedup=false 重新取全文。\n",
                             render_search_mode_header(params.regex, &params.query)
                         );
                         return self.result_on(
@@ -3285,6 +3492,7 @@ impl AstrolabeServer {
                     }
                 }
                 let mut matches: Vec<SearchHit> = Vec::new();
+                let mut variants: Vec<SearchHit> = Vec::new();
                 let mut hits = 0u64;
                 let mut misses = 0u64;
                 let mut skipped = 0usize;
@@ -3297,6 +3505,8 @@ impl AstrolabeServer {
                     cache_hit: bool,
                     skipped: usize,
                     unlexed: Option<String>,
+                    /// Lines matching only when case is ignored (smart case).
+                    variants: Vec<SearchHit>,
                 }
                 // Per-file scan: pure (no shared mutable state), so files are
                 // scanned in parallel; results come back in graph order, which
@@ -3315,11 +3525,25 @@ impl AstrolabeServer {
                         cache_hit,
                         skipped: 0,
                         unlexed: None,
+                        variants: Vec::new(),
                     };
                     // Lazy: the mask is only computed once a line matches.
                     let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
                     for (line_no, line) in lines.iter().enumerate() {
                         if !matcher.is_match(line) {
+                            if variant_matcher.as_ref().is_some_and(|v| v.is_match(line)) {
+                                let text = if out.variants.is_empty() {
+                                    line.trim().to_string()
+                                } else {
+                                    String::new()
+                                };
+                                out.variants.push(SearchHit {
+                                    path: path.to_string(),
+                                    line: line_no + 1,
+                                    text,
+                                    text_only: false,
+                                });
+                            }
                             continue;
                         }
                         if params.skip_comments {
@@ -3372,6 +3596,7 @@ impl AstrolabeServer {
                     let scanned: Vec<Option<FileScan>> =
                         candidates.par_iter().map(|path| scan_file(path)).collect();
                     for scan in scanned.into_iter().flatten() {
+                        variants.extend(scan.variants);
                         if scan.cache_hit {
                             hits += 1;
                         } else {
@@ -3391,7 +3616,6 @@ impl AstrolabeServer {
                     .copied()
                     .filter(|p| !excluded(p.as_str()))
                     .collect();
-                let sensitive = params.case_sensitive.unwrap_or(params.regex);
                 {
                     let rels: Vec<&str> = text_paths.iter().map(|p| p.as_str()).collect();
                     let found = astrolabe_core::text_search::search_files_opts(
@@ -3452,6 +3676,7 @@ impl AstrolabeServer {
                     }
                 }
                 let text_matches = matches.len() - code_matches;
+                let variant_note = search_shape::case_variant_note(&variants);
                 let skip_note = if params.skip_comments {
                     let mut note = format!("skip_comments：已跳过注释/字符串/文档中的 {skipped} 处命中，以下不含它们。\n");
                     if !unlexed.is_empty() {
@@ -3510,10 +3735,11 @@ impl AstrolabeServer {
                         self.call_seq.fetch_add(1, Ordering::Relaxed);
                     }
                     let body = format!(
-                        "confidence: exact (磁盘源码字面匹配)\n{}{}",
+                        "{conf}{}{}",
                         render_search_mode_header(params.regex, &params.query),
                         render_search_counts(&matches, params.aggregate.as_deref(), params.offset),
-                    ) + &skip_note;
+                    ) + &variant_note
+                        + &skip_note;
                     return self.result_on(
                         &session.root,
                         "search_code",
@@ -3545,22 +3771,24 @@ impl AstrolabeServer {
                 // the hit list and cannot be paged by `offset`; with offset > 0
                 // fall through to ordinary pagination.
                 if ((params.group == Some(true) && params.offset == 0) || auto_group) && total > 0 {
-                    let (grouped, shown) = render_grouped_hits(
+                    let (grouped, shown, folded_tests) = render_grouped_hits(
                         index,
                         &session.file_cache,
                         &matches,
                         clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS),
+                        self.once("search_code.group_legend"),
                     );
                     let mut body = format!(
-                        "confidence: exact (磁盘源码字面匹配)\n{}",
+                        "{conf}{}",
                         render_search_mode_header(params.regex, &params.query)
                     );
                     body.push_str(&format!(
                         "grouped=true total={total} shown={shown}\n"
                     ));
                     body.push_str(&grouped);
-                    body.push_str(&grouped_closure_line(&matches, shown));
-                    body.push_str(&many_hits_hint(total));
+                    body.push_str(&grouped_closure_line(&matches, shown, folded_tests));
+                    body.push_str(&variant_note);
+                    body.push_str(&self.many_hits_once(total));
                     body.push_str(&skip_note);
                     body.push_str(&data_note);
                     return self.result_on(
@@ -3583,7 +3811,7 @@ impl AstrolabeServer {
                     && params.context_lines.is_none();
                 if broad {
                     let mut body = format!(
-                        "confidence: exact (磁盘源码字面匹配)\n{}",
+                        "{conf}{}",
                         render_search_mode_header(params.regex, &params.query)
                     );
                     let ranked = rank_broad_hits(index, &matches);
@@ -3609,7 +3837,8 @@ impl AstrolabeServer {
                         ));
                     }
                     body.push_str(&closure_line(&matches, shown_preview, 0, true));
-                    body.push_str(&many_hits_hint(total));
+                    body.push_str(&variant_note);
+                    body.push_str(&self.many_hits_once(total));
                     body.push_str(&skip_note);
                     body.push_str(&data_note);
                     return self.result_on(
@@ -3694,7 +3923,7 @@ impl AstrolabeServer {
                 let next_offset = truncated.then_some(offset + shown);
                 let mode = if params.regex { "regex" } else { "literal" };
                 let mut body = format!(
-                    "confidence: exact (磁盘源码字面匹配)\n{}",
+                    "{conf}{}",
                     render_search_mode_header(params.regex, &params.query)
                 );
                 body.push_str(&render_search_page_status(
@@ -3705,9 +3934,13 @@ impl AstrolabeServer {
                     clamped_budget,
                     params.offset,
                 ));
-                if bodies {
+                if bodies && self.once("search_code.bodies_legend") {
                     body.push_str("上下文：命中所在的函数/类型整体给出（`── kind 名字 · 路径:起-止 ──`，`  行号| 源码`，命中行为 `@路径:行`），无需再 Read。\n");
-                } else if context > 0 && shown > 0 {
+                } else if !bodies
+                    && context > 0
+                    && shown > 0
+                    && self.once("search_code.context_legend")
+                {
                     body.push_str(&format!(
                         "上下文：每处命中前后 {context} 行（`  行号| 源码`），同一文件内重叠窗口已合并。\n"
                     ));
@@ -3715,7 +3948,8 @@ impl AstrolabeServer {
                 body.push_str(&rendered);
                 if !matches.is_empty() {
                     body.push_str(&closure_line(&matches, shown, offset, false));
-                    body.push_str(&many_hits_hint(total));
+                    body.push_str(&self.many_hits_once(total));
+                    body.push_str(&variant_note);
                 }
                 body.push_str(&skip_note);
                     body.push_str(&data_note);
@@ -3724,6 +3958,7 @@ impl AstrolabeServer {
                 let mut unindexed_hint = false;
                 if matches.is_empty() {
                     body.push_str("(未找到匹配的代码行)\n");
+                    body.push_str(&variant_note);
                     let near = if params.regex {
                         Vec::new()
                     } else {
@@ -3736,13 +3971,19 @@ impl AstrolabeServer {
                         }
                     }
                     if let Some(filter) = params.path_filter.as_deref() {
-                        let wider = loosened_filter(filter)
-                            .map(|p| format!("放宽到 path_filter=\"{p}\" 或"))
-                            .unwrap_or_default();
-                        body.push_str(&format!(
-                            "提示：path_filter=\"{filter}\" 可能过窄，{wider}去掉后再试；也可缩短查询词。\n"
-                        ));
-                    } else if near.is_empty() {
+                        // Say what the filter removed instead of "too narrow":
+                        // the model re-ran every such query without it.
+                        let outside: Vec<SearchHit> = index
+                            .graph()
+                            .files
+                            .iter()
+                            .map(|file| file.path.as_str())
+                            .filter(|path| !path.contains(filter) && !excluded(path))
+                            .filter_map(&scan_file)
+                            .flat_map(|scan| scan.hits)
+                            .collect();
+                        body.push_str(&search_shape::search_hits_outside_filter(filter, &outside));
+                    } else if near.is_empty() && variants.is_empty() {
                         body.push_str("提示：换更短的字面量，或用 find_symbol 按名字查。\n");
                     }
                     let counts = index.unindexed_code_exts(params.path_filter.as_deref());
@@ -4011,11 +4252,22 @@ impl AstrolabeServer {
                 }
             }
         }
+        // Exact-case last segment first (`Command.Execute`: Execute before
+        // execute); stable, so the matcher's order holds otherwise.
+        let last_segment = params
+            .query
+            .rsplit('/')
+            .find(|seg| !seg.is_empty())
+            .unwrap_or_default();
+        hits.sort_by_key(|(_, idx)| symbols[*idx].name != last_segment);
         let total = hits.len();
         let offset = params.offset.min(total);
-        let mut body =
-            "confidence: syntactic (层级路径匹配：行范围嵌套推断，语法容器如 impl 会形成中间层；请核验)\n"
-                .to_string();
+        let mut body = if self.once("find_symbol.path_confidence") {
+            "confidence: syntactic (层级路径匹配：按行范围嵌套推断，语法容器如 impl 会形成中间层)\n"
+                .to_string()
+        } else {
+            "confidence: syntactic\n".to_string()
+        };
         let generation = index.generation();
         if let Some(note) = self.symbol_page_drift_note(params, generation) {
             body.push_str(&note);
@@ -4026,7 +4278,13 @@ impl AstrolabeServer {
         if receiver_fallback {
             body.push_str("注意：层级由接收者类型/签名/路径段推断（非行范围嵌套）\n");
         }
+        let implementors = search_shape::implementors_block(
+            index,
+            hits[offset..].iter().map(|(_, idx)| *idx),
+            params.budget_tokens / 3,
+        );
         let reserve = estimate_tokens(&body)
+            + estimate_tokens(&implementors)
             + estimate_tokens(&render_search_page_status(
                 total,
                 offset,
@@ -4045,18 +4303,23 @@ impl AstrolabeServer {
         let truncated = omitted > 0;
         // 一条都放不下时 next_offset 不能等于当前 offset（自动翻页会死循环）。
         let next_offset = (truncated && kept_count > 0).then_some(offset + kept_count);
-        body.push_str(&render_search_page_status(
+        let narrow = truncated
+            .then(|| search_shape::suggest_symbol_filter(index, &hits[offset + kept_count..]))
+            .flatten();
+        body.push_str(&render_search_page_status_narrow(
             total,
             offset,
             kept_count,
             omitted,
             params.budget_tokens,
             params.offset,
+            narrow.as_deref(),
         ));
         for line in &kept {
             body.push_str(line);
             body.push('\n');
         }
+        body.push_str(&implementors);
         // 零命中时显式声明，避免只剩 confidence 元信息的歧义输出。
         if hits.is_empty() {
             body.push_str("(未找到匹配的符号)\n");
@@ -4368,9 +4631,9 @@ const TEXT_SEARCH_MAX_FILE_BYTES: u64 = 1_500_000;
 
 /// Compile the single matcher used by `search_code`.
 ///
-/// Literal queries are escaped. Default case rules: literal is
-/// case-insensitive, regex is case-sensitive; `case_sensitive` overrides
-/// both.
+/// Literal queries are escaped. Default case rules (`case_sensitive: None`):
+/// literal is case-insensitive, regex is case-sensitive. `search_code`
+/// passes the smart-case decision explicitly (see `search_shape`).
 fn build_search_matcher(
     query: &str,
     regex: bool,
@@ -5685,6 +5948,24 @@ mod tests {
         }
     }
 
+    /// A result as a later call in the same session renders it: fixed
+    /// legends, footers and confidence parentheticals are sent once.
+    fn once_free(text: &str) -> String {
+        text.replace("confidence: exact (磁盘源码字面匹配)", "confidence: exact")
+            .replace(
+                "confidence: syntactic (符号名称匹配)",
+                "confidence: syntactic",
+            )
+            .lines()
+            .filter(|l| {
+                !l.starts_with("下一步：要统计")
+                    && !l.starts_with("命中行标注：")
+                    && !l.starts_with("上下文：")
+            })
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
     fn text_of(result: &CallToolResult) -> String {
         result.content[0].as_text().unwrap().text.clone()
     }
@@ -5756,7 +6037,7 @@ mod tests {
         grouped.group = Some(true);
         grouped.budget_tokens = 300;
         let text = text_of(&server.search_code(Parameters(grouped.clone())));
-        assert!(text.contains("有截断"), "{text}");
+        assert!(text.contains("未列全"), "{text}");
         assert!(text.contains("不能用 offset 翻页"), "{text}");
         assert!(
             !text.contains("offset=") || text.contains("group=false 再 offset="),
@@ -5781,7 +6062,7 @@ mod tests {
         let second = text_of(&server.search_code(Parameters(p.clone())));
         assert!(second.contains("pkg/a.py"), "{second}");
         assert!(!second.contains("同一查询已在"), "{second}");
-        assert_eq!(first, second);
+        assert_eq!(once_free(&first), second);
         let mut c = search("foo(");
         c.count_only = true;
         let _ = server.search_code(Parameters(c.clone()));
@@ -5968,7 +6249,8 @@ mod tests {
         assert!(text.contains("(未找到匹配的代码行)"), "{text}");
         assert!(text.contains("最接近的符号名"), "{text}");
         assert!(text.contains("def compute(a, b):"), "{text}");
-        assert!(text.contains("放宽到 path_filter=\"pkg\""), "{text}");
+        assert!(text.contains("全仓库都没有这个字面量"), "{text}");
+        assert!(!text.contains("过窄"), "{text}");
         // Nothing close: no suggestion block, still the generic hint.
         let none = text_of(&server.search_code(Parameters(search("zzzqqq"))));
         assert!(!none.contains("最接近的符号名"), "{none}");
@@ -5980,8 +6262,6 @@ mod tests {
     fn name_helpers_split_and_measure() {
         assert_eq!(name_tokens("fooBar_baz"), ["foo", "bar", "baz"]);
         assert_eq!(edit_distance("compute", "computee"), 1);
-        assert_eq!(loosened_filter("a/b/c/"), Some("a/b".into()));
-        assert_eq!(loosened_filter("a"), None);
     }
 
     #[test]
@@ -6095,10 +6375,7 @@ mod tests {
         // 11 hits <= GROUP_FULL_HITS: all 9 rows of one.go are listed.
         assert_eq!(text.matches("  L").count(), 11, "{text}");
         assert!(!text.contains("未列出"), "{text}");
-        assert!(
-            text.contains("汇总：11/11 行命中 / 2 个文件，无截断，已全部列出（结果完整"),
-            "{text}"
-        );
+        assert!(text.contains("汇总：11 行 / 2 个文件，已全列。"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6112,8 +6389,8 @@ mod tests {
         p.group = Some(true);
         let text = text_of(&server.search_code(Parameters(p)));
         assert!(text.contains("本文件还有 44 处未列出"), "{text}");
-        assert!(text.contains("不完整"), "{text}");
-        assert!(!text.contains("已全部列出"), "{text}");
+        assert!(text.contains("未列全：path_filter=\"a/one.go\""), "{text}");
+        assert!(!text.contains("已全列"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6124,7 +6401,10 @@ mod tests {
             .collect();
         let (server, dir) = smart_server(&[("a/one.go", format!("package a\n{rows}"))]);
         let text = text_of(&server.search_code(Parameters(search("BROAD_KEY"))));
-        assert!(text.contains("不完整；page=true 再 offset="), "{text}");
+        assert!(
+            text.contains("未列全：path_filter=\"a/one.go\" 收窄，或 page=true 再 offset="),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6132,10 +6412,7 @@ mod tests {
     fn flat_results_end_with_completeness_line() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
         let text = text_of(&server.search_code(Parameters(search("marker_x"))));
-        assert!(
-            text.contains("汇总：2/2 行命中 / 1 个文件，无截断，已全部列出（结果完整"),
-            "{text}"
-        );
+        assert!(text.contains("汇总：2 行 / 1 个文件，已全列。"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6244,6 +6521,7 @@ mod tests {
         p.budget_tokens = 20000;
         let first = text_of(&server.search_code(Parameters(p.clone())));
         // The loop guard blocks the 4th identical call, so stop at 3.
+        let first = once_free(&first);
         for _ in 0..2 {
             assert_eq!(text_of(&server.search_code(Parameters(p.clone()))), first);
         }
@@ -8979,6 +9257,18 @@ mod tests {
         assert!(!search_text(&server, "Load.ser", false, None)
             .0
             .contains("@main.py:1"));
+        // Smart case: an uppercase letter makes a literal case-sensitive,
+        // and the case-only variant is counted in a footnote.
+        let (text, _) = search_text(&server, "LOADUSER", false, None);
+        assert!(!text.contains("@main.py:1"), "{text}");
+        assert!(text.contains("另有 1 行仅大小写不同"), "{text}");
+        assert!(text.contains("case_sensitive=false"), "{text}");
+        assert!(search_text(&server, "LoadUser", false, None)
+            .0
+            .contains("@main.py:1"));
+        assert!(search_text(&server, "LOADUSER", false, Some(false))
+            .0
+            .contains("@main.py:1"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9087,7 +9377,10 @@ mod tests {
         let tool = tools.iter().find(|t| t.name == "search_code").unwrap();
         let desc = tool.description.as_deref().unwrap_or("");
         assert!(desc.contains("[text-only]"), "{desc}");
-        assert!(desc.contains("case-insensitive"), "{desc}");
+        assert!(
+            desc.contains("case-sensitive only if query has uppercase"),
+            "{desc}"
+        );
     }
 }
 
