@@ -554,6 +554,149 @@ fn bats_tests(out: &mut [u8], tests: &mut Vec<(u32, String)>) {
     }
 }
 
+/// Heredoc bodies that tree-sitter-bash 0.25 ends too early: its scanner
+/// closes the heredoc at the first body line that merely *starts* with the
+/// delimiter (`BLOCKER (W6-A22):` inside `<<'BLOCKER' … BLOCKER`), and the
+/// rest of the body is then parsed as commands. Same-length rewrite: a
+/// quoted heredoc (`<<'D'`, `<<"D"`, `<<\D`) does not expand, so its body is
+/// blanked to spaces; in an unquoted body only the first byte of each such
+/// look-alike line becomes `_`, keeping its expansions. Newlines stay, so
+/// lines are unchanged. `None` when no heredoc needs it. The caller uses it
+/// only for a retry after a partial parse.
+pub(super) fn neutralize_heredoc_bodies(source: &str) -> Option<String> {
+    if !source.contains("<<") {
+        return None;
+    }
+    let b = source.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let (mut sq, mut dq, mut comment) = (false, false, false);
+    let mut ansi = false;
+    let mut arith = 0u32;
+    // (delimiter, quoted) queued on the current line.
+    let mut pending: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\n' {
+            comment = false;
+            i += 1;
+            for (delim, quoted) in std::mem::take(&mut pending) {
+                let mut needed = false;
+                let body_start = i;
+                let mut body_end = None;
+                while i < b.len() {
+                    let end = b[i..]
+                        .iter()
+                        .position(|&x| x == b'\n')
+                        .map_or(b.len(), |p| i + p);
+                    let line = &b[i..end];
+                    if line.trim_ascii() == delim.as_slice() {
+                        body_end = Some(i);
+                        i = (end + 1).min(b.len());
+                        break;
+                    }
+                    let lead = line
+                        .iter()
+                        .take_while(|&&x| x == b' ' || x == b'\t')
+                        .count();
+                    if line[lead..].starts_with(&delim) {
+                        needed = true;
+                        if !quoted {
+                            out.get_or_insert_with(|| b.to_vec())[i + lead] = b'_';
+                        }
+                    }
+                    i = (end + 1).min(b.len());
+                }
+                if needed && quoted {
+                    let buf = out.get_or_insert_with(|| b.to_vec());
+                    for x in &mut buf[body_start..body_end.unwrap_or(b.len())] {
+                        if *x != b'\n' {
+                            *x = b' ';
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if comment {
+            i += 1;
+            continue;
+        }
+        if sq {
+            if ansi && c == b'\\' && b.get(i + 1).is_some_and(|&n| n != b'\n') {
+                i += 1;
+            } else {
+                sq = c != b'\'';
+                ansi &= sq;
+            }
+        } else if c == b'\\' {
+            i += 1;
+        } else if dq {
+            dq = c != b'"';
+        } else {
+            match c {
+                b'\'' => {
+                    sq = true;
+                    ansi = i > 0 && b[i - 1] == b'$';
+                }
+                b'"' => dq = true,
+                b'#' if is_word_start(b, i) => comment = true,
+                b'(' if b.get(i + 1) == Some(&b'(') => {
+                    arith += 1;
+                    i += 2;
+                    continue;
+                }
+                b')' if arith > 0 && b.get(i + 1) == Some(&b')') => {
+                    arith -= 1;
+                    i += 2;
+                    continue;
+                }
+                b'<' if arith > 0 && b[i..].starts_with(b"<<") => {
+                    i += 2;
+                    continue;
+                }
+                b'<' if b[i..].starts_with(b"<<<") => {
+                    i += 3;
+                    continue;
+                }
+                b'<' if b[i..].starts_with(b"<<") => {
+                    let mut j = i + 2;
+                    if matches!(b.get(j), Some(b'-' | b'~')) {
+                        j += 1;
+                    }
+                    while j < b.len() && matches!(b[j], b' ' | b'\t') {
+                        j += 1;
+                    }
+                    let q = b
+                        .get(j)
+                        .copied()
+                        .filter(|q| matches!(q, b'\'' | b'"' | b'\\'));
+                    if q.is_some() {
+                        j += 1;
+                    }
+                    let s = j;
+                    while j < b.len()
+                        && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'-'))
+                    {
+                        j += 1;
+                    }
+                    if j > s {
+                        pending.push((b[s..j].to_vec(), q.is_some()));
+                        if matches!(q, Some(b'\'' | b'"')) && b.get(j) == q.as_ref() {
+                            j += 1;
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out.and_then(|v| String::from_utf8(v).ok())
+}
+
 fn is_word_start(out: &[u8], i: usize) -> bool {
     i == 0
         || matches!(
@@ -1354,5 +1497,54 @@ mod audit_fix_tests {
         assert_eq!(d, vec![true, false, false, true, true]);
         let e = code_line_starts("echo 'a\nf() { :; }\n'\n");
         assert!(!e[1], "{e:?}");
+    }
+}
+
+#[cfg(test)]
+mod heredoc_prefix_tests {
+    use super::neutralize_heredoc_bodies as fix;
+    use crate::parse::ParserPool;
+    use crate::types::{Language, RelPath};
+
+    #[test]
+    fn blanks_quoted_body_and_marks_unquoted_lookalikes() {
+        let src = "cat >&2 <<'BLOCKER'\nERROR: x\nBLOCKER (W6):\nBLOCKER\nf() { :; }\n";
+        let out = fix(src).unwrap();
+        assert_eq!(out.len(), src.len());
+        assert_eq!(
+            out,
+            "cat >&2 <<'BLOCKER'\n        \n             \nBLOCKER\nf() { :; }\n"
+        );
+        let src = "cat <<EOF\nhi $x\nEOFX $(y)\nEOF\n";
+        assert_eq!(fix(src).unwrap(), "cat <<EOF\nhi $x\n_OFX $(y)\nEOF\n");
+    }
+
+    #[test]
+    fn leaves_ordinary_heredocs_and_shifts_alone() {
+        for src in [
+            "cat <<'EOF'\nhello\nEOF\n",
+            "cat <<-EOF\n\thi\n\tEOF\n",
+            "x=$((1<<EOF))\nEOF2=1\n",
+            "echo '<<EOF'\nEOFX\n",
+            "cat <<< \"EOF\"\nEOFX=1\n",
+        ] {
+            assert_eq!(fix(src), None, "{src}");
+        }
+    }
+
+    #[test]
+    fn script_with_delimiter_prefixed_body_line_parses_clean() {
+        let src = "#!/usr/bin/env bash\nset -euo pipefail\ninfo() { echo \"$*\"; }\nif true; then\n  :\nelse\n  cat >&2 <<'BLOCKER'\nERROR: Android NDK not found.\n\nBLOCKER (W6-A22 Android build):\n  - Install NDK via \"ndk;27\"\nBLOCKER\n  exit 2\nfi\nbuild() { cargo ndk build; }\n";
+        let p = ParserPool::new()
+            .parse(Language::Shell, &RelPath::new("build_android.sh"), src)
+            .unwrap();
+        assert!(!p.partial);
+        let names: Vec<_> = p.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"info") && names.contains(&"build"),
+            "{names:?}"
+        );
+        let b = p.symbols.iter().find(|s| s.name == "build").unwrap();
+        assert_eq!(b.start_line, 15);
     }
 }
