@@ -1250,6 +1250,11 @@ fn assemble_graph_with(
                 // attributing it to the file would collapse every caller in
                 // the file into one node.
                 let callers = enclosing_symbols(&in_file, &row.parsed.calls);
+                // (caller, its candidate targets) per call. Sorting these
+                // (one per call) and then each caller's target ids (u32s)
+                // emits the edges already ordered by `(from, to)`, far
+                // cheaper than sorting the edges themselves.
+                let mut by_caller: Vec<(u32, &[SymbolId])> = Vec::new();
                 for ((callee, _line), caller) in row.parsed.calls.iter().zip(&callers) {
                     let Some(caller) = caller else {
                         continue;
@@ -1265,15 +1270,23 @@ fn assemble_graph_with(
                     if targets.len() > MAX_SYNTACTIC_CALL_TARGETS {
                         continue;
                     }
-                    for target in targets {
-                        if *target == caller.id {
-                            continue;
-                        }
+                    by_caller.push((caller.id.0, targets.as_slice()));
+                }
+                by_caller.sort_by_key(|(caller, _)| *caller);
+                let mut to: Vec<u32> = Vec::new();
+                for group in by_caller.chunk_by(|a, b| a.0 == b.0) {
+                    let from = group[0].0;
+                    to.clear();
+                    for (_, targets) in group {
+                        to.extend(targets.iter().map(|t| t.0).filter(|&t| t != from));
+                    }
+                    to.sort_unstable();
+                    for run in to.chunk_by(|a, b| a == b) {
                         out.push(CodeEdge {
-                            from: caller.id.0,
-                            to: target.0,
+                            from,
+                            to: run[0],
                             kind: EdgeKind::Call,
-                            weight: 1,
+                            weight: run.len() as u32,
                             // Name matching only, with no scope or type
                             // information. Measured recall against a
                             // language server: 66% on TypeScript, 18% on
@@ -1287,7 +1300,6 @@ fn assemble_graph_with(
                 // ascend with the file, so per-file sorted runs concatenate
                 // into one sorted run: no global sort over millions of call
                 // edges on every apply.
-                sort_and_merge(&mut out);
                 out
             })
             .collect();
