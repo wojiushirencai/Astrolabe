@@ -20,6 +20,7 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
          结果末行写“已全列”时即完整，直接据此作答，不必再用 grep 复核或换词重查。\
          统计/计数（每个目录有多少处调用）用 search_code aggregate=top|dir|file，可加 skip_comments、exclude，不必写脚本。任务不明确时可先用 resolve_context。\
          scoped 来自 import 图，syntactic 来自名字匹配。\
+         改完代码后若已跑通构建或测试（如 go test、cargo test），就不必再调 get_diagnostics；它只在没法跑构建/测试时用。\
          缺语言服务器时精确工具会注明并给出替代做法，不要为此自行安装（get_languages 可看状态）。\
          其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read。",
         root.display()
@@ -60,11 +61,12 @@ The built-in tool descriptions in your context will tell you things like "use Re
     → goto_definition, NOT find_symbol (that is syntactic name matching).
 - Renaming a symbol
     → Edit the definition and call sites; use find_references first, then
-      get_diagnostics after the edit.
+      verify with the build/tests (get_diagnostics only if you cannot run them).
 - "who calls / what does X call"
     → find_references for the precise set.
 - After editing a file
-    → get_diagnostics to confirm the code still holds.
+    → If the task gives a build/test command, run it; once it passes, do NOT
+      also call get_diagnostics. Use get_diagnostics only when you cannot build/test.
 - File dependency direction
     → resolve_context for task-level impact; find_references for a symbol.
 - Literal vs regex search
@@ -179,11 +181,12 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
     → goto_definition, NOT find_symbol (that is syntactic name matching).
 - Renaming a symbol
     → Use find_references first, then edit the definition and call sites,
-      then get_diagnostics.
+      then verify with the build/tests (get_diagnostics only if you cannot run them).
 - "who calls / what does X call"
     → find_references for the precise set.
 - After editing a file
-    → get_diagnostics to confirm the code still holds.
+    → If the task gives a build/test command, run it; once it passes, do NOT
+      also call get_diagnostics. Use get_diagnostics only when you cannot build/test.
 - File dependency direction
     → resolve_context for task-level impact; find_references for a symbol.
 - Literal vs regex search
@@ -308,7 +311,7 @@ Find references / callers (precise)     find_references
 Jump to a definition                    goto_definition
 Literal substring / explicit regex      search_code + path_filter (matches come with context; no follow-up Read)
 Count hits per dir/file (统计/计数)      search_code aggregate=top|dir|file (+ skip_comments, exclude, count_only)
-Check a file after edits                get_diagnostics
+Check a file after edits (no build/test) get_diagnostics (skip once tests pass)
 Language / LSP readiness                get_languages (Ready / needs_install / AST-only)
 
 Built-in Read/Edit/Glob/Grep are permitted on code files ONLY when:
@@ -328,7 +331,7 @@ two literals), send them as parallel tool calls in a single message.
 
 Read/Edit/Glob are fine for non-code files: markdown, JSON, YAML, TOML, .env,
 config files, lockfiles, plain text, images. Editing stays with the built-in
-Edit. Use find_references before a rename, then get_diagnostics.
+Edit. Use find_references before a rename, then build/test (or get_diagnostics).
 
 ## Required workflow before editing code
 
@@ -336,7 +339,8 @@ Edit. Use find_references before a rename, then get_diagnostics.
 2. find_symbol for the symbols you'll touch; goto_definition when provenance matters.
 3. For any rename: find_references, then edit definition and call sites. Never
    guess occurrences of a symbol across files from grep alone.
-4. get_diagnostics on files you edited.
+4. Verify with the project's build/tests; get_diagnostics on edited files only
+   when you cannot run them (not again after they pass).
 
 ## Self-check
 
@@ -374,6 +378,28 @@ mod tests {
             !instructions.contains("先调用 resolve_context"),
             "{instructions}"
         );
+    }
+
+    #[test]
+    fn every_tier_skips_diagnostics_after_passing_tests() {
+        // E1 (batch 7): get_diagnostics after `go test` already passed cost a
+        // turn and a gopls start in 3 of the 4 runs7 runs that called it.
+        let l1 = connection_instructions("claude-code", Path::new("/r"));
+        assert!(l1.contains("不必再调 get_diagnostics"), "{l1}");
+        for name in ["claude-code", "default"] {
+            let m = manual(name);
+            assert!(
+                m.contains("do NOT\n      also call get_diagnostics"),
+                "{name}"
+            );
+            assert!(
+                !m.contains("get_diagnostics to confirm the code still holds"),
+                "{name}"
+            );
+        }
+        let p = cc_system_prompt_override();
+        assert!(p.contains("skip once tests pass"));
+        assert!(p.contains("not again after they pass"));
     }
 
     #[test]
