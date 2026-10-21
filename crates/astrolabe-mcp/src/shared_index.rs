@@ -28,6 +28,8 @@
 //!   is abandoned and the follower indexes on its own.
 //! * `ASTROLABE_SHARED_INDEX=off` disables all of it. Multi-project mode and
 //!   Windows (no named-pipe transport yet) always run independently.
+// Windows has only the stub below; the protocol types are unused there.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
