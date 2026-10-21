@@ -120,14 +120,20 @@ async fn main() -> anyhow::Result<()> {
         } => (requested_root, context),
     };
     let limit = max_root_files_from_env();
-    let server = match build_server(&requested, context.clone(), limit) {
+    let mut server = match build_server(&requested, context.clone(), limit) {
         Ok(server) => server,
         Err(failure) => return serve_startup_failure(failure, context).await,
     };
     // Indexing is spawn_blocking, so it never stalls stdio. Start it before the
     // accept loop so handshake-less clients can call tools as soon as the graph
     // is ready rather than waiting for a handshake that may never arrive.
-    server.start_indexing();
+    //
+    // With the shared index (default on, single-root mode, Unix), a second
+    // session on the same repository joins the process holding
+    // `indexer.lock` and forwards tool calls instead of indexing; see
+    // `shared_index`. `ASTROLABE_SHARED_INDEX=off` restores one index per
+    // session.
+    server.start_indexing_shared();
     // Kept to cancel in-flight builds on shutdown; clones share all state.
     let indexing = server.clone();
     // MCP spec 2026-07-28 removed the required `initialize` handshake.
@@ -155,6 +161,9 @@ async fn main() -> anyhow::Result<()> {
     // concurrently with the language-server shutdown below.
     let indexing_stop = tokio::task::spawn_blocking(move || {
         let started = std::time::Instant::now();
+        // Close the shared-index socket first so followers see EOF and
+        // race for the lock that `shutdown_indexing` releases next.
+        indexing.shutdown_shared();
         let idle = indexing.shutdown_indexing(std::time::Duration::from_secs(2));
         tracing::info!(
             idle,

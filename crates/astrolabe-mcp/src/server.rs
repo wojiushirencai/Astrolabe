@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use crate::loop_guard::{LoopGuard, Verdict};
 
 mod search_shape;
+mod shared;
 mod symbol_outline;
 use crate::{
     context::ClientContext,
@@ -1856,6 +1857,12 @@ pub struct AstrolabeServer {
     /// Fixed legends and footers already shown this MCP session (each is
     /// printed once, like the syntax-error footnote).
     shown_once: Arc<Mutex<std::collections::HashSet<&'static str>>>,
+    /// Shared index across sessions (`shared_index`): `Some` on the stdio
+    /// server when sharing is on; `None` in leader-side session views.
+    shared: Option<Arc<crate::shared_index::Shared>>,
+    /// Per-session coverage-note memory for leader-side session views
+    /// (the root session's own slot otherwise).
+    coverage_note_override: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl AstrolabeServer {
@@ -1977,6 +1984,8 @@ impl AstrolabeServer {
             context_page_generations: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
             shown_once: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            shared: None,
+            coverage_note_override: None,
         }
     }
 
@@ -2300,7 +2309,7 @@ impl AstrolabeServer {
                         .and_then(|block| block.as_text())
                         .map(|t| t.text.as_str())
                         .unwrap_or_default();
-                    match index.query_coverage_note(text, &session.coverage_note_shown) {
+                    match index.query_coverage_note(text, self.coverage_slot(&session)) {
                         Some(note) => append_stale_note(result, &note),
                         None => result,
                     }
@@ -4609,6 +4618,19 @@ impl ServerHandler for AstrolabeServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if self.shared.is_some() {
+            let ct = context.ct.clone();
+            let forwarded = self
+                .forward_call(
+                    &request.name,
+                    request.arguments.clone(),
+                    Box::new(move || ct.is_cancelled()),
+                )
+                .await;
+            if let Some(done) = forwarded {
+                return done;
+            }
+        }
         let ct = context.ct.clone();
         let flag = Arc::new(AtomicBool::new(false));
         let worker_flag = Arc::clone(&flag);
@@ -4682,8 +4704,17 @@ impl ServerHandler for AstrolabeServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        if self.shared.is_some() {
+            let ct = context.ct.clone();
+            let forwarded = self
+                .forward_read(&request.uri, Box::new(move || ct.is_cancelled()))
+                .await;
+            if let Some(done) = forwarded {
+                return done;
+            }
+        }
         let mut resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
         let Some(text) = resources.get(&request.uri) else {
             return Err(ErrorData::resource_not_found(

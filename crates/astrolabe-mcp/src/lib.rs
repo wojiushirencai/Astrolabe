@@ -19,6 +19,7 @@ mod explain;
 mod knobs;
 mod line_scan;
 mod session;
+mod shared_index;
 // hooks / instructions 对 bin（main.rs 的子命令分发）公开：hook 协议入口
 // 不经 ServerHandler，直接调用模块函数。
 pub mod hooks;
