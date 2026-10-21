@@ -372,13 +372,20 @@ the index.
 
 Override with ASTROLABE_LSP_JAVA=/path/to/jdtls";
 
+/// `off` keeps a private gopls per session instead of the shared daemon.
+pub const GOPLS_REMOTE_ENV: &str = "ASTROLABE_GOPLS_REMOTE";
+
 const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
 impl Discovery {
     /// Snapshot `PATH` and `ASTROLABE_LSP_*` from the current process.
     pub fn from_process() -> Self {
         let mut env = BTreeMap::new();
-        for key in override_keys_all().iter().copied().chain(["PATHEXT"]) {
+        for key in override_keys_all()
+            .iter()
+            .copied()
+            .chain(["PATHEXT", GOPLS_REMOTE_ENV])
+        {
             if let Ok(value) = std::env::var(key) {
                 env.insert(key.to_string(), value);
             }
@@ -480,6 +487,40 @@ impl Discovery {
     ///
     /// Ladder: env override → PATH → cache → (if On) install → Unavailable hint.
     pub fn probe(&self, language: Language) -> ProbeResult {
+        let mut probed = self.probe_ladder(language);
+        if let Some(spec) = probed.spec.as_mut() {
+            self.share_gopls(spec);
+        }
+        probed
+    }
+
+    /// gopls: run as a forwarder to the shared per-user daemon
+    /// (`-remote=auto`), so several Astrolabe sessions on one machine share
+    /// one gopls (and its type-checked packages) instead of one each. The
+    /// daemon exits about a minute after its last client disconnects.
+    /// `ASTROLABE_GOPLS_REMOTE=off` keeps a private gopls per session; any
+    /// other non-empty value is passed through as the `-remote` address.
+    fn share_gopls(&self, spec: &mut ServerSpec) {
+        if spec.language != Language::Go
+            || bin_stem(&spec.command) != "gopls"
+            || spec.args.iter().any(|a| a.starts_with("-remote"))
+        {
+            return;
+        }
+        let setting = self
+            .env
+            .get(GOPLS_REMOTE_ENV)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        let remote = match setting.to_ascii_lowercase().as_str() {
+            "" | "auto" | "on" | "1" | "true" | "yes" => "auto".to_string(),
+            "off" | "0" | "false" | "no" | "none" => return,
+            _ => setting,
+        };
+        spec.args.insert(0, format!("-remote={remote}"));
+    }
+
+    fn probe_ladder(&self, language: Language) -> ProbeResult {
         if matches!(language, Language::CSharp | Language::VisualBasic) {
             return self.probe_roslyn(language);
         }
@@ -1625,7 +1666,7 @@ mod tests {
             d.discover(Language::TypeScript).unwrap().args,
             vec!["--stdio"]
         );
-        assert_eq!(d.discover(Language::Go).unwrap().args, Vec::<String>::new());
+        assert_eq!(d.discover(Language::Go).unwrap().args, vec!["-remote=auto"]);
         assert_eq!(
             d.discover(Language::Rust).unwrap().args,
             Vec::<String>::new()
@@ -1696,6 +1737,39 @@ mod tests {
             .to_string_lossy()
             .starts_with("jdtls"));
         assert!(spec.args.is_empty());
+    }
+
+    /// gopls joins the shared daemon unless switched off; an explicit
+    /// address passes through.
+    #[test]
+    fn gopls_shares_one_daemon_unless_switched_off() {
+        let dir = scratch();
+        fake_bin(&dir.0, "gopls");
+        let d = discovery_with_dirs(&[&dir.0]);
+        assert_eq!(d.discover(Language::Go).unwrap().args, vec!["-remote=auto"]);
+        assert!(d.probe(Language::Go).summary().contains("-remote=auto"));
+        for off in ["off", "0", "false", "NO"] {
+            let d = discovery_with_dirs(&[&dir.0]).with_env(GOPLS_REMOTE_ENV, off);
+            assert!(d.discover(Language::Go).unwrap().args.is_empty(), "{off}");
+        }
+        let d = discovery_with_dirs(&[&dir.0]).with_env(GOPLS_REMOTE_ENV, "unix;/tmp/g.sock");
+        assert_eq!(
+            d.discover(Language::Go).unwrap().args,
+            vec!["-remote=unix;/tmp/g.sock"]
+        );
+        // An override pointing at gopls gets the same treatment; other
+        // binaries for Go do not.
+        let d = discovery_with_dirs(&[]).with_env(
+            "ASTROLABE_LSP_GO",
+            dir.0.join("gopls").display().to_string(),
+        );
+        assert_eq!(d.discover(Language::Go).unwrap().args, vec!["-remote=auto"]);
+        fake_bin(&dir.0, "my-go-ls");
+        let d = discovery_with_dirs(&[]).with_env(
+            "ASTROLABE_LSP_GO",
+            dir.0.join("my-go-ls").display().to_string(),
+        );
+        assert!(d.discover(Language::Go).unwrap().args.is_empty());
     }
 
     #[test]
