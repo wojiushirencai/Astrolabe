@@ -71,6 +71,7 @@ Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、�
 | `ASTROLABE_SAFETY_SECS` | 兜底巡检间隔秒数（0 关闭） | `1800` |
 | `ASTROLABE_CACHE_MB` | 文件解析内存缓存大小预算（MB） | `256` |
 | `ASTROLABE_PARSE_CACHE_MB` | 增量索引的内存缓存预算（MB） | `256` |
+| `ASTROLABE_MALLOC_TRIM` | 建完索引、以及编辑停下 5 秒后，把空闲堆内存还给系统（仅 Linux glibc，其他平台无效）。设为 `0` 关闭 | 开 |
 | `ASTROLABE_LSP_TIMEOUT` | 单次 LSP 语言服务器响应超时时间（秒） | `300` |
 | `ASTROLABE_LSP_DART` | 覆盖 Dart 语言服务器（`dart language-server`）可执行文件路径 | 自动探测（随 Dart/Flutter SDK 自带） |
 | `ASTROLABE_LSP_<LANG>` | 覆盖指定语言 LSP 服务器可执行文件路径（如 `ASTROLABE_LSP_PYTHON`, `ASTROLABE_LSP_RUST`, `ASTROLABE_LSP_C` 等） | 自动探测对应 LSP |

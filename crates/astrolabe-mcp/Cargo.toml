@@ -33,3 +33,8 @@ regex.workspace = true
 rayon.workspace = true
 globset.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "signal"] }
+
+# malloc_trim after index builds (src/alloc.rs). glibc only; already in the
+# lockfile through astrolabe-core.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc.workspace = true

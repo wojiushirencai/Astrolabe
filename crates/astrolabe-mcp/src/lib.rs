@@ -7,6 +7,7 @@
 //! `{confidence, budget_tokens}`. Named contexts (`--context` /
 //! `ASTROLABE_CONTEXT`) and `ASTROLABE_STRUCTURED` can turn it on.
 
+mod alloc;
 mod cli;
 mod code_mask;
 mod context;

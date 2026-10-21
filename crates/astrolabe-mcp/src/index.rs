@@ -228,6 +228,11 @@ impl RepoIndex {
                 index.names();
                 if coverage {
                     index.coverage_detail();
+                    // A cold build / full rebuild has freed its parse
+                    // temporaries by now; hand them back to the OS (glibc
+                    // only). Watcher applies trim later, once edits go quiet
+                    // (`apply_pending`).
+                    crate::alloc::release_free_memory();
                 }
             });
     }

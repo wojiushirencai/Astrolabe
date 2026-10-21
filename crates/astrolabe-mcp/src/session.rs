@@ -503,6 +503,9 @@ fn apply_pending(session: &RootSession, pending: &mut ChangeSet) -> bool {
         let _ = std::thread::Builder::new()
             .name("astrolabe-drop".into())
             .spawn(move || drop(previous));
+        // Return the freed pages to the OS once edits go quiet (glibc only;
+        // off-thread, long after the drop above has finished).
+        crate::alloc::release_free_memory_when_quiet();
         if session.rebuild_inflight.load(Ordering::SeqCst) {
             session.rebuild_journal.lock_or_recover().merge(applied);
         }
