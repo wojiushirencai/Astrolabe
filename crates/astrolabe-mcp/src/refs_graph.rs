@@ -1408,6 +1408,11 @@ pub(crate) fn graph_references_at(
     // Python: also `__init__` / `__all__` re-exports and `as` aliases (py_refs).
     let py = (language == Language::Python)
         .then(|| crate::py_refs::python_scope(index, root, decl.file, name));
+    // Python methods / attributes: receivers checked against the class.
+    let py_member = py
+        .as_ref()
+        .filter(|_| decl.kind != SymbolKind::Class)
+        .and_then(|(s, _)| crate::py_refs::PyMember::new(index, root, decl, name, s));
     let mut files: Vec<&RelPath> = graph
         .files
         .iter()
@@ -1420,6 +1425,9 @@ pub(crate) fn graph_references_at(
                     || importers.contains(&f.id.0)
                     || ts.as_ref().is_some_and(|t| t.contains(f.id.0))
                     || py.as_ref().is_some_and(|(s, _)| s.contains_key(&f.id.0))
+                    || py_member
+                        .as_ref()
+                        .is_some_and(|m| m.extra_files.contains(&f.id.0))
             }
         })
         .map(|f| &f.path)
@@ -1574,6 +1582,23 @@ pub(crate) fn graph_references_at(
                     continue;
                 }
             }
+            if let (Some(m), Some(id)) = (py_member.as_ref(), index.file_id(path.as_str())) {
+                if !is_decl {
+                    use crate::py_refs::PyVerdict;
+                    match m.verdict(id.0, &lines, line, byte) {
+                        PyVerdict::Ours => {}
+                        PyVerdict::Other => {
+                            other_type.push((path.as_str().to_string(), line));
+                            continue;
+                        }
+                        PyVerdict::Bare => {
+                            members += 1;
+                            continue;
+                        }
+                        PyVerdict::Unknown => unconfirmed.push((path.as_str().to_string(), line)),
+                    }
+                }
+            }
             if let Some(r) = resolver.as_mut() {
                 if !is_decl {
                     let verdict = match base {
@@ -1717,6 +1742,13 @@ pub(crate) fn graph_references_at(
     }
     if py.is_some() {
         note.push_str("（字符串形式的类型注解 `x: \"Foo\"` 按代码计）");
+    }
+    if let Some(m) = &py_member {
+        note.push_str(&format!(
+            "，`x.{name}` 已按接收者类核对（定义类 `{}` 及其子类；另查了 {} 个未导入定义文件但出现 `.{name}` 的文件）",
+            m.class,
+            m.extra_files.len()
+        ));
     }
     note.push('。');
     if interface_method {

@@ -21,7 +21,7 @@ Go 的范围：定义所在包（目录）+ 经 import 边到达该包的文件�
 > - **Python 召回 0.78 是低估。** pyright 每次 30 s 超时，基线是文本搜索。列出来的"漏报"大多是 docstring、f-string 里的文字，或者同名的其他属性和局部变量。真正的漏报主要是字符串类型注解（前向引用），例如 `tools_base.py:53` 的 `"LanguageServerSymbolRetriever"`。第 7 批用 pyright 重测，同一批 19 例在第 6 批规则下召回 0.936、精度 1.000（见文末）。
 > - JS（express）的基线有 7/30 不是 Exact，数字同样只能参考。
 >
-> 新基线的做法：TS 装好 node_modules，让 tsserver 达到 Exact；pyright 超时调到 180 s 以上并先预热；召回和精度只用 `Confidence::Exact` 的行计算。修正后的数字由第 7 批的 TS 和 PY 两路补入，见上表 `TODO(B7-TS)` 和 `TODO(B7-PY)`。审计依据：`lang-graph` 审计第 3.1 节。
+> 新基线的做法：TS 装好 node_modules，让 tsserver 达到 Exact；pyright 超时调到 180 s 以上并先预热；召回和精度只用 `Confidence::Exact` 的行计算。修正后的数字由第 7 批的 TS 和 PY 两路补入：TS 见上表 `TODO(B7-TS)`，Python 已补入上表并见文末“第 7 批：Python 重测”。审计依据：`lang-graph` 审计第 3.1 节。
 
 会话里查过的 Go 符号：cobra 8 个中 7 个索引作答（`MarkFlagRequired` 有多处定义，交给 LSP），aiproxy 14 个中 11 个（`Provider`、`MaskSensitiveInfo`、`Register` 交给 LSP），aicon 2 个中 1 个；作答的全部召回 1.0。
 

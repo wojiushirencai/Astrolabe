@@ -368,6 +368,444 @@ fn module_name(path: &str) -> String {
     }
 }
 
+// ----------------------------------------------- members (methods, attributes)
+
+/// What a `x.name` / `self.name` hit is, for a Python method or attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PyVerdict {
+    /// The receiver is the defining class or a subclass.
+    Ours,
+    /// The receiver is another, unrelated class of this repo.
+    Other,
+    /// A bare `name` (no receiver): a local / global of the same name.
+    Bare,
+    /// The receiver's type is not known from the source.
+    Unknown,
+}
+
+/// Typing wrappers skipped when reading a class out of an annotation.
+const TYPING_WORDS: &[&str] = &[
+    "Optional",
+    "Union",
+    "None",
+    "List",
+    "Dict",
+    "Set",
+    "Tuple",
+    "Type",
+    "Sequence",
+    "Iterable",
+    "Iterator",
+    "Mapping",
+    "Callable",
+    "Any",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "type",
+    "typing",
+    "t",
+    "Final",
+    "ClassVar",
+    "Annotated",
+    "Awaitable",
+    "Generator",
+    "Collection",
+    "MutableMapping",
+    "frozenset",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "bytes",
+    "object",
+];
+
+/// Receiver resolution for one Python method / attribute declaration.
+pub(crate) struct PyMember {
+    /// The defining class and its known subclasses (by name).
+    related: HashSet<String>,
+    /// Ancestors of the defining class (a receiver typed as one is
+    /// unconfirmed, not another class).
+    ancestors: HashSet<String>,
+    /// Every Python class name in the repo.
+    known: HashSet<String>,
+    /// Python classes per file: `(start, end, name)`, 1-based lines.
+    classes: BTreeMap<u32, Vec<(u32, u32, String)>>,
+    /// Defining class name.
+    pub class: String,
+    /// Files outside the import scope that mention `.name` (a member is
+    /// reached through objects whose module the caller need not import).
+    pub extra_files: BTreeSet<u32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Recall dumps: answer as before member checks (batch-7 first commit).
+    static NO_MEMBER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Base class names in a `class X(A, b.B, metaclass=M):` signature.
+fn class_bases(signature: &str, name: &str) -> Vec<String> {
+    let Some(at) = signature.find(&format!("class {name}")) else {
+        return Vec::new();
+    };
+    let rest = &signature[at + 6 + name.len()..];
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix('[')
+        .map_or(rest, |r| r.split_once(']').map_or("", |x| x.1));
+    let Some(inner) = rest.trim_start().strip_prefix('(') else {
+        return Vec::new();
+    };
+    let inner = inner.split(')').next().unwrap_or("");
+    inner
+        .split(',')
+        .map(str::trim)
+        .filter(|b| !b.contains('='))
+        .filter_map(|b| {
+            let b = b.split('[').next().unwrap_or(b);
+            let last = b.rsplit('.').next().unwrap_or(b).trim();
+            is_ident(last).then(|| last.to_string())
+        })
+        .collect()
+}
+
+impl PyMember {
+    /// `None` unless `decl` sits inside a Python class.
+    pub(crate) fn new(
+        index: &RepoIndex,
+        root: &Path,
+        decl: &astrolabe_core::types::CodeSymbol,
+        name: &str,
+        scope: &BTreeMap<u32, BTreeSet<String>>,
+    ) -> Option<Self> {
+        use astrolabe_core::types::SymbolKind;
+        #[cfg(test)]
+        if NO_MEMBER.with(|c| c.get()) {
+            return None;
+        }
+        let graph = index.graph();
+        let mut classes: BTreeMap<u32, Vec<(u32, u32, String)>> = BTreeMap::new();
+        let mut bases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for s in &graph.symbols {
+            if s.kind != SymbolKind::Class {
+                continue;
+            }
+            let py = index
+                .file(s.file)
+                .is_some_and(|f| matches!(f.language, Some(Language::Python)));
+            if !py {
+                continue;
+            }
+            classes
+                .entry(s.file.0)
+                .or_default()
+                .push((s.start_line, s.end_line, s.name.clone()));
+            bases
+                .entry(s.name.clone())
+                .or_default()
+                .extend(class_bases(&s.signature, &s.name));
+        }
+        let class = classes
+            .get(&decl.file.0)?
+            .iter()
+            .filter(|(a, b, n)| {
+                *a <= decl.start_line
+                    && decl.start_line <= *b
+                    && !(n == name && *a == decl.start_line)
+            })
+            .min_by_key(|(a, b, _)| b - a)?
+            .2
+            .clone();
+        let decl_lines = crate::refs_graph::read_lines(root, index.file(decl.file)?.path.as_str())?;
+        if !directly_in_class(
+            &decl_lines,
+            decl.start_line.saturating_sub(1) as usize,
+            name,
+        ) {
+            return None;
+        }
+        // Subclasses: fixed point over the base lists.
+        let mut related: HashSet<String> = HashSet::from([class.clone()]);
+        loop {
+            let before = related.len();
+            for (c, bs) in &bases {
+                if !related.contains(c) && bs.iter().any(|b| related.contains(b)) {
+                    related.insert(c.clone());
+                }
+            }
+            if related.len() == before {
+                break;
+            }
+        }
+        let mut ancestors: HashSet<String> = HashSet::new();
+        let mut stack = vec![class.clone()];
+        while let Some(c) = stack.pop() {
+            for b in bases.get(&c).into_iter().flatten() {
+                if ancestors.insert(b.clone()) {
+                    stack.push(b.clone());
+                }
+            }
+        }
+        ancestors.retain(|a| !related.contains(a));
+        let known: HashSet<String> = bases.keys().cloned().collect();
+        let mut extra_files = BTreeSet::new();
+        let dotted = format!(".{name}");
+        for f in &graph.files {
+            if !matches!(f.language, Some(Language::Python)) || scope.contains_key(&f.id.0) {
+                continue;
+            }
+            let Some(lines) = crate::refs_graph::read_lines(root, f.path.as_str()) else {
+                continue;
+            };
+            let hit = lines.iter().any(|l| {
+                let mut from = 0;
+                while let Some(i) = l[from..].find(&dotted) {
+                    let end = from + i + dotted.len();
+                    if !l[end..].starts_with(is_ident_char) {
+                        return true;
+                    }
+                    from = end;
+                }
+                false
+            });
+            if hit {
+                extra_files.insert(f.id.0);
+            }
+        }
+        Some(PyMember {
+            related,
+            ancestors,
+            known,
+            classes,
+            class,
+            extra_files,
+        })
+    }
+
+    fn enclosing_class(&self, file: u32, line1: u32) -> Option<&str> {
+        self.classes
+            .get(&file)?
+            .iter()
+            .filter(|(a, b, _)| *a <= line1 && line1 <= *b)
+            .min_by_key(|(a, b, _)| b - a)
+            .map(|(_, _, n)| n.as_str())
+    }
+
+    fn judge_type(&self, ty: Option<String>) -> PyVerdict {
+        match ty {
+            Some(t) if self.related.contains(&t) => PyVerdict::Ours,
+            Some(t) if self.ancestors.contains(&t) => PyVerdict::Unknown,
+            Some(t) if self.known.contains(&t) => PyVerdict::Other,
+            _ => PyVerdict::Unknown,
+        }
+    }
+
+    /// Verdict for the hit at `(line, byte)` (0-based line) in `file`.
+    pub(crate) fn verdict(
+        &self,
+        file: u32,
+        lines: &[String],
+        line: usize,
+        byte: usize,
+    ) -> PyVerdict {
+        let text = &lines[line];
+        let before = &text[..byte];
+        let line1 = line as u32 + 1;
+        let lead = text.trim_start();
+        // A dotted module path in an import (`from a.name import X`).
+        if (lead.starts_with("from ") && !before.contains(" import "))
+            || lead.starts_with("import ")
+        {
+            return PyVerdict::Bare;
+        }
+        let Some(recv_part) = before.strip_suffix('.') else {
+            // A bare name: only the (re)definition in a class body counts
+            // (`def name` with decorators above, `name: T = …`).
+            let head = before.trim_start();
+            let defines = head.is_empty() || head == "def " || head == "async def ";
+            let after = text[byte..].trim_start_matches(is_ident_char).trim_start();
+            let def_like = (head == "def " || head == "async def ")
+                || (head.is_empty()
+                    && (after.starts_with(':')
+                        || (after.starts_with('=') && !after.starts_with("=="))));
+            if defines && def_like {
+                return match self.enclosing_class(file, line1) {
+                    Some(c) if self.related.contains(c) => PyVerdict::Ours,
+                    Some(_) => PyVerdict::Other,
+                    None => PyVerdict::Bare,
+                };
+            }
+            return PyVerdict::Bare;
+        };
+        let recv_part = recv_part.trim_end();
+        if recv_part.ends_with("super()") {
+            return match self.enclosing_class(file, line1) {
+                Some(c) if self.related.contains(c) => PyVerdict::Ours,
+                Some(c) if self.known.contains(c) => PyVerdict::Other,
+                _ => PyVerdict::Unknown,
+            };
+        }
+        let start = recv_part
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_ident_char(*c))
+            .last()
+            .map(|(i, _)| i);
+        let Some(start) = start else {
+            return PyVerdict::Unknown;
+        };
+        let base = &recv_part[start..];
+        let pre = &recv_part[..start];
+        if pre.ends_with('.') {
+            // `self.attr.name`: the attribute's declared / assigned type.
+            if pre.trim_end_matches('.').ends_with("self") {
+                return self.judge_type(self_attr_type(lines, base));
+            }
+            return PyVerdict::Unknown;
+        }
+        match base {
+            "self" | "cls" => match self.enclosing_class(file, line1) {
+                Some(c) if self.related.contains(c) => PyVerdict::Ours,
+                Some(c) if self.ancestors.contains(c) => PyVerdict::Unknown,
+                Some(_) => PyVerdict::Other,
+                None => PyVerdict::Unknown,
+            },
+            b if self.related.contains(b) => PyVerdict::Ours,
+            b if self.known.contains(b) => PyVerdict::Other,
+            b => self.judge_type(local_type(lines, line, b)),
+        }
+    }
+}
+
+/// First class-like identifier of an annotation / call text.
+fn type_of_annotation(ann: &str) -> Option<String> {
+    ann.split(|c: char| !(is_ident_char(c) || c == '.'))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.rsplit('.').next().unwrap_or(w))
+        .find(|w| is_ident(w) && !TYPING_WORDS.contains(w))
+        .map(str::to_string)
+}
+
+/// The binding of `pat` on `l`, if `l` binds it: `Some(Some(class))` for
+/// an annotation `pat: T` / `pat = Class(…)` / `except T as pat`,
+/// `Some(None)` for a binding whose type is not readable (`pat = f()`,
+/// `for pat in …`, `with … as pat`), `None` when `l` does not bind `pat`.
+fn binding_on(l: &str, pat: &str) -> Option<Option<String>> {
+    let self_attr = pat.starts_with("self.");
+    let mut from = 0;
+    while let Some(i) = l[from..].find(pat) {
+        let at = from + i;
+        let end = at + pat.len();
+        from = end;
+        if !self_attr
+            && l[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_ident_char(c) || c == '.')
+        {
+            continue;
+        }
+        if l[end..].starts_with(is_ident_char) {
+            continue;
+        }
+        let head = l[..at].trim_end();
+        if head.ends_with(" as") {
+            let t = l.trim_start();
+            if let Some(e) = t.strip_prefix("except") {
+                let e = e.split(" as").next().unwrap_or("");
+                return Some(type_of_annotation(e));
+            }
+            return Some(None);
+        }
+        if head.ends_with("for")
+            || (head.trim_start().starts_with("for ") && l[end..].trim_start().starts_with("in "))
+        {
+            return Some(None);
+        }
+        let rest = l[end..].trim_start();
+        if let Some(ann) = rest.strip_prefix(':') {
+            if ann.starts_with('=') {
+                return Some(None);
+            }
+            // `if x:` / `lambda x:` / dict entries are not annotations.
+            let ann_text = ann.split(['=', ',', ')']).next().unwrap_or("");
+            if ann_text.trim().is_empty() {
+                continue;
+            }
+            return Some(type_of_annotation(ann_text));
+        } else if let Some(v) = rest.strip_prefix('=') {
+            if v.starts_with('=') {
+                continue;
+            }
+            let v = v.trim_start();
+            let call = v.split('(').next().unwrap_or("");
+            if v.len() > call.len()
+                && !call.is_empty()
+                && call.chars().all(|c| is_ident_char(c) || c == '.')
+            {
+                let last = call.rsplit('.').next().unwrap_or(call);
+                if last.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    return Some(Some(last.to_string()));
+                }
+            }
+            return Some(None);
+        }
+    }
+    None
+}
+
+/// Declared / assigned type of `self.attr` anywhere in the file, or of a
+/// class-level `attr: T`.
+fn self_attr_type(lines: &[String], attr: &str) -> Option<String> {
+    let pat = format!("self.{attr}");
+    lines
+        .iter()
+        .find_map(|l| binding_on(l, &pat).flatten())
+        .or_else(|| {
+            lines.iter().find_map(|l| {
+                let t = l.trim_start();
+                (indent_of(l) > 0 && t.starts_with(attr) && !t.starts_with("def "))
+                    .then(|| binding_on(t, attr).flatten())
+                    .flatten()
+            })
+        })
+}
+
+/// Type of local / parameter `var` from its nearest earlier binding (up to
+/// 300 lines back).
+fn local_type(lines: &[String], line: usize, var: &str) -> Option<String> {
+    (line.saturating_sub(300)..=line)
+        .rev()
+        .find_map(|k| binding_on(&lines[k], var))
+        .flatten()
+}
+
+/// Whether the `def name` at or below `start0` (0-based; decorators come
+/// first) sits directly in a class body, not inside a function.
+fn directly_in_class(lines: &[String], start0: usize, name: &str) -> bool {
+    let Some(def_at) = (start0..lines.len().min(start0 + 80)).find(|&k| {
+        let t = lines[k].trim_start();
+        let t = t.strip_prefix("async ").unwrap_or(t);
+        t.strip_prefix("def ")
+            .is_some_and(|r| r.starts_with(name) && !r[name.len()..].starts_with(is_ident_char))
+    }) else {
+        // An attribute (`name: T = …`): fine.
+        return true;
+    };
+    let d = indent_of(&lines[def_at]);
+    for l in lines[..def_at].iter().rev() {
+        let t = l.trim_start();
+        if t.is_empty() || t.starts_with('#') || t.starts_with('@') || indent_of(l) >= d {
+            continue;
+        }
+        return t.starts_with("class ");
+    }
+    false
+}
+
 // ------------------------------------------------- string type annotations
 
 /// Typing heads whose subscripts are type expressions even when lower-case.
@@ -828,6 +1266,104 @@ mod tests {
     }
 
     #[test]
+    fn member_receivers_checked_against_the_class() {
+        let dir = repo(&[
+            (
+                "pkg/a.py",
+                concat!(
+                    "class Base:\n",
+                    "    def run(self):\n",
+                    "        pass\n",
+                    "\n",
+                    "    def go(self):\n",
+                    "        self.run()\n",
+                    "\n",
+                    "class Sub(Base):\n",
+                    "    def go2(self):\n",
+                    "        self.run()\n",
+                    "        super().run()\n",
+                ),
+            ),
+            (
+                "pkg/other.py",
+                concat!(
+                    "from pkg.a import Base\n",
+                    "class Other:\n",
+                    "    def __init__(self):\n",
+                    "        self.run = 1\n",
+                    "    def f(self):\n",
+                    "        return self.run\n",
+                    "\n",
+                    "def g(b: Base, x):\n",
+                    "    b.run()\n",
+                    "    x.run()\n",
+                    "    o = Other()\n",
+                    "    o.run\n",
+                    "    run = 3\n",
+                ),
+            ),
+            ("tests/t.py", "def t(obj):\n    obj.run()\n"),
+            (
+                "pkg/nested.py",
+                "def outer():\n    def helper():\n        pass\n    helper()\n",
+            ),
+        ]);
+        let (hits, note) = refs(&dir, "run", "pkg/a.py");
+        let got: Vec<(&str, u32)> = hits.iter().map(|h| (h.0.as_str(), h.1)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("pkg/a.py", 2),
+                ("pkg/a.py", 6),
+                ("pkg/a.py", 10),
+                ("pkg/a.py", 11),
+                ("pkg/other.py", 9),
+                ("pkg/other.py", 10),
+                ("tests/t.py", 2),
+            ],
+            "{note}"
+        );
+        assert!(note.contains("`Base`"), "{note}");
+        assert!(note.contains("已排除 3 处其他类型"), "{note}");
+        assert!(note.contains("其中 2 处接收者类型无法从索引判定"), "{note}");
+        // A function nested in a function is not a member: bare calls count.
+        let (hits, _) = refs(&dir, "helper", "pkg/nested.py");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binding_reads_annotations_assignments_and_loops() {
+        assert_eq!(
+            binding_on("def f(self, b: Base, x):", "b"),
+            Some(Some("Base".into()))
+        );
+        assert_eq!(
+            binding_on("    b: Optional[\"Base\"] = None", "b"),
+            Some(Some("Base".into()))
+        );
+        assert_eq!(
+            binding_on("    o = mod.Other(1)", "o"),
+            Some(Some("Other".into()))
+        );
+        assert_eq!(binding_on("    o = make()", "o"), Some(None));
+        assert_eq!(binding_on("    for o in items:", "o"), Some(None));
+        assert_eq!(
+            binding_on("    except ValueError as o:", "o"),
+            Some(Some("ValueError".into()))
+        );
+        assert_eq!(binding_on("    if o == 1:", "o"), None);
+        assert_eq!(
+            binding_on("        self.mm = MemoryManager(x)", "self.mm"),
+            Some(Some("MemoryManager".into()))
+        );
+        assert_eq!(
+            class_bases("class Sub(Base, mod.Mixin, metaclass=M):", "Sub"),
+            vec!["Base", "Mixin"]
+        );
+    }
+
+    #[test]
     fn dunder_all_reexport_reaches_package_importers() {
         let dir = repo(&[
             (
@@ -903,6 +1439,9 @@ mod tests {
                 cases.push((p.to_string(), s.to_string()));
             }
         }
+        if std::env::var_os("PY_RECALL_NO_MEMBER").is_some() {
+            NO_MEMBER.with(|c| c.set(true));
+        }
         let out_path = std::env::var("PY_RECALL_OUT").expect("PY_RECALL_OUT");
         let mut out = std::fs::File::create(out_path).unwrap();
         for (path, sym) in &cases {
@@ -975,9 +1514,47 @@ mod tests {
                     (new, old)
                 }
             };
+            // Hits whose receiver the index could not confirm.
+            let (scope, _) = python_scope(&index, &root, decl.file, sym);
+            let member = (decl.kind != astrolabe_core::SymbolKind::Class)
+                .then(|| PyMember::new(&index, &root, decl, sym, &scope))
+                .flatten();
+            let mut unconfirmed: Vec<serde_json::Value> = Vec::new();
+            if let (Some(m), Some(r)) = (&member, &r) {
+                for l in &r.value {
+                    let Some(id) = index.file_id(l.path.as_str()) else {
+                        continue;
+                    };
+                    let Some(ls) = crate::refs_graph::read_lines(&root, l.path.as_str()) else {
+                        continue;
+                    };
+                    let Some(text) = ls.get(l.range.start.line as usize) else {
+                        continue;
+                    };
+                    let mut seen = 0u32;
+                    let mut byte = text.len();
+                    for (i, ch) in text.char_indices() {
+                        if seen >= l.range.start.character {
+                            byte = i;
+                            break;
+                        }
+                        seen += ch.len_utf16() as u32;
+                    }
+                    if m.verdict(id.0, &ls, l.range.start.line as usize, byte) == PyVerdict::Unknown
+                    {
+                        unconfirmed.push(serde_json::json!([
+                            l.path.as_str(),
+                            l.range.start.line,
+                            l.range.start.character
+                        ]));
+                    }
+                }
+            }
             let row = serde_json::json!({
+                "unconfirmed": unconfirmed,
                 "path": path, "sym": sym, "line": dline, "col": dcol,
                 "answered": r.is_some(), "ms": ms as u64, "new": new, "old": old,
+                "note": r.as_ref().and_then(|r| r.note.clone()),
             });
             writeln!(out, "{row}").unwrap();
         }
