@@ -418,7 +418,13 @@ fn go_foreign_imports(
 ) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut in_block = false;
-    for line in lines {
+    // Imports follow the `package` clause; a package doc comment above it
+    // may hold example code (`var png []byte`, `import …`).
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("package "))
+        .map_or(0, |i| i + 1);
+    for line in &lines[start..] {
         let t = line.trim();
         let spec = if in_block {
             if t.starts_with(')') {
@@ -491,7 +497,13 @@ fn selector_base(line: &str, byte: usize) -> Option<&str> {
 fn go_imports(lines: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut in_block = false;
-    for line in lines {
+    // Imports follow the `package` clause; a package doc comment above it
+    // may hold example code (`var png []byte`, `import …`).
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("package "))
+        .map_or(0, |i| i + 1);
+    for line in &lines[start..] {
         let t = line.trim();
         let spec = if in_block {
             if t.starts_with(')') {
@@ -1342,6 +1354,24 @@ fn choose_declaration<'a>(
     pick(imported)
 }
 
+/// The bare Go name at `(line, byte)` is a function-local binding: inside
+/// one of `funcs` (1-based line ranges), it is bound on its own line (`x :=`
+/// left side, a parameter) or above it in the function.
+fn go_shadowed(
+    lines: &[String],
+    line: usize,
+    byte: usize,
+    name: &str,
+    funcs: &[(u32, u32)],
+) -> bool {
+    let line1 = line as u32 + 1;
+    if !funcs.iter().any(|&(s, e)| s <= line1 && line1 <= e) {
+        return false;
+    }
+    binding_on_line(&lines[line], name).is_some()
+        || go_local_binding(lines, line, byte, name).is_some()
+}
+
 /// What the Go use(s) of a name on the caller's line say.
 enum Site<'a> {
     /// They all refer to this declaration.
@@ -1739,6 +1769,8 @@ fn decl_refs(
             (HashSet::new(), HashSet::new())
         };
         let mut first_on_line: HashSet<usize> = HashSet::new();
+        // Go: (start, end) lines of this file's functions, on demand.
+        let mut funcs: Option<Vec<(u32, u32)>> = None;
         for ((line, byte), kind) in found.into_iter().zip(kinds) {
             let first = first_on_line.insert(line);
             if kind != HitKind::Code {
@@ -1807,6 +1839,28 @@ fn decl_refs(
                 if !reached {
                     members += 1;
                     continue;
+                }
+                // A function-local binding of the same name shadows it
+                // (`verifier := …`, a parameter, `var item T`).
+                if base.is_none() && !is_decl {
+                    let funcs = funcs.get_or_insert_with(|| {
+                        index
+                            .file_id(path.as_str())
+                            .map(|id| {
+                                index
+                                    .file_symbols(id)
+                                    .filter(|s| {
+                                        matches!(s.kind, SymbolKind::Function | SymbolKind::Method)
+                                    })
+                                    .map(|s| (s.start_line, s.end_line))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    });
+                    if go_shadowed(&lines, line, byte, name, funcs) {
+                        members += 1;
+                        continue;
+                    }
                 }
             }
             if let (Some(m), Some(id)) = (py_member.as_ref(), index.file_id(path.as_str())) {
@@ -2376,6 +2430,19 @@ mod tests {
         // Unknown module: same last segment counts as ours.
         let f = go_foreign_imports(&lines, None, "x/service");
         assert!(!f.contains("service") && f.contains("fmt"));
+        // Example code in the package doc comment does not end the scan.
+        let doc: Vec<String> = "/*\nUsage:\n\tvar png []byte\n\tfunc f() {}\n*/\npackage qrcode\n\nimport (\n\trs \"github.com/skip2/go-qrcode/reedsolomon\"\n)\n"
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            go_imports(&doc),
+            vec![(
+                "rs".to_string(),
+                "github.com/skip2/go-qrcode/reedsolomon".to_string()
+            )]
+        );
+        assert!(go_foreign_imports(&doc, None, "x").contains("rs"));
         assert_eq!(selector_base("\tfmt.Println(x)", 5), Some("fmt"));
         assert_eq!(selector_base("Println(x)", 0), None);
     }
