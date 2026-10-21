@@ -39,3 +39,24 @@ Go 多出的 5 处：
   - 基线本身不可靠，无法证明索引不差：tsserver 缺依赖，pyright 超时。
   - 已经确认的真实缺口：TS/JS 经 barrel 文件转导出的引用、改名绑定（default import、CommonJS `require` 改名、`{A as B}`），以及 Python 的字符串类型注解和 `__init__.py` 转导出，索引目前拿不到。召回的具体数字待第 7 批重测（TODO(B7-TS) / TODO(B7-PY)）；第 6 批写的"Python 召回 0.78"是坏基线下的数字，已作废。
   - 这些语言等基线修好后再测。
+
+## 第 7 批：TS/JS 重测（可信基线）
+
+第 6 批 TS 一行的对照组是坏的（tsserver 缺依赖，27/40 退回文本），"召回 1.000" 不成立。本次换成可信基线：
+- **基线：** TypeScript LanguageService `findReferences`，从声明位置查询。aiproxy web 先装好 node_modules（`bun install --frozen-lockfile --ignore-scripts`），按 `tsconfig.app.json` 建程序，"Cannot find module" 诊断为 0；express 用 `allowJs` 加载全部 141 个 .js。
+- **用例：** 第 6 批的同一批用例（TS 40 个、JS 30 个），外加更大的抽样（TS 200 个，全仓唯一定义、非测试；JS 抽样池只有 59 个）。
+- **对比：** before 是第 6 批的范围（定义文件 + 直接 importer），after 是本批 `refs_graph_ts`（转导出链 + 改名绑定），按 `(文件, 行, 列)` 比较。
+- **复现：** `TS_RECALL_REPO=<repo> TS_RECALL_OUT=g.jsonl TS_RECALL_SAMPLE='.ts|.tsx:200' cargo test -p astrolabe-mcp --lib refs_graph_ts::tests::dump_graph_answers -- --ignored --nocapture`，然后 `node lsrefs.js <repo> tsconfig.app.json g.jsonl ls.jsonl`、`python3 cmp.py g.jsonl,ls.jsonl,label`（脚本在 `/workspace/audit/arch2026/ts-recall/`）。
+
+| 语料 / 用例 | 召回 before → after | 精度 before → after | 与基线完全一致 before → after |
+|---|---|---|---|
+| aiproxy web / TS，第 6 批 40 例 | 0.992 → **1.000** | 0.998 → 0.998 | 38 → 39 |
+| aiproxy web / TS，抽样 200 例 | 0.984 → **1.000**（1589 → 1615 / 1615） | 0.998 → 0.998 | 188 → 197 |
+| express / JS，第 6 批 30 例（不含 createApplication） | 1.000 → 1.000 | 0.631 → 0.631 | — |
+| express / JS，`createApplication` | 2/12 → 6/12（tsserver 口径） | — | — |
+
+- **TS：** 抽样 200 例里有 9 例召回变高，全部是经 barrel 导入的情况（例如 `IconDiscord` 从 2 处补到 6 处，与基线一致）。after 多报的 3 处是同一文件里同名的外部导入（`lucide-react` 的 `Calendar`）、定义文件里同名的外部绑定，第 6 批就已存在。索引作答中位数 18 ms，最长 305 ms；LanguageService 每次约 100 ms，但前提是先装依赖并花 45 秒建程序。
+- **JS：** 精度低的原因与本批无关：一是 `app.disable = function disable(` 这种同一行两个同名（R3），二是 `app.handle` / `this.route` 这类成员同名（R5）。
+- **JS 的 `createApplication`：** after 给出 850 处。多出的部分都是经 `require('../../')`、`require('..')`（根目录 `index.js` 写的是 `module.exports = require('./lib/express')`）绑定的本地名 `express`：`express()` 调用 652 处，后面跟空格的 96 处（主要是 `var express = require(...)` 这一行），`express.static` 这类属性访问 96 处。tsserver 的 JS 推断不跟这条 CJS 链，所以这些在它的口径下都算多报，但调用是真实引用。tsserver 另外报出的 6 处是 `test/acceptance/route-map.js` 里的 `app` 变量，那是返回值，不是引用。按 tsserver 口径算，这个用例的精度是 0.007，没有意义，所以表里单列。
+
+**结论（未切换）：** 在这一个 TS 语料上，召回和精度已经达到 Go 切换时的水平（≥0.996）。但要把 TS 切到索引优先，还缺两项证据：第二个 TS 语料（monorepo 加 workspace 包，Vue 需要 vue 语言服务作基线），以及 Method/Field（本次抽样里没有全仓唯一的 TS 方法）。JS 还不能切，要先做 R3（同一行去重）和 R5（成员只走语言服务）。
