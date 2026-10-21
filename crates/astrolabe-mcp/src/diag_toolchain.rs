@@ -450,6 +450,14 @@ fn go_check(root: &Path, rel: &RelPath) -> Outcome {
                 diags: if diags.is_empty() { vet_diags } else { diags },
             }
         }
+        // It compiles after all: vet's `# pkg` header (Go <= 1.25 prints it
+        // for analyzer findings too) was not a build failure, so the located
+        // findings are analyzer warnings.
+        Ok(out) if out.status == Some(0) => Outcome::Ran {
+            tool: "go vet（含测试文件的类型检查）",
+            scope,
+            diags: parse_go(root, &dir, rel, &vet_text, Severity::Warning),
+        },
         _ => Outcome::Ran {
             tool: "go vet（只报第一处类型错误）",
             scope,
