@@ -1236,19 +1236,35 @@ impl Binding {
     }
 }
 
+/// How [`choose_declaration`] picked among several declarations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Choice {
+    /// The only declaration (or the only non-field one).
+    Only,
+    /// By the file / package / imports of `path`, or the declaration line.
+    Path,
+    /// By the occurrence at the caller's line (a call site): its package
+    /// qualifier, receiver type or package.
+    CallSite,
+}
+
 /// Pick the declaration `find_references` is about when the name has
-/// several: the one at `line` of `origin`, the only one in `origin`, the
-/// only one in `origin`'s Go package, or the only one in a package
-/// `origin` imports. `None` when that still leaves a choice.
+/// several: the one declared at `line` of `origin`, the one the use of the
+/// name at `line` resolves to (Go: package qualifier, receiver type, or
+/// the package of a bare name), the one whose range holds `line`, the only
+/// one in `origin`, the only one in `origin`'s Go package, or the only one
+/// in a package `origin` imports. `None` when that still leaves a choice.
 fn choose_declaration<'a>(
     index: &RepoIndex,
+    root: &Path,
+    name: &str,
     decls: &[&'a CodeSymbol],
     origin: &RelPath,
     line: Option<u32>,
     go: bool,
-) -> Option<&'a CodeSymbol> {
+) -> Option<(&'a CodeSymbol, Choice)> {
     if let [only] = decls {
-        return Some(only);
+        return Some((only, Choice::Only));
     }
     // Other languages keep the old rule: one declaration or the server.
     if !go {
@@ -1272,15 +1288,27 @@ fn choose_declaration<'a>(
         .filter(|s| path_of(s).as_deref() == Some(origin.as_str()))
         .collect();
     if let Some(line) = line.map(|l| l + 1) {
+        // The declaration line itself.
+        if let Some(d) = in_file.iter().copied().find(|s| s.start_line == line) {
+            return Some((d, Choice::Path));
+        }
+        // A use of the name on that line (a call site): its package
+        // qualifier, receiver type or package decides (batch 8, H6).
+        match go_call_site(index, root, name, decls, origin, line as usize - 1) {
+            Site::Pick(d) => return Some((d, Choice::CallSite)),
+            Site::Block => return None,
+            Site::Undecided => {}
+        }
         let at = in_file
             .iter()
             .copied()
             .filter(|s| s.start_line <= line && line <= s.end_line.max(s.start_line))
             .min_by_key(|s| s.end_line.saturating_sub(s.start_line));
-        if at.is_some() {
-            return at;
+        if let Some(at) = at {
+            return Some((at, Choice::Path));
         }
     }
+    let pick = |c: Vec<&'a CodeSymbol>| pick(c).map(|d| (d, Choice::Path));
     if !in_file.is_empty() {
         return pick(in_file);
     }
@@ -1312,6 +1340,175 @@ fn choose_declaration<'a>(
         return None;
     }
     pick(imported)
+}
+
+/// What the Go use(s) of a name on the caller's line say.
+enum Site<'a> {
+    /// They all refer to this declaration.
+    Pick(&'a CodeSymbol),
+    /// They refer to different declarations, or to a method the index cannot
+    /// pick: the file / package of `path` must not decide either.
+    Block,
+    /// No code use, or none tells (a foreign package, a shadowing local).
+    Undecided,
+}
+
+/// The declaration the Go use(s) of `name` on 0-based `line` of `origin`
+/// refer to: `pkg.Name` → the top-level one in the package `pkg` imports;
+/// `x.Name` → the method whose receiver type `x` has (or the only method of
+/// that name that `x` may have); a bare `Name` → the top-level one of
+/// `origin`'s package (unless a local binding shadows it).
+fn go_call_site<'a>(
+    index: &RepoIndex,
+    root: &Path,
+    name: &str,
+    decls: &[&'a CodeSymbol],
+    origin: &RelPath,
+    line: usize,
+) -> Site<'a> {
+    let Some(lines) = read_lines(root, origin.as_str()) else {
+        return Site::Undecided;
+    };
+    let Some(text) = lines.get(line) else {
+        return Site::Undecided;
+    };
+    let offsets = word_offsets(text, name);
+    if offsets.is_empty() {
+        return Site::Undecided;
+    }
+    let at: Vec<(usize, usize)> = offsets.iter().map(|&b| (line, b)).collect();
+    let kinds = classify(origin.as_str(), &lines, &at);
+    let imports = go_imports(&lines);
+    let origin_dir = dir_of(origin.as_str());
+    let path_of = |s: &CodeSymbol| index.file(s.file).map(|f| f.path.as_str().to_string());
+    let top = |s: &&&CodeSymbol| !matches!(s.kind, SymbolKind::Method | SymbolKind::Field);
+    let one = |c: Vec<&'a CodeSymbol>| match c.as_slice() {
+        [d] => Site::Pick(d),
+        _ => Site::Undecided,
+    };
+    let methods: Vec<&'a CodeSymbol> = decls
+        .iter()
+        .copied()
+        .filter(|s| s.kind == SymbolKind::Method)
+        .collect();
+    // An interface method may be what any `x.Name` calls.
+    let interface = methods
+        .iter()
+        .any(|s| go_receiver_type(&s.signature).is_none());
+    // A member access whose receiver the index cannot type: the only
+    // method of that name, if there is one.
+    let only_method = || match methods.as_slice() {
+        [m] if !interface => Site::Pick(m),
+        _ => Site::Block,
+    };
+    let mut chosen: Option<&'a CodeSymbol> = None;
+    for (byte, kind) in offsets.into_iter().zip(kinds) {
+        if kind != HitKind::Code {
+            continue;
+        }
+        let site = match selector_base(text, byte) {
+            Some(base) => {
+                let chained = text[..byte - base.len() - 1].ends_with('.');
+                let pkg = (!chained)
+                    .then(|| imports.iter().find(|(l, _)| l == base))
+                    .flatten();
+                if let Some((_, ipath)) = pkg {
+                    // `pkg.Name`: the package's own top-level declaration.
+                    one(decls
+                        .iter()
+                        .filter(top)
+                        .copied()
+                        .filter(|s| {
+                            path_of(s).is_some_and(|p| {
+                                let d = dir_of(&p);
+                                go_import_is_def(ipath, go_import_path(root, d).as_deref(), d)
+                            })
+                        })
+                        .collect())
+                } else if interface {
+                    Site::Block
+                } else {
+                    // `x.Name`: the receiver type decides among methods.
+                    let (mut ours, mut unknown) = (Vec::new(), Vec::new());
+                    for &s in &methods {
+                        let (Some(recv), Some(def_path)) =
+                            (go_receiver_type(&s.signature), path_of(s))
+                        else {
+                            continue;
+                        };
+                        let def_dir = dir_of(&def_path);
+                        let def_import = go_import_path(root, def_dir);
+                        let mut r =
+                            go_recv(index, root, def_dir, def_import.as_deref(), &recv, name);
+                        let ty = r.base_type(origin.as_str(), line, byte, base);
+                        match r.verdict(ty) {
+                            Recv::Ours => ours.push(s),
+                            Recv::Other => {}
+                            Recv::Unknown => unknown.push(s),
+                        }
+                    }
+                    match (ours.as_slice(), unknown.as_slice()) {
+                        ([one], _) => Site::Pick(one),
+                        ([], [one]) => Site::Pick(one),
+                        // Another type's method (stdlib, third party).
+                        ([], []) => Site::Undecided,
+                        _ => Site::Block,
+                    }
+                }
+            }
+            // `f().Name`, `xs[i].Name`: a method / field, receiver untyped.
+            None if text[..byte].ends_with('.') => only_method(),
+            None => {
+                if go_local_binding(&lines, line, byte, name).is_some() {
+                    Site::Undecided
+                } else {
+                    one(decls
+                        .iter()
+                        .filter(top)
+                        .copied()
+                        .filter(|s| path_of(s).is_some_and(|p| dir_of(&p) == origin_dir))
+                        .collect())
+                }
+            }
+        };
+        match site {
+            Site::Block => return Site::Block,
+            Site::Undecided => {}
+            Site::Pick(d) => match chosen {
+                Some(c) if !std::ptr::eq(c, d) => return Site::Block,
+                _ => chosen = Some(d),
+            },
+        }
+    }
+    chosen.map_or(Site::Undecided, Site::Pick)
+}
+
+/// Receiver resolver for the method `name` of `recv` declared in `def_dir`.
+fn go_recv<'a>(
+    index: &'a RepoIndex,
+    root: &'a Path,
+    def_dir: &'a str,
+    def_import: Option<&'a str>,
+    recv: &'a str,
+    name: &'a str,
+) -> GoRecv<'a> {
+    GoRecv {
+        index,
+        root,
+        def_dir,
+        def_import,
+        module: go_module(root, def_dir),
+        go_dirs: index
+            .graph()
+            .files
+            .iter()
+            .filter(|f| f.language == Some(Language::Go))
+            .map(|f| dir_of(f.path.as_str()).to_string())
+            .collect(),
+        recv,
+        method: name,
+        files: HashMap::new(),
+    }
 }
 
 /// `name` at `byte` is a composite-literal key (`{Name: v`, `, Name: v`,
@@ -1381,7 +1578,35 @@ pub(crate) fn graph_references_at(
     let language = Language::from_path(origin)?;
     let go = language == Language::Go;
     let decls = declarations(index, name, Some(language));
-    let decl = choose_declaration(index, &decls, origin, line, go)?;
+    match choose_declaration(index, root, name, &decls, origin, line, go) {
+        Some((decl, how)) => {
+            decl_refs(index, root, name, language, &decls, decl, how).map(|r| r.answer)
+        }
+        // Go: several declarations and nothing picks one. When their
+        // references do not overlap, one grouped answer instead of gopls.
+        None if go => grouped_references(index, root, name, language, &decls),
+        None => None,
+    }
+}
+
+/// One declaration's index answer, plus the hits whose receiver could not
+/// be typed (path, 0-based line).
+struct DeclRefs {
+    answer: Precise<Vec<Location>>,
+    unconfirmed: Vec<(String, usize)>,
+}
+
+/// References of `decl` (one of `decls`, all named `name`) from the index.
+fn decl_refs(
+    index: &RepoIndex,
+    root: &Path,
+    name: &str,
+    language: Language,
+    decls: &[&CodeSymbol],
+    decl: &CodeSymbol,
+    how: Choice,
+) -> Option<DeclRefs> {
+    let go = language == Language::Go;
     let graph = index.graph();
     let def_file = index.file(decl.file)?;
     let def_path = def_file.path.as_str();
@@ -1445,22 +1670,9 @@ pub(crate) fn graph_references_at(
     let interface_method = go && decl.kind == SymbolKind::Method && method_recv.is_none();
     // Top-level Go names are reached bare or as `pkg.Name`, never `x.Name`.
     let top_level = go && !matches!(decl.kind, SymbolKind::Method | SymbolKind::Field);
-    let mut resolver = method_recv.as_deref().map(|recv| GoRecv {
-        index,
-        root,
-        def_dir,
-        def_import: def_import.as_deref(),
-        module: go_module(root, def_dir),
-        go_dirs: graph
-            .files
-            .iter()
-            .filter(|f| f.language == Some(Language::Go))
-            .map(|f| dir_of(f.path.as_str()).to_string())
-            .collect(),
-        recv,
-        method: name,
-        files: HashMap::new(),
-    });
+    let mut resolver = method_recv
+        .as_deref()
+        .map(|recv| go_recv(index, root, def_dir, def_import.as_deref(), recv, name));
     // Same-named declarations other than `decl`, by (path, 1-based line).
     let others: HashMap<(String, u32), &CodeSymbol> = decls
         .iter()
@@ -1616,6 +1828,14 @@ pub(crate) fn graph_references_at(
             }
             if let Some(r) = resolver.as_mut() {
                 if !is_decl {
+                    // `pkg.Name` through the declaring package's import is
+                    // its top-level `Name`, never a method value.
+                    if base.is_some_and(|b| ours_locals.contains(b))
+                        && !lines[line][..byte - base.map_or(0, str::len) - 1].ends_with('.')
+                    {
+                        members += 1;
+                        continue;
+                    }
                     let verdict = match base {
                         Some(b) => {
                             let ty = r.base_type(path.as_str(), line, byte, b);
@@ -1747,8 +1967,13 @@ pub(crate) fn graph_references_at(
         } else {
             format!("：{}", elsewhere.join("、"))
         };
+        let by = if how == Choice::CallSite {
+            "按 path 所给行的用法（包限定名 / 接收者类型 / 所在包）"
+        } else {
+            "按 path"
+        };
         format!(
-            "`{name}` 另有 {} 处同名定义{fields}{listed}；已按 path 选定 {at}",
+            "`{name}` 另有 {} 处同名定义{fields}{listed}；已{by}选定 {at}",
             rest.len()
         )
     };
@@ -1794,8 +2019,197 @@ pub(crate) fn graph_references_at(
             list_hits(&unconfirmed)
         ));
     }
+    Some(DeclRefs {
+        answer: Precise {
+            value: hits,
+            confidence: Confidence::Scoped,
+            note: Some(note),
+        },
+        unconfirmed,
+    })
+}
+
+/// `find_references` with no usable `path` and a Go name declared in
+/// several files (batch 8, E1: `ViaQuietDropped` in two packages): the
+/// grouped per-definition answer of [`grouped_references`], when every
+/// declaration is Go and their references do not overlap. `None` keeps the
+/// "pass one of these as path" answer.
+pub(crate) fn grouped_references_without_path(
+    index: &RepoIndex,
+    root: &Path,
+    name: &str,
+) -> Option<Precise<Vec<Location>>> {
+    let name = name.trim();
+    let decls = declarations(index, name, Some(Language::Go));
+    let all = declarations(index, name, None);
+    if decls.len() < 2 || decls.len() > MAX_GROUPED_WITHOUT_PATH || decls.len() != all.len() {
+        return None;
+    }
+    grouped_references(index, root, name, Language::Go, &decls)
+}
+
+/// Most declarations grouped when no `path` was given at all.
+const MAX_GROUPED_WITHOUT_PATH: usize = 3;
+/// Each declaration's index answer, or `None` when one has none or a hit
+/// is claimed by two declarations (undecidable from the index).
+fn go_groups<'a>(
+    index: &RepoIndex,
+    root: &Path,
+    name: &str,
+    language: Language,
+    decls: &[&'a CodeSymbol],
+) -> Option<Vec<(&'a CodeSymbol, DeclRefs)>> {
+    let mut groups: Vec<(&CodeSymbol, DeclRefs)> = Vec::new();
+    for &d in decls {
+        groups.push((
+            d,
+            decl_refs(index, root, name, language, decls, d, Choice::Path)?,
+        ));
+    }
+    let mut owner: HashSet<(String, u32, u32)> = HashSet::new();
+    for (_, g) in &groups {
+        for loc in &g.answer.value {
+            let key = (
+                loc.path.as_str().to_string(),
+                loc.range.start.line,
+                loc.range.start.character,
+            );
+            if !owner.insert(key) {
+                return None;
+            }
+        }
+    }
+    Some(groups)
+}
+
+/// Test harness view of [`go_groups`]: `(decl path, 1-based decl line,
+/// hits)` per declaration of `name`, when they group.
+#[cfg(test)]
+pub(crate) fn go_groups_for_test(
+    index: &RepoIndex,
+    root: &Path,
+    name: &str,
+) -> Option<Vec<(String, u32, Vec<Location>)>> {
+    let decls = declarations(index, name, Some(Language::Go));
+    if decls.len() < 2 || decls.iter().any(|s| s.kind == SymbolKind::Field) {
+        return None;
+    }
+    let groups = go_groups(index, root, name, Language::Go, &decls)?;
+    groups
+        .into_iter()
+        .map(|(d, g)| {
+            Some((
+                index.file(d.file)?.path.as_str().to_string(),
+                d.start_line,
+                g.answer.value,
+            ))
+        })
+        .collect()
+}
+
+/// Most same-named Go declarations a grouped answer covers.
+const MAX_GROUPED_DECLS: usize = 6;
+/// Most hits a non-largest group lists by `path:line` in the note.
+const MAX_GROUP_LISTED: usize = 40;
+
+/// Go, several declarations of `name` and nothing in the request picks
+/// one (H6: `MarkFlagRequired` is both `(*Command).MarkFlagRequired` and a
+/// package function, declared in the very file passed as `path`): each
+/// declaration's index answer, merged into one list with a note that says
+/// which hit belongs to which declaration. Only when the groups are
+/// disjoint (no hit claimed by two declarations): the package qualifier /
+/// receiver type / package of every hit separates them. `None` (language
+/// server) otherwise, or with a struct field among the declarations
+/// (`x.Name` field accesses are not attributed), or with too many.
+fn grouped_references(
+    index: &RepoIndex,
+    root: &Path,
+    name: &str,
+    language: Language,
+    decls: &[&CodeSymbol],
+) -> Option<Precise<Vec<Location>>> {
+    if decls.len() < 2
+        || decls.len() > MAX_GROUPED_DECLS
+        || decls.iter().any(|s| s.kind == SymbolKind::Field)
+    {
+        return None;
+    }
+    let groups = go_groups(index, root, name, language, decls)?;
+    let total: usize = groups.iter().map(|(_, g)| g.answer.value.len()).sum();
+    if total > MAX_GRAPH_HITS {
+        return None;
+    }
+    // The largest group is described as "the rest"; the others are listed.
+    let largest = groups
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, (_, g))| (g.answer.value.len(), std::cmp::Reverse(*i)))
+        .map(|(i, _)| i)?;
+    if groups
+        .iter()
+        .enumerate()
+        .any(|(i, (_, g))| i != largest && g.answer.value.len() > MAX_GROUP_LISTED)
+    {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut unconfirmed: Vec<(String, usize)> = Vec::new();
+    for (i, (d, g)) in groups.iter().enumerate() {
+        let path = index.file(d.file)?.path.as_str();
+        let kind = match d.kind {
+            SymbolKind::Method => match go_receiver_type(&d.signature) {
+                Some(r) => format!("`{r}` 的方法，已按接收者类型核对"),
+                None => "接口方法".to_string(),
+            },
+            SymbolKind::Function => "包级函数，只计裸名和 `包名.` 限定的用法".to_string(),
+            _ => "包级声明，只计裸名和 `包名.` 限定的用法".to_string(),
+        };
+        let sig: String = d.signature.trim().chars().take(100).collect();
+        let n = g.answer.value.len();
+        let list = if i == largest {
+            format!("其余 {n} 处都属于它")
+        } else {
+            let hits: Vec<String> = g
+                .answer
+                .value
+                .iter()
+                .map(|l| format!("{}:{}", l.path.as_str(), l.range.start.line + 1))
+                .collect();
+            format!("{n} 处：{}", hits.join("、"))
+        };
+        lines.push(format!(
+            "  [定义{}] `{sig}` @{path}:{}（{kind}）—— {list}",
+            i + 1,
+            d.start_line
+        ));
+        unconfirmed.extend(g.unconfirmed.iter().cloned());
+    }
+    let mut note = format!(
+        "索引作答（未启动语言服务器）：`{name}` 有 {} 处同名定义，path 选不出其中一处；各定义的引用互不重叠，已按定义分组（下方清单是各组合并，每处只属于一个定义，含各自的 [声明]）：\n{}\n以下是各定义所在包内及导入该包的文件中的代码出现，已排除注释和字符串。只要其中一个定义时，把 path 设为它的声明文件并传它的 line。",
+        groups.len(),
+        lines.join("\n")
+    );
+    if !unconfirmed.is_empty() {
+        unconfirmed.sort();
+        note.push_str(&format!(
+            "其中 {} 处接收者类型无法从索引判定（未核实，可能是其他类型的同名方法）：{}。",
+            unconfirmed.len(),
+            list_hits(&unconfirmed)
+        ));
+    }
+    let mut value: Vec<Location> = groups
+        .into_iter()
+        .flat_map(|(_, g)| g.answer.value)
+        .collect();
+    value.sort_by(|a, b| {
+        (a.path.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+            b.path.as_str(),
+            b.range.start.line,
+            b.range.start.character,
+        ))
+    });
     Some(Precise {
-        value: hits,
+        value,
         confidence: Confidence::Scoped,
         note: Some(note),
     })
@@ -2220,7 +2634,10 @@ mod tests {
         let r = graph_references(&ix2, &dir2, "Dup", &RelPath::new("a/x.go")).expect("by path");
         assert_eq!(r.value.len(), 1);
         assert_eq!(r.value[0].path.as_str(), "a/x.go");
-        assert!(graph_references(&ix2, &dir2, "Dup", &RelPath::new("c/z.go")).is_none());
+        // A path that reaches neither: grouped per declaration (batch 8).
+        let r = graph_references(&ix2, &dir2, "Dup", &RelPath::new("c/z.go")).expect("grouped");
+        assert_eq!(hit_lines(&r), vec!["a/x.go:3", "b/y.go:3"]);
+        assert!(r.note.unwrap().contains("已按定义分组"));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }
@@ -2409,14 +2826,180 @@ mod tests {
         ]);
         let ix = index(&dir);
         let origin = RelPath::new("p/a.go");
-        // No line: two candidates in the file → language server.
-        assert!(graph_references(&ix, &dir, "Name", &origin).is_none());
+        // No line: two candidates in the file; their hits separate by
+        // receiver type → one grouped answer (batch 8), no language server.
+        let r = graph_references(&ix, &dir, "Name", &origin).expect("grouped");
+        assert_eq!(
+            hit_lines(&r),
+            vec!["p/a.go:6", "p/a.go:8", "p/a.go:13", "p/a.go:13"]
+        );
+        assert!(r.note.unwrap().contains("已按定义分组"));
+        // A line whose two uses resolve to different methods picks
+        // neither: still the grouped answer.
+        let r = graph_references_at(&ix, &dir, "Name", &origin, Some(12)).expect("line 13");
+        assert!(r.note.unwrap().contains("已按定义分组"));
         let r = graph_references_at(&ix, &dir, "Name", &origin, Some(7)).expect("line 8");
         assert_eq!(hit_lines(&r), vec!["p/a.go:8", "p/a.go:13"]);
         assert_eq!(r.value[1].range.start.character, 18);
         let r = graph_references_at(&ix, &dir, "Name", &origin, Some(5)).expect("line 6");
         assert_eq!(hit_lines(&r), vec!["p/a.go:6", "p/a.go:13"]);
         assert_eq!(r.value[1].range.start.character, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Batch 8 H6: cobra's `MarkFlagRequired` is a `*Command` method and a
+    /// package function in the same file, and that file was passed as
+    /// `path` with no line. gopls was started 3/3 runs.
+    fn h6_repo() -> std::path::PathBuf {
+        repo(&[
+            ("go.mod", "module github.com/spf13/cobra\n"),
+            (
+                "shell_completions.go",
+                "package cobra\n\nimport \"github.com/spf13/pflag\"\n\ntype Command struct{}\n\nfunc (c *Command) Flags() *pflag.FlagSet { return nil }\n\n// MarkFlagRequired marks.\nfunc (c *Command) MarkFlagRequired(name string) error {\n\treturn MarkFlagRequired(c.Flags(), name)\n}\n\n// MarkFlagRequired marks.\nfunc MarkFlagRequired(flags *pflag.FlagSet, name string) error {\n\treturn nil\n}\n",
+            ),
+            (
+                "flag_groups.go",
+                "package cobra\n\nfunc (c *Command) enforce() {\n\t_ = c.MarkFlagRequired(\"a\")\n}\n",
+            ),
+            (
+                "command_test.go",
+                "package cobra\n\nimport \"testing\"\n\nfunc TestReq(t *testing.T) {\n\tc := &Command{}\n\t_ = c.MarkFlagRequired(\"foo\")\n}\n",
+            ),
+            (
+                "app/main.go",
+                "package main\n\nimport (\n\t\"github.com/spf13/cobra\"\n\t\"github.com/spf13/pflag\"\n)\n\nfunc main() {\n\tcmd := &cobra.Command{}\n\t_ = cmd.MarkFlagRequired(\"x\")\n\tvar fs *pflag.FlagSet\n\t_ = cobra.MarkFlagRequired(fs, \"y\")\n}\n",
+            ),
+        ])
+    }
+
+    #[test]
+    fn go_h6_same_file_method_and_function_are_grouped() {
+        let dir = h6_repo();
+        let ix = index(&dir);
+        let origin = RelPath::new("shell_completions.go");
+        let r = graph_references(&ix, &dir, "MarkFlagRequired", &origin).expect("grouped");
+        assert_eq!(
+            hit_lines(&r),
+            vec![
+                "app/main.go:10",
+                "app/main.go:12",
+                "command_test.go:7",
+                "flag_groups.go:4",
+                "shell_completions.go:10",
+                "shell_completions.go:11",
+                "shell_completions.go:15",
+            ]
+        );
+        let note = r.note.clone().unwrap();
+        assert!(
+            note.contains("索引作答") && note.contains("已按定义分组"),
+            "{note}"
+        );
+        assert!(
+            note.contains("[定义1]") && note.contains("`Command` 的方法"),
+            "{note}"
+        );
+        // The function's group is listed hit by hit, the method's is "the rest".
+        assert!(
+            note.contains("3 处：app/main.go:12、shell_completions.go:11、shell_completions.go:15"),
+            "{note}"
+        );
+        assert!(note.contains("其余 4 处都属于它"), "{note}");
+        // Complete by construction: the "已全列" line applies.
+        assert!(
+            crate::refs_render::complete_source(r.confidence, r.note.as_deref()).is_some(),
+            "{note}"
+        );
+        // Call sites pick one declaration.
+        let at = |origin: &str, line: u32| {
+            let r = graph_references_at(
+                &ix,
+                &dir,
+                "MarkFlagRequired",
+                &RelPath::new(origin),
+                Some(line),
+            )
+            .expect("picked");
+            let note = r.note.clone().unwrap_or_default();
+            assert!(!note.contains("已按定义分组"), "{note}");
+            hit_lines(&r)
+        };
+        let function = vec![
+            "app/main.go:12",
+            "shell_completions.go:11",
+            "shell_completions.go:15",
+        ];
+        let method = vec![
+            "app/main.go:10",
+            "command_test.go:7",
+            "flag_groups.go:4",
+            "shell_completions.go:10",
+        ];
+        // Bare call inside the method's own body: the package function.
+        assert_eq!(at("shell_completions.go", 10), function);
+        assert_eq!(at("app/main.go", 11), function, "cobra.MarkFlagRequired");
+        assert_eq!(at("flag_groups.go", 3), method, "c.MarkFlagRequired");
+        assert_eq!(at("app/main.go", 9), method, "cmd := &cobra.Command{{}}");
+        // Declaration lines still pick their own declaration.
+        assert_eq!(at("shell_completions.go", 14), function);
+        assert_eq!(at("shell_completions.go", 9), method);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hit two declarations could both claim (an interface method and a
+    /// concrete one, receiver not typable): the index cannot group it, the
+    /// language server decides.
+    #[test]
+    fn go_overlapping_groups_defer_to_the_server() {
+        let dir = repo(&[
+            ("go.mod", "module example.com/m\n"),
+            (
+                "p/a.go",
+                "package p\n\ntype Runner interface {\n\tRun() error\n}\n\ntype T struct{}\n\nfunc (t *T) Run() error { return nil }\n\nfunc use(rs []Runner) {\n\tfor _, r := range rs {\n\t\t_ = r.Run()\n\t}\n}\n",
+            ),
+            ("q/b.go", "package q\n\nfunc Z() {}\n"),
+        ]);
+        let ix = index(&dir);
+        assert!(graph_references(&ix, &dir, "Run", &RelPath::new("q/b.go")).is_none());
+        assert!(grouped_references_without_path(&ix, &dir, "Run").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Batch 8 E1 r2: no path, `ViaQuietDropped` declared in two packages.
+    #[test]
+    fn go_no_path_several_packages_is_grouped() {
+        let dir = repo(&[
+            ("src/go.mod", "module aicon\n"),
+            (
+                "src/server/srv/push/quiet.go",
+                "package push\n\nconst (\n\tViaQuietDropped = \"quiet_dropped\"\n)\n\nfunc q() string { return ViaQuietDropped }\n",
+            ),
+            (
+                "src/daemon/internal/signaling/wake.go",
+                "package signaling\n\nconst ViaQuietDropped = \"dropped\"\n\nfunc W() string { return ViaQuietDropped }\n",
+            ),
+            (
+                "src/server/api/h.go",
+                "package api\n\nimport \"aicon/server/srv/push\"\n\nfunc H() string { return push.ViaQuietDropped }\n",
+            ),
+        ]);
+        let ix = index(&dir);
+        let r = grouped_references_without_path(&ix, &dir, "ViaQuietDropped").expect("grouped");
+        assert_eq!(
+            hit_lines(&r),
+            vec![
+                "src/daemon/internal/signaling/wake.go:3",
+                "src/daemon/internal/signaling/wake.go:5",
+                "src/server/api/h.go:5",
+                "src/server/srv/push/quiet.go:4",
+                "src/server/srv/push/quiet.go:7",
+            ]
+        );
+        let note = r.note.unwrap();
+        assert!(
+            note.contains("有 2 处同名定义") && note.contains("[定义2]"),
+            "{note}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
