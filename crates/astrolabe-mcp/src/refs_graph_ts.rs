@@ -426,6 +426,28 @@ pub(crate) fn ts_scope(
     scope
 }
 
+/// `name` at `byte` is an object-literal key or type member (`name:` right
+/// after `{`, `,` or the start of the line; not `::`, not a `case` label,
+/// not a destructuring `require`/`import` binding).
+pub(crate) fn is_object_key(line: &str, byte: usize) -> bool {
+    let Some(rest) = line.get(byte..) else {
+        return false;
+    };
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    let after = rest[end..].trim_start();
+    let after = after.strip_prefix('?').unwrap_or(after).trim_start();
+    if !after.starts_with(':') || after.starts_with("::") {
+        return false;
+    }
+    if line.contains("require(") || line.trim_start().starts_with("import ") {
+        return false;
+    }
+    let before = line[..byte].trim_end();
+    before.is_empty() || before.ends_with('{') || before.ends_with(',')
+}
+
 /// When the first occurrence of `name` on 1-based `line` is a property
 /// assignment target `x.name =` (also `x.y.name =`), the object right
 /// before the dot (`x`, or `y`).
@@ -925,6 +947,18 @@ mod tests {
                 f.local_exports
             );
         }
+    }
+
+    #[test]
+    fn object_keys_are_not_references() {
+        assert!(is_object_key("  smootherstep: smootherstep,", 2));
+        assert!(!is_object_key("  smootherstep: smootherstep,", 16));
+        assert!(is_object_key("const o = { a: 1, fn: x }", 18));
+        assert!(is_object_key("  fn?: string;", 2));
+        assert!(!is_object_key("  case fn: break", 7));
+        assert!(!is_object_key("cond ? fn : other", 7));
+        assert!(!is_object_key("const { fn: f } = require('./x')", 8));
+        assert!(!is_object_key("  call(fn)", 7));
     }
 
     #[test]

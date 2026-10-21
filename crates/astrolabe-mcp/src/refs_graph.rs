@@ -35,15 +35,19 @@ const MAX_GRAPH_HITS: usize = 2_000;
 /// Source line text kept per hit.
 pub(crate) const HIT_TEXT_CHARS: usize = 120;
 
-/// Languages whose `find_references` is answered from the index first.
+/// Languages whose `find_references` is answered from the index first for
+/// every symbol kind: Go.
 ///
 /// Chosen by measurement against the language servers
 /// (`docs/find-references-graph-first.md`): on cobra / aiproxy / aicon the
-/// Go answer recalled every gopls hit (precision ≥ 0.996). TypeScript /
-/// JavaScript and Python keep the language server first: members reached
-/// through attributes (`self.x.method`, `exports.x`) are not tied to the
-/// declaring file by the import graph, which measurably cost recall
-/// (Python 0.78) or precision (JS 0.70).
+/// Go answer recalled every gopls hit (precision ≥ 0.996).
+///
+/// TypeScript/TSX and Python are index-first only for top-level names
+/// with exactly one definition in the repo (batch 7, measured against
+/// LanguageService / pyright baselines): see
+/// [`crate::refs_graph_ts::ts_graph_first`] and `py_refs::graph_first`.
+/// Their methods and fields, names with several definitions, and
+/// JavaScript keep the language server first.
 pub(crate) fn graph_first_language(language: Language) -> bool {
     matches!(language, Language::Go)
 }
@@ -1545,6 +1549,17 @@ pub(crate) fn graph_references_at(
                 if !embedded {
                     continue;
                 }
+            }
+            // TS/JS object-literal key / type member `name: …` (after `{`,
+            // `,` or at line start): a property, not the declaration
+            // (`{ smootherstep: smootherstep }`, `interface I { name: T }`).
+            if ts.is_some()
+                && !is_decl
+                && base.is_none()
+                && crate::refs_graph_ts::is_object_key(&lines[line], byte)
+            {
+                members += 1;
+                continue;
             }
             // TS/JS top-level declarations: `x.name` is ours only through a
             // module object (`ns.name`, `require(...).name` bound to a local).
