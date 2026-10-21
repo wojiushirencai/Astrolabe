@@ -514,7 +514,7 @@ fn discover(
     let scanned = scan::scan(root, &opts.scan);
     let files = scan::to_index(root, &scanned);
     let resolvers = ResolverSet::detect(&files);
-    let (scanned, files, dropped) = apply_declared_excludes(root, scanned, &resolvers);
+    let (scanned, files, dropped) = apply_declared_excludes(root, scanned, files, &resolvers);
     (scanned, files, resolvers, dropped)
 }
 
@@ -534,6 +534,7 @@ fn dropped_sources(before: &[RelPath], after: &[RelPath]) -> Vec<RelPath> {
 fn apply_declared_excludes(
     root: &Path,
     scanned: ScanResult,
+    files: FileIndex,
     resolvers: &ResolverSet,
 ) -> (ScanResult, FileIndex, Vec<RelPath>) {
     // Build output can sit outside the default exclude list — Cargo's
@@ -542,16 +543,21 @@ fn apply_declared_excludes(
     // than walked twice. Detection itself stays valid: dropping generated
     // files cannot invalidate the build config we already read.
     let excludes = declared_excludes(resolvers);
+    // `files` is the index of `scanned` as passed in; it is rebuilt only
+    // when an exclude actually removed something (rebuilding it was a
+    // visible share of every incremental apply).
     if excludes.is_empty() {
-        let files = scan::to_index(root, &scanned);
-        (scanned, files, Vec::new())
-    } else {
-        let before = scanned.files.clone();
-        let scanned = scan::apply_excludes(scanned, &excludes);
-        let dropped = dropped_sources(&before, &scanned.files);
-        let files = scan::to_index(root, &scanned);
-        (scanned, files, dropped)
+        return (scanned, files, Vec::new());
     }
+    let before_len = scanned.files.len();
+    let before = scanned.files.clone();
+    let scanned = scan::apply_excludes(scanned, &excludes);
+    if scanned.files.len() == before_len {
+        return (scanned, files, Vec::new());
+    }
+    let dropped = dropped_sources(&before, &scanned.files);
+    let files = scan::to_index(root, &scanned);
+    (scanned, files, dropped)
 }
 
 /// `(mtime, len)` of a file as observed before it was read.
@@ -1143,7 +1149,8 @@ fn assemble_graph_with(
     report.files_parsed = parsed.len();
 
     let mut graph = CodeGraph::default();
-    let mut index_of: HashMap<RelPath, FileId, FxBuild> = HashMap::default();
+    let mut index_of: HashMap<RelPath, FileId, FxBuild> =
+        HashMap::with_capacity_and_hasher(parsed.len(), FxBuild::default());
     for (i, row) in parsed.iter().enumerate() {
         let id = FileId(i as u32);
         index_of.insert(row.path.clone(), id);
@@ -1328,7 +1335,8 @@ fn assemble_graph_with(
         // Import edges join files; call edges join symbols. Both endpoints are
         // plain u32, so the distinction lives in `kind` — callers must read it
         // before interpreting `from`/`to`.
-        let mut by_name: HashMap<&str, Vec<SymbolId>, FxBuild> = HashMap::default();
+        let mut by_name: HashMap<&str, Vec<SymbolId>, FxBuild> =
+            HashMap::with_capacity_and_hasher(graph.symbols.len(), FxBuild::default());
         for s in &graph.symbols {
             by_name.entry(s.name.as_str()).or_default().push(s.id);
         }
@@ -1776,7 +1784,8 @@ pub fn index_repo_incremental(
     } else {
         (ResolverSet::detect(&file_index), None)
     };
-    let (scanned, file_index, newly_dropped) = apply_declared_excludes(root, scanned, &resolvers);
+    let (scanned, file_index, newly_dropped) =
+        apply_declared_excludes(root, scanned, file_index, &resolvers);
     let mut excluded_sources: BTreeSet<RelPath> = previous
         .excluded_sources
         .iter()
