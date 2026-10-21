@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::refs_graph::{HitInfo, HitKind};
+use crate::refs_render;
 
 const DEFAULT_BUDGET: usize = 2_500;
 
@@ -170,6 +171,11 @@ pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
     /// then renders as bare coordinates.
     fn annotate(&self, _symbol: &str, _locations: &[Location]) -> Vec<HitInfo> {
         Vec::new()
+    }
+    /// Source lines of a repo-relative file (cached), for inline caller
+    /// context. `None`: no context is shown.
+    fn source_lines(&self, _path: &str) -> Option<Arc<Vec<String>>> {
+        None
     }
     fn definition(
         &self,
@@ -342,7 +348,7 @@ pub(crate) fn run_find_references(
     if infos.len() != locations.len() {
         infos = vec![HitInfo::default(); locations.len()];
     }
-    let hits = RefHits::new(&locations, &infos);
+    let mut hits = RefHits::new(&locations, &infos);
     let wide = params.offset.is_none()
         && params.dry_run_rename.is_none()
         && locations.len() > WIDE_REFERENCES;
@@ -369,12 +375,49 @@ pub(crate) fn run_find_references(
     }
 
     let offset = params.offset.unwrap_or(0);
-    let items = hits.items();
-    let summary = if locations.is_empty() {
+    let mut summary = if locations.is_empty() {
         String::new()
     } else {
         hits.summary_line()
     };
+    if offset == 0 {
+        if let Some(line) = refs_render::caller_summary(&locations, &infos) {
+            summary.push_str(&line);
+        }
+    }
+    // Complete by construction (language server, or the index answer), so
+    // the model can stop instead of grepping to re-check.
+    let complete = refs_render::complete_source(result.confidence, result.note.as_deref())
+        .filter(|_| !locations.is_empty());
+    let files = locations
+        .iter()
+        .map(|l| l.path.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let completion = complete
+        .map(|src| refs_render::completion_line(locations.len(), files, src))
+        .unwrap_or_default();
+    // Short lists carry the callers' code inline (no Read needed), when it
+    // fits the budget with the whole list.
+    let mut items = hits.items();
+    if params.dry_run_rename.is_none() && offset == 0 {
+        hits.ctx = refs_render::context_blocks(&locations, &infos, &hits.order, &|p| {
+            backend.source_lines(p)
+        });
+        if !hits.ctx.blocks.is_empty() {
+            let with_ctx = hits.items();
+            let fixed = estimate_tokens(&preamble)
+                + estimate_tokens(&summary)
+                + estimate_tokens(REF_COORD_NOTE)
+                + estimate_tokens(&completion);
+            let need: usize = with_ctx.iter().map(|l| estimate_tokens(l) + 1).sum();
+            if fixed + need <= params.budget_tokens {
+                items = with_ctx;
+            } else {
+                hits.ctx = refs_render::Context::default();
+            }
+        }
+    }
     // The header (confidence, note, summary, coordinate line, truncation
     // marker) is part of the output, so it is charged to the budget first.
     let overhead = estimate_tokens(&preamble)
@@ -405,6 +448,8 @@ pub(crate) fn run_find_references(
     let next_offset = offset + kept.len();
     if omitted > 0 {
         body.push_str(&omitted_line(omitted, next_offset));
+    } else if offset == 0 && !kept.is_empty() {
+        body.push_str(&completion);
     }
     let mut preview_files = 0usize;
     if let Some(new_name) = params.dry_run_rename.as_deref() {
@@ -439,6 +484,8 @@ pub(crate) fn run_find_references(
             "next_offset": (omitted > 0).then_some(next_offset),
             "dry_run_rename": params.dry_run_rename.is_some(),
             "rename_files": preview_files,
+            "complete": complete.is_some() && omitted == 0 && offset == 0,
+            "context_blocks": hits.ctx.blocks.len(),
         }),
     )
 }
@@ -457,6 +504,8 @@ struct RefHits<'a> {
     locations: &'a [Location],
     infos: &'a [HitInfo],
     order: Vec<usize>,
+    /// Inline caller context for short lists (empty otherwise).
+    ctx: refs_render::Context,
 }
 
 impl<'a> RefHits<'a> {
@@ -468,6 +517,7 @@ impl<'a> RefHits<'a> {
             locations,
             infos,
             order,
+            ctx: refs_render::Context::default(),
         }
     }
 
@@ -562,7 +612,12 @@ impl<'a> RefHits<'a> {
         if let Some((name, start, end)) = &info.enclosing {
             line.push_str(&format!(" in {name}[{start}-{end}]"));
         }
-        if let Some(text) = info.text.as_deref().filter(|t| !t.is_empty()) {
+        // The line already shows in an inline context block.
+        if let Some(text) = info
+            .text
+            .as_deref()
+            .filter(|t| !t.is_empty() && !self.ctx.covered.contains(&i))
+        {
             line.push_str(": ");
             line.push_str(text);
         }
@@ -585,6 +640,10 @@ impl<'a> RefHits<'a> {
                 item.push_str(&self.file_header(path, test));
             }
             item.push_str(&self.hit_line(i));
+            if let Some(block) = self.ctx.blocks.get(&i) {
+                item.push('\n');
+                item.push_str(block.trim_end_matches('\n'));
+            }
             prev = Some((test, path));
             out.push(item);
         }

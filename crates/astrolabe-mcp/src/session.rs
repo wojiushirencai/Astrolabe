@@ -149,13 +149,16 @@ impl RootSession {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let state = Arc::new(RwLock::new(IndexState::Building));
         let syntax_state = Arc::clone(&state);
-        let precise =
-            LiveBackend::new(root.clone()).with_syntax_index(Arc::new(
-                move || match &*syntax_state.read().ok()? {
-                    IndexState::Ready(index) => Some(Arc::clone(index)),
-                    _ => None,
-                },
-            ));
+        let file_cache = Arc::new(FileCache::new(CacheConfig {
+            budget_bytes: cache_budget_bytes,
+            ..CacheConfig::default()
+        }));
+        let precise = LiveBackend::new(root.clone())
+            .with_syntax_index(Arc::new(move || match &*syntax_state.read().ok()? {
+                IndexState::Ready(index) => Some(Arc::clone(index)),
+                _ => None,
+            }))
+            .with_file_cache(Arc::clone(&file_cache));
         Arc::new(Self {
             precise: Arc::new(precise),
             root,
@@ -164,10 +167,7 @@ impl RootSession {
             freshness: Arc::new(Mutex::new(None)),
             indexer_lock: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(ChangeSet::default())),
-            file_cache: SharedFileCache(Arc::new(FileCache::new(CacheConfig {
-                budget_bytes: cache_budget_bytes,
-                ..CacheConfig::default()
-            }))),
+            file_cache: SharedFileCache(file_cache),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             cache_budget_bytes,

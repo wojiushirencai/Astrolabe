@@ -17,7 +17,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
+use astrolabe_core::cache::FileCache;
 use astrolabe_core::lsp::{Location, Position, Precise, Range};
 use astrolabe_core::types::{
     CodeSymbol, Confidence, EdgeKind, FileId, Language, RelPath, SymbolKind,
@@ -46,14 +48,29 @@ pub(crate) fn graph_first_language(language: Language) -> bool {
     matches!(language, Language::Go)
 }
 
-fn read_lines(root: &Path, path: &str) -> Option<Vec<String>> {
+thread_local! {
+    /// Session file cache for the reads of one `find_references` call (see
+    /// [`with_file_cache`]); `None` reads from disk.
+    static FILE_CACHE: std::cell::RefCell<Option<Arc<FileCache>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with [`read_lines`] served from `cache` (the session's
+/// search_code cache, keyed by repo-relative path, mtime/len-checked), so
+/// fix_path / snap / graph / annotate stop re-reading the same files.
+pub(crate) fn with_file_cache<R>(cache: Option<&Arc<FileCache>>, f: impl FnOnce() -> R) -> R {
+    let prev = FILE_CACHE.with(|c| c.replace(cache.cloned()));
+    let out = f();
+    FILE_CACHE.with(|c| *c.borrow_mut() = prev);
+    out
+}
+
+pub(crate) fn read_lines(root: &Path, path: &str) -> Option<Arc<Vec<String>>> {
+    if let Some(cache) = FILE_CACHE.with(|c| c.borrow().clone()) {
+        return crate::index::load_source_lines(&cache, root, path).map(|(lines, _)| lines);
+    }
     let source = astrolabe_core::text::read_source(&root.join(path)).ok()?;
-    Some(
-        source
-            .split('\n')
-            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned())
-            .collect(),
-    )
+    Some(Arc::new(source.lines().map(str::to_owned).collect()))
 }
 
 fn is_ident(c: char) -> bool {

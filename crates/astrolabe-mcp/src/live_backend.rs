@@ -57,6 +57,9 @@ pub(crate) struct LiveBackend {
     /// then take the synchronous `acquire` path so the real error (install
     /// hint) reaches the user instead of an endless "still importing".
     start_failed: Arc<AtomicBool>,
+    /// The session's search_code file cache; `find_references` reads
+    /// through it instead of re-reading each file several times per call.
+    file_cache: Option<Arc<astrolabe_core::cache::FileCache>>,
 }
 
 impl std::fmt::Debug for LiveBackend {
@@ -82,7 +85,14 @@ impl LiveBackend {
             syntax: None,
             starting: Arc::new(AtomicBool::new(false)),
             start_failed: Arc::new(AtomicBool::new(false)),
+            file_cache: None,
         }
+    }
+
+    /// Serve `find_references` file reads from the session's file cache.
+    pub(crate) fn with_file_cache(mut self, cache: Arc<astrolabe_core::cache::FileCache>) -> Self {
+        self.file_cache = Some(cache);
+        self
     }
 
     /// Answer from `index` while a language server is still warming up.
@@ -583,6 +593,88 @@ impl PreciseCapability for LiveBackend {
         position: Option<Position>,
         exact: bool,
     ) -> Precise<Vec<Location>> {
+        refs_graph::with_file_cache(self.file_cache.as_ref(), || {
+            self.references_inner(symbol, path, position, exact)
+        })
+    }
+
+    fn annotate(&self, symbol: &str, locations: &[Location]) -> Vec<refs_graph::HitInfo> {
+        let index = self.syntax.as_ref().and_then(|f| f());
+        refs_graph::with_file_cache(self.file_cache.as_ref(), || {
+            refs_graph::annotate(index.as_deref(), &self.root, symbol, locations)
+        })
+    }
+
+    fn source_lines(&self, path: &str) -> Option<Arc<Vec<String>>> {
+        refs_graph::with_file_cache(self.file_cache.as_ref(), || {
+            refs_graph::read_lines(&self.root, path)
+        })
+    }
+
+    fn definition(
+        &self,
+        path: &str,
+        symbol: Option<&str>,
+        line: Option<u32>,
+        character: Option<u32>,
+    ) -> Precise<Vec<Location>> {
+        let Some(language) = server_language(&self.root, path) else {
+            return Precise::unknown(Vec::new(), unknown_language("精确定义查询", path));
+        };
+        let rel = RelPath::new(path);
+        // The symbol wins over coordinates that disagree with it.
+        let mut snap_note = None;
+        let (line, character) = match (line, character, symbol) {
+            (Some(l), Some(c), Some(name)) if !name.trim().is_empty() => {
+                let snap = refs_graph::snap_position(
+                    &self.root,
+                    path,
+                    name,
+                    Position {
+                        line: l,
+                        character: c,
+                    },
+                );
+                snap_note = snap.note;
+                match snap.position {
+                    Some(p) => (Some(p.line), Some(p.character)),
+                    None => (None, None),
+                }
+            }
+            other => (other.0, other.1),
+        };
+        let mut result = self.definition_at(language, &rel, symbol, line, character);
+        if let Some(note) = snap_note {
+            result.note = Some(match result.note.take().filter(|n| !n.is_empty()) {
+                Some(rest) => format!("{note}\n{rest}"),
+                None => note,
+            });
+        }
+        result
+    }
+
+    fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>> {
+        let rel = RelPath::new(path);
+        let Some(language) = server_language(&self.root, path) else {
+            return Precise::unknown(Vec::new(), unknown_language("诊断", path));
+        };
+        match self.with_server(language, |server| {
+            query_server(server, &rel, FetchOptions::default())
+        }) {
+            Ok(result) => result,
+            Err(error) => Precise::unknown(Vec::new(), error.to_string()),
+        }
+    }
+}
+
+impl LiveBackend {
+    fn references_inner(
+        &self,
+        symbol: &str,
+        path: Option<&str>,
+        position: Option<Position>,
+        exact: bool,
+    ) -> Precise<Vec<Location>> {
         let index = self.syntax.as_ref().and_then(|f| f());
         let mut notes: Vec<String> = Vec::new();
         let mut path: Option<String> = path.map(str::to_string);
@@ -651,66 +743,6 @@ impl PreciseCapability for LiveBackend {
             result.note = Some(head);
         }
         result
-    }
-
-    fn annotate(&self, symbol: &str, locations: &[Location]) -> Vec<refs_graph::HitInfo> {
-        let index = self.syntax.as_ref().and_then(|f| f());
-        refs_graph::annotate(index.as_deref(), &self.root, symbol, locations)
-    }
-
-    fn definition(
-        &self,
-        path: &str,
-        symbol: Option<&str>,
-        line: Option<u32>,
-        character: Option<u32>,
-    ) -> Precise<Vec<Location>> {
-        let Some(language) = server_language(&self.root, path) else {
-            return Precise::unknown(Vec::new(), unknown_language("精确定义查询", path));
-        };
-        let rel = RelPath::new(path);
-        // The symbol wins over coordinates that disagree with it.
-        let mut snap_note = None;
-        let (line, character) = match (line, character, symbol) {
-            (Some(l), Some(c), Some(name)) if !name.trim().is_empty() => {
-                let snap = refs_graph::snap_position(
-                    &self.root,
-                    path,
-                    name,
-                    Position {
-                        line: l,
-                        character: c,
-                    },
-                );
-                snap_note = snap.note;
-                match snap.position {
-                    Some(p) => (Some(p.line), Some(p.character)),
-                    None => (None, None),
-                }
-            }
-            other => (other.0, other.1),
-        };
-        let mut result = self.definition_at(language, &rel, symbol, line, character);
-        if let Some(note) = snap_note {
-            result.note = Some(match result.note.take().filter(|n| !n.is_empty()) {
-                Some(rest) => format!("{note}\n{rest}"),
-                None => note,
-            });
-        }
-        result
-    }
-
-    fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>> {
-        let rel = RelPath::new(path);
-        let Some(language) = server_language(&self.root, path) else {
-            return Precise::unknown(Vec::new(), unknown_language("诊断", path));
-        };
-        match self.with_server(language, |server| {
-            query_server(server, &rel, FetchOptions::default())
-        }) {
-            Ok(result) => result,
-            Err(error) => Precise::unknown(Vec::new(), error.to_string()),
-        }
     }
 }
 
@@ -796,6 +828,7 @@ mod start_failure_tests {
             syntax: Some(syntax),
             starting: Arc::new(AtomicBool::new(false)),
             start_failed: Arc::new(AtomicBool::new(false)),
+            file_cache: None,
         };
         // First call: warming while the background start runs.
         let first = backend.with_server(Language::Kotlin, |s| s.is_none());
