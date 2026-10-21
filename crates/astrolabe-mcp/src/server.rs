@@ -2335,10 +2335,6 @@ impl AstrolabeServer {
         }
     }
 
-    /// Catalog for `tools/list`: drop `excluded_tools`, optionally sanitize
-    /// schemas for OpenAI/Codex, then sort by name.
-    fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
-        let mut tools = self.tool_router.list_all();
     /// The coordinate legend of find_references / goto_definition is the
     /// same sentence every time (seven times in one A/B run); keep the
     /// first one in the session and drop the rest.
@@ -2364,17 +2360,21 @@ impl AstrolabeServer {
         result
     }
 
+    /// Catalog for `tools/list`: drop `excluded_tools`, optionally sanitize
+    /// schemas for OpenAI/Codex, then sort by name.
+    fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
+        let mut tools = self.tool_router.list_all();
         tools.retain(|tool| !self.context.excludes(tool.name.as_ref()));
         for tool in &mut tools {
             let mut schema = Value::Object((*tool.input_schema).clone());
             slim_schema(&mut schema);
+            if !full_schema_requested() {
+                hide_unadvertised_params(&mut schema, self.dispatch.is_some());
+            }
             if let Value::Object(slim) = schema {
                 tool.input_schema = Arc::new(slim);
             }
             // Every served tool only reads the repository (dry_run_rename
-            if !full_schema_requested() {
-                hide_unadvertised_params(&mut schema, self.dispatch.is_some());
-            }
             // previews, never writes). Claude Code runs MCP calls from one
             // turn concurrently only when `readOnlyHint` is true
             // (`isConcurrencySafe`); without it they queue serially. A tool
@@ -2566,10 +2566,6 @@ impl AstrolabeServer {
 /// type is enough), and the `["x","null"]` union of `Option<T>` fields, which
 /// becomes plain `"x"`: optional is already expressed by absence from
 /// `required`, and deserialization still accepts an explicit `null`.
-fn slim_schema(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.remove("$schema");
 /// Parameters still accepted by every tool but left out of `tools/list`.
 /// None was passed once in 66 A/B runs (306 Astrolabe calls), yet together
 /// they were 3.4 KB of the 7.3 KB catalog, resent on every API turn. Tool
@@ -2618,6 +2614,10 @@ fn hide_unadvertised_params(schema: &mut Value, multi_root: bool) {
     }
 }
 
+fn slim_schema(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
             if map.get("default").is_some_and(Value::is_null) {
                 map.remove("default");
             }
@@ -7242,6 +7242,7 @@ mod tests {
         assert!(find_symbol.contains("include_body"), "{find_symbol}");
         assert!(!find_symbol.contains("offset=next_offset"), "{find_symbol}");
         let find_references = desc("find_references");
+        // One source of truth: index-first, language server as fallback.
         assert!(
             !find_references.contains("LSP-resolved"),
             "{find_references}"
@@ -7262,7 +7263,6 @@ mod tests {
         assert_eq!(parse_cache_budget_mb(Some("8")), 8 * 1024 * 1024);
         assert_eq!(parse_cache_budget_mb(Some("256")), 256 * 1024 * 1024);
         assert_eq!(parse_cache_budget_mb(Some(" 4 ")), 4 * 1024 * 1024);
-        // One source of truth: index-first, language server as fallback.
         assert_eq!(
             parse_cache_budget_mb(Some("nope")),
             DEFAULT_MEMORY_BUDGET_BYTES
@@ -8150,6 +8150,9 @@ mod tests {
             .pointer("/properties/path_filter/description")
             .unwrap();
         let tool_desc = search.description.as_deref().unwrap_or("");
+        // `regex` is accepted but not advertised; query and tool descriptions
+        // still name it.
+        assert!(schema.pointer("/properties/regex").is_none());
         assert!(query.as_str().unwrap().contains("regex=true"), "{query}");
         assert!(
             path_filter.as_str().unwrap().contains("case-sensitive"),
@@ -8161,9 +8164,6 @@ mod tests {
         assert!(!tool_desc.contains("offset=next_offset"), "{tool_desc}");
     }
 
-        // `regex` is accepted but not advertised; query and tool descriptions
-        // still name it.
-        assert!(schema.pointer("/properties/regex").is_none());
     fn server_on_files(files: &[(&str, &str)]) -> (AstrolabeServer, PathBuf) {
         let dir = unique_temp_dir();
         for (path, body) in files {
