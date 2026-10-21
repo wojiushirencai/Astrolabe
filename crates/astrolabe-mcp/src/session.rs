@@ -599,9 +599,9 @@ fn settle_unapplied(session: &Arc<RootSession>) -> Option<String> {
             missing.len(),
             sample,
             !health.unapplied.is_empty()
-                && !health
+                && health
                     .rebuild_backoff_until
-                    .is_some_and(|until| Instant::now() < until),
+                    .is_none_or(|until| Instant::now() >= until),
         )
     };
     if needs_rebuild {
