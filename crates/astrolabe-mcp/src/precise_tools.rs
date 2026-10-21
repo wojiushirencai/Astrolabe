@@ -889,6 +889,9 @@ pub(crate) fn run_get_diagnostics(
     };
 
     let result = backend.diagnostics(&params.path);
+    if let Some(fault) = crate::diag_env::detect(&params.path, &result.value) {
+        return env_fault_result(&params, &result.value, &fault);
+    }
     let mut diagnostics = result.value;
     if let Some(min) = min_severity {
         diagnostics.retain(|d| d.severity <= min);
@@ -934,6 +937,59 @@ pub(crate) fn run_get_diagnostics(
             "confidence": confidence_json(result.confidence),
             "budget_tokens": params.budget_tokens,
             "matches": diagnostics.len(),
+        }),
+    )
+}
+
+/// The toolchain environment is broken (read-only GOCACHE, modules not
+/// downloadable, wrong venv, no node_modules…), so the diagnostics are
+/// cascade noise. Say so in a few lines: the root-cause line, how many were
+/// dropped, and any parser errors (those do not depend on the environment).
+fn env_fault_result(
+    params: &GetDiagnosticsParams,
+    diags: &[Diagnostic],
+    fault: &crate::diag_env::EnvFault,
+) -> CallToolResult {
+    const ROOT_MAX_CHARS: usize = 400;
+    const SYNTAX_MAX: usize = 10;
+    let mut root_line = render_diagnostic(&diags[fault.root]);
+    if root_line.chars().count() > ROOT_MAX_CHARS {
+        root_line = root_line.chars().take(ROOT_MAX_CHARS).collect::<String>() + "…";
+    }
+    let syntax: Vec<&Diagnostic> = diags
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| *i != fault.root && crate::diag_env::is_syntax_error(d))
+        .map(|(_, d)| d)
+        .collect();
+    let suppressed = diags.len() - 1 - syntax.len();
+    let mut body = confidence_header(Confidence::Unknown);
+    body.push_str(&format!(
+        "环境异常，诊断不可信：{}。\n根因：{root_line}\n",
+        fault.kind
+    ));
+    if suppressed > 0 {
+        body.push_str(&format!(
+            "另有 {suppressed} 条诊断多半是它引发的级联错误，已省略。\n"
+        ));
+    }
+    if !syntax.is_empty() {
+        body.push_str("下列语法错误与环境无关，仍可信：\n");
+        for d in syntax.iter().take(SYNTAX_MAX) {
+            body.push_str(&render_diagnostic(d));
+            body.push('\n');
+        }
+    }
+    body.push_str(fault.hint);
+    body.push('\n');
+    text_result(
+        body,
+        json!({
+            "confidence": "unknown",
+            "budget_tokens": params.budget_tokens,
+            "matches": syntax.len(),
+            "environment_fault": fault.kind,
+            "suppressed": suppressed,
         }),
     )
 }

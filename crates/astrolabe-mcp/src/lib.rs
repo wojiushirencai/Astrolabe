@@ -12,6 +12,7 @@ mod code_mask;
 mod context;
 mod context_page;
 mod coverage;
+mod diag_env;
 mod ensure_ls;
 mod explain;
 mod knobs;
