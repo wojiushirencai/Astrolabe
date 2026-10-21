@@ -973,32 +973,36 @@ fn persist_cache_writes(
             .expect("live paths poisoned")
             .into_iter()
             .collect();
-        match store.prune_parse_cache(&live_keys, &live_paths) {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(removed, "parse cache pruned");
-                // redb reuses freed pages but never returns them, so after an
-                // upgrade (every old-format entry dead at once) the file would
-                // keep the previous generation's size on top of the new one.
-                // Compact when a large share went; it is a one-off after a
-                // format or extractor change, not a per-start cost.
-                if removed >= COMPACT_MIN_REMOVED && removed * 4 >= removed + live_keys.len() {
-                    let started = std::time::Instant::now();
-                    match store.compact() {
-                        Ok(_) => tracing::info!(
-                            removed,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "parse cache compacted"
-                        ),
-                        Err(error) => tracing::warn!(
-                            error = %error,
-                            "parse cache compaction failed; index is still valid"
-                        ),
-                    }
-                }
-            }
-            Ok(_) => {}
+        let removed = match store.prune_parse_cache(&live_keys, &live_paths) {
+            Ok(removed) => removed,
             Err(error) => {
                 tracing::warn!(error = %error, "parse cache prune failed; index is still valid");
+                0
+            }
+        };
+        if removed > 0 {
+            tracing::info!(removed, "parse cache pruned");
+        }
+        // redb reuses freed pages but never returns them. After an upgrade
+        // (every old-format entry dead at once) the file would keep the
+        // previous generation's size on top of the new one, and a cold build
+        // leaves the slack of its batched commits. Compact when a large share
+        // of the table was removed or rewritten: a one-off after a format or
+        // extractor change or a cold build (tens of ms), never on a warm start.
+        let churn = removed.max(stored);
+        if churn >= COMPACT_MIN_CHURN && churn * 4 >= removed + live_keys.len() {
+            let started = std::time::Instant::now();
+            match store.compact() {
+                Ok(_) => tracing::info!(
+                    removed,
+                    stored,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "parse cache compacted"
+                ),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "parse cache compaction failed; index is still valid"
+                ),
             }
         }
     }
@@ -1010,9 +1014,9 @@ fn persist_cache_writes(
     );
 }
 
-/// Pruned entries that make a compaction worthwhile (and at least a quarter
-/// of the table).
-const COMPACT_MIN_REMOVED: usize = 256;
+/// Removed or written entries that make a compaction worthwhile (and at
+/// least a quarter of the table).
+const COMPACT_MIN_CHURN: usize = 256;
 
 /// Parse every path that has a known language. Failures are collected, never
 /// swallowed. A disk-store cache hit skips tree-sitter; FileId assignment
@@ -3536,7 +3540,7 @@ mod persist_audit_tests {
             // A previous format's generation: many dead entries at once.
             let s = Store::open(&store_path(&root)).unwrap();
             let junk = vec![b'j'; 8 * 1024];
-            let keys: Vec<String> = (0..COMPACT_MIN_REMOVED + 50)
+            let keys: Vec<String> = (0..COMPACT_MIN_CHURN + 50)
                 .map(|i| format!("x6-v0.15.0:python:{i:016x}"))
                 .collect();
             s.put_cached_parses(keys.iter().map(|k| (k.as_str(), junk.as_slice())))
