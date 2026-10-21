@@ -166,6 +166,130 @@ pub fn is_roslyn_dll(path: &Path) -> bool {
     is_dll && name.to_ascii_lowercase().contains("languageserver")
 }
 
+/// MSBuild hook through which Roslyn's design-time builds pick up
+/// [`msbuild_redirect`]'s props file. Imported by `Microsoft.Common.props`
+/// right after the project's own `Directory.Build.props` and before the SDK
+/// derives `IntermediateOutputPath` from `BaseIntermediateOutputPath`.
+pub const MSBUILD_HOOK_ENV: &str = "CustomAfterDirectoryBuildProps";
+
+/// Overrides where design-time build output goes (`<dir>/obj/...`). `off`
+/// (or `0`, `false`, `project`) keeps MSBuild's default `obj/` in the project.
+pub const ENV_ROSLYN_OBJ_DIR: &str = "ASTROLABE_ROSLYN_OBJ_DIR";
+
+/// Environment for the Roslyn process so its design-time builds keep the
+/// user's project tree clean.
+///
+/// Even with NuGet restore switched off, every project load runs a
+/// design-time build that writes `obj/<Configuration>/<tfm>/`
+/// (`AssemblyInfo.cs`, `GlobalUsings.g.cs`, `*.editorconfig`, `*.cache`)
+/// into the user's project. A props file under Astrolabe's own cache points
+/// `IntermediateOutputPath` (one subdirectory per project file) there
+/// instead. `BaseIntermediateOutputPath` / `MSBuildProjectExtensionsPath` are
+/// left alone: that is where an existing `project.assets.json` and the
+/// `*.nuget.g.props` imports live, and moving them would make every package
+/// reference unresolved. A project that sets `IntermediateOutputPath` itself
+/// keeps its own value. A `CustomAfterDirectoryBuildProps` already in the
+/// environment is still imported.
+///
+/// Returns the variable to set and the props path, or `None` when disabled
+/// or the cache directory cannot be written (Roslyn then starts as before).
+pub fn msbuild_redirect(root: &Path) -> Option<(&'static str, PathBuf)> {
+    let base = match std::env::var_os(ENV_ROSLYN_OBJ_DIR).filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let s = v.to_string_lossy().to_ascii_lowercase();
+            if matches!(s.as_str(), "off" | "0" | "false" | "project") {
+                return None;
+            }
+            PathBuf::from(v)
+        }
+        None => roslyn_cache_dir(root),
+    };
+    let chained = std::env::var_os(MSBUILD_HOOK_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let props = write_redirect_props(&base, chained.as_deref()).ok()?;
+    Some((MSBUILD_HOOK_ENV, props))
+}
+
+/// `~/.astrolabe/roslyn/<repo>-<hash>`: one directory per repo root.
+fn roslyn_cache_dir(root: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
+    let name = canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".into());
+    let base = super::installer::default_servers_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("roslyn")
+        .join(format!("{name}-{}", &hex::encode(digest)[..12]))
+}
+
+/// Write `<base>/astrolabe-obj.props` (only when its content changed) and
+/// return its path.
+fn write_redirect_props(base: &Path, chained: Option<&Path>) -> std::io::Result<PathBuf> {
+    let obj = base.join("obj");
+    std::fs::create_dir_all(&obj)?;
+    let props = base.join("astrolabe-obj.props");
+    let content = redirect_props_xml(&obj, chained, &props);
+    if std::fs::read_to_string(&props).ok().as_deref() != Some(content.as_str()) {
+        let tmp = base.join(format!("astrolabe-obj.props.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &content)?;
+        std::fs::rename(&tmp, &props)?;
+    }
+    Ok(props)
+}
+
+fn redirect_props_xml(obj: &Path, chained: Option<&Path>, own: &Path) -> String {
+    let mut dir = msbuild_literal(&obj.to_string_lossy());
+    if !dir.ends_with('/') && !dir.ends_with('\\') {
+        dir.push(std::path::MAIN_SEPARATOR);
+    }
+    let import = match chained.filter(|c| *c != own) {
+        Some(c) => {
+            let c = msbuild_literal(&c.to_string_lossy());
+            format!("  <Import Project=\"{c}\" Condition=\"Exists('{c}')\" />\n")
+        }
+        None => String::new(),
+    };
+    // StableStringHash keeps two projects with the same file name in
+    // different directories apart; the SDK appends `<tfm>/` itself.
+    format!(
+        "<!-- Written by Astrolabe: keeps Roslyn design-time build output out of the project's obj/. -->\n\
+         <Project>\n\
+         {import}  <PropertyGroup Condition=\"'$(IntermediateOutputPath)' == ''\">\n\
+         \x20   <IntermediateOutputPath>{dir}$(MSBuildProjectName)-$([MSBuild]::StableStringHash($(MSBuildProjectFullPath)))/$(Configuration)/</IntermediateOutputPath>\n\
+         \x20 </PropertyGroup>\n\
+         </Project>\n"
+    )
+}
+
+/// A path as a literal MSBuild property value inside XML: MSBuild's special
+/// characters `% $ @ ' ;` are %-escaped, then the XML ones.
+fn msbuild_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '$' => out.push_str("%24"),
+            '@' => out.push_str("%40"),
+            '\'' => out.push_str("%27"),
+            ';' => out.push_str("%3B"),
+            '*' => out.push_str("%2A"),
+            '?' => out.push_str("%3F"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +404,55 @@ mod tests {
             }
             other => panic!("expected projects, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn redirect_props_points_intermediate_output_at_cache() {
+        let s = scratch();
+        let base = s.0.join("cache dir");
+        let props = write_redirect_props(&base, None).unwrap();
+        let xml = fs::read_to_string(&props).unwrap();
+        assert!(base.join("obj").is_dir());
+        assert!(
+            xml.contains("<PropertyGroup Condition=\"'$(IntermediateOutputPath)' == ''\">"),
+            "{xml}"
+        );
+        let obj = base.join("obj").to_string_lossy().into_owned();
+        assert!(
+            xml.contains(&format!(
+                "<IntermediateOutputPath>{obj}{}$(MSBuildProjectName)-",
+                std::path::MAIN_SEPARATOR
+            )),
+            "{xml}"
+        );
+        // Restore outputs stay where NuGet put them.
+        assert!(!xml.contains("BaseIntermediateOutputPath"), "{xml}");
+        assert!(!xml.contains("MSBuildProjectExtensionsPath"), "{xml}");
+        assert!(!xml.contains("<Import"), "{xml}");
+        // Unchanged content is not rewritten.
+        let before = fs::metadata(&props).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_redirect_props(&base, None).unwrap();
+        assert_eq!(fs::metadata(&props).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn redirect_props_chains_existing_hook_and_escapes() {
+        let s = scratch();
+        let base = s.0.join("a$b;c'd&e");
+        let user = s.0.join("user.props");
+        let props = write_redirect_props(&base, Some(&user)).unwrap();
+        let xml = fs::read_to_string(&props).unwrap();
+        let user = user.to_string_lossy().into_owned();
+        assert!(
+            xml.contains(&format!(
+                "<Import Project=\"{user}\" Condition=\"Exists('{user}')\" />"
+            )),
+            "{xml}"
+        );
+        assert!(xml.contains("a%24b%3Bc%27d&amp;e"), "{xml}");
+        // Never imports itself.
+        let again = write_redirect_props(&base, Some(&props)).unwrap();
+        assert!(!fs::read_to_string(again).unwrap().contains("<Import"));
     }
 }

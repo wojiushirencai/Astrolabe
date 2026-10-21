@@ -207,6 +207,13 @@ impl LspTransport {
         }
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
+            // Roslyn's design-time builds would otherwise write obj/ into
+            // the user's project (see `csharp::msbuild_redirect`).
+            if is_roslyn(spec.language) {
+                if let Some((key, props)) = super::csharp::msbuild_redirect(cwd) {
+                    cmd.env(key, props);
+                }
+            }
         }
 
         let mut child = match cmd.spawn() {

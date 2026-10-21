@@ -6,6 +6,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+### 修复
+
+- **Roslyn 设计时构建不再往用户工程写 `obj/`**：启动 Roslyn（C#/VB）时设 `CustomAfterDirectoryBuildProps`，指向 Astrolabe 写在 `~/.astrolabe/roslyn/<仓库>-<hash>/astrolabe-obj.props` 的属性文件，把 `IntermediateOutputPath` 改到同目录 `obj/<工程名>-<hash>/` 下；`BaseIntermediateOutputPath` / `MSBuildProjectExtensionsPath` 不动，已有的 `project.assets.json` 照常读取。工程自己设了 `IntermediateOutputPath` 时不覆盖；环境里已有的 `CustomAfterDirectoryBuildProps` 仍会被导入。`ASTROLABE_ROSLYN_OBJ_DIR` 可改目录，设为 `off` 恢复写工程内 `obj/`。实测（.NET 10 SDK 小工程，已还原与未还原两种）：工程目录内不再新增或改动任何 `obj/` 文件，`goto_definition` 仍为 Exact。
+
 ## [0.15.0] - 2026-10-20
 
 自 v0.14.0 以来的 PR：#84（关闭 Roslyn 自动 NuGet 还原）、#85（第 6 批）。工具目录仍为 7 个，`tools/list` 7,307 B（Linux 实测，上限测试 7,500 B）。完整说明与 A/B 数据见 GitHub Release。
