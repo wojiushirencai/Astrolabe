@@ -62,6 +62,9 @@ pub(crate) struct TsScope {
     pub decl_is_member: bool,
     /// Object of that assignment (`app` in `app.handle =`).
     pub decl_base: Option<String>,
+    /// TS `namespace N {` / `module N {` blocks of the declaring file:
+    /// `N.name` reaches a declaration inside one.
+    pub containers: HashSet<String>,
 }
 
 impl TsScope {
@@ -82,13 +85,14 @@ impl TsScope {
             // Elsewhere the object's type is unknown: kept.
             return !in_def_file || base == "this" || self.decl_base.as_deref() == Some(base);
         }
-        self.namespaces.get(&file).is_some_and(|n| n.contains(base))
+        self.containers.contains(base)
+            || self.namespaces.get(&file).is_some_and(|n| n.contains(base))
     }
 
     /// A bare `name` (no `x.` before it) counts; `in_def_file` is whether
     /// the hit is in the declaring file.
     pub(crate) fn bare_reaches(&self, in_def_file: bool) -> bool {
-        !self.member_rule || !(self.decl_is_member && in_def_file)
+        !(self.member_rule && self.decl_is_member && in_def_file)
     }
 
     /// Words to search in `file`: the declared name plus its local aliases.
@@ -170,13 +174,19 @@ pub(crate) fn ts_scope(
         member_rule: legacy() == 0,
         ..TsScope::default()
     };
-    if let Some(base) = index
+    let def_src = index
         .file(def)
-        .and_then(|f| astrolabe_core::text::read_source(&root.join(f.path.as_str())).ok())
-        .and_then(|src| declared_as_property(&src, decl_line, name))
-    {
-        scope.decl_is_member = true;
-        scope.decl_base = Some(base);
+        .and_then(|f| astrolabe_core::text::read_source(&root.join(f.path.as_str())).ok());
+    if let Some(src) = &def_src {
+        if let Some(base) = declared_as_property(src, decl_line, name) {
+            scope.decl_is_member = true;
+            scope.decl_base = Some(base);
+        }
+        static CONTAINER: OnceLock<Regex> = OnceLock::new();
+        scope.containers = re(&CONTAINER, r"\b(?:namespace|module)\s+([\w$]+)\s*\{")
+            .captures_iter(src)
+            .map(|c| c[1].to_string())
+            .collect();
     }
     scope.files.insert(def.0, Vec::new());
     if legacy() == 2 {
@@ -723,28 +733,48 @@ fn spec_target(importer: &str, spec: &str, targets: &[(u32, String)]) -> Option<
             })
             .map(|(t, _)| *t);
     }
-    let tail = spec
+    let find = |tail: &str| {
+        let tail = strip_ext(tail).trim_end_matches('/');
+        if tail.is_empty() {
+            return None;
+        }
+        let suffix = format!("/{tail}");
+        targets
+            .iter()
+            .filter(|(_, p)| {
+                let (stem, no_index) = keys(p);
+                stem == tail
+                    || no_index == tail
+                    || stem.ends_with(&suffix)
+                    || no_index.ends_with(&suffix)
+            })
+            .min_by_key(|(_, p)| p.len())
+            .map(|(t, _)| *t)
+    };
+    // Path aliases (`@/x`, `~/x`, `#/x`): the rest is a source path.
+    let alias = spec
         .strip_prefix("@/")
         .or_else(|| spec.strip_prefix("~/"))
         .or_else(|| spec.strip_prefix("#/"))
-        .or_else(|| spec.strip_prefix('~'))
-        .unwrap_or(spec);
-    let tail = strip_ext(tail).trim_end_matches('/');
-    if tail.is_empty() {
-        return None;
+        .or_else(|| spec.strip_prefix('~'));
+    if let Some(rest) = alias {
+        return find(rest);
     }
-    let suffix = format!("/{tail}");
-    targets
-        .iter()
-        .filter(|(_, p)| {
-            let (stem, no_index) = keys(p);
-            stem == tail
-                || no_index == tail
-                || stem.ends_with(&suffix)
-                || no_index.ends_with(&suffix)
-        })
-        .min_by_key(|(_, p)| p.len())
-        .map(|(t, _)| *t)
+    // A package spec (`pkg`, `pkg/sub`, `@scope/pkg/sub`): a single bare
+    // segment (`aws-lambda`) never matches a directory by suffix; a
+    // multi-segment one may be a baseUrl path, else its subpath inside the
+    // (workspace) package is tried (`@trpc/server/adapters/x`).
+    let segs: Vec<&str> = spec.split('/').collect();
+    let pkg_len = if spec.starts_with('@') { 2 } else { 1 };
+    if segs.len() > pkg_len {
+        if !spec.starts_with('@') {
+            if let Some(t) = find(spec) {
+                return Some(t);
+            }
+        }
+        return find(&segs[pkg_len..].join("/"));
+    }
+    None
 }
 
 /// A relative spec with no matching edge can still be `module` (an
@@ -839,6 +869,16 @@ mod tests {
         assert_eq!(spec_target("src/c/x.ts", "@/a", &t), Some(1));
         assert_eq!(spec_target("src/c/x.ts", "@/lib/util", &t), Some(3));
         assert_eq!(spec_target("src/c/x.ts", "react", &t), None);
+        // A bare single-segment package never matches a directory name.
+        let t2 = vec![(
+            4,
+            "packages/server/src/adapters/aws-lambda/index.ts".to_string(),
+        )];
+        assert_eq!(spec_target("t/a.ts", "aws-lambda", &t2), None);
+        assert_eq!(
+            spec_target("t/a.ts", "@trpc/server/adapters/aws-lambda", &t2),
+            Some(4)
+        );
     }
     fn repo(files: &[(&str, &str)]) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1057,9 +1097,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn namespace_members_and_bare_package_specs() {
+        let dir = repo(&[
+            (
+                "src/rpc.ts",
+                "export namespace JSONRPC2 {\n  export type RequestId = number\n}\nexport type Env = { id: JSONRPC2.RequestId }\n",
+            ),
+            (
+                "src/use.ts",
+                "import type { JSONRPC2 } from './rpc'\nconst x: JSONRPC2.RequestId = 1\nconst y = other.RequestId\n",
+            ),
+        ]);
+        let got = hits(&dir, "RequestId", "src/rpc.ts");
+        assert_eq!(
+            got,
+            vec!["src/rpc.ts:2:9", "src/rpc.ts:4:9", "src/use.ts:2:9"],
+            "{got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Measurement dump (batch 7): for `TS_RECALL_REPO` and either
     /// `TS_RECALL_CASES="path:sym,…"` or `TS_RECALL_SAMPLE="<ext|ext>:<n>"`
-    /// (same pool rule as `live_backend::recall_harness`), write one JSON
+    /// (same pool rule as `live_backend::recall_harness`; `TS_RECALL_KINDS`
+    /// overrides the kinds, e.g. `Method,Field`), write one JSON
     /// line per case to `TS_RECALL_OUT` with the declaration position and
     /// the index answer before (batch-6 scope) and after this module. The
     /// reference side is computed separately (TypeScript LanguageService).
@@ -1086,6 +1148,11 @@ mod tests {
             let (exts, n) = spec.rsplit_once(':').expect("ext:n");
             let n: usize = n.parse().unwrap();
             let exts: Vec<&str> = exts.split('|').collect();
+            // Optional kind filter, e.g. `TS_RECALL_KINDS=Method,Field`.
+            let kinds: Option<Vec<String>> = std::env::var("TS_RECALL_KINDS")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .map(|k| k.split(',').map(str::to_string).collect());
             let mut count: HashMap<&str, usize> = HashMap::new();
             for s in &g.symbols {
                 *count.entry(s.name.as_str()).or_default() += 1;
@@ -1100,15 +1167,18 @@ mod tests {
                     || crate::explain::is_test_caller(p, &s.name)
                     || count[s.name.as_str()] != 1
                     || s.name.len() < 4
-                    || !matches!(
-                        s.kind,
-                        astrolabe_core::SymbolKind::Function
-                            | astrolabe_core::SymbolKind::Method
-                            | astrolabe_core::SymbolKind::Class
-                            | astrolabe_core::SymbolKind::Interface
-                            | astrolabe_core::SymbolKind::Struct
-                            | astrolabe_core::SymbolKind::Type
-                    )
+                    || !match &kinds {
+                        Some(k) => k.contains(&format!("{:?}", s.kind)),
+                        None => matches!(
+                            s.kind,
+                            astrolabe_core::SymbolKind::Function
+                                | astrolabe_core::SymbolKind::Method
+                                | astrolabe_core::SymbolKind::Class
+                                | astrolabe_core::SymbolKind::Interface
+                                | astrolabe_core::SymbolKind::Struct
+                                | astrolabe_core::SymbolKind::Type
+                        ),
+                    }
                 {
                     continue;
                 }
