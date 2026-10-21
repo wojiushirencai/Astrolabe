@@ -179,12 +179,10 @@ struct ParsedRow {
     language: Language,
     sha: String,
     loc: u32,
-    parsed: ParsedFile,
-    /// The cache encoding of `parsed`, produced once (by the parse thread, or
-    /// read back from the store) and shared by the persistent store write and
-    /// the in-memory product cache, so a cold start holds one copy of it and
-    /// never re-encodes. `None` when encoding failed.
-    encoded: Option<Arc<[u8]>>,
+    /// Shared with the in-memory product cache: an incremental apply reuses
+    /// an unchanged file's parse as-is (no decode, no copy of its imports
+    /// and calls); only its symbols are cloned into the new graph.
+    parsed: Arc<ParsedFile>,
 }
 
 #[derive(Clone)]
@@ -192,13 +190,37 @@ struct CachedProduct {
     language: Language,
     sha: String,
     loc: u32,
-    encoded: Arc<[u8]>,
+    parsed: Arc<ParsedFile>,
+    /// Estimated heap footprint of `parsed`, computed once for the weigher.
+    weight: u32,
 }
 
-/// Byte-capped LRU of encoded [`ParsedFile`] products, keyed by repo-relative
-/// path. Values are cheap to clone (`Arc` bytes). A new cache is filled on
-/// each incremental apply so a retained previous [`IncrementalIndex`] is
-/// not mutated.
+/// Approximate heap bytes of a decoded parse (strings plus vector slots).
+fn parsed_weight(parsed: &ParsedFile) -> usize {
+    let symbols: usize = parsed
+        .symbols
+        .iter()
+        .map(|s| std::mem::size_of::<CodeSymbol>() + s.name.len() + s.signature.len())
+        .sum();
+    let imports: usize = parsed
+        .imports
+        .iter()
+        .map(|i| std::mem::size_of::<String>() + i.len())
+        .sum();
+    let calls: usize = parsed
+        .calls
+        .iter()
+        .map(|(c, _)| std::mem::size_of::<(String, u32)>() + c.len())
+        .sum();
+    std::mem::size_of::<ParsedFile>() + symbols + imports + calls
+}
+
+/// Byte-capped LRU of decoded [`ParsedFile`] products, keyed by repo-relative
+/// path. Values are cheap to clone (`Arc`). They used to be the JSON cache
+/// encoding, which every apply decoded again for every unchanged file; that
+/// decode was a fifth of the cost of a one-file edit on a large repository.
+/// A new cache is filled on each incremental apply so a retained previous
+/// [`IncrementalIndex`] is not mutated.
 struct ParseProductCache {
     inner: Cache<RelPath, CachedProduct>,
 }
@@ -213,7 +235,7 @@ impl ParseProductCache {
                     .as_str()
                     .len()
                     .saturating_add(value.sha.len())
-                    .saturating_add(value.encoded.len())
+                    .saturating_add(value.weight as usize)
                     .saturating_add(std::mem::size_of::<CachedProduct>());
                 u32::try_from(bytes).unwrap_or(u32::MAX).max(1)
             })
@@ -555,8 +577,7 @@ fn stamp_hit(
         language,
         sha: stamp.sha,
         loc: stamp.loc,
-        parsed,
-        encoded: Some(Arc::from(bytes)),
+        parsed: Arc::new(parsed),
     })
 }
 
@@ -605,7 +626,6 @@ fn parse_one(
     cache_writes: &CacheWrites,
     cache_hits: &AtomicUsize,
     side: &ParseSide,
-    keep_encoded: bool,
 ) -> Option<ParsedRow> {
     let by_path = Language::from_path(path);
     // Extension-less files may still be scripts (`#!/usr/bin/env bash`);
@@ -624,10 +644,7 @@ fn parse_one(
         .ok()
         .and_then(|m| FileStat::of(&m));
     if let (Some(store), Some(stat)) = (store, stat.as_ref()) {
-        if let Some(mut row) = stamp_hit(store, path, stat, side, cache_hits) {
-            if !keep_encoded {
-                row.encoded = None;
-            }
+        if let Some(row) = stamp_hit(store, path, stat, side, cache_hits) {
             if row.parsed.partial {
                 note_partial(failures, path, &row.parsed);
             }
@@ -672,8 +689,7 @@ fn parse_one(
                         language,
                         sha,
                         loc,
-                        parsed,
-                        encoded: keep_encoded.then(|| Arc::from(bytes)),
+                        parsed: Arc::new(parsed),
                     });
                 }
                 Err(error) => {
@@ -697,7 +713,6 @@ fn parse_one(
 
     match pool.parse(language, path, &source) {
         Ok(parsed) => {
-            let mut encoded = None;
             if parsed.partial {
                 // Syntax errors: symbols/imports/calls may be incomplete.
                 // Keep what was extracted and surface it. The product is
@@ -708,15 +723,13 @@ fn parse_one(
                 // parse errors are `Err` below and are never cached.
                 note_partial(failures, path, &parsed);
             }
-            if store.is_some() || keep_encoded {
+            // Only a writable store needs the encoding; the in-memory product
+            // keeps the decoded parse.
+            if let Some(store) = store.filter(|s| !s.is_read_only()) {
                 match store::encode_parsed(&parsed) {
                     Ok(bytes) => {
-                        let bytes: Arc<[u8]> = Arc::from(bytes);
-                        if let Some(store) = store {
-                            side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
-                            cache_writes.push(store, cache_key, Arc::clone(&bytes));
-                        }
-                        encoded = keep_encoded.then_some(bytes);
+                        side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
+                        cache_writes.push(store, cache_key, Arc::from(bytes));
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -732,8 +745,7 @@ fn parse_one(
                 language,
                 sha,
                 loc,
-                parsed,
-                encoded,
+                parsed: Arc::new(parsed),
             })
         }
         Err(error) => {
@@ -749,8 +761,7 @@ fn parse_one(
 /// Encoded parses waiting for the next store write. Bounded: once the pending
 /// bytes pass [`CACHE_FLUSH_BYTES`] a parse thread flushes them, so a cold
 /// start never accumulates the whole repo's encoding just to write it at the
-/// end. The `Arc`s are shared with the in-memory product cache, so pending
-/// entries cost no extra memory while that cache still holds them.
+/// end.
 /// `(entries, total bytes)` not yet written.
 type PendingWrites = (Vec<(String, Arc<[u8]>)>, usize);
 
@@ -888,9 +899,8 @@ fn parse_paths(
     paths: &[RelPath],
     opts: &IndexOptions,
     full_scan: bool,
-    keep_encoded: bool,
 ) -> ParseOutcome {
-    parse_paths_cancellable(root, paths, opts, full_scan, keep_encoded, None)
+    parse_paths_cancellable(root, paths, opts, full_scan, None)
         .expect("parse without a cancel token always completes")
 }
 
@@ -907,7 +917,6 @@ fn parse_paths_cancellable(
     paths: &[RelPath],
     opts: &IndexOptions,
     full_scan: bool,
-    keep_encoded: bool,
     cancel: Option<&AtomicBool>,
 ) -> Option<ParseOutcome> {
     let pool = ParserPool::new();
@@ -931,7 +940,6 @@ fn parse_paths_cancellable(
                 &cache_writes,
                 &cache_hits,
                 &side,
-                keep_encoded,
             )
         })
         .collect();
@@ -957,30 +965,16 @@ struct ParseOutcome {
 }
 
 fn insert_product(cache: &ParseProductCache, row: &ParsedRow) {
-    // Reuse the encoding made on the parse thread; encode only when absent
-    // (no store and no product requested, or an encode failure).
-    let encoded = match &row.encoded {
-        Some(bytes) => Ok(Arc::clone(bytes)),
-        None => store::encode_parsed(&row.parsed).map(Arc::from),
-    };
-    match encoded {
-        Ok(encoded) => cache.insert(
-            row.path.clone(),
-            CachedProduct {
-                language: row.language,
-                sha: row.sha.clone(),
-                loc: row.loc,
-                encoded,
-            },
-        ),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                path = %row.path.as_str(),
-                "parse product encode failed; file will be re-parsed on next incremental apply"
-            );
-        }
-    }
+    cache.insert(
+        row.path.clone(),
+        CachedProduct {
+            language: row.language,
+            sha: row.sha.clone(),
+            loc: row.loc,
+            parsed: Arc::clone(&row.parsed),
+            weight: u32::try_from(parsed_weight(&row.parsed)).unwrap_or(u32::MAX),
+        },
+    );
 }
 
 fn fill_products(rows: &[ParsedRow], budget_bytes: u64) -> ParseProductCache {
@@ -992,19 +986,14 @@ fn fill_products(rows: &[ParsedRow], budget_bytes: u64) -> ParseProductCache {
     products
 }
 
-fn row_from_product(
-    path: RelPath,
-    product: &CachedProduct,
-) -> Result<ParsedRow, store::StoreError> {
-    let parsed = store::decode_parsed(&product.encoded)?;
-    Ok(ParsedRow {
+fn row_from_product(path: RelPath, product: &CachedProduct) -> ParsedRow {
+    ParsedRow {
         path,
         language: product.language,
         sha: product.sha.clone(),
         loc: product.loc,
-        parsed,
-        encoded: None,
-    })
+        parsed: Arc::clone(&product.parsed),
+    }
 }
 
 /// Parallel collection order is not stable; sort before assigning ids so
@@ -1077,14 +1066,13 @@ fn assemble_graph_with(
     graph
         .symbols
         .reserve(parsed.iter().map(|r| r.parsed.symbols.len()).sum());
-    for row in &mut parsed {
+    for row in &parsed {
         let file = index_of[&row.path];
-        row.encoded = None;
-        for sym in std::mem::take(&mut row.parsed.symbols) {
+        for sym in &row.parsed.symbols {
             graph.symbols.push(CodeSymbol {
                 id: SymbolId(next_symbol),
                 file,
-                ..sym
+                ..sym.clone()
             });
             next_symbol += 1;
         }
@@ -1377,7 +1365,7 @@ pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) 
         too_large: too_large_sources(root, &scanned),
         ..IndexReport::default()
     };
-    let outcome = parse_paths(root, &scanned.files, opts, true, false);
+    let outcome = parse_paths(root, &scanned.files, opts, true);
     (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
     assemble_graph(outcome.parsed, &files, &resolvers, opts, report)
 }
@@ -1467,7 +1455,7 @@ impl IncrementalIndex {
             too_large: too_large_sources(root, &scanned),
             ..IndexReport::default()
         };
-        let outcome = parse_paths_cancellable(root, &scanned.files, opts, true, true, cancel)?;
+        let outcome = parse_paths_cancellable(root, &scanned.files, opts, true, cancel)?;
         let failures = outcome.failures.clone();
         (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
@@ -1642,32 +1630,20 @@ pub fn index_repo_incremental(
             continue;
         }
         if let Some(product) = previous.products.get(path) {
-            match row_from_product(path.clone(), &product) {
-                Ok(row) => {
-                    // A partial parse keeps its product (the flag travels in
-                    // the encoded payload); carry it so the report stays stable.
-                    let previous_reason = previous_failures
-                        .get(path)
-                        .map(|r| r.as_str())
-                        .filter(|r| is_partial_reason(r));
-                    if row.parsed.partial {
-                        failures.push((path.clone(), partial_reason(&row.parsed).to_owned()));
-                    } else if let Some(reason) = previous_reason {
-                        failures.push((path.clone(), reason.to_owned()));
-                    }
-                    reused_products.push((path.clone(), product));
-                    reused.push(row);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        path = %path.as_str(),
-                        "in-memory parse product ignored; re-parsing"
-                    );
-                    lru_misses += 1;
-                    to_parse.push(path.clone());
-                }
+            let row = row_from_product(path.clone(), &product);
+            // A partial parse keeps its product (the flag travels in the
+            // product); carry it so the report stays stable.
+            let previous_reason = previous_failures
+                .get(path)
+                .map(|r| r.as_str())
+                .filter(|r| is_partial_reason(r));
+            if row.parsed.partial {
+                failures.push((path.clone(), partial_reason(&row.parsed).to_owned()));
+            } else if let Some(reason) = previous_reason {
+                failures.push((path.clone(), reason.to_owned()));
             }
+            reused_products.push((path.clone(), product));
+            reused.push(row);
         } else if let Some(reason) = previous_failures.get(path) {
             let tries = previous.failure_retries.get(path).copied().unwrap_or(0);
             if is_transient_failure(reason) && tries < MAX_FAILURE_RETRIES {
@@ -1687,7 +1663,7 @@ pub fn index_repo_incremental(
     }
 
     let reused_count = reused.len();
-    let outcome = parse_paths(root, &to_parse, opts, false, true);
+    let outcome = parse_paths(root, &to_parse, opts, false);
     let parsed_count = outcome.parsed.len();
     for (path, _) in &outcome.failures {
         if let Some(tries) = retried.get(path) {
@@ -2297,18 +2273,18 @@ mod tests {
     }
 
     #[test]
-    fn cold_build_products_reuse_cache_encoding() {
+    fn cold_build_products_match_the_store() {
         let root = scratch("reuse-enc");
         write(&root, "a.py", "def a():\n    return 1\n");
         write(&root, "b.go", "package b\nfunc B() {}\n");
         let inc = IncrementalIndex::build(&root, &IndexOptions::default());
-        // The product bytes held in memory equal what the store holds.
+        // The decoded product held in memory is what the store holds.
         let store = Store::open(&store_path(&root)).unwrap();
         for f in &inc.graph.files {
             let key = store::parse_cache_key(f.language.unwrap(), &f.sha);
             let stored = store.cached_parse(&key).unwrap().expect("stored");
             let held = inc.products.get(&f.path).expect("product");
-            assert_eq!(&stored[..], &held.encoded[..]);
+            assert_eq!(&stored[..], &store::encode_parsed(&held.parsed).unwrap()[..]);
         }
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3813,7 +3789,7 @@ mod cancel_tests {
         write(&root, "c.go", "package p\nfunc C() {}\n");
         let paths = vec![RelPath::new("a.go"), RelPath::new("c.go")];
         let cancel = AtomicBool::new(true);
-        assert!(parse_paths_cancellable(&root, &paths, &opts, true, true, Some(&cancel)).is_none());
+        assert!(parse_paths_cancellable(&root, &paths, &opts, true, Some(&cancel)).is_none());
         assert_eq!(
             store_len(&root),
             before,
@@ -3822,7 +3798,7 @@ mod cancel_tests {
         assert!(!has_stamp(&root, "c.go"), "cancelled parse wrote a stamp");
 
         // Control: the same parse, not cancelled, prunes b and stores c.
-        let done = parse_paths(&root, &paths, &opts, true, true);
+        let done = parse_paths(&root, &paths, &opts, true);
         assert_eq!(done.parsed.len(), 2);
         assert_eq!(store_len(&root), 2);
         assert!(has_stamp(&root, "c.go"));
