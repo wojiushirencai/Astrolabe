@@ -212,6 +212,17 @@ pub fn msbuild_redirect(root: &Path) -> Option<(&'static str, PathBuf)> {
 }
 
 /// `~/.astrolabe/roslyn/<repo>-<hash>`: one directory per repo root.
+///
+/// Unit tests (fake Roslyn transports included) keep it inside the root,
+/// which is always a scratch directory there, so the suite never writes into
+/// the real `$HOME`.
+#[cfg(test)]
+fn roslyn_cache_dir(root: &Path) -> PathBuf {
+    root.join(".astrolabe-roslyn-test")
+}
+
+/// `~/.astrolabe/roslyn/<repo>-<hash>`: one directory per repo root.
+#[cfg(not(test))]
 fn roslyn_cache_dir(root: &Path) -> PathBuf {
     use sha2::{Digest, Sha256};
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -454,5 +465,12 @@ mod tests {
         // Never imports itself.
         let again = write_redirect_props(&base, Some(&props)).unwrap();
         assert!(!fs::read_to_string(again).unwrap().contains("<Import"));
+    }
+
+    #[test]
+    fn test_cache_dir_stays_inside_scratch_root() {
+        let s = scratch();
+        let dir = roslyn_cache_dir(&s.0);
+        assert!(dir.starts_with(&s.0), "{}", dir.display());
     }
 }
