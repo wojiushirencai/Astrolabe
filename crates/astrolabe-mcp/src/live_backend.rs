@@ -718,7 +718,10 @@ impl LiveBackend {
             .and_then(|ix| {
                 let name = symbol.trim();
                 (!name.is_empty())
-                    .then(|| refs_graph::graph_references(ix, &self.root, name, &rel))
+                    .then(|| {
+                        let line = position.map(|p| p.line);
+                        refs_graph::graph_references_at(ix, &self.root, name, &rel, line)
+                    })
                     .flatten()
             });
         let mut result = match graph {
