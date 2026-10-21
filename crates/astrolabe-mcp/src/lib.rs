@@ -27,6 +27,7 @@ mod live_backend;
 mod loop_guard;
 mod openai_schema;
 mod precise_tools;
+mod py_refs;
 mod refs_graph;
 mod refs_graph_ts;
 mod refs_render;

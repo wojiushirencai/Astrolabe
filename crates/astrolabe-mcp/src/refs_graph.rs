@@ -132,6 +132,7 @@ pub(crate) enum HitKind {
 fn classify(path: &str, lines: &[String], hits: &[(usize, usize)]) -> Vec<HitKind> {
     let all_masked = crate::code_mask::code_mask(path, lines, false);
     let comments = crate::code_mask::code_mask(path, lines, true);
+    let python = path.ends_with(".py") || path.ends_with(".pyi");
     hits.iter()
         .map(|&(line, byte)| {
             let at = |m: &Option<Vec<Vec<bool>>>| {
@@ -144,7 +145,12 @@ fn classify(path: &str, lines: &[String], hits: &[(usize, usize)]) -> Vec<HitKin
             if !at(&comments) {
                 HitKind::Comment
             } else if !at(&all_masked) {
-                HitKind::Str
+                // Python forward references (`x: "Foo"`) are code.
+                if python && crate::py_refs::type_string_in(lines, line, byte) {
+                    HitKind::Code
+                } else {
+                    HitKind::Str
+                }
             } else {
                 HitKind::Code
             }
@@ -1399,6 +1405,9 @@ pub(crate) fn graph_references_at(
     // TS/JS: also barrel re-exports and renamed bindings (refs_graph_ts).
     let ts = (!go && crate::refs_graph_ts::is_ts_family(language))
         .then(|| crate::refs_graph_ts::ts_scope(index, root, decl.file, name));
+    // Python: also `__init__` / `__all__` re-exports and `as` aliases (py_refs).
+    let py = (language == Language::Python)
+        .then(|| crate::py_refs::python_scope(index, root, decl.file, name));
     let mut files: Vec<&RelPath> = graph
         .files
         .iter()
@@ -1410,6 +1419,7 @@ pub(crate) fn graph_references_at(
                 f.id == decl.file
                     || importers.contains(&f.id.0)
                     || ts.as_ref().is_some_and(|t| t.contains(f.id.0))
+                    || py.as_ref().is_some_and(|(s, _)| s.contains_key(&f.id.0))
             }
         })
         .map(|f| &f.path)
@@ -1462,6 +1472,10 @@ pub(crate) fn graph_references_at(
         // The name, plus (TS/JS) the local aliases it has in this file.
         let words: Vec<&str> = match (&ts, index.file_id(path.as_str())) {
             (Some(t), Some(id)) => t.words(id.0, name),
+            (None, Some(id)) => match py.as_ref().and_then(|(s, _)| s.get(&id.0)) {
+                Some(w) => w.iter().map(String::as_str).collect(),
+                None => vec![name],
+            },
             _ => vec![name],
         };
         let mut alias_units: HashMap<(usize, usize), u32> = HashMap::new();
@@ -1612,6 +1626,27 @@ pub(crate) fn graph_references_at(
             s += &format!("（含改名绑定 {}）", shown.join("、"));
         }
         s
+    } else if let Some((scope, via)) = py.as_ref() {
+        let mut s = "定义文件及导入它的文件".to_string();
+        if !via.is_empty() {
+            let shown: Vec<&str> = via.iter().take(3).map(String::as_str).collect();
+            s += &format!(
+                "，以及经 {} 个转导出模块（{}）到达的文件",
+                via.len(),
+                shown.join("、")
+            );
+        }
+        let aliases: BTreeSet<&str> = scope
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .filter(|a| *a != name)
+            .collect();
+        if !aliases.is_empty() {
+            let shown: Vec<String> = aliases.iter().take(5).map(|a| format!("`{a}`")).collect();
+            s += &format!("（含 as 改名 {}）", shown.join("、"));
+        }
+        s
     } else {
         "定义文件及导入它的文件".to_string()
     };
@@ -1659,6 +1694,9 @@ pub(crate) fn graph_references_at(
     );
     if method_recv.is_some() {
         note.push_str("，已按接收者类型核对");
+    }
+    if py.is_some() {
+        note.push_str("（字符串形式的类型注解 `x: \"Foo\"` 按代码计）");
     }
     note.push('。');
     if interface_method {
