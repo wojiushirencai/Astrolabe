@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe-ai/win32-x64-msvc",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "The Windows x86_64 MSVC binary for Astrolabe AI (x86_64-pc-windows-msvc)",
   "license": "MIT OR Apache-2.0",
   "repository": {

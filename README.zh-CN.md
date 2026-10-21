@@ -7,13 +7,13 @@
 
 > **同名消歧**：不是 npm 上的 `astrolabe`（2014 年的 Protractor 页面对象库）或 `astrolabe-ai`（无关的简历工具），也不是其它叫 “astrolabe” 的 MCP 服务。本项目在 `github.com/wojiushirencai/Astrolabe`，二进制名是 `astrolabe`。
 
-## 事实卡（截至 2026-10-20）
+## 事实卡（截至 2026-10-21）
 
 | | |
 |---|---|
-| 最新版本 | [v0.15.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.15.0)，2026-10-20 发布 |
+| 最新版本 | [v0.16.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.16.0)，2026-10-21 发布 |
 | 暴露的工具 | 7 个 MCP 工具：`resolve_context`、`search_code`、`find_symbol`、`find_references`、`goto_definition`、`get_diagnostics`、`get_languages` |
-| `tools/list` 体积 | 紧凑 JSON 约 7.3 KB（v0.15.0 Linux 实测 7,307 B；macOS 未重测） |
+| `tools/list` 体积 | 紧凑 JSON 约 3.6 KB（v0.16.0 Linux 实测 3,607 B；macOS 未重测） |
 | 二进制 | 单文件、无运行时；Release 压缩包 7.4–9.1 MB，Linux x64 解压后约 50 MB |
 | 平台 | macOS arm64/x64、Linux x64（glibc/musl）、Linux arm64、Windows x64 |
 | 语言 | 17 行语言矩阵，含 Python、Go、Rust、Java、TS/JS、C/C++、Swift、Objective-C、PHP、Vue、Dart、C#、VB.NET、Kotlin、Shell、Ruby、Lua（[详情](docs/REFERENCE.zh-CN.md)） |

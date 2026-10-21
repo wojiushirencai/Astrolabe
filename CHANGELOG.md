@@ -6,7 +6,9 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
-第 7 批（架构盘点后的 14 路改动）。
+## [0.16.0] - 2026-10-21
+
+自 v0.15.0 以来的 PR：#87（第 7 批，架构盘点后的 14 路改动）、#88（第 8 批：`get_diagnostics` 不启动语言服务、Go 同名消歧不启动 gopls、多会话共用索引）。工具目录仍为 7 个，`tools/list` 紧凑 JSON 3,607 B（Linux 实测；同一方法测 v0.15.0 为 7,356 B）。缓存格式变化，升级后首次启动冷解析一次。完整说明与 A/B 数据见 GitHub Release。
 
 ### 行为变化（升级时请留意）
 
