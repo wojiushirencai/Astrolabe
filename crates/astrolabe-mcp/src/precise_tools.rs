@@ -56,7 +56,7 @@ fn effective_budget(raw: usize) -> usize {
 }
 
 /// Stated once per result that lists positions.
-const COORD_NOTE: &str =
+pub(crate) const COORD_NOTE: &str =
     "坐标：行、列均从 1 起，列按 UTF-16 单位；作为 line/character 入参时用 0 起的值（各减 1）。\n";
 
 /// One page of `items` starting at `offset`, cut by `budget`. Always keeps at
@@ -81,17 +81,15 @@ pub(crate) struct FindReferencesParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Symbol name to find references for.")]
+    #[schemars(description = "Symbol name.")]
     pub symbol: String,
-    // No `serde(default)`: schemars would then drop it from `required`. A
-    // missing `Option` field still deserializes to `None`.
-    #[schemars(
-        required,
-        description = "Repo-relative file (selects the language server)."
-    )]
+    // Optional: a missing or wrong path is fixed from the index
+    // (`refs_graph::fix_path`); requiring it only made models guess.
+    #[serde(default)]
+    #[schemars(description = "File declaring or using it (inferred if omitted).")]
     pub path: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based line.")]
+    #[schemars(description = "0-based line (disambiguates).")]
     pub line: Option<u32>,
     #[serde(default)]
     #[schemars(description = "Optional 0-based UTF-16 column; used with line.")]
@@ -112,13 +110,13 @@ pub(crate) struct GotoDefinitionParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Repo-relative file containing the target symbol reference.")]
+    #[schemars(description = "File containing the use site.")]
     pub path: String,
     #[serde(default)]
-    #[schemars(description = "Symbol name to locate definition for.")]
+    #[schemars(description = "Symbol name.")]
     pub symbol: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based line; used with character.")]
+    #[schemars(description = "0-based line.")]
     pub line: Option<u32>,
     #[serde(default)]
     #[schemars(description = "Optional 0-based UTF-16 column.")]
@@ -136,7 +134,7 @@ pub(crate) struct GetDiagnosticsParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Repo-relative file to diagnose.")]
+    #[schemars(description = "Repo-relative file.")]
     pub path: String,
     #[serde(default)]
     #[schemars(description = "Minimum severity: error, warning, information, or hint.")]
@@ -147,6 +145,13 @@ pub(crate) struct GetDiagnosticsParams {
 }
 
 /// Backend for the precise MCP query tools.
+/// Tool descriptions shared by `PreciseTools` and `AstrolabeServer`, so the
+/// two catalogs cannot drift apart.
+pub(crate) const FIND_REFERENCES_DESC: &str = "精确引用（索引优先，语言服务器兜底）：调用点与用法，改名和调用方分析用它。Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
+pub(crate) const GOTO_DEFINITION_DESC: &str =
+    "Jump to definition: 按使用处文件 + 符号名返回定义锚点。";
+pub(crate) const GET_DIAGNOSTICS_DESC: &str = "文件诊断（语法与类型错误），编辑后核对用。";
+
 ///
 /// Production uses `LiveBackend` (on-demand language-server pool). Tests
 /// inject fakes for the missing-server path.
@@ -248,7 +253,7 @@ impl PreciseTools {
 #[tool_router]
 impl PreciseTools {
     #[tool(
-        description = "精确引用查询（索引优先，语言服务器兜底）。LSP-resolved call sites and usages across repository. Required for renames and caller analysis. Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.",
+        description = FIND_REFERENCES_DESC,
         annotations(title = "精确引用", read_only_hint = true)
     )]
     pub(crate) fn find_references(
@@ -259,7 +264,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "精确定义跳转（语言服务器绑定解析）。Resolves definition anchor via language server semantics.",
+        description = GOTO_DEFINITION_DESC,
         annotations(title = "精确定义", read_only_hint = true)
     )]
     pub(crate) fn goto_definition(
@@ -270,7 +275,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "文件诊断（语言服务器）。LSP diagnostics (syntax and type errors) to verify file correctness after edits.",
+        description = GET_DIAGNOSTICS_DESC,
         annotations(title = "文件诊断", read_only_hint = true)
     )]
     pub(crate) fn get_diagnostics(
@@ -443,7 +448,7 @@ pub(crate) fn run_find_references(
 const WIDE_REFERENCES: usize = 150;
 
 /// Coordinate legend for the reference list.
-const REF_COORD_NOTE: &str =
+pub(crate) const REF_COORD_NOTE: &str =
     "坐标 L行:列 均从 1 起（列按 UTF-16）；作 line/character 入参时各减 1。\n";
 
 /// A reference list in display order: non-test hits first (backend order
@@ -1384,8 +1389,8 @@ mod tests {
         let required = required_fields(&refs);
         assert!(required.iter().any(|f| f == "symbol"), "{required:?}");
         assert!(
-            required.iter().any(|f| f == "path"),
-            "path is effectively required and must be listed: {required:?}"
+            !required.iter().any(|f| f == "path"),
+            "path is optional (fixed from the index): {required:?}"
         );
 
         let diags = schema_for_tool("get_diagnostics");

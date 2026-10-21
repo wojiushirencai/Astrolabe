@@ -55,6 +55,8 @@ Codex, Windsurf and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-clie
 | `get_diagnostics` | Syntax and type errors for a file. |
 | `get_languages` | Languages, file counts, lines of code, language-server status, and index coverage (see below). |
 
+`tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn). The others — `regex`, `exclude`, `count_only`, `context_lines`, `group`, `dedup`, `kind`, `depth`, `substring`, `dry_run_rename`, `character`, `severity`, `offset`, `page`, `budget_tokens`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
+
 **Index coverage.** Every file of a supported language is indexed, including files with syntax or compile errors: the symbols that parse are kept, but symbols inside the broken region may be missing. `get_languages` reports:
 - files *not* in the index, as counts by reason (over the size cap, read failure, parser timeout);
 - files with syntax errors, counted by kind:

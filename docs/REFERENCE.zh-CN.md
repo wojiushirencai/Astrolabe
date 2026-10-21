@@ -17,6 +17,8 @@ Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、�
 | `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态；报告索引覆盖：未进索引的文件按原因计数，有语法错误的文件仍在索引里，按两类计数：其他语法错误（索引可能不完整，符号可能缺失），以及 C/C++/Objective-C 里预处理/宏导致的语法错误（启发式判断，符号基本完整）；≤10 个时逐个列出类别和首个错误的行号与该行片段，>10 个时给出 Markdown 报告 `<仓库>/.astrolabe/coverage-report.md` 的绝对路径（含类别列，其他语法错误在前），不支持语言的文件只按扩展名汇总。 |
 
 
+默认 `tools/list` 只声明各工具的常用参数：`query`、`path_filter`、`include_body`、`case_sensitive`、`skip_comments`、`aggregate`、`symbol`、`path`、`line`、`task_description`（多仓工作区另加 `root`）。表中其余参数（如 `offset`、`group`、`exclude`、`count_only`、`dry_run_rename`）以及 `regex`、`kind`、`depth`、`substring`、`context_lines`、`dedup`、`character`、`severity`、`page`、`budget_tokens` 不在声明里，但照常接受；设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。`find_references` 的 `path` 可省略，由索引按符号定义推断。
+
 ## 二、进阶配置与运行细节
 
 ### 1. 仓库定位逻辑
@@ -60,6 +62,7 @@ Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、�
 | `ASTROLABE_CONTEXT` | 指定客户端模式（`default` / `claude-code` / `cursor` / `codex` / `readonly`） | `default` |
 | `ASTROLABE_STRUCTURED` | 是否开启结构化输出（`1` 开启，`0` 关闭） | 默认关闭 |
 | `ASTROLABE_RESOURCE_THRESHOLD` | 工具结果超过该 token 估算值时卸载为 MCP resource（附前瞻摘要）；实际阈值为它与 `budget_tokens`（钳制后）的较大值 | `4000` |
+| `ASTROLABE_FULL_SCHEMA` | 设为 `1` 时 `tools/list` 声明全部参数。默认只声明常用参数（见第一节表后说明），其余参数照常接受 | 未设置 |
 | `ASTROLABE_MAX_BUDGET_TOKENS` | `budget_tokens` 硬上限：动态卸载阈值取 `max(阈值基线, budget)` 时防止异常大的 budget 把阈值顶穿 | `32000` |
 | `ASTROLABE_WATCH_SECS` | 文件变更监听：未设置走原生系统事件（空闲 0% CPU）；`0` 关闭；`N` 走轮询兜底 | 未设置（原生事件优先） |
 | `ASTROLABE_REINDEX_MS` | 两次索引更新之间的最小间隔毫秒数（0 关间隔） | `2000` |

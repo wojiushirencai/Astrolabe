@@ -15,11 +15,12 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
     let _ = context_name;
     format!(
         "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages. All are read-only: batch independent calls in parallel in one turn.\n\n\
-         当前索引根 index_root: {}。每条工具结果第一行会重复该绝对路径；\
+         当前索引根 index_root: {}。结果里的 index_root 即该路径；\
          若与你正在编辑的仓库不符，不要用这些路径读文件。\
-         统计/计数（每个目录有多少处调用）用 search_code aggregate=top|dir|file，可加 skip_comments、exclude，不必写脚本。先调用 resolve_context。所有工具保证 content[0] 为非空文本；\
+         结果末行写“已全列”时即完整，直接据此作答，不必再用 grep 复核或换词重查。\
+         统计/计数（每个目录有多少处调用）用 search_code aggregate=top|dir|file，可加 skip_comments、exclude，不必写脚本。任务不明确时可先用 resolve_context。\
          scoped 来自 import 图，syntactic 来自名字匹配。\
-         精确工具 Unavailable 时请在本机安装对应语言服务器，并用 get_languages 查看状态。\
+         缺语言服务器时精确工具会注明并给出替代做法，不要为此自行安装（get_languages 可看状态）。\
          其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read。",
         root.display()
     )
@@ -52,8 +53,8 @@ The built-in tool descriptions in your context will tell you things like "use Re
       have the overview and know exactly which file/bodies you need.
 - Grep / search-for-references
     → Allowed for discovery only. A reference/usage query that will drive
-      an edit or rename decision MUST use find_references (LSP-resolved,
-      scope-aware); grep only matches text and cannot support rewrite
+      an edit or rename decision MUST use find_references (index-first,
+      language-server fallback, scope-aware); grep only matches text and cannot support rewrite
       decisions.
 - Jumping to a definition
     → goto_definition, NOT find_symbol (that is syntactic name matching).
@@ -69,8 +70,9 @@ The built-in tool descriptions in your context will tell you things like "use Re
 - Literal vs regex search
     → search_code is literal unless regex=true. A|B without that flag searches
       for a vertical bar. Prefer two parallel literal calls over one regex.
-      Truncation is declared as shown=/omitted=/truncated=/total=; fetch the
-      next page with offset=next_offset, or raise budget_tokens / tighten path_filter.
+      Truncation is declared as shown=/omitted=/truncated=/total=; tighten
+      path_filter or the literal rather than paging (a truncated result names
+      its next_offset).
 - Unsupported languages
     → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. get_languages summarises them by file type.
 
@@ -93,8 +95,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - search_code results are exhaustive over the files Astrolabe has indexed: total= is the
   full count of literal matches there and truncation is always declared, so one query
   is enough per literal. Files in unsupported languages and files created very recently
-  may be missing or tagged [text-only]; if a result looks stale or incomplete, re-check
-  with dedup=false (or a narrow Grep) instead of trusting it. find_symbol matches
+  may be missing or tagged [text-only]. find_symbol matches
   declared names only (syntax-level), not every textual mention.
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
@@ -102,7 +103,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
 - search_code auto-groups wide hits (see above); few hits list every row and every
   result ends with a "汇总" line saying whether the listing is complete — if it says
-  complete, answer from it, do not re-query with other words. Counting / 统计 / 计数 (how many
+  complete (已全列), answer from it: do not re-check with grep or re-query with other words. Counting / 统计 / 计数 (how many
   calls per directory or file, 每个目录有多少处调用): search_code aggregate=top|dir|file gives
   "N 处 / M 个文件" per row plus a total — add skip_comments=true to ignore comment/string
   hits and exclude=["_test.go","vendor"] to skip paths; count_only=true for totals only.
@@ -171,8 +172,8 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
       have the overview and know exactly which file/bodies you need.
 - Grep / search-for-references
     → Allowed for discovery. A reference/usage query that will drive
-      an edit or rename decision should use find_references (LSP-resolved,
-      scope-aware); grep only matches text and cannot support rewrite
+      an edit or rename decision should use find_references (index-first,
+      language-server fallback, scope-aware); grep only matches text and cannot support rewrite
       decisions.
 - Jumping to a definition
     → goto_definition, NOT find_symbol (that is syntactic name matching).
@@ -188,8 +189,9 @@ Astrolabe provides indexed, symbol-aware tools that are generally more efficient
 - Literal vs regex search
     → search_code is literal unless regex=true. A|B without that flag searches
       for a vertical bar. Prefer two parallel literal calls over one regex.
-      Truncation is declared as shown=/omitted=/truncated=/total=; fetch the
-      next page with offset=next_offset, or raise budget_tokens / tighten path_filter.
+      Truncation is declared as shown=/omitted=/truncated=/total=; tighten
+      path_filter or the literal rather than paging (a truncated result names
+      its next_offset).
 - Unsupported languages
     → Source files outside the supported languages (python, go, java, rust, ts/tsx/js, c/cpp, objc/objcpp/swift, php, vue, dart, c#, vb, kotlin, shell, ruby, lua) are invisible to Astrolabe's index. Empty results from search_code / find_symbol do not cover them — use Grep/Read directly. get_languages summarises them by file type.
 
@@ -212,8 +214,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - search_code results are exhaustive over the files Astrolabe has indexed: total= is the
   full count of literal matches there and truncation is always declared, so one query
   is enough per literal. Files in unsupported languages and files created very recently
-  may be missing or tagged [text-only]; if a result looks stale or incomplete, re-check
-  with dedup=false (or a narrow Grep) instead of trusting it. find_symbol matches
+  may be missing or tagged [text-only]. find_symbol matches
   declared names only (syntax-level), not every textual mention.
 - Before editing or renaming a literal, or asserting on it: search_code group=true
   (automatic when hits span more than 3 files) groups hits per file, code first then
@@ -221,7 +222,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 - Prefer these tools over Grep/Read for code: the goal is fewer tokens and less wall time.
 - search_code auto-groups wide hits (see above); few hits list every row and every
   result ends with a "汇总" line saying whether the listing is complete — if it says
-  complete, answer from it, do not re-query with other words. Counting / 统计 / 计数 (how many
+  complete (已全列), answer from it: do not re-check with grep or re-query with other words. Counting / 统计 / 计数 (how many
   calls per directory or file, 每个目录有多少处调用): search_code aggregate=top|dir|file gives
   "N 处 / M 个文件" per row plus a total — add skip_comments=true to ignore comment/string
   hits and exclude=["_test.go","vendor"] to skip paths; count_only=true for totals only.
@@ -358,6 +359,21 @@ mod tests {
         assert!(instructions.contains("search_code"));
         assert!(instructions.contains("get_languages"));
         assert!(instructions.contains("parallel"));
+        // Complete results need no grep re-check: said in the default-loaded tier.
+        assert!(instructions.contains("已全列"), "{instructions}");
+        assert!(
+            instructions.contains("不必再用 grep 复核"),
+            "{instructions}"
+        );
+        // Language servers are a fallback: never tell the model to install one.
+        assert!(
+            !instructions.contains("安装对应语言服务器"),
+            "{instructions}"
+        );
+        assert!(
+            !instructions.contains("先调用 resolve_context"),
+            "{instructions}"
+        );
     }
 
     #[test]
@@ -444,7 +460,8 @@ mod tests {
         assert!(m.contains("## Read-only exploration"));
         assert!(m.contains("NOT a ban on reading or exploring"));
         assert!(m.contains("search_code is literal unless regex=true"));
-        assert!(m.contains("offset=next_offset"));
+        assert!(!m.contains("offset=next_offset"), "paging is not taught");
+        assert!(!m.contains("narrow Grep"), "no grep re-check advice");
         assert!(m.contains("get_languages") || m.contains("language server"));
     }
 
