@@ -6,7 +6,14 @@
 //!
 //! * [`context_blocks`]: for a short list (≤ [`CONTEXT_MAX_HITS`] non-test
 //!   code hits), the enclosing function inline when it is short, else a
-//!   ±[`CONTEXT_RADIUS`] window, merged per file and capped in bytes;
+//!   ±[`CONTEXT_RADIUS`] window, merged per file and capped in bytes.
+//!   **Off by default since batch 8** (opt in with
+//!   `ASTROLABE_REFS_CONTEXT_HITS`): on the batch 7 C runs (33) the model
+//!   Read 0 ranges that were fully shown inline and still Read 26 times
+//!   around hits whose context it had just been given (21 behind a ±4
+//!   window in a long function, 5 behind a whole short function), so the
+//!   ~960 B/run of context (≈10 KB/run once re-sent on later turns) saved
+//!   no Reads; see `/workspace/audit/b8cx/REPORT.md`;
 //! * [`caller_summary`]: one line naming the non-test callers when test hits
 //!   outnumber them;
 //! * [`completion_line`]: an explicit "complete, no grep needed" line, only
@@ -20,8 +27,10 @@ use astrolabe_core::types::Confidence;
 
 use crate::refs_graph::{HitInfo, HitKind};
 
-/// Context is shown when the list has at most this many non-test code hits
-/// (`ASTROLABE_REFS_CONTEXT_HITS` overrides; 0 turns inline context off).
+/// When enabled, context is shown for lists with at most this many non-test
+/// code hits. Disabled by default; `ASTROLABE_REFS_CONTEXT_HITS=on` (or
+/// `1`/`true`) enables it with this threshold, a number `N > 1` enables it
+/// with threshold `N`, and `0`/`off`/unset keeps it off.
 pub(crate) const CONTEXT_MAX_HITS: usize = 8;
 /// A function this short (lines) is inlined whole instead of a window.
 pub(crate) const CONTEXT_WHOLE_FN_LINES: u32 = 40;
@@ -48,11 +57,30 @@ const INCOMPLETE_MARKS: &[&str] = &[
     "fallback",
 ];
 
+/// Threshold from an `ASTROLABE_REFS_CONTEXT_HITS` value; 0 = off.
+fn parse_context_hits(v: Option<&str>) -> usize {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
+        return 0;
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => CONTEXT_MAX_HITS,
+        "off" | "false" | "no" | "0" => 0,
+        n => n.parse().unwrap_or(0),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test override of the threshold (env vars are process-global).
+    static TEST_CONTEXT_HITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 fn context_max_hits() -> usize {
-    std::env::var("ASTROLABE_REFS_CONTEXT_HITS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(CONTEXT_MAX_HITS)
+    #[cfg(test)]
+    if let Some(n) = TEST_CONTEXT_HITS.with(|c| c.get()) {
+        return n;
+    }
+    parse_context_hits(std::env::var("ASTROLABE_REFS_CONTEXT_HITS").ok().as_deref())
 }
 
 /// Context per hit index (`locations` index) and the hit indices whose own
@@ -317,6 +345,14 @@ mod tests {
         }
     }
 
+    /// Run `f` with inline context enabled at `n` (default: off).
+    fn with_context<T>(n: usize, f: impl FnOnce() -> T) -> T {
+        TEST_CONTEXT_HITS.with(|c| c.set(Some(n)));
+        let out = f();
+        TEST_CONTEXT_HITS.with(|c| c.set(None));
+        out
+    }
+
     fn run(fake: Fake, budget: usize) -> (String, serde_json::Value) {
         let r = run_find_references(
             FindReferencesParams {
@@ -365,7 +401,9 @@ mod tests {
 
     #[test]
     fn short_lists_inline_caller_context_and_say_complete() {
-        let (text, json) = run(h1_like(Confidence::Exact, None), 2_500);
+        let (text, json) = with_context(CONTEXT_MAX_HITS, || {
+            run(h1_like(Confidence::Exact, None), 2_500)
+        });
         // Short function inlined whole, hit line marked.
         assert!(
             text.contains("    10| line 10\n    11| line 11\n    12> line 12\n"),
@@ -441,7 +479,9 @@ mod tests {
     #[test]
     fn paged_or_long_lists_get_no_context_or_completion() {
         // Budget too small for the context: plain list; paged: no "complete".
-        let (text, json) = run(h1_like(Confidence::Exact, None), 60);
+        let (text, json) = with_context(CONTEXT_MAX_HITS, || {
+            run(h1_like(Confidence::Exact, None), 60)
+        });
         assert!(!text.contains("> line"), "{text}");
         assert!(!text.contains("已全列"), "{text}");
         assert_eq!(json["complete"], false);
@@ -455,7 +495,7 @@ mod tests {
             confidence: Confidence::Exact,
             note: None,
         };
-        let (text, json) = run(fake, 2_500);
+        let (text, json) = with_context(CONTEXT_MAX_HITS, || run(fake, 2_500));
         assert!(!text.contains("> line"), "{text}");
         assert_eq!(json["context_blocks"], 0);
         assert!(!text.contains("非测试调用方"), "{text}");
@@ -499,7 +539,9 @@ mod tests {
             hit(Some(("Long", 1, 190)), false),
         ];
         let lines = |_: &str| Some(Arc::new((1..=200).map(|n| format!("line {n}")).collect()));
-        let ctx = context_blocks(&locs, &infos, &[0, 1], &lines);
+        let ctx = with_context(CONTEXT_MAX_HITS, || {
+            context_blocks(&locs, &infos, &[0, 1], &lines)
+        });
         assert_eq!(ctx.blocks.len(), 1);
         let block = &ctx.blocks[&0];
         assert!(
@@ -517,9 +559,43 @@ mod tests {
             .map(|&l| loc("a.go", l))
             .collect();
         let far_infos: Vec<HitInfo> = (0..5).map(|_| hit(Some(("Long", 1, 190)), false)).collect();
-        let ctx = context_blocks(&far, &far_infos, &[0, 1, 2, 3, 4], &wide);
+        let ctx = with_context(CONTEXT_MAX_HITS, || {
+            context_blocks(&far, &far_infos, &[0, 1, 2, 3, 4], &wide)
+        });
         // 9 lines × ~126 B per window: the 5th window is over the cap.
         assert_eq!(ctx.blocks.len(), 4, "byte cap");
         assert!(!ctx.covered.contains(&4));
+    }
+
+    #[test]
+    fn context_is_off_by_default_but_summary_and_completion_stay() {
+        // Batch 8: inline context saved no Reads in the C runs; default off.
+        let (text, json) = run(h1_like(Confidence::Exact, None), 2_500);
+        assert!(!text.contains("> line"), "{text}");
+        assert!(!text.contains("| line"), "{text}");
+        assert_eq!(json["context_blocks"], 0);
+        // Hits keep their one-line text and enclosing function.
+        assert!(text.contains("in Short[10-14]: callee(x)"), "{text}");
+        assert!(text.contains("in Long[50-150]: callee(x)"), "{text}");
+        assert!(
+            text.contains("非测试调用方（2 处 / 2 个函数；测试 3 处）"),
+            "{text}"
+        );
+        assert!(text.trim_end().ends_with("无需再 grep 复核。"), "{text}");
+        assert_eq!(json["complete"], true);
+    }
+
+    #[test]
+    fn context_switch_values() {
+        assert_eq!(parse_context_hits(None), 0);
+        assert_eq!(parse_context_hits(Some("")), 0);
+        for v in ["0", "off", "OFF", "false", "no", "garbage"] {
+            assert_eq!(parse_context_hits(Some(v)), 0, "{v}");
+        }
+        for v in ["on", "1", "true", " yes "] {
+            assert_eq!(parse_context_hits(Some(v)), CONTEXT_MAX_HITS, "{v}");
+        }
+        assert_eq!(parse_context_hits(Some("3")), 3);
+        assert_eq!(parse_context_hits(Some("12")), 12);
     }
 }

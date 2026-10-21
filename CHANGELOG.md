@@ -15,7 +15,7 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 - **Go `goto_definition` 索引优先**：索引能唯一判定时直接作答（0.25–3.4 ms），无解或有歧义才启动 gopls。关闭：`ASTROLABE_DEFINITION_INDEX_FIRST=off`。
 - **Go `find_references`**：方法引用按接收者类型过滤（如模板的 `t.Execute` 不再算进来），判定不了的标「未核实」；同名多处定义时按调用方给的 `path` 选定，不再退回 gopls；开头不再写「全仓唯一定义」这类不实措辞。
 - **gopls 以 `-remote=auto` 启动**，多个会话共用一个 gopls 守护进程；此时 Astrolabe 设的 gopls 内存上限不再生效。关闭：`ASTROLABE_GOPLS_REMOTE=off`。
-- **`find_references` 输出**：非测试命中不超过 8 处时内联所在函数上下文（`ASTROLABE_REFS_CONTEXT_HITS`，`0` 关闭）；结果确实查全时末行写「已全列」；测试命中占多数时加一行非测试调用方汇总。
+- **`find_references` 输出**：结果确实查全时末行写「已全列」；测试命中占多数时加一行非测试调用方汇总。内联所在函数上下文默认关闭（第 8 批复盘：第 7 批 33 次 run 里模型照样在这些命中附近 Read 了 26 次，没省下 Read，却每次 run 多约 1 KB 输出），需要时设 `ASTROLABE_REFS_CONTEXT_HITS=on`（非测试命中不超过 8 处时内联）或一个数字作阈值。
 - **`tools/list` 瘦身**：隐藏 16 个从未用过的参数（照常接受；`ASTROLABE_FULL_SCHEMA=1` 全部声明），说明文字去掉互相冲突与「请安装语言服务器」的句子，「末行写已全列时不必复核」放入默认说明。工具定义加说明 8,447 B → 4,740 B（−44%）。
 - **语言服务器缺失时**，`find_references` / `goto_definition` 改由索引作答并附一行安装提示，不再只回 Unknown。
 
