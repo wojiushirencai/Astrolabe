@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use moka::sync::Cache;
 use rayon::prelude::*;
 
 use crate::graph::CodeGraph;
@@ -222,45 +221,143 @@ fn parsed_weight(parsed: &ParsedFile) -> usize {
 /// A new cache is filled on each incremental apply so a retained previous
 /// [`IncrementalIndex`] is not mutated.
 struct ParseProductCache {
-    inner: Cache<RelPath, CachedProduct>,
+    budget: u64,
+    bytes: u64,
+    /// Apply number that produced this cache; entries carry the generation
+    /// in which their file was last parsed.
+    generation: u64,
+    entries: HashMap<RelPath, (CachedProduct, u64), FxBuild>,
 }
 
 impl ParseProductCache {
-    fn new(budget_bytes: u64) -> Self {
-        let budget = budget_bytes.max(1);
-        let inner = Cache::builder()
-            .max_capacity(budget)
-            .weigher(|path: &RelPath, value: &CachedProduct| -> u32 {
-                let bytes = path
-                    .as_str()
-                    .len()
-                    .saturating_add(value.sha.len())
-                    .saturating_add(value.weight as usize)
-                    .saturating_add(std::mem::size_of::<CachedProduct>());
-                u32::try_from(bytes).unwrap_or(u32::MAX).max(1)
-            })
-            .build();
-        Self { inner }
+    fn new(budget_bytes: u64, generation: u64) -> Self {
+        Self {
+            budget: budget_bytes.max(1),
+            bytes: 0,
+            generation,
+            entries: HashMap::default(),
+        }
+    }
+
+    fn entry_bytes(path: &RelPath, value: &CachedProduct) -> u64 {
+        (path.as_str().len()
+            + value.sha.len()
+            + value.weight as usize
+            + std::mem::size_of::<CachedProduct>()) as u64
     }
 
     fn get(&self, path: &RelPath) -> Option<CachedProduct> {
-        self.inner.get(path)
+        self.entries.get(path).map(|(product, _)| product.clone())
     }
 
-    fn insert(&self, path: RelPath, product: CachedProduct) {
-        self.inner.insert(path, product);
+    /// A product parsed in this cache's generation.
+    fn insert(&mut self, path: RelPath, product: CachedProduct) {
+        let generation = self.generation;
+        self.insert_at(path, product, generation);
     }
 
-    fn run_pending(&self) {
-        self.inner.run_pending_tasks();
+    /// Carry a product over from an earlier cache, keeping its age.
+    fn insert_at(&mut self, path: RelPath, product: CachedProduct, generation: u64) {
+        self.bytes += Self::entry_bytes(&path, &product);
+        if let Some((old, _)) = self.entries.insert(path.clone(), (product, generation)) {
+            self.bytes -= Self::entry_bytes(&path, &old);
+        }
+    }
+
+    fn generation_of(&self, path: &RelPath) -> Option<u64> {
+        self.entries.get(path).map(|(_, generation)| *generation)
+    }
+
+    /// Enforce the byte budget: drop the products parsed longest ago (files
+    /// edited recently are the likeliest to be edited again), path order
+    /// breaking ties so eviction is deterministic. An evicted file is simply
+    /// re-read and re-parsed by the next apply.
+    fn run_pending(&mut self) {
+        if self.bytes <= self.budget {
+            return;
+        }
+        let mut order: Vec<(u64, RelPath, u64)> = self
+            .entries
+            .iter()
+            .map(|(path, (product, generation))| {
+                (*generation, path.clone(), Self::entry_bytes(path, product))
+            })
+            .collect();
+        order.sort_unstable();
+        for (_, path, bytes) in order {
+            if self.bytes <= self.budget {
+                break;
+            }
+            self.entries.remove(&path);
+            self.bytes -= bytes;
+        }
     }
 
     #[cfg(test)]
     fn weighted_size(&self) -> u64 {
-        self.run_pending();
-        self.inner.weighted_size()
+        self.bytes
     }
 }
+
+/// FxHash (rustc's hasher): the assembly maps are keyed by repository paths
+/// and symbol names, rebuilt on every apply, and SipHash was a visible share
+/// of a one-file edit. Not DoS-resistant, which a local index does not need.
+#[derive(Default, Clone, Copy)]
+struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
 
 fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
     [
@@ -964,7 +1061,7 @@ struct ParseOutcome {
     failures: Vec<(RelPath, String)>,
 }
 
-fn insert_product(cache: &ParseProductCache, row: &ParsedRow) {
+fn insert_product(cache: &mut ParseProductCache, row: &ParsedRow) {
     cache.insert(
         row.path.clone(),
         CachedProduct {
@@ -978,9 +1075,9 @@ fn insert_product(cache: &ParseProductCache, row: &ParsedRow) {
 }
 
 fn fill_products(rows: &[ParsedRow], budget_bytes: u64) -> ParseProductCache {
-    let products = ParseProductCache::new(budget_bytes);
+    let mut products = ParseProductCache::new(budget_bytes, 0);
     for row in rows {
-        insert_product(&products, row);
+        insert_product(&mut products, row);
     }
     products.run_pending();
     products
@@ -1046,7 +1143,7 @@ fn assemble_graph_with(
     report.files_parsed = parsed.len();
 
     let mut graph = CodeGraph::default();
-    let mut index_of = HashMap::new();
+    let mut index_of: HashMap<RelPath, FileId, FxBuild> = HashMap::default();
     for (i, row) in parsed.iter().enumerate() {
         let id = FileId(i as u32);
         index_of.insert(row.path.clone(), id);
@@ -1231,7 +1328,7 @@ fn assemble_graph_with(
         // Import edges join files; call edges join symbols. Both endpoints are
         // plain u32, so the distinction lives in `kind` — callers must read it
         // before interpreting `from`/`to`.
-        let mut by_name: HashMap<&str, Vec<SymbolId>> = HashMap::new();
+        let mut by_name: HashMap<&str, Vec<SymbolId>, FxBuild> = HashMap::default();
         for s in &graph.symbols {
             by_name.entry(s.name.as_str()).or_default().push(s.id);
         }
@@ -1545,7 +1642,9 @@ impl IncrementalIndex {
         if cancelled() {
             return None;
         }
+        let started = std::time::Instant::now();
         let (scanned, files, resolvers, excluded_sources) = discover(root, opts);
+        let discovered = started.elapsed();
         if cancelled() {
             return None;
         }
@@ -1557,12 +1656,20 @@ impl IncrementalIndex {
         let outcome = parse_paths_cancellable(root, &scanned.files, opts, true, cancel)?;
         let failures = outcome.failures.clone();
         (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
+        let parsed_at = started.elapsed();
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
         if cancelled() {
             return None;
         }
         let (graph, report, resolutions) =
             assemble_graph_with(outcome.parsed, &files, &resolvers, opts, report, None, true);
+        tracing::info!(
+            files = graph.files.len(),
+            discover_ms = discovered.as_millis() as u64,
+            parse_ms = (parsed_at - discovered).as_millis() as u64,
+            assemble_ms = (started.elapsed() - parsed_at).as_millis() as u64,
+            "index build"
+        );
         if cancelled() {
             return None;
         }
@@ -1783,12 +1890,14 @@ pub fn index_repo_incremental(
         "incremental index"
     );
 
-    let products = ParseProductCache::new(opts.parse_cache_bytes);
+    let mut products =
+        ParseProductCache::new(opts.parse_cache_bytes, previous.products.generation + 1);
     for (path, product) in reused_products {
-        products.insert(path, product);
+        let generation = previous.products.generation_of(&path).unwrap_or(0);
+        products.insert_at(path, product, generation);
     }
     for row in &outcome.parsed {
-        insert_product(&products, row);
+        insert_product(&mut products, row);
     }
     products.run_pending();
 
@@ -2349,6 +2458,30 @@ mod tests {
                 .copied();
             assert_eq!(got.map(|s| &s.name), want.map(|s| &s.name), "line {line}");
         }
+    }
+
+    #[test]
+    fn product_cache_evicts_oldest_generation_first_and_tracks_bytes() {
+        let product = |n: usize| CachedProduct {
+            language: Language::Go,
+            sha: "s".into(),
+            loc: 1,
+            parsed: Arc::new(ParsedFile::default()),
+            weight: n as u32,
+        };
+        let one = ParseProductCache::entry_bytes(&RelPath::new("a"), &product(100));
+        let mut cache = ParseProductCache::new(2 * one, 5);
+        cache.insert_at(RelPath::new("a"), product(100), 1);
+        cache.insert_at(RelPath::new("b"), product(100), 3);
+        cache.insert(RelPath::new("c"), product(100));
+        // Replacing an entry does not double count it.
+        cache.insert(RelPath::new("c"), product(100));
+        assert_eq!(cache.weighted_size(), 3 * one);
+        cache.run_pending();
+        assert_eq!(cache.weighted_size(), 2 * one);
+        assert!(cache.get(&RelPath::new("a")).is_none(), "oldest evicted");
+        assert!(cache.get(&RelPath::new("b")).is_some());
+        assert_eq!(cache.generation_of(&RelPath::new("c")), Some(5));
     }
 
     #[test]
@@ -3595,7 +3728,7 @@ mod persist_audit_tests {
     fn with_failure(root: &Path, opts: &IndexOptions, reason: &str, tries: u8) -> IncrementalIndex {
         let mut prev = IncrementalIndex::build(root, opts);
         // Pretend the last apply failed on a.py and kept no product for it.
-        prev.products = ParseProductCache::new(1 << 20);
+        prev.products = ParseProductCache::new(1 << 20, 0);
         prev.failures = vec![(RelPath::new("a.py"), reason.to_owned())];
         prev.failure_retries.insert(RelPath::new("a.py"), tries);
         prev
