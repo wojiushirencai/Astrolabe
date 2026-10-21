@@ -152,7 +152,7 @@ pub(crate) fn filter_changeset(root: &Path, changes: ChangeSet) -> ChangeSet {
 /// `try_acquire` promotes a follower. An I/O error is logged and treated as
 /// follower so the server keeps answering tools.
 pub(crate) fn refresh_leader(slot: &Mutex<Option<IndexerLock>>, root: &Path) -> bool {
-    let mut guard = slot.lock().expect("indexer lock slot poisoned");
+    let mut guard = crate::session::LockOrRecover::lock_or_recover(slot);
     if guard.as_ref().is_some_and(IndexerLock::held) {
         return true;
     }
