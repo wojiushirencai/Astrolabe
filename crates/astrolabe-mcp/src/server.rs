@@ -277,10 +277,8 @@ fn enclosing_symbol(index: &RepoIndex, path: &str, line: usize) -> Option<CodeSy
     let file = index.file_id(path)?;
     let line = line as u32;
     index
-        .graph()
-        .symbols
-        .iter()
-        .filter(|s| s.file == file && s.start_line <= line && line <= s.end_line)
+        .file_symbols(file)
+        .filter(|s| s.start_line <= line && line <= s.end_line)
         .filter(|s| s.end_line >= s.start_line + 2)
         .min_by_key(|s| s.end_line - s.start_line)
         .cloned()
@@ -308,31 +306,37 @@ fn is_test_path(path: &str) -> bool {
 /// Order broad-query hits for the preview: definition lines first, other
 /// non-test hits next, test/docs/example files last (stable within each class).
 fn rank_broad_hits<'a>(index: &RepoIndex, hits: &'a [SearchHit]) -> Vec<&'a SearchHit> {
-    let defs: std::collections::HashSet<(FileId, u32)> = index
-        .graph()
-        .symbols
-        .iter()
-        .filter(|s| {
-            !matches!(
-                s.kind,
-                astrolabe_core::SymbolKind::Variable
-                    | astrolabe_core::SymbolKind::Field
-                    | astrolabe_core::SymbolKind::Const
-            )
-        })
-        .map(|s| (s.file, s.start_line))
-        .collect();
+    // Definition start lines, built only for the files that have hits.
+    let mut defs: std::collections::HashMap<&str, Option<std::collections::HashSet<u32>>> =
+        std::collections::HashMap::new();
+    let mut is_def = |path: &'a str, line: u32| {
+        defs.entry(path)
+            .or_insert_with(|| {
+                index.file_id(path).map(|f| {
+                    index
+                        .file_symbols(f)
+                        .filter(|s| {
+                            !matches!(
+                                s.kind,
+                                astrolabe_core::SymbolKind::Variable
+                                    | astrolabe_core::SymbolKind::Field
+                                    | astrolabe_core::SymbolKind::Const
+                            )
+                        })
+                        .map(|s| s.start_line)
+                        .collect()
+                })
+            })
+            .as_ref()
+            .is_some_and(|set| set.contains(&line))
+    };
     let mut ranked: Vec<(u8, usize, &SearchHit)> = hits
         .iter()
         .enumerate()
         .map(|(i, h)| {
             let class = if is_test_path(&h.path) {
                 2
-            } else if !h.text_only
-                && index
-                    .file_id(&h.path)
-                    .is_some_and(|f| defs.contains(&(f, h.line as u32)))
-            {
+            } else if !h.text_only && is_def(&h.path, h.line as u32) {
                 0
             } else {
                 1
@@ -3473,6 +3477,16 @@ impl AstrolabeServer {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(format!("无效正则表达式：{error}")),
                 };
+                // Whole-buffer candidate lines (a superset of the lines the
+                // per-line matchers accept; see `line_scan`). With smart case
+                // the case-insensitive variant covers both matchers.
+                let line_scanner = if variant_matcher.is_some() {
+                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), true)
+                } else if params.regex {
+                    crate::line_scan::LineScanner::new(&params.query, !sensitive)
+                } else {
+                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), !sensitive)
+                };
                 if let Some(mode) = params.aggregate.as_deref() {
                     if mode != "top" && mode != "dir" && mode != "file" {
                         return text_error(format!(
@@ -3595,7 +3609,8 @@ impl AstrolabeServer {
                     };
                     // Lazy: the mask is only computed once a line matches.
                     let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
-                    for (line_no, line) in lines.iter().enumerate() {
+                    for line_no in line_scanner.candidates(&lines) {
+                        let line = &lines[line_no];
                         if !matcher.is_match(line) {
                             if variant_matcher.as_ref().is_some_and(|v| v.is_match(line)) {
                                 let text = if out.variants.is_empty() {

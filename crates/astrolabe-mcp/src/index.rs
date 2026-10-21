@@ -27,6 +27,8 @@ pub(crate) struct RepoIndex {
     inner: InnerIndex,
     in_graph_paths: OnceLock<HashSet<String>>,
     names: OnceLock<NameIndex>,
+    /// Path → file and file → symbols tables (built on first lookup).
+    files_lookup: OnceLock<FileLookup>,
     /// Sub-word index for `find_symbol`'s zero-hit fallback, built on first use.
     words: OnceLock<crate::word_index::WordIndex>,
     /// Markdown coverage report path, written lazily once per snapshot.
@@ -79,6 +81,41 @@ impl NameIndex {
     }
 }
 
+/// Per-snapshot file lookups that replace linear scans on the query path:
+/// exact path → file, file name → candidate files (for suffix targets), and
+/// file → positions of its symbols in `graph().symbols` (in graph order).
+pub(crate) struct FileLookup {
+    exact: std::collections::HashMap<Box<str>, FileId>,
+    /// Last path component → indices into `graph().files`, in graph order.
+    by_basename: std::collections::HashMap<Box<str>, Vec<u32>>,
+    symbols_by_file: std::collections::HashMap<FileId, Vec<u32>>,
+}
+
+impl FileLookup {
+    fn build(graph: &CodeGraph) -> Self {
+        let mut exact = std::collections::HashMap::with_capacity(graph.files.len());
+        let mut by_basename: std::collections::HashMap<Box<str>, Vec<u32>> =
+            std::collections::HashMap::with_capacity(graph.files.len());
+        for (i, file) in graph.files.iter().enumerate() {
+            let path = file.path.as_str();
+            // First file with a path wins, as the old linear `find` did.
+            exact.entry(path.into()).or_insert(file.id);
+            let base = path.rsplit('/').next().unwrap_or(path);
+            by_basename.entry(base.into()).or_default().push(i as u32);
+        }
+        let mut symbols_by_file: std::collections::HashMap<FileId, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (i, symbol) in graph.symbols.iter().enumerate() {
+            symbols_by_file.entry(symbol.file).or_default().push(i as u32);
+        }
+        Self {
+            exact,
+            by_basename,
+            symbols_by_file,
+        }
+    }
+}
+
 enum InnerIndex {
     Incremental(IncrementalIndex),
     #[cfg(test)]
@@ -115,6 +152,7 @@ impl RepoIndex {
             inner: InnerIndex::Incremental(incremental),
             in_graph_paths: OnceLock::new(),
             names: OnceLock::new(),
+            files_lookup: OnceLock::new(),
             words: OnceLock::new(),
             coverage_report: OnceLock::new(),
             partial_diagnoses: OnceLock::new(),
@@ -129,6 +167,7 @@ impl RepoIndex {
             inner: InnerIndex::Static { graph, report },
             in_graph_paths: OnceLock::new(),
             names: OnceLock::new(),
+            files_lookup: OnceLock::new(),
             words: OnceLock::new(),
             coverage_report: OnceLock::new(),
             partial_diagnoses: OnceLock::new(),
@@ -185,6 +224,7 @@ impl RepoIndex {
         let _ = std::thread::Builder::new()
             .name("astrolabe-prewarm".into())
             .spawn(move || {
+                index.file_lookup();
                 index.names();
                 if coverage {
                     index.coverage_detail();
@@ -318,21 +358,44 @@ impl RepoIndex {
     /// shortest path wins, which keeps the choice stable and predictable.
     pub fn file_id(&self, target: &str) -> Option<FileId> {
         let target = target.trim_start_matches("./");
-        if let Some(file) = self
-            .graph()
-            .files
-            .iter()
-            .find(|file| file.path.as_str() == target)
-        {
-            return Some(file.id);
+        let lookup = self.file_lookup();
+        if let Some(&id) = lookup.exact.get(target) {
+            return Some(id);
         }
-        let suffix = format!("/{target}");
-        self.graph()
-            .files
+        // A path ending in `/{target}` has `target`'s last component as its
+        // file name, so only files with that name can match.
+        let base = target.rsplit('/').next().unwrap_or(target);
+        let files = &self.graph().files;
+        lookup
+            .by_basename
+            .get(base)?
             .iter()
-            .filter(|file| file.path.as_str().ends_with(&suffix))
+            .map(|&i| &files[i as usize])
+            .filter(|file| {
+                let path = file.path.as_str();
+                path.len() > target.len()
+                    && path.ends_with(target)
+                    && path.as_bytes()[path.len() - target.len() - 1] == b'/'
+            })
             .min_by_key(|file| file.path.as_str().len())
             .map(|file| file.id)
+    }
+
+    fn file_lookup(&self) -> &FileLookup {
+        self.files_lookup
+            .get_or_init(|| FileLookup::build(self.graph()))
+    }
+
+    /// Symbols of `file`, in `graph().symbols` order.
+    pub fn file_symbols(&self, file: FileId) -> impl Iterator<Item = &astrolabe_core::CodeSymbol> {
+        let symbols = &self.graph().symbols;
+        self.file_lookup()
+            .symbols_by_file
+            .get(&file)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .map(move |&i| &symbols[i as usize])
     }
 }
 
@@ -428,6 +491,95 @@ pub(crate) fn build_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic(paths: &[&str], symbols: &[(u32, u32, u32)]) -> RepoIndex {
+        use astrolabe_core::{CodeSymbol, Language, SymbolId, SymbolKind};
+        let graph = CodeGraph {
+            files: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| CodeFile {
+                    id: FileId(i as u32),
+                    path: RelPath::new(p),
+                    language: Some(Language::Rust),
+                    loc: 1,
+                    sha: String::new(),
+                })
+                .collect(),
+            symbols: symbols
+                .iter()
+                .enumerate()
+                .map(|(i, &(file, start, end))| CodeSymbol {
+                    id: SymbolId(i as u32),
+                    file: FileId(file),
+                    name: format!("s{i}"),
+                    kind: SymbolKind::Function,
+                    signature: String::new(),
+                    start_line: start,
+                    end_line: end,
+                    exported: true,
+                })
+                .collect(),
+            edges: vec![],
+        };
+        RepoIndex::from_graph(PathBuf::from("."), graph, IndexReport::default())
+    }
+
+    /// The pre-index linear `file_id`, kept as the reference.
+    fn file_id_linear(index: &RepoIndex, target: &str) -> Option<FileId> {
+        let target = target.trim_start_matches("./");
+        let files = &index.graph().files;
+        if let Some(file) = files.iter().find(|f| f.path.as_str() == target) {
+            return Some(file.id);
+        }
+        let suffix = format!("/{target}");
+        files
+            .iter()
+            .filter(|f| f.path.as_str().ends_with(&suffix))
+            .min_by_key(|f| f.path.as_str().len())
+            .map(|f| f.id)
+    }
+
+    #[test]
+    fn file_id_lookup_matches_linear_scan() {
+        let paths = [
+            "a.rs",
+            "src/a.rs",
+            "src/lib/a.rs",
+            "x/src/a.rs",
+            "y/src/a.rs",
+            "b.rs",
+            "src/b.rs",
+            "srcb.rs",
+            "deep/one/two/c.go",
+            "one/two/c.go",
+            "dir/",
+            "weird//d.rs",
+            "日本/語.rs",
+        ];
+        let index = synthetic(&paths, &[]);
+        let targets = [
+            "a.rs", "./a.rs", "src/a.rs", "./src/a.rs", "lib/a.rs", "rc/a.rs", "b.rs", "src/b.rs",
+            "rcb.rs", "c.go", "two/c.go", "one/two/c.go", "/c.go", "", "/", "dir", "dir/", "d.rs",
+            "/d.rs", "weird//d.rs", "語.rs", "日本/語.rs", "missing.rs", "a", ".rs", "./",
+            "././a.rs",
+        ];
+        for t in targets {
+            assert_eq!(index.file_id(t), file_id_linear(&index, t), "target {t:?}");
+        }
+    }
+
+    #[test]
+    fn file_symbols_lists_a_files_symbols_in_graph_order() {
+        // Symbols of one file need not be contiguous.
+        let index = synthetic(&["a.rs", "b.rs"], &[(0, 1, 9), (1, 1, 3), (0, 2, 4), (1, 5, 5)]);
+        let names = |f: u32| -> Vec<String> {
+            index.file_symbols(FileId(f)).map(|s| s.name.clone()).collect()
+        };
+        assert_eq!(names(0), ["s0", "s2"]);
+        assert_eq!(names(1), ["s1", "s3"]);
+        assert!(names(7).is_empty());
+    }
 
     /// `prewarm` builds the lookup tables off the query path; a query that
     /// arrives meanwhile gets the same tables from the `OnceLock`.

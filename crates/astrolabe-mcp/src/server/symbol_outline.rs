@@ -416,6 +416,7 @@ impl AstrolabeServer {
         let total = lines.len();
         let offset = params.offset.min(total);
         // Go interfaces in the outlined files: their implementing types.
+        let file_set: std::collections::HashSet<FileId> = files.iter().copied().collect();
         let implementors = super::search_shape::implementors_block(
             index,
             index
@@ -423,7 +424,7 @@ impl AstrolabeServer {
                 .symbols
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| files.contains(&s.file))
+                .filter(|(_, s)| file_set.contains(&s.file))
                 .map(|(i, _)| i),
             params.budget_tokens / 3,
         );
