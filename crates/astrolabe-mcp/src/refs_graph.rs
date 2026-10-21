@@ -1691,6 +1691,9 @@ pub(crate) fn graph_references_at(
             let shown: Vec<String> = aliases.iter().take(5).map(|a| format!("`{a}`")).collect();
             s += &format!("（含 as 改名 {}）", shown.join("、"));
         }
+        if via.truncated {
+            s += "（转导出链超过跟踪上限，结果可能不全）";
+        }
         s
     } else {
         "定义文件及导入它的文件".to_string()

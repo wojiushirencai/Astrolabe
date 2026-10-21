@@ -231,7 +231,7 @@ pub(crate) fn python_scope(
     root: &Path,
     decl_file: FileId,
     name: &str,
-) -> (BTreeMap<u32, BTreeSet<String>>, Vec<String>) {
+) -> (BTreeMap<u32, BTreeSet<String>>, Reexports) {
     let graph = index.graph();
     let mut importers_of: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for e in &graph.edges {
@@ -259,7 +259,7 @@ pub(crate) fn python_scope(
         }
     }
     let mut scope: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
-    let mut via: Vec<String> = Vec::new();
+    let mut via = Reexports::default();
     let mut seen: HashSet<(u32, String)> = HashSet::new();
     let mut queue: VecDeque<(u32, String, usize)> = VecDeque::new();
     scope
@@ -340,6 +340,9 @@ pub(crate) fn python_scope(
                 names.insert(a);
             }
             if depth + 1 > MAX_REEXPORT_DEPTH {
+                if !reexported_as(&lines, &n, &from_module).is_empty() {
+                    via.truncated = true;
+                }
                 continue;
             }
             for e in reexported_as(&lines, &n, &from_module) {
@@ -355,6 +358,27 @@ pub(crate) fn python_scope(
     (scope, via)
 }
 
+/// Re-exporting modules followed by [`python_scope`] (derefs to their
+/// paths); `truncated` when a chain went past [`MAX_REEXPORT_DEPTH`].
+#[derive(Debug, Default)]
+pub(crate) struct Reexports {
+    pub files: Vec<String>,
+    pub truncated: bool,
+}
+
+impl std::ops::Deref for Reexports {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Vec<String> {
+        &self.files
+    }
+}
+
+impl std::ops::DerefMut for Reexports {
+    fn deref_mut(&mut self) -> &mut Vec<String> {
+        &mut self.files
+    }
+}
+
 /// Last dotted segment of the module at `path` (`ls` for `pkg/ls.py`,
 /// `pkg` for `pkg/__init__.py`).
 fn module_name(path: &str) -> String {
@@ -366,6 +390,61 @@ fn module_name(path: &str) -> String {
     } else {
         stem.to_string()
     }
+}
+
+// ------------------------------------------------------------ routing
+
+/// `ASTROLABE_PY_GRAPH_FIRST=off` (or `0` / `false`) keeps pyright first for
+/// every Python name.
+fn graph_first_enabled() -> bool {
+    switch_on(std::env::var("ASTROLABE_PY_GRAPH_FIRST").ok().as_deref())
+}
+
+fn switch_on(v: Option<&str>) -> bool {
+    !v.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+/// Whether `find_references` for the Python name `name` is answered from
+/// the index before pyright: exactly one Python definition in the repo, and
+/// it is module-level (function, class, constant / variable). Methods,
+/// attributes and names defined more than once keep pyright first
+/// (measured: top-level 65/65 identical to pyright on serena + rich;
+/// members' precision 0.90–0.92, `docs/find-references-graph-first.md`).
+pub(crate) fn graph_first(index: &RepoIndex, root: &Path, name: &str) -> bool {
+    use astrolabe_core::types::SymbolKind;
+    if name.is_empty() || !graph_first_enabled() {
+        return false;
+    }
+    let mut decls = index.graph().symbols.iter().filter(|s| {
+        s.name == name
+            && index
+                .file(s.file)
+                .is_some_and(|f| matches!(f.language, Some(Language::Python)))
+    });
+    let (Some(decl), None) = (decls.next(), decls.next()) else {
+        return false;
+    };
+    if !matches!(
+        decl.kind,
+        SymbolKind::Function | SymbolKind::Class | SymbolKind::Const | SymbolKind::Variable
+    ) {
+        return false;
+    }
+    let Some(path) = index.file(decl.file).map(|f| f.path.as_str().to_string()) else {
+        return false;
+    };
+    let Some(lines) = crate::refs_graph::read_lines(root, &path) else {
+        return false;
+    };
+    // Module level: the definition (or its first decorator) starts at column 0.
+    lines
+        .get(decl.start_line.saturating_sub(1) as usize)
+        .is_some_and(|l| !l.is_empty() && indent_of(l) == 0)
 }
 
 // ----------------------------------------------- members (methods, attributes)
@@ -1361,6 +1440,145 @@ mod tests {
             class_bases("class Sub(Base, mod.Mixin, metaclass=M):", "Sub"),
             vec!["Base", "Mixin"]
         );
+    }
+
+    fn routing_repo() -> std::path::PathBuf {
+        repo(&[
+            (
+                "pkg/core.py",
+                concat!(
+                    "import functools\n",
+                    "LIMIT = 3\n",
+                    "\n",
+                    "@functools.cache\n",
+                    "def build(x):\n",
+                    "    return x\n",
+                    "\n",
+                    "class Engine:\n",
+                    "    def start(self):\n",
+                    "        def inner():\n",
+                    "            pass\n",
+                    "        return build(LIMIT)\n",
+                    "\n",
+                    "def dup():\n",
+                    "    pass\n",
+                ),
+            ),
+            ("pkg/other.py", "def dup():\n    pass\n"),
+            (
+                "app.py",
+                "from pkg.core import build, Engine, LIMIT\n\nEngine().start()\nbuild(LIMIT)\n",
+            ),
+        ])
+    }
+
+    #[test]
+    fn python_graph_first_only_for_unique_module_level_names() {
+        let dir = routing_repo();
+        let index = crate::index::build_with_options(&dir, false, 1 << 20).expect("index");
+        for name in ["build", "Engine", "LIMIT"] {
+            assert!(graph_first(&index, &dir, name), "{name}");
+        }
+        // Method, nested function, two definitions, unknown name.
+        for name in ["start", "inner", "dup", "missing", ""] {
+            assert!(!graph_first(&index, &dir, name), "{name}");
+        }
+        assert!(switch_on(None) && switch_on(Some("on")) && switch_on(Some("1")));
+        for off in ["off", "OFF", " 0", "false", "no"] {
+            assert!(!switch_on(Some(off)), "{off}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end: a unique top-level Python name is answered from the index
+    /// (no pyright), and the answer is marked complete.
+    #[test]
+    fn python_top_level_references_answer_from_the_index() {
+        use crate::precise_tools::PreciseCapability;
+        let dir = routing_repo();
+        let index = std::sync::Arc::new(
+            crate::index::build_with_options(&dir, false, 1 << 20).expect("index"),
+        );
+        let backend = crate::live_backend::LiveBackend::new(dir.clone())
+            .with_syntax_index(std::sync::Arc::new(move || Some(index.clone())));
+        let r = backend.references("build", Some("pkg/core.py"), None, false);
+        let note = r.note.clone().unwrap_or_default();
+        assert!(note.contains("未启动语言服务器"), "{note}");
+        let got: Vec<String> = r
+            .value
+            .iter()
+            .map(|l| format!("{}:{}", l.path.as_str(), l.range.start.line + 1))
+            .collect();
+        assert_eq!(
+            got,
+            vec!["app.py:1", "app.py:4", "pkg/core.py:5", "pkg/core.py:12"]
+        );
+        assert!(
+            crate::refs_render::complete_source(r.confidence, r.note.as_deref()).is_some(),
+            "{note}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member answer with receivers the index could not confirm is not
+    /// presented as complete.
+    #[test]
+    fn unconfirmed_member_hits_are_not_marked_complete() {
+        let dir = repo(&[
+            (
+                "pkg/a.py",
+                "class Base:\n    def run(self):\n        pass\n",
+            ),
+            (
+                "pkg/b.py",
+                "from pkg.a import Base\n\ndef g(x):\n    x.run()\n",
+            ),
+        ]);
+        let index = crate::index::build_with_options(&dir, false, 1 << 20).expect("index");
+        let r = crate::refs_graph::graph_references(
+            &index,
+            &dir,
+            "run",
+            &astrolabe_core::types::RelPath::new("pkg/a.py"),
+        )
+        .expect("graph answer");
+        assert!(
+            crate::refs_render::complete_source(r.confidence, r.note.as_deref()).is_none(),
+            "{:?}",
+            r.note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A re-export chain deeper than the cap is followed no further and the
+    /// answer says it may be incomplete (no completion line).
+    #[test]
+    fn deep_reexport_chain_is_not_marked_complete() {
+        let mut files: Vec<(String, String)> =
+            vec![("m0.py".into(), "def Deep():\n    pass\n".into())];
+        for i in 1..=MAX_REEXPORT_DEPTH + 2 {
+            files.push((format!("m{i}.py"), format!("from m{} import Deep\n", i - 1)));
+        }
+        files.push((
+            "user.py".into(),
+            format!("from m{} import Deep\n\nDeep()\n", MAX_REEXPORT_DEPTH + 2),
+        ));
+        let refs_files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let dir = repo(&refs_files);
+        let index = crate::index::build_with_options(&dir, false, 1 << 20).expect("index");
+        let (_, via) = python_scope(&index, &dir, index.file_id("m0.py").unwrap(), "Deep");
+        assert!(via.truncated && via.len() == MAX_REEXPORT_DEPTH, "{via:?}");
+        let (_, note) = refs(&dir, "Deep", "m0.py");
+        assert!(note.contains("可能不全"), "{note}");
+        assert!(crate::refs_render::complete_source(
+            astrolabe_core::types::Confidence::Scoped,
+            Some(&note)
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

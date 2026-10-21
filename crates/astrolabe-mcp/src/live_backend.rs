@@ -719,7 +719,12 @@ impl LiveBackend {
         let graph_first = refs_graph::graph_first_language(language)
             || index.as_deref().is_some_and(|ix| {
                 crate::refs_graph_ts::ts_graph_first(ix, language, symbol.trim())
-            });
+            })
+            // Python: module-level names with exactly one definition.
+            || (language == Language::Python
+                && index
+                    .as_deref()
+                    .is_some_and(|ix| crate::py_refs::graph_first(ix, &self.root, symbol.trim())));
         let graph = (!exact && graph_first)
             .then_some(index.as_deref())
             .flatten()
