@@ -123,10 +123,24 @@ impl AstrolabeServer {
                 self.shared = Some(Arc::clone(&shared));
                 shared.set_host(Arc::new(ServerHost(self.clone())));
                 shared.boot();
+                self.log_indexing();
                 return;
             }
         }
+        self.log_indexing();
         self.start_indexing();
+    }
+
+    /// "indexing repository", except for a follower (it indexes nothing).
+    fn log_indexing(&self) {
+        if self.dispatch.is_none() && !self.is_shared_follower() {
+            tracing::info!(
+                root = %self.root.display(),
+                context = %self.context.name,
+                structured = self.context.structured_or_auto_off(),
+                "indexing repository"
+            );
+        }
     }
 
     /// Whether this process forwards to a leader instead of indexing.
@@ -249,6 +263,32 @@ impl shared_index::Host for ServerHost {
 
     fn start_local(&self) {
         self.0.start_indexing();
+    }
+
+    fn try_take_lock(&self) -> bool {
+        // Not `refresh_leader`: it warns on every I/O error, and this is
+        // polled once a second.
+        use crate::session::LockOrRecover;
+        let mut slot = self.0.primary.indexer_lock.lock_or_recover();
+        if slot.is_some() {
+            return true;
+        }
+        match astrolabe_core::elect::IndexerLock::try_acquire(&self.0.root) {
+            Ok(Some(lock)) => {
+                *slot = Some(lock);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::debug!(%error, "shared index: indexer lock not available");
+                false
+            }
+        }
+    }
+
+    fn release_lock(&self) {
+        use crate::session::LockOrRecover;
+        *self.0.primary.indexer_lock.lock_or_recover() = None;
     }
 }
 

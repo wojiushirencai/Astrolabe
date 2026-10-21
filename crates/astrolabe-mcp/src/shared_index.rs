@@ -41,7 +41,7 @@ use serde_json::Value;
 use crate::context::ClientContext;
 
 /// Wire protocol version; bump on any frame change.
-pub(crate) const PROTO: u32 = 1;
+pub(crate) const PROTO: u32 = 2;
 /// How long a call waits for a leader hand-over before going local.
 pub(crate) const QUEUE_BUDGET: Duration = Duration::from_secs(3);
 /// At startup, a held lock with no reachable socket (an older or opted-out
@@ -56,6 +56,39 @@ const SETTINGS_IGNORED: &[&str] = &[
     "ASTROLABE_ROOT",
     "ASTROLABE_CONTEXT",
 ];
+
+/// Environment a language server or toolchain launched for a forwarded
+/// call would inherit (`get_diagnostics` toolchain path, `lsp=true`, rename,
+/// LSP fallbacks). The leader spawns them with *its* environment, so a
+/// follower whose toolchain env differs must not share.
+const TOOLCHAIN_ENV: &[&str] = &[
+    "PATH",
+    "GOPATH",
+    "GOROOT",
+    "GOFLAGS",
+    "GOWORK",
+    "CARGO_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "VIRTUAL_ENV",
+    "NODE_PATH",
+];
+
+/// Hash of [`TOOLCHAIN_ENV`] (unset and empty are distinct).
+pub(crate) fn toolchain_env_hash() -> String {
+    let mut buf = Vec::new();
+    for key in TOOLCHAIN_ENV {
+        buf.extend_from_slice(key.as_bytes());
+        match std::env::var_os(key) {
+            Some(value) => {
+                buf.push(b'=');
+                buf.extend_from_slice(value.to_string_lossy().as_bytes());
+            }
+            None => buf.push(b'!'),
+        }
+        buf.push(0);
+    }
+    format!("{:016x}", fnv64(&buf))
+}
 
 /// `ASTROLABE_SHARED_INDEX` (default on; `off`/`0`/`false`/`no` disables).
 pub(crate) fn enabled() -> bool {
@@ -146,6 +179,9 @@ pub(crate) struct Hello {
     pub cache_format: u32,
     pub tools_hash: String,
     pub settings_hash: String,
+    /// [`toolchain_env_hash`].
+    #[serde(default)]
+    pub toolchain_hash: String,
     pub root: String,
     pub session_id: String,
     pub pid: u32,
@@ -168,6 +204,7 @@ impl Hello {
             cache_format: astrolabe_core::store::CACHE_FORMAT_VERSION,
             tools_hash,
             settings_hash: settings_hash(),
+            toolchain_hash: toolchain_env_hash(),
             root: root.display().to_string(),
             session_id: format!("{pid}-{nanos:x}"),
             pid,
@@ -180,7 +217,7 @@ impl Hello {
 
     /// Why `other` (a follower) cannot share this leader, if it cannot.
     pub(crate) fn mismatch(&self, other: &Hello) -> Option<String> {
-        let checks: [(&str, String, String); 7] = [
+        let checks: [(&str, String, String); 8] = [
             ("proto", self.proto.to_string(), other.proto.to_string()),
             ("version", self.pkg.clone(), other.pkg.clone()),
             (
@@ -198,6 +235,11 @@ impl Hello {
                 "settings",
                 self.settings_hash.clone(),
                 other.settings_hash.clone(),
+            ),
+            (
+                "toolchain env",
+                self.toolchain_hash.clone(),
+                other.toolchain_hash.clone(),
             ),
             ("root", self.root.clone(), other.root.clone()),
         ];
@@ -290,6 +332,11 @@ pub(crate) trait Host: Send + Sync {
     fn adopt_lock(&self, lock: IndexerLock);
     /// Start (once) the local watcher + index build.
     fn start_local(&self);
+    /// Hold this root's indexer lock if free (`refresh_leader`); `true` when
+    /// this process holds it afterwards.
+    fn try_take_lock(&self) -> bool;
+    /// Drop the indexer lock (a promotion that lost a race with shutdown).
+    fn release_lock(&self);
 }
 
 /// Socket directory: see the module docs.
@@ -397,6 +444,9 @@ mod tests {
         let mut e = hello();
         e.root = "/other".into();
         assert!(a.mismatch(&e).unwrap().starts_with("root"));
+        let mut f = hello();
+        f.toolchain_hash = "other-path".into();
+        assert!(a.mismatch(&f).unwrap().starts_with("toolchain env"));
     }
 
     #[test]

@@ -295,13 +295,9 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// The "indexing repository" line is logged by `start_indexing_shared`, and
+/// not at all when this session attaches to a shared-index leader.
 fn boot_single(root: std::path::PathBuf, context: astrolabe_mcp::ClientContext) -> AstrolabeServer {
-    tracing::info!(
-        root = %root.display(),
-        context = %context.name,
-        structured = context.structured_or_auto_off(),
-        "indexing repository"
-    );
     AstrolabeServer::with_context(root, context)
 }
 

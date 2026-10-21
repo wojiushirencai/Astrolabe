@@ -218,7 +218,64 @@ fn two_followers_forward_to_one_leader() {
         .matches("shared index: follower attached")
         .count();
     assert_eq!(attached, 2, "{}", leader.log());
-    let _ = BUILT;
+    assert!(leader.log().contains(BUILT), "{}", leader.log());
+    for f in [&f1, &f2] {
+        assert!(
+            !f.log().contains(BUILT),
+            "follower says it indexes:\n{}",
+            f.log()
+        );
+    }
+}
+
+#[test]
+fn independent_session_starts_serving_once_it_takes_the_lock() {
+    let fx = Fixture::new();
+    // A non-sharing holder of the lock (older version / opted out).
+    let mut legacy = Session::spawn(&fx, "legacy", &[("ASTROLABE_SHARED_INDEX", "off")]);
+    greet_symbol(&mut legacy);
+    let mut b = Session::spawn(&fx, "b", &[]);
+    greet_symbol(&mut b);
+    assert!(b.log().contains(INDEPENDENT), "{}", b.log());
+    assert!(!b.log().contains(LEADER), "{}", b.log());
+    // The holder exits: the independent session takes the lock and serves.
+    legacy.close();
+    assert!(
+        b.wait_log("took over the indexer lock", Duration::from_secs(5)),
+        "{}",
+        b.log()
+    );
+    let mut c = Session::spawn(&fx, "c", &[]);
+    assert!(greet_symbol(&mut c).contains("hello.py"));
+    assert!(c.log().contains(FOLLOWER), "{}", c.log());
+    assert!(!c.log().contains(INDEPENDENT), "{}", c.log());
+    assert!(
+        b.log().contains("shared index: follower attached"),
+        "{}",
+        b.log()
+    );
+}
+
+#[test]
+fn toolchain_env_mismatch_falls_back_to_independent() {
+    let fx = Fixture::new();
+    let mut leader = Session::spawn(&fx, "l", &[]);
+    greet_symbol(&mut leader);
+    let path = format!(
+        "{}:/nonexistent-astrolabe-bin",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut other = Session::spawn(&fx, "path", &[("PATH", path.as_str())]);
+    assert!(greet_symbol(&mut other).contains("hello.py"));
+    let log = other.log();
+    assert!(
+        log.contains(INDEPENDENT) && log.contains("toolchain env differs"),
+        "{log}"
+    );
+    // Same toolchain env: shares.
+    let mut same = Session::spawn(&fx, "same", &[]);
+    greet_symbol(&mut same);
+    assert!(same.log().contains(FOLLOWER), "{}", same.log());
 }
 
 #[test]

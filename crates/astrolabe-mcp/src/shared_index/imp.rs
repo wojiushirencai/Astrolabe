@@ -23,6 +23,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll step while waiting for the lock / a reply.
 const STEP: Duration = Duration::from_millis(25);
+/// How often an independent session checks whether it can take the lock.
+const PROMOTE_POLL: Duration = Duration::from_secs(1);
 /// Reconnect attempts per call after the leader went away mid-call.
 const MAX_HANDOVERS_PER_CALL: usize = 3;
 
@@ -244,6 +246,10 @@ pub(crate) struct Shared {
     leader: Mutex<Option<Listener>>,
     local_started: AtomicBool,
     local_since: Mutex<Option<Instant>>,
+    /// The promotion watcher is running (or done).
+    promote_watch: AtomicBool,
+    /// Binding the socket failed once; do not keep retrying.
+    bind_failed: AtomicBool,
     me: Weak<Shared>,
 }
 
@@ -278,6 +284,8 @@ impl Shared {
             leader: Mutex::new(None),
             local_started: AtomicBool::new(false),
             local_since: Mutex::new(None),
+            promote_watch: AtomicBool::new(false),
+            bind_failed: AtomicBool::new(false),
             me: me.clone(),
         })
     }
@@ -371,16 +379,66 @@ impl Shared {
         }
         let Some(host) = self.host() else { return };
         host.adopt_lock(lock);
-        match Listener::bind(&self.sock, self.hello.clone(), Arc::clone(&host)) {
+        self.serve_socket(&host, "");
+        self.go_local(handover);
+    }
+
+    /// Bind and serve the socket (we hold the lock). `true` when serving.
+    fn serve_socket(&self, host: &Arc<dyn Host>, how: &str) -> bool {
+        let mut leader = self.leader.lock_or_recover();
+        if leader.is_some() {
+            return true;
+        }
+        if matches!(*self.role.lock_or_recover(), Role::Closed) {
+            return false;
+        }
+        match Listener::bind(&self.sock, self.hello.clone(), Arc::clone(host)) {
             Ok(listener) => {
-                tracing::info!(sock = %self.sock.display(), "shared index: leader, serving other sessions");
-                *self.leader.lock_or_recover() = Some(listener);
+                tracing::info!(sock = %self.sock.display(), "shared index: leader, serving other sessions{how}");
+                *leader = Some(listener);
+                true
             }
             Err(error) => {
+                self.bind_failed.store(true, Ordering::SeqCst);
                 tracing::warn!(%error, sock = %self.sock.display(), "shared index: cannot bind socket; leader for this session only");
+                false
             }
         }
-        self.go_local(handover);
+    }
+
+    /// An independent process may get the lock later (the holder that did
+    /// not share exits, or `refresh_leader` on an apply wins it). Poll for
+    /// it and start serving, so later sessions share instead of waiting out
+    /// [`STARTUP_GRACE`] and indexing alone.
+    fn watch_for_promotion(&self) {
+        if self.promote_watch.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = self.me.clone();
+        let spawned = std::thread::Builder::new()
+            .name("astrolabe-shared-promote".into())
+            .spawn(move || loop {
+                std::thread::sleep(PROMOTE_POLL);
+                let Some(me) = weak.upgrade() else { return };
+                if matches!(*me.role.lock_or_recover(), Role::Closed)
+                    || me.leader.lock_or_recover().is_some()
+                    || me.bind_failed.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                let Some(host) = me.host() else { return };
+                if host.try_take_lock() {
+                    if !me.serve_socket(&host, " (took over the indexer lock)")
+                        && matches!(*me.role.lock_or_recover(), Role::Closed)
+                    {
+                        host.release_lock();
+                    }
+                    return;
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "shared index: cannot spawn promotion watcher");
+        }
     }
 
     fn go_local(&self, handover: bool) {
@@ -400,6 +458,9 @@ impl Shared {
             if let Some(host) = self.host() {
                 host.start_local();
             }
+        }
+        if self.leader.lock_or_recover().is_none() {
+            self.watch_for_promotion();
         }
     }
 
