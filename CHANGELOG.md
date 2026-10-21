@@ -37,6 +37,10 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 - **内存（Linux glibc）**：建完索引及编辑停下 5 秒后 `malloc_trim`，435 万行仓库连改 10 次后 RSS 2,010 MB → 1,372 MB（−32%）。`ASTROLABE_MALLOC_TRIM=0` 关闭；macOS 上无效。
 - **gopls 共用**：两个会话 gopls 总 RSS 5.7 GB → 3.0 GB（−47%）。
 
+### 依赖
+
+- `ureq` 2 → 3（语言服务器自动安装的下载器）：去掉 `webpki-roots` 0.26 垫片；`rustls-webpki` 0.103.16、`webpki-roots` 1.0.10，修复 RUSTSEC-2026-0381 / 0382（emSign 失信中间证书）。下载体积上限显式放开（clangd 等压缩包超过 ureq 3 默认的 10 MB）；ureq 3 默认读取 `HTTPS_PROXY` 等代理环境变量。
+
 ### 文档
 
 - 撤下第 6 批坏基线下的 TS/Python 召回数字，换成第 7 批重测结果（`docs/find-references-graph-first.md`）。
