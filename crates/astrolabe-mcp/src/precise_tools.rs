@@ -143,6 +143,10 @@ pub(crate) struct GetDiagnosticsParams {
     #[serde(default = "default_budget")]
     #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
+    /// Not advertised (`server.rs` UNADVERTISED_PARAMS); results name it.
+    #[serde(default)]
+    #[schemars(description = "true: ask the language server (slow, memory-heavy).")]
+    pub lsp: Option<bool>,
 }
 
 /// Tool descriptions shared by `PreciseTools` and `AstrolabeServer`, so the
@@ -150,7 +154,8 @@ pub(crate) struct GetDiagnosticsParams {
 pub(crate) const FIND_REFERENCES_DESC: &str = "精确引用（索引优先，语言服务器兜底）：调用点与用法，改名和调用方分析用它。Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
 pub(crate) const GOTO_DEFINITION_DESC: &str =
     "Jump to definition: 按使用处文件 + 符号名返回定义锚点。";
-pub(crate) const GET_DIAGNOSTICS_DESC: &str = "文件诊断（语法与类型错误），编辑后核对用。";
+pub(crate) const GET_DIAGNOSTICS_DESC: &str =
+    "文件诊断（语法与类型错误），编辑后核对用；已跑通构建/测试则不必再调。";
 
 /// Backend for the precise MCP query tools.
 ///
@@ -185,6 +190,12 @@ pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
         character: Option<u32>,
     ) -> Precise<Vec<Location>>;
     fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>>;
+    /// Diagnostics with an explicit choice of source. `lsp`: the caller asked
+    /// for the language server; otherwise the backend may answer from the
+    /// toolchain / parser without starting one.
+    fn diagnostics_with(&self, path: &str, _lsp: bool) -> Precise<Vec<Diagnostic>> {
+        self.diagnostics(path)
+    }
     /// Files changed on disk; keeps running language servers in sync.
     fn files_changed(&self, _changes: &astrolabe_core::watch::ChangeSet) {}
 }
@@ -397,8 +408,9 @@ pub(crate) fn run_find_references(
     let completion = complete
         .map(|src| refs_render::completion_line(locations.len(), files, src))
         .unwrap_or_default();
-    // Short lists carry the callers' code inline (no Read needed), when it
-    // fits the budget with the whole list.
+    // Inline caller context: off by default since batch 8 (the model read
+    // around those hits anyway); `ASTROLABE_REFS_CONTEXT_HITS=on|N` turns it
+    // on, and then only when it fits the budget with the whole list.
     let mut items = hits.items();
     if params.dry_run_rename.is_none() && offset == 0 {
         hits.ctx = refs_render::context_blocks(&locations, &infos, &hits.order, &|p| {
@@ -802,7 +814,7 @@ fn render_rename_preview(
         ));
     }
     if confidence == Confidence::Exact {
-        out.push_str("清单来自语言服务器（精确）；替换完成后用 get_diagnostics 逐文件验证。\n");
+        out.push_str("清单来自语言服务器（精确）；替换完成后跑构建/测试验证（跑不了才用 get_diagnostics 逐文件查）。\n");
     } else {
         out.push_str("注意：引用置信度低于 exact，清单可能漏报或误报，替换前请核对。\n");
     }
@@ -952,7 +964,7 @@ pub(crate) fn run_get_diagnostics(
         },
     };
 
-    let result = backend.diagnostics(&params.path);
+    let result = backend.diagnostics_with(&params.path, params.lsp.unwrap_or(false));
     if let Some(fault) = crate::diag_env::detect(&params.path, &result.value) {
         return env_fault_result(&params, &result.value, &fault);
     }
@@ -1512,6 +1524,7 @@ mod tests {
             path: "src/main.go".into(),
             severity: None,
             budget_tokens: 800,
+            lsp: None,
         })));
     }
 
@@ -1554,6 +1567,7 @@ mod tests {
             path: "pkg/server.go".into(),
             severity: None,
             budget_tokens: 800,
+            lsp: None,
         })));
         let text = first_text(&diags);
         assert!(text.contains("confidence: Unknown"), "{text}");
@@ -1618,6 +1632,7 @@ mod tests {
             path: "src/lib.rs".into(),
             severity: None,
             budget_tokens: 0,
+            lsp: None,
         })));
         let text = first_text(&diags);
         assert!(text.contains("因 budget_tokens 被省略"), "{text}");
@@ -1665,6 +1680,7 @@ mod tests {
             path: "src/a.rs".into(),
             severity: Some("error".into()),
             budget_tokens: 800,
+            lsp: None,
         })));
         let text = first_text(&filtered);
         assert!(text.contains("[error]"), "{text}");
@@ -1676,6 +1692,7 @@ mod tests {
             path: "src/a.rs".into(),
             severity: Some("fatal".into()),
             budget_tokens: 800,
+            lsp: None,
         })));
         let text = first_text(&invalid);
         assert!(text.contains("无法识别的 severity"), "{text}");

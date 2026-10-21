@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use crate::loop_guard::{LoopGuard, Verdict};
 
 mod search_shape;
+mod shared;
 mod symbol_outline;
 use crate::{
     context::ClientContext,
@@ -1017,7 +1018,7 @@ fn classify_task(task: &str) -> TaskKind {
 /// One-line pointer to the follow-up tool that fits the task wording.
 fn next_step_hint(task: &str) -> &'static str {
     match classify_task(task) {
-        TaskKind::Rename => "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后 get_diagnostics 验证。\n",
+        TaskKind::Rename => "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后跑构建/测试验证（跑不了才用 get_diagnostics）。\n",
         TaskKind::Count => "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 行 / M 个文件计数（按行计，同一行多次出现算 1）；只要总数加 count_only=true。\n",
         TaskKind::Refs => "下一步：find_references(symbol) 取精确调用点；定义用 goto_definition。\n",
         TaskKind::Other => "下一步：已知名字用 find_symbol（include_body=true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n",
@@ -1856,6 +1857,12 @@ pub struct AstrolabeServer {
     /// Fixed legends and footers already shown this MCP session (each is
     /// printed once, like the syntax-error footnote).
     shown_once: Arc<Mutex<std::collections::HashSet<&'static str>>>,
+    /// Shared index across sessions (`shared_index`): `Some` on the stdio
+    /// server when sharing is on; `None` in leader-side session views.
+    shared: Option<Arc<crate::shared_index::Shared>>,
+    /// Per-session coverage-note memory for leader-side session views
+    /// (the root session's own slot otherwise).
+    coverage_note_override: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl AstrolabeServer {
@@ -1977,6 +1984,8 @@ impl AstrolabeServer {
             context_page_generations: Arc::new(Mutex::new(HashMap::new())),
             call_seq: Arc::new(AtomicU64::new(0)),
             shown_once: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            shared: None,
+            coverage_note_override: None,
         }
     }
 
@@ -2300,7 +2309,7 @@ impl AstrolabeServer {
                         .and_then(|block| block.as_text())
                         .map(|t| t.text.as_str())
                         .unwrap_or_default();
-                    match index.query_coverage_note(text, &session.coverage_note_shown) {
+                    match index.query_coverage_note(text, self.coverage_slot(&session)) {
                         Some(note) => append_stale_note(result, &note),
                         None => result,
                     }
@@ -2588,6 +2597,7 @@ const UNADVERTISED_PARAMS: &[&str] = &[
     "dry_run_rename",
     "character",
     "severity",
+    "lsp",
 ];
 
 fn full_schema_requested() -> bool {
@@ -4609,6 +4619,19 @@ impl ServerHandler for AstrolabeServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if self.shared.is_some() {
+            let ct = context.ct.clone();
+            let forwarded = self
+                .forward_call(
+                    &request.name,
+                    request.arguments.clone(),
+                    Box::new(move || ct.is_cancelled()),
+                )
+                .await;
+            if let Some(done) = forwarded {
+                return done;
+            }
+        }
         let ct = context.ct.clone();
         let flag = Arc::new(AtomicBool::new(false));
         let worker_flag = Arc::clone(&flag);
@@ -4682,8 +4705,17 @@ impl ServerHandler for AstrolabeServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        if self.shared.is_some() {
+            let ct = context.ct.clone();
+            let forwarded = self
+                .forward_read(&request.uri, Box::new(move || ct.is_cancelled()))
+                .await;
+            if let Some(done) = forwarded {
+                return done;
+            }
+        }
         let mut resources = self.resources.lock().unwrap_or_else(|e| e.into_inner());
         let Some(text) = resources.get(&request.uri) else {
             return Err(ErrorData::resource_not_found(
@@ -9785,6 +9817,7 @@ mod mcp_routing_tests {
                 path: file.to_string_lossy().into_owned(),
                 severity: None,
                 budget_tokens: 300,
+                lsp: None,
             },
         )));
         assert!(
