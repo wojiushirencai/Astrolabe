@@ -366,11 +366,15 @@ fn go_check(root: &Path, rel: &RelPath) -> Outcome {
     let Some(dir) = file.parent().map(Path::to_path_buf) else {
         return Outcome::Skipped(String::new());
     };
-    if find_up(root, &dir, "go.mod").is_none() && find_up(root, &dir, "go.work").is_none() {
+    let Some(mod_dir) = find_up(root, &dir, "go.mod") else {
         return Outcome::Skipped("文件不在 Go 模块里（找不到 go.mod），没法用 go 编译检查".into());
-    }
+    };
     let timeout = timeout_for(30);
     let started = Instant::now();
+    // A module that is not a `use` member of the active go.work (a nested
+    // module pulled in by `replace`, e.g. aicon's src/third_party/go-qrcode)
+    // only builds with the workspace off.
+    let mut work_off = go_needs_work_off(&dir, &mod_dir);
     let pkg = dir
         .strip_prefix(root)
         .ok()
@@ -380,13 +384,14 @@ fn go_check(root: &Path, rel: &RelPath) -> Outcome {
     let scope = format!("包 {pkg}");
     // 1. `go vet .`: type-checks the package with its tests and runs the
     //    analyzers, without linking (30-50 MiB, 0.1-0.8 s on a warm cache).
-    let mut cmd = Command::new("go");
-    cmd.args(["vet", "."]).current_dir(&dir);
-    let vet = match run(cmd, timeout) {
+    let vet = match run_go(&["vet", "."], &dir, &mut work_off, timeout) {
         Ok(out) => out,
         Err(e) => return skipped("go vet", e),
     };
     let vet_text = format!("{}\n{}", vet.stdout, vet.stderr);
+    if go_workspace_trouble(&vet_text) {
+        return go_workspace_skip(&vet_text);
+    }
     if vet.status == Some(0) {
         return Outcome::Ran {
             tool: "go vet（含测试文件的类型检查）",
@@ -413,19 +418,25 @@ fn go_check(root: &Path, rel: &RelPath) -> Outcome {
             diags: vet_diags,
         };
     }
-    let mut cmd = Command::new("go");
-    cmd.args([
-        "test",
-        "-c",
-        "-o",
-        null_device(),
-        "-vet=off",
-        "-gcflags=-e",
-        ".",
-    ])
-    .current_dir(&dir);
-    match run(cmd, left) {
-        Ok(out) if out.status != Some(0) => {
+    let compile = run_go(
+        &[
+            "test",
+            "-c",
+            "-o",
+            null_device(),
+            "-vet=off",
+            "-gcflags=-e",
+            ".",
+        ],
+        &dir,
+        &mut work_off,
+        left,
+    );
+    match compile {
+        Ok(out)
+            if out.status != Some(0)
+                && !go_workspace_trouble(&format!("{}\n{}", out.stdout, out.stderr)) =>
+        {
             let diags = parse_go(
                 root,
                 &dir,
@@ -445,6 +456,145 @@ fn go_check(root: &Path, rel: &RelPath) -> Outcome {
             diags: vet_diags,
         },
     }
+}
+
+/// go-command messages that mean the workspace (go.work) does not cover the
+/// module, not that the code is wrong. Never shown as diagnostics.
+const GO_WORKSPACE_MARKERS: &[&str] = &[
+    "does not contain package",
+    "not one of the workspace modules",
+    "outside modules listed in go.work",
+    "directory prefix . does not contain modules listed in go.work",
+];
+
+fn go_workspace_trouble(text: &str) -> bool {
+    GO_WORKSPACE_MARKERS.iter().any(|m| text.contains(m))
+}
+
+fn go_workspace_skip(text: &str) -> Outcome {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| go_workspace_trouble(l))
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect::<String>();
+    Outcome::Skipped(format!(
+        "go 工作区（go.work）不覆盖这个模块，GOWORK=off 也没能编译检查（{line}）"
+    ))
+}
+
+/// Run `go args` in `dir`; `work_off` adds `GOWORK=off`. When the output
+/// says the workspace does not cover the module, retry once with the
+/// workspace off (within the same time budget) and remember that.
+fn run_go(
+    args: &[&str],
+    dir: &Path,
+    work_off: &mut bool,
+    timeout: Duration,
+) -> Result<Output, RunError> {
+    let started = Instant::now();
+    let go = |off: bool, t: Duration| {
+        let mut cmd = Command::new("go");
+        cmd.args(args).current_dir(dir);
+        if off {
+            cmd.env("GOWORK", "off");
+        }
+        run(cmd, t)
+    };
+    let out = go(*work_off, timeout)?;
+    if *work_off || !go_workspace_trouble(&format!("{}\n{}", out.stdout, out.stderr)) {
+        return Ok(out);
+    }
+    let left = timeout.saturating_sub(started.elapsed());
+    if left.is_zero() {
+        return Ok(out);
+    }
+    *work_off = true;
+    go(true, left)
+}
+
+/// The active go.work for `dir`: `$GOWORK` when set (`off` = none), else the
+/// nearest go.work up to the file-system root (what the go command uses).
+fn active_go_work(dir: &Path) -> Option<PathBuf> {
+    match std::env::var("GOWORK") {
+        Ok(v) if v.trim() == "off" => return None,
+        Ok(v) if !v.trim().is_empty() => {
+            let p = PathBuf::from(v.trim());
+            return p.is_file().then_some(p);
+        }
+        _ => {}
+    }
+    dir.ancestors()
+        .map(|d| d.join("go.work"))
+        .find(|p| p.is_file())
+}
+
+/// Directories named by `use` in a go.work file (single-line and block
+/// forms), resolved against the file's directory.
+pub(crate) fn go_work_uses(work: &Path, text: &str) -> Vec<PathBuf> {
+    let base = work.parent().unwrap_or(Path::new("."));
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for raw in text.lines() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let spec = if in_block {
+            if line.starts_with(')') {
+                in_block = false;
+                continue;
+            }
+            line
+        } else if let Some(rest) = line
+            .strip_prefix("use")
+            .filter(|r| r.starts_with([' ', '\t', '(']))
+        {
+            let rest = rest.trim_start();
+            match rest.strip_prefix('(') {
+                Some(inner) => {
+                    let inner = inner.trim();
+                    if let Some(one) = inner.strip_suffix(')') {
+                        one.trim()
+                    } else {
+                        in_block = true;
+                        if inner.is_empty() {
+                            continue;
+                        }
+                        inner
+                    }
+                }
+                None => rest,
+            }
+        } else {
+            continue;
+        };
+        let spec = spec.trim_matches(|c| c == '"' || c == '`');
+        if spec.is_empty() {
+            continue;
+        }
+        let p = Path::new(spec);
+        out.push(normalize(&if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        }));
+    }
+    out
+}
+
+/// `mod_dir` has an active go.work that does not `use` it.
+fn go_needs_work_off(dir: &Path, mod_dir: &Path) -> bool {
+    let Some(work) = active_go_work(dir) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(&work) else {
+        return false;
+    };
+    let module = normalize(mod_dir);
+    !go_work_uses(&work, &text).iter().any(|u| *u == module)
 }
 
 /// `go vet` output that means the package (or a dependency) does not build:
@@ -1114,6 +1264,84 @@ FAIL\tex.com/m/p [build failed]\n";
         assert!(r.note.as_deref().unwrap().contains("go vet"));
         let r = check(&dir, &rel, Language::Go);
         assert!(r.value.is_empty(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_work_use_lines_parse() {
+        let work = Path::new("/r/src/go.work");
+        let text = "go 1.26.0\n\nuse .\nuse ./tools // dev\nuse (\n\t./a\n\t\"../b\"\n)\nuse (./c)\nuser x\nreplace x => ./y\n";
+        let got: Vec<String> = go_work_uses(work, text)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["/r/src", "/r/src/tools", "/r/src/a", "/r/b", "/r/src/c"]
+        );
+        assert!(go_workspace_trouble(
+            "main module (github.com/x/AI-con) does not contain package github.com/x/AI-con/third_party/q"
+        ));
+        assert!(!go_workspace_trouble("./a.go:3:1: undefined: x"));
+    }
+
+    /// aicon layout: src/go.work `use .`, src/go.mod replaces a nested module
+    /// (src/third_party/lib, its own go.mod, not a `use` member). Its files
+    /// get real diagnostics (GOWORK=off), never the workspace error.
+    #[test]
+    fn go_nested_replaced_module_outside_go_work() {
+        if !have("go") || std::env::var_os("GOWORK").is_some() {
+            return;
+        }
+        let dir = repo(
+            "gowork",
+            &[
+                ("src/go.work", "go 1.21\n\nuse .\n"),
+                (
+                    "src/go.mod",
+                    "module ex.com/app\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n\nreplace ex.com/lib => ./third_party/lib\n",
+                ),
+                (
+                    "src/main.go",
+                    "package main\n\nimport \"ex.com/lib\"\n\nfunc main() { _ = lib.L() }\n",
+                ),
+                ("src/third_party/lib/go.mod", "module ex.com/lib\n\ngo 1.21\n"),
+                (
+                    "src/third_party/lib/lib.go",
+                    "package lib\n\nfunc L() int { return missing }\n",
+                ),
+                ("src/third_party/lib/ok/ok.go", "package ok\n\nfunc O() int { return 1 }\n"),
+            ],
+        );
+        let mod_dir = dir.join("src/third_party/lib");
+        assert!(go_needs_work_off(&mod_dir, &mod_dir));
+        assert!(!go_needs_work_off(&dir.join("src"), &dir.join("src")));
+        let rel = RelPath::new("src/third_party/lib/lib.go");
+        let r = check(&dir, &rel, Language::Go);
+        assert_eq!(r.confidence, Confidence::Exact, "{r:?}");
+        assert_eq!(r.value.len(), 1, "{r:?}");
+        assert!(r.value[0].message.contains("undefined: missing"), "{r:?}");
+        assert!(r.value.iter().all(|d| !go_workspace_trouble(&d.message)));
+        // A clean package of the nested module: clean, not the workspace error.
+        let r = check(
+            &dir,
+            &RelPath::new("src/third_party/lib/ok/ok.go"),
+            Language::Go,
+        );
+        assert_eq!(r.confidence, Confidence::Exact, "{r:?}");
+        assert!(r.value.is_empty(), "{r:?}");
+        // The workspace member still builds through go.work.
+        let r = check(&dir, &RelPath::new("src/main.go"), Language::Go);
+        assert!(
+            r.value.iter().all(|d| !go_workspace_trouble(&d.message)),
+            "{r:?}"
+        );
+        // No go.mod at all (only a go.work): skipped, syntax only.
+        std::fs::create_dir_all(dir.join("loose")).unwrap();
+        std::fs::write(dir.join("go.work"), "go 1.21\n").unwrap();
+        std::fs::write(dir.join("loose/x.go"), "package x\n").unwrap();
+        let r = check(&dir, &RelPath::new("loose/x.go"), Language::Go);
+        assert_eq!(r.confidence, Confidence::Syntactic, "{r:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
