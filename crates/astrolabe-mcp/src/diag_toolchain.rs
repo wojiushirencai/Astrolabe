@@ -594,7 +594,7 @@ fn go_needs_work_off(dir: &Path, mod_dir: &Path) -> bool {
         return false;
     };
     let module = normalize(mod_dir);
-    !go_work_uses(&work, &text).iter().any(|u| *u == module)
+    !go_work_uses(&work, &text).contains(&module)
 }
 
 /// `go vet` output that means the package (or a dependency) does not build:
