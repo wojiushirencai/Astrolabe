@@ -205,6 +205,14 @@ struct FreshnessInner {
     /// When `distrusted`, [`FreshnessLog::suspect_paths`] hides these and
     /// returns empty (callers look at [`FreshnessLog::distrusted`]).
     suspects: Vec<(Instant, RelPath)>,
+    /// Paths the query barrier re-read from disk on its own
+    /// ([`FreshnessLog::note_repaired`]). The index may now hold content the
+    /// watcher snapshot never saw (an intermediate save), so the next check
+    /// that looks at such a path reports it even when it matches the old
+    /// snapshot stamp. Without this, "edit, query, revert within the
+    /// debounce" compared the revert against the pre-edit stamp, found no
+    /// change, and the deleted symbol stayed in the index until a rebuild.
+    repaired: BTreeSet<RelPath>,
 }
 
 impl FreshnessLog {
@@ -214,6 +222,7 @@ impl FreshnessLog {
                 watermark: Instant::now(),
                 distrusted: false,
                 suspects: Vec::new(),
+                repaired: BTreeSet::new(),
             }),
             verify_requested: AtomicBool::new(false),
             seeded: AtomicBool::new(false),
@@ -297,14 +306,57 @@ impl FreshnessLog {
         self.lock().distrusted
     }
 
+    /// Note event paths as suspects. A path that is already a suspect is
+    /// re-stamped instead of duplicated: a second write to a path that is
+    /// still waiting for its debounce (edit, then revert) must become visible
+    /// to the barrier again even if an earlier suspect for it was already
+    /// repaired and cleared.
     pub(crate) fn note_paths(&self, paths: &[RelPath]) {
         if paths.is_empty() {
             return;
         }
         let mut g = self.lock();
         let now = Instant::now();
+        let mut fresh: HashSet<&RelPath> = paths.iter().collect();
+        for entry in g.suspects.iter_mut() {
+            if fresh.remove(&entry.1) {
+                entry.0 = now;
+            }
+        }
         for p in paths {
-            g.suspects.push((now, p.clone()));
+            if fresh.remove(p) {
+                g.suspects.push((now, p.clone()));
+            }
+        }
+    }
+
+    /// The query barrier is about to re-read `paths` from disk into the
+    /// index, bypassing the watcher. Call this *before* reading, so a check
+    /// that races the repair still reports the path (see
+    /// `FreshnessInner::repaired`).
+    pub fn note_repaired(&self, paths: &[RelPath]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut g = self.lock();
+        g.repaired.extend(paths.iter().cloned());
+    }
+
+    /// Take the repaired marks for `paths` (all of them when `None`).
+    fn take_repaired(&self, paths: Option<&BTreeSet<RelPath>>) -> BTreeSet<RelPath> {
+        let mut g = self.lock();
+        if g.repaired.is_empty() {
+            return BTreeSet::new();
+        }
+        match paths {
+            None => std::mem::take(&mut g.repaired),
+            Some(paths) => {
+                let hit: BTreeSet<RelPath> = g.repaired.intersection(paths).cloned().collect();
+                for p in &hit {
+                    g.repaired.remove(p);
+                }
+                hit
+            }
         }
     }
 
@@ -654,11 +706,13 @@ impl Watcher {
 
         self.snapshot = next_snapshot;
 
-        let changes = ChangeSet {
+        let mut changes = ChangeSet {
             added,
             modified,
             removed,
         };
+        let repaired = self.freshness.take_repaired(None);
+        self.report_repaired(&mut changes, repaired);
         if !changes.is_empty() {
             tracing::debug!(
                 added = changes.added.len(),
@@ -785,6 +839,7 @@ impl Watcher {
         let mut modified = Vec::new();
         let mut removed = Vec::new();
 
+        let repaired = self.freshness.take_repaired(Some(&work));
         for rel in work {
             match self.snapshot.get(&rel).cloned() {
                 Some(old) => match (
@@ -820,14 +875,12 @@ impl Watcher {
             }
         }
 
-        added.sort();
-        modified.sort();
-        removed.sort();
-        let changes = ChangeSet {
+        let mut changes = ChangeSet {
             added,
             modified,
             removed,
         };
+        self.report_repaired(&mut changes, repaired);
         if !changes.is_empty() {
             tracing::debug!(
                 added = changes.added.len(),
@@ -838,6 +891,28 @@ impl Watcher {
         }
         self.freshness.bump_watermark(&changes);
         Ok(changes)
+    }
+
+    /// Add barrier-repaired paths the diff did not report: the index may hold
+    /// content the snapshot never saw, so re-read them (modified) or drop
+    /// them (removed) to converge on what is on disk now. Sorts all vecs.
+    fn report_repaired(&self, changes: &mut ChangeSet, repaired: BTreeSet<RelPath>) {
+        for rel in repaired {
+            if changes.added.contains(&rel)
+                || changes.modified.contains(&rel)
+                || changes.removed.contains(&rel)
+            {
+                continue;
+            }
+            if self.snapshot.contains_key(&rel) {
+                changes.modified.push(rel);
+            } else {
+                changes.removed.push(rel);
+            }
+        }
+        changes.added.sort();
+        changes.modified.sort();
+        changes.removed.sort();
     }
 
     /// Run `check` on a background thread and send debounced changesets.
@@ -1274,6 +1349,7 @@ impl Intake {
     fn absorb(&mut self, paths: Vec<PathBuf>, overflow: bool) {
         let mut kept = 0usize;
         let mut noted: Vec<RelPath> = Vec::new();
+        let mut seen: HashSet<RelPath> = HashSet::new();
         if overflow {
             self.all_dirty = true;
             self.freshness.note_distrust();
@@ -1285,7 +1361,11 @@ impl Intake {
                 self.rooted_events += 1;
             }
             if let Some((abs, rel)) = keep_event_path(&self.root, &self.scan, &p) {
-                if self.pending.insert(abs) {
+                // Re-note a path that is already pending too: the barrier may
+                // have repaired (and cleared) its first suspect while this
+                // later write still waits for the debounce.
+                self.pending.insert(abs);
+                if seen.insert(rel.clone()) {
                     noted.push(rel);
                 }
                 kept += 1;
@@ -2101,6 +2181,52 @@ mod tests {
     fn rewrite_and_bump(dir: &TestDir, rel: &str, contents: impl AsRef<[u8]>) {
         dir.write(rel, contents);
         bump_mtime(&dir.abs(rel));
+    }
+
+    #[test]
+    fn repaired_path_is_reported_even_when_content_matches_snapshot() {
+        // The barrier re-read an intermediate edit into the index, then the
+        // file was restored to its snapshot bytes before the debounce fired.
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        let _ = w.check();
+        let log = Arc::clone(&w.freshness);
+        log.note_repaired(&[RelPath::new("a.rs"), RelPath::new("gone.rs")]);
+        rewrite_and_bump(&dir, "a.rs", "fn a() {}");
+        let cs = w.check_paths(&[dir.abs("a.rs"), dir.abs("gone.rs")]);
+        assert_eq!(cs.modified, vec![RelPath::new("a.rs")]);
+        assert_eq!(cs.removed, vec![RelPath::new("gone.rs")]);
+        // Reported changes stay suspects until the index absorbs them.
+        let suspects = log.suspect_paths(log.watermark());
+        assert!(suspects.contains(&RelPath::new("a.rs")), "{suspects:?}");
+        // The mark is consumed: a plain re-check is quiet again.
+        assert!(w.check_paths(&[dir.abs("a.rs")]).is_empty());
+    }
+
+    #[test]
+    fn full_check_reports_repaired_paths_and_consumes_them() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = watcher(&dir);
+        let _ = w.check();
+        w.freshness.note_repaired(&[RelPath::new("a.rs")]);
+        let cs = w.check();
+        assert_eq!(cs.modified, vec![RelPath::new("a.rs")]);
+        assert!(w.check().is_empty());
+    }
+
+    #[test]
+    fn renoting_a_suspect_restamps_it_without_duplicates() {
+        let log = FreshnessLog::new();
+        log.note_paths(&[RelPath::new("a.rs")]);
+        let first = Instant::now();
+        log.clear_suspects_through(first);
+        assert!(log.suspect_paths(log.watermark()).is_empty());
+        log.note_paths(&[RelPath::new("a.rs"), RelPath::new("a.rs")]);
+        log.note_paths(&[RelPath::new("a.rs")]);
+        assert_eq!(log.suspect_paths(first), vec![RelPath::new("a.rs")]);
+        assert_eq!(log.lock().suspects.len(), 1);
     }
 
     #[test]
