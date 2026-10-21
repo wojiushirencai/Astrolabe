@@ -12,7 +12,7 @@ Go 的范围：定义所在包（目录）+ 经 import 边到达该包的文件�
 | cobra / Go（会话 8 个 + 抽样 25） | 33 | 32 | 1 | 28 | **1.000** | 0.996（1020 中多 4） | gopls Exact |
 | aiproxy / Go（会话 14 个 + 抽样 40） | 54 | 51 | 3 | 50 | **1.000** | 0.999（1159 中多 1） | gopls Exact |
 | aicon / Go（会话 2 个 + 抽样 30） | 32 | 31 | 1 | 31 | **1.000** | 1.000 | gopls Exact |
-| aiproxy web / TS（抽样 40） | 40 | 40 | 0 | 31 | **待重测**（TODO(B7-TS): 填入修正后的召回） | **待重测**（TODO(B7-TS): 填入修正后的精度） | 27/40 不是 Exact（无 node_modules，tsserver 退回文本）；原值作废，见下方说明 |
+| aiproxy web / TS（抽样 40） | 40 | 40 | 0 | 31 | 0.992（第 7 批改后 **1.000**） | 0.998（改后 0.998） | 第 7 批用装好 node_modules 的 LanguageService 重测；第 6 批原值（27/40 不是 Exact）作废，见下方说明与“第 7 批：TS/JS 重测” |
 | express / JS（抽样 30） | 30 | 30 | 0 | 13 | 0.958 | 0.535；只看 Exact 的 23 个：0.952 / 0.702 | 7/30 Unknown/Scoped |
 | serena / Python（抽样 40，600 s 内跑完 19） | 19 | 19 | 0 | 17 | 0.936（第 7 批改后 **1.000**） | 1.000（改后 1.000） | 第 7 批用 pyright 重测：预热、不设超时、无文本兜底。原值 0.779 是第 6 批坏基线下的数字，已作废；详见文末“第 7 批：Python 重测” |
 
@@ -21,7 +21,7 @@ Go 的范围：定义所在包（目录）+ 经 import 边到达该包的文件�
 > - **Python 召回 0.78 是低估。** pyright 每次 30 s 超时，基线是文本搜索。列出来的"漏报"大多是 docstring、f-string 里的文字，或者同名的其他属性和局部变量。真正的漏报主要是字符串类型注解（前向引用），例如 `tools_base.py:53` 的 `"LanguageServerSymbolRetriever"`。第 7 批用 pyright 重测，同一批 19 例在第 6 批规则下召回 0.936、精度 1.000（见文末）。
 > - JS（express）的基线有 7/30 不是 Exact，数字同样只能参考。
 >
-> 新基线的做法：TS 装好 node_modules，让 tsserver 达到 Exact；pyright 超时调到 180 s 以上并先预热；召回和精度只用 `Confidence::Exact` 的行计算。修正后的数字由第 7 批的 TS 和 PY 两路补入：TS 见上表 `TODO(B7-TS)`，Python 已补入上表并见文末“第 7 批：Python 重测”。审计依据：`lang-graph` 审计第 3.1 节。
+> 新基线的做法：TS 装好 node_modules，让 tsserver 达到 Exact；pyright 超时调到 180 s 以上并先预热；召回和精度只用 `Confidence::Exact` 的行计算。修正后的数字由第 7 批的 TS 和 PY 两路补入：TS 已补入上表并见下文 TS/JS 重测段，Python 已补入上表并见文末“第 7 批：Python 重测”。审计依据：`lang-graph` 审计第 3.1 节。
 
 会话里查过的 Go 符号：cobra 8 个中 7 个索引作答（`MarkFlagRequired` 有多处定义，交给 LSP），aiproxy 14 个中 11 个（`Provider`、`MaskSensitiveInfo`、`Register` 交给 LSP），aicon 2 个中 1 个；作答的全部召回 1.0。
 
@@ -37,7 +37,7 @@ Go 多出的 5 处：
 - **Go：索引优先**（`refs_graph::graph_first_language`）。只有名字有多处定义、或用 `dry_run_rename` 要编译器级清单时，才启动 gopls。
 - **TS / JS / Python：保留语言服务器优先**。
   - 基线本身不可靠，无法证明索引不差：tsserver 缺依赖，pyright 超时。
-  - 已经确认的真实缺口：TS/JS 经 barrel 文件转导出的引用、改名绑定（default import、CommonJS `require` 改名、`{A as B}`），以及 Python 的字符串类型注解和 `__init__.py` 转导出，索引目前拿不到。TS 的数字见 TODO(B7-TS)；Python 已重测，见文末“第 7 批：Python 重测”。第 6 批写的"Python 召回 0.78"是坏基线下的数字，已作废。
+  - 已经确认的真实缺口：TS/JS 经 barrel 文件转导出的引用、改名绑定（default import、CommonJS `require` 改名、`{A as B}`），以及 Python 的字符串类型注解和 `__init__.py` 转导出，索引目前拿不到。TS 第 7 批已补上（见下文 TS/JS 重测）；Python 已重测，见文末“第 7 批：Python 重测”。第 6 批写的"Python 召回 0.78"是坏基线下的数字，已作废。
   - 这些语言等基线修好后再测。
 
 ## 第 7 批：TS/JS 重测（可信基线）
