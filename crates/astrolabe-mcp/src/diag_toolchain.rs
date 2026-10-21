@@ -1262,13 +1262,10 @@ FAIL\tex.com/m/p [build failed]\n";
         assert_eq!(r.confidence, Confidence::Exact, "{r:?}");
         assert_eq!(r.value.len(), 1, "{r:?}");
         assert_eq!(r.value[0].severity, Severity::Warning);
-        assert_eq!(
-            (
-                r.value[0].range.start.line,
-                r.value[0].range.start.character
-            ),
-            (5, 13)
-        );
+        // Line 6; the printf analyzer reports the bad argument (col 14) on
+        // recent Go and the call (col 2, after the tab) on older ones.
+        assert_eq!(r.value[0].range.start.line, 5, "{r:?}");
+        assert!(matches!(r.value[0].range.start.character, 1 | 13), "{r:?}");
         assert!(r.note.as_deref().unwrap().contains("go vet"));
         let r = check(&dir, &rel, Language::Go);
         assert!(r.value.is_empty(), "{r:?}");
