@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe-ai/darwin-arm64",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "The macOS ARM 64-bit binary for Astrolabe AI (aarch64-apple-darwin)",
   "license": "MIT OR Apache-2.0",
   "repository": {

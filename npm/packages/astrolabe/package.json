@@ -1,6 +1,6 @@
 {
   "name": "@astrolabe-ai/astrolabe",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "mcpName": "io.github.wojiushirencai/astrolabe",
   "description": "Local MCP server for code search and navigation (search_code, find_symbol, find_references, goto_definition) for AI coding agents. Node shim for the native Astrolabe AI binary.",
   "keywords": [
@@ -40,12 +40,12 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@astrolabe-ai/darwin-arm64": "0.15.0",
-    "@astrolabe-ai/darwin-x64": "0.15.0",
-    "@astrolabe-ai/linux-x64-gnu": "0.15.0",
-    "@astrolabe-ai/linux-x64-musl": "0.15.0",
-    "@astrolabe-ai/linux-arm64-gnu": "0.15.0",
-    "@astrolabe-ai/win32-x64-msvc": "0.15.0"
+    "@astrolabe-ai/darwin-arm64": "0.16.0",
+    "@astrolabe-ai/darwin-x64": "0.16.0",
+    "@astrolabe-ai/linux-x64-gnu": "0.16.0",
+    "@astrolabe-ai/linux-x64-musl": "0.16.0",
+    "@astrolabe-ai/linux-arm64-gnu": "0.16.0",
+    "@astrolabe-ai/win32-x64-msvc": "0.16.0"
   },
   "publishConfig": {
     "access": "public"
