@@ -22,9 +22,149 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
          scoped 来自 import 图，syntactic 来自名字匹配。\
          改完代码后若已跑通构建或测试（如 go test、cargo test），就不必再调 get_diagnostics；它只在没法跑构建/测试时用。\
          缺语言服务器时精确工具会注明并给出替代做法，不要为此自行安装（get_languages 可看状态）。\
-         其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read。",
-        root.display()
+         其他语言源码文件不入索引：search_code/find_symbol 空结果不覆盖它们，请直接使用 Grep/Read。{}",
+        root.display(),
+        go_layout_hint(root).map(|h| format!("\n{h}")).unwrap_or_default()
     )
+}
+
+/// Go modules that do not sit at the index root. E1 (batch 8): a repo whose
+/// only `go.mod` is `src/go.mod` (root holds just `go.work`) made the model
+/// run `go test ./...` at the root, which matches no package with or without
+/// the `go.work` ("directory prefix . does not contain ..."), then wander for
+/// ~10 turns. One line naming the module roots up front avoids that.
+/// `None` when the root itself is a module or holds no Go module at all.
+fn go_layout_hint(root: &Path) -> Option<String> {
+    if root.join("go.mod").is_file() {
+        return None;
+    }
+    let from_work = root.join("go.work").is_file();
+    let mut mods: Vec<String> = if from_work {
+        std::fs::read_to_string(root.join("go.work"))
+            .map(|w| go_work_uses(&w))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d != "." && root.join(d).join("go.mod").is_file())
+            .collect()
+    } else {
+        scan_go_modules(root)
+    };
+    if mods.is_empty() {
+        return None;
+    }
+    mods.sort();
+    mods.dedup();
+    let first = mods[0].clone();
+    let mut list = mods
+        .iter()
+        .take(4)
+        .map(|d| format!("{d}/"))
+        .collect::<Vec<_>>()
+        .join("、");
+    if mods.len() > 4 {
+        list.push_str(&format!(" 等 {} 个", mods.len()));
+    }
+    let via = if from_work {
+        "（由根目录 go.work use）"
+    } else {
+        ""
+    };
+    Some(format!(
+        "Go：仓库根没有 go.mod，模块根在 {list}{via}；在根目录跑 `go test ./...` 匹配不到任何包，会直接报错。\
+         请进模块目录对改动的包跑，如 `cd {first} && go test ./<包路径>/`。"
+    ))
+}
+
+/// `use` targets of a go.work, both `use ./a` and `use ( ./a ./b )`, with
+/// a leading `./` and trailing `/` stripped.
+fn go_work_uses(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for raw in text.lines() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        let item = if in_block {
+            if line.starts_with(')') {
+                in_block = false;
+                continue;
+            }
+            line
+        } else if let Some(rest) = line.strip_prefix("use") {
+            let rest = rest.trim();
+            if rest.starts_with('(') {
+                in_block = true;
+                rest.trim_start_matches('(').trim()
+            } else if line.starts_with("use ") || line.starts_with("use\t") {
+                rest
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+        let item = item.trim_matches('"').trim();
+        if item.is_empty() || item.starts_with('/') {
+            continue;
+        }
+        let d = item.trim_start_matches("./").trim_end_matches('/');
+        out.push(if d.is_empty() {
+            ".".to_string()
+        } else {
+            d.to_string()
+        });
+    }
+    out
+}
+
+/// Shallow, bounded walk (depth 3, 2000 dirs) for `go.mod` directories,
+/// not descending into a module once found nor into trees the go tool or
+/// the index ignore.
+fn scan_go_modules(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(String::new(), 0usize)]);
+    let mut seen = 0usize;
+    while let Some((rel, depth)) = queue.pop_front() {
+        seen += 1;
+        if seen > 2000 {
+            break;
+        }
+        let dir = if rel.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&rel)
+        };
+        if !rel.is_empty() && dir.join("go.mod").is_file() {
+            out.push(rel);
+            continue;
+        }
+        if depth >= 3 {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.')
+                || name.starts_with('_')
+                || matches!(
+                    name.as_str(),
+                    "vendor" | "node_modules" | "testdata" | "target"
+                )
+            {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            queue.push_back((child, depth + 1));
+        }
+    }
+    out
 }
 
 /// L2: the full manual for hosts that inject it (Claude Code `--system-prompt`, tests).
@@ -378,6 +518,76 @@ mod tests {
             !instructions.contains("先调用 resolve_context"),
             "{instructions}"
         );
+    }
+
+    fn tmp_repo(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("astrolabe-gw-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for (p, body) in files {
+            let f = d.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, body).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn go_layout_hint_names_module_root_from_go_work() {
+        // The AI-con layout: root go.work `use ./src`, nested third_party module.
+        let d = tmp_repo(
+            "work",
+            &[
+                ("go.work", "go 1.26.0\n\nuse ./src\n"),
+                ("src/go.mod", "module example.com/m\n"),
+                ("src/third_party/q/go.mod", "module q\n"),
+            ],
+        );
+        let l1 = connection_instructions("claude-code", &d);
+        assert!(l1.contains("模块根在 src/（由根目录 go.work use）"), "{l1}");
+        assert!(l1.contains("cd src && go test"), "{l1}");
+        assert!(!l1.contains("third_party"), "{l1}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn go_layout_hint_scans_without_go_work() {
+        let d = tmp_repo(
+            "scan",
+            &[
+                ("svc/a/go.mod", "module a\n"),
+                ("svc/a/inner/go.mod", "module inner\n"),
+                ("tools/go.mod", "module tools\n"),
+                ("node_modules/x/go.mod", "module x\n"),
+                (".hidden/go.mod", "module h\n"),
+            ],
+        );
+        let h = go_layout_hint(&d).unwrap();
+        assert!(h.contains("svc/a/、tools/"), "{h}");
+        assert!(
+            !h.contains("inner") && !h.contains("node_modules") && !h.contains("hidden"),
+            "{h}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn go_layout_hint_silent_for_root_module_and_non_go() {
+        let d = tmp_repo(
+            "root",
+            &[("go.mod", "module m\n"), ("sub/go.mod", "module s\n")],
+        );
+        assert!(go_layout_hint(&d).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+        let d = tmp_repo("none", &[("src/lib.rs", "")]);
+        assert!(go_layout_hint(&d).is_none());
+        assert!(!connection_instructions("claude-code", &d).contains("Go："));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn go_work_uses_parses_block_and_single_forms() {
+        let w = "go 1.22\nuse ./a\nuse (\n\t./b/\n\t\"c\" // note\n\t.\n)\nuser x\n";
+        assert_eq!(go_work_uses(w), vec!["a", "b", "c", "."]);
     }
 
     #[test]
