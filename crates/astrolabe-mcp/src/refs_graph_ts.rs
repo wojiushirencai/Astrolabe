@@ -49,11 +49,46 @@ pub(crate) struct TsScope {
     pub files: HashMap<u32, Vec<String>>,
     /// Barrel files followed (files re-exporting the name).
     pub barrels: usize,
+    /// File id → locals holding a module object that exports it
+    /// (`import * as ns`, `const m = require()`, `import { ns }` of an
+    /// `export * as ns`): `ns.name` there is ours.
+    pub namespaces: HashMap<u32, HashSet<String>>,
+    /// Apply [`Self::member_reaches`] (off only in before/after measurement).
+    pub member_rule: bool,
+    /// The declaration is a property assignment (`app.handle = function
+    /// handle(`, `exports.load = function(`): its references are member
+    /// accesses `x.name`, and a bare `name` in the declaring file is the
+    /// function expression's own name or an unrelated local.
+    pub decl_is_member: bool,
+    /// Object of that assignment (`app` in `app.handle =`).
+    pub decl_base: Option<String>,
 }
 
 impl TsScope {
     pub(crate) fn contains(&self, file: u32) -> bool {
         self.files.contains_key(&file)
+    }
+
+    /// `base.name` in `file` reaches the declaration: `base` holds a
+    /// module object exporting it. Any other `x.name` is a same-named
+    /// member (`app.handle`, `this.route`), not a top-level declaration.
+    pub(crate) fn member_reaches(&self, file: u32, base: &str, in_def_file: bool) -> bool {
+        if !self.member_rule {
+            return true;
+        }
+        if self.decl_is_member {
+            // In its own file, through the same object or `this`
+            // (`this.router.handle` / `fn.handle` are other objects).
+            // Elsewhere the object's type is unknown: kept.
+            return !in_def_file || base == "this" || self.decl_base.as_deref() == Some(base);
+        }
+        self.namespaces.get(&file).is_some_and(|n| n.contains(base))
+    }
+
+    /// A bare `name` (no `x.` before it) counts; `in_def_file` is whether
+    /// the hit is in the declaring file.
+    pub(crate) fn bare_reaches(&self, in_def_file: bool) -> bool {
+        !self.member_rule || !(self.decl_is_member && in_def_file)
     }
 
     /// Words to search in `file`: the declared name plus its local aliases.
@@ -80,19 +115,20 @@ impl TsScope {
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only switch: `true` restores the batch-6 scope (declaring file
-    /// plus direct importers, no aliases), for before/after measurement.
-    pub(crate) static LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only switch for before/after measurement: 2 restores the batch-6
+    /// scope (declaring file plus direct importers, no aliases), 1 the first
+    /// batch-7 commit (no member rule), 0 is current.
+    pub(crate) static LEGACY: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
-fn legacy() -> bool {
+fn legacy() -> u8 {
     #[cfg(test)]
     {
         LEGACY.with(std::cell::Cell::get)
     }
     #[cfg(not(test))]
     {
-        false
+        0
     }
 }
 
@@ -107,7 +143,13 @@ enum Via {
 
 /// Scope of `name` declared in `def`: the declaring file, its importers,
 /// and the importers of every barrel that re-exports it.
-pub(crate) fn ts_scope(index: &RepoIndex, root: &Path, def: FileId, name: &str) -> TsScope {
+pub(crate) fn ts_scope(
+    index: &RepoIndex,
+    root: &Path,
+    def: FileId,
+    decl_line: u32,
+    name: &str,
+) -> TsScope {
     let graph = index.graph();
     let family = |id: u32| {
         index
@@ -124,9 +166,20 @@ pub(crate) fn ts_scope(index: &RepoIndex, root: &Path, def: FileId, name: &str) 
             targets.entry(e.from).or_default().push(e.to);
         }
     }
-    let mut scope = TsScope::default();
+    let mut scope = TsScope {
+        member_rule: legacy() == 0,
+        ..TsScope::default()
+    };
+    if let Some(base) = index
+        .file(def)
+        .and_then(|f| astrolabe_core::text::read_source(&root.join(f.path.as_str())).ok())
+        .and_then(|src| declared_as_property(&src, decl_line, name))
+    {
+        scope.decl_is_member = true;
+        scope.decl_base = Some(base);
+    }
     scope.files.insert(def.0, Vec::new());
-    if legacy() {
+    if legacy() == 2 {
         for &i in importers.get(&def.0).into_iter().flatten() {
             scope.files.entry(i).or_default();
         }
@@ -204,6 +257,14 @@ pub(crate) fn ts_scope(index: &RepoIndex, root: &Path, def: FileId, name: &str) 
                     continue;
                 }
                 for (imported, local) in bindings {
+                    if imported == "*" || names.get(imported) == Some(&Via::Namespace) {
+                        scope
+                            .namespaces
+                            .entry(imp)
+                            .or_default()
+                            .insert(local.clone());
+                        continue;
+                    }
                     if names.get(imported) == Some(&Via::Direct) {
                         bound.insert(local.clone());
                         // `{ Card as C }`: `Card` here names it too.
@@ -282,6 +343,26 @@ pub(crate) fn ts_scope(index: &RepoIndex, root: &Path, def: FileId, name: &str) 
         }
     }
     scope
+}
+
+/// When the first occurrence of `name` on 1-based `line` is a property
+/// assignment target `x.name =` (also `x.y.name =`), the object right
+/// before the dot (`x`, or `y`).
+fn declared_as_property(src: &str, line: u32, name: &str) -> Option<String> {
+    let text = src.lines().nth(line.saturating_sub(1) as usize)?;
+    let &b = crate::refs_graph::word_offsets(text, name).first()?;
+    let after = text[b + name.len()..].trim_start();
+    if !after.starts_with('=') || after.starts_with("==") || after.starts_with("=>") {
+        return None;
+    }
+    let before = text[..b].strip_suffix('.')?;
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .last()
+        .map(|(i, _)| i)?;
+    Some(before[start..].to_string())
 }
 
 // ------------------------------------------------------------- parsing
@@ -515,8 +596,10 @@ impl Facts {
         {
             if let Some(l) = ident(&c["id"]) {
                 // Whole module: its `module.exports` (our `default`).
-                f.imports
-                    .push((c["spec"].to_string(), vec![("default".to_string(), l)]));
+                f.imports.push((
+                    c["spec"].to_string(),
+                    vec![("default".to_string(), l.clone()), ("*".to_string(), l)],
+                ));
             }
         }
         for c in re(
@@ -711,7 +794,10 @@ mod tests {
         assert_eq!(imports["@/x/y"], &vec![pair("*", "ns")]);
         assert_eq!(imports["../z"], &vec![pair("e", "e"), pair("f", "g")]);
         assert!(!imports.contains_key("./commented"));
-        assert_eq!(imports["./req"], &vec![pair("default", "R")]);
+        assert_eq!(
+            imports["./req"],
+            &vec![pair("default", "R"), pair("*", "R")]
+        );
         assert_eq!(imports["./obj"], &vec![pair("p", "p"), pair("q", "Q")]);
         assert_eq!(
             f.reexports,
@@ -861,9 +947,9 @@ mod tests {
             "{got:?}"
         );
         // Batch-6 scope: declaring file and its direct importer only.
-        LEGACY.with(|l| l.set(true));
+        LEGACY.with(|l| l.set(2));
         let old = hits(&dir, "IconDiscord", "src/icons/discord.tsx");
-        LEGACY.with(|l| l.set(false));
+        LEGACY.with(|l| l.set(0));
         assert_eq!(
             old,
             vec!["src/icons/discord.tsx:1:11", "src/icons/index.ts:1:11"]
@@ -920,6 +1006,57 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn member_access_counts_only_through_a_module_object() {
+        let dir = repo(&[
+            (
+                "lib/app.js",
+                "var app = exports = module.exports = {};\napp.handle = function handle(req) {\n  this.handle(req)\n  this.router.handle(req)\n};\nexports.helper = function helper() {}\n",
+            ),
+            (
+                "lib/use.js",
+                "var a = require('./app');\na.helper();\nother.helper();\nimport * as ns from './app'\nns.helper()\n",
+            ),
+        ]);
+        // Declared by property assignment: `app.handle` and `this.handle`
+        // are it, the function expression's own name is not.
+        let got = hits(&dir, "handle", "lib/app.js");
+        assert_eq!(got, vec!["lib/app.js:2:6", "lib/app.js:3:6"], "{got:?}");
+        let got = hits(&dir, "helper", "lib/app.js");
+        assert_eq!(
+            got,
+            vec![
+                "lib/app.js:6:6",
+                "lib/use.js:2:6",
+                "lib/use.js:3:6",
+                "lib/use.js:5:6"
+            ],
+            "{got:?}"
+        );
+        // A free function: only `ns.f` through a module object counts.
+        let dir2 = repo(&[
+            ("lib/f.js", "function route(p) {\n  return p\n}\nmodule.exports = { route };\n"),
+            (
+                "lib/g.js",
+                "var f = require('./f');\nf.route(1);\nrouter.route(2);\nconst { route } = require('./f');\nroute(3);\n",
+            ),
+        ]);
+        let got = hits(&dir2, "route", "lib/f.js");
+        assert_eq!(
+            got,
+            vec![
+                "lib/f.js:1:5",
+                "lib/f.js:4:5",
+                "lib/g.js:2:5",
+                "lib/g.js:4:5",
+                "lib/g.js:5:5"
+            ],
+            "{got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Measurement dump (batch 7): for `TS_RECALL_REPO` and either
     /// `TS_RECALL_CASES="path:sym,…"` or `TS_RECALL_SAMPLE="<ext|ext>:<n>"`
     /// (same pool rule as `live_backend::recall_harness`), write one JSON
@@ -1001,12 +1138,12 @@ mod tests {
                 }
             }
             let Some((line0, col)) = pos else { continue };
-            let run = |legacy: bool| {
+            let run = |legacy: u8| {
                 LEGACY.with(|l| l.set(legacy));
                 let t = std::time::Instant::now();
                 let r = crate::refs_graph::graph_references(&index, &root, sym, &rel);
                 let ms = t.elapsed().as_millis();
-                LEGACY.with(|l| l.set(false));
+                LEGACY.with(|l| l.set(0));
                 let hits: Vec<serde_json::Value> = r
                     .map(|r| {
                         r.value
@@ -1023,13 +1160,14 @@ mod tests {
                     .unwrap_or_default();
                 (hits, ms)
             };
-            let (before, _) = run(true);
-            let (after, ms) = run(false);
+            let (before, _) = run(2);
+            let (mid, _) = run(1);
+            let (after, ms) = run(0);
             lines_out.push(
                 serde_json::json!({
                     "path": path, "sym": sym, "kind": format!("{:?}", decl.kind),
                     "line": line0, "col": col,
-                    "before": before, "after": after, "after_ms": ms,
+                    "before": before, "mid": mid, "after": after, "after_ms": ms,
                 })
                 .to_string(),
             );

@@ -1404,7 +1404,7 @@ pub(crate) fn graph_references_at(
         .collect();
     // TS/JS: also barrel re-exports and renamed bindings (refs_graph_ts).
     let ts = (!go && crate::refs_graph_ts::is_ts_family(language))
-        .then(|| crate::refs_graph_ts::ts_scope(index, root, decl.file, name));
+        .then(|| crate::refs_graph_ts::ts_scope(index, root, decl.file, decl.start_line, name));
     // Python: also `__init__` / `__all__` re-exports and `as` aliases (py_refs).
     let py = (language == Language::Python)
         .then(|| crate::py_refs::python_scope(index, root, decl.file, name));
@@ -1535,6 +1535,26 @@ pub(crate) fn graph_references_at(
                 let embedded =
                     o.kind == SymbolKind::Field && o.signature.split_whitespace().count() == 1;
                 if !embedded {
+                    continue;
+                }
+            }
+            // TS/JS top-level declarations: `x.name` is ours only through a
+            // module object (`ns.name`, `require(...).name` bound to a local).
+            // A declaration made by property assignment (`app.x = function
+            // x(`) is reached as `obj.x`; a bare `x` in its file is not it.
+            if let Some(t) = &ts {
+                let member_kind = matches!(decl.kind, SymbolKind::Method | SymbolKind::Field);
+                let reached = match base {
+                    Some(b) => {
+                        member_kind
+                            || index.file_id(path.as_str()).is_some_and(|f| {
+                                t.member_reaches(f.0, b, path.as_str() == def_path)
+                            })
+                    }
+                    None => member_kind || t.bare_reaches(path.as_str() == def_path),
+                };
+                if !reached {
+                    members += 1;
                     continue;
                 }
             }
