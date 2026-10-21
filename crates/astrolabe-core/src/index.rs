@@ -1062,20 +1062,37 @@ fn assemble_graph_with(
     // Symbols move into the graph (no second copy of every name/signature);
     // nothing below reads `row.parsed.symbols`. The cache encoding is not
     // needed past this point either.
-    let mut next_symbol = 0u32;
-    graph
-        .symbols
-        .reserve(parsed.iter().map(|r| r.parsed.symbols.len()).sum());
+    // Rows are sorted by path and FileId(i) is row i, so symbols stay grouped
+    // by file in file order; `file_ranges[i]` is file i's slice. Cloned (not
+    // moved) because the parse is shared with the product cache, in parallel
+    // because this is a copy of every symbol of the repository per apply.
+    let mut file_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(parsed.len());
+    let mut next_symbol = 0usize;
     for row in &parsed {
-        let file = index_of[&row.path];
-        for sym in &row.parsed.symbols {
-            graph.symbols.push(CodeSymbol {
-                id: SymbolId(next_symbol),
-                file,
-                ..sym.clone()
-            });
-            next_symbol += 1;
-        }
+        let n = row.parsed.symbols.len();
+        file_ranges.push(next_symbol..next_symbol + n);
+        next_symbol += n;
+    }
+    let per_file: Vec<Vec<CodeSymbol>> = parsed
+        .par_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let base = file_ranges[i].start;
+            row.parsed
+                .symbols
+                .iter()
+                .enumerate()
+                .map(|(k, sym)| CodeSymbol {
+                    id: SymbolId((base + k) as u32),
+                    file: FileId(i as u32),
+                    ..sym.clone()
+                })
+                .collect()
+        })
+        .collect();
+    graph.symbols.reserve(next_symbol);
+    for chunk in per_file {
+        graph.symbols.extend(chunk);
     }
     report.symbols = graph.symbols.len();
 
@@ -1083,39 +1100,48 @@ fn assemble_graph_with(
     // looks like it points inside the repo — stdlib and third-party imports
     // resolving to None is the correct answer, not a gap.
     let mut edges = Vec::new();
-    for row in &parsed {
+    // Resolution is per file and read-only, so it runs in parallel; edges,
+    // the report and the cache are merged below in file order, keeping the
+    // output deterministic.
+    let entries: Vec<Arc<FileResolutions>> = parsed
+        .par_iter()
+        .map(|row| {
+            // Path language first (keeps `.h` on the C resolver); content-sniffed
+            // language only for extension-less shebang scripts.
+            let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
+            let cached = reuse.as_ref().and_then(|r| {
+                let entry = r.cache.by_path.get(&row.path)?;
+                let same = entry.lang == import_lang
+                    && !r.changed.contains(&resolver_owner(import_lang))
+                    && entry.items.len() == row.parsed.imports.len()
+                    && entry
+                        .items
+                        .iter()
+                        .zip(&row.parsed.imports)
+                        .all(|((spec, _), now)| spec == now);
+                same.then(|| Arc::clone(entry))
+            });
+            let entry = cached.unwrap_or_else(|| {
+                Arc::new(FileResolutions {
+                    lang: import_lang,
+                    items: row
+                        .parsed
+                        .imports
+                        .iter()
+                        .map(|spec| {
+                            (
+                                spec.clone(),
+                                resolvers.resolve_import_as(import_lang, &row.path, spec, files),
+                            )
+                        })
+                        .collect(),
+                })
+            });
+            entry
+        })
+        .collect();
+    for (row, entry) in parsed.iter().zip(entries) {
         let from = index_of[&row.path];
-        // Path language first (keeps `.h` on the C resolver); content-sniffed
-        // language only for extension-less shebang scripts.
-        let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
-        let cached = reuse.as_ref().and_then(|r| {
-            let entry = r.cache.by_path.get(&row.path)?;
-            let same = entry.lang == import_lang
-                && !r.changed.contains(&resolver_owner(import_lang))
-                && entry.items.len() == row.parsed.imports.len()
-                && entry
-                    .items
-                    .iter()
-                    .zip(&row.parsed.imports)
-                    .all(|((spec, _), now)| spec == now);
-            same.then(|| Arc::clone(entry))
-        });
-        let entry = cached.unwrap_or_else(|| {
-            Arc::new(FileResolutions {
-                lang: import_lang,
-                items: row
-                    .parsed
-                    .imports
-                    .iter()
-                    .map(|spec| {
-                        (
-                            spec.clone(),
-                            resolvers.resolve_import_as(import_lang, &row.path, spec, files),
-                        )
-                    })
-                    .collect(),
-            })
-        });
         for (spec, resolution) in &entry.items {
             match resolution {
                 ImportResolution::Files(targets) => {
@@ -1200,6 +1226,7 @@ fn assemble_graph_with(
     // `EdgeKind::Pair`): lets queries hop from a declaration to its body.
     edges.extend(crate::resolvers::c_cpp::pair_edges(&graph.files));
 
+    let mut call_edges: Vec<CodeEdge> = Vec::new();
     if opts.call_edges {
         // Import edges join files; call edges join symbols. Both endpoints are
         // plain u32, so the distinction lives in `kind` — callers must read it
@@ -1208,53 +1235,65 @@ fn assemble_graph_with(
         for s in &graph.symbols {
             by_name.entry(s.name.as_str()).or_default().push(s.id);
         }
-        let mut symbols_by_file: HashMap<FileId, Vec<&CodeSymbol>> = HashMap::new();
-        for s in &graph.symbols {
-            symbols_by_file.entry(s.file).or_default().push(s);
-        }
-
-        for row in &parsed {
-            let file = index_of[&row.path];
-            let in_file = symbols_by_file.get(&file);
-            // A call belongs to the smallest symbol spanning its line;
-            // attributing it to the file would collapse every caller in
-            // the file into one node.
-            let callers: Vec<Option<&CodeSymbol>> = match in_file {
-                Some(syms) => enclosing_symbols(syms, &row.parsed.calls),
-                None => Vec::new(),
-            };
-            for ((callee, _line), caller) in row.parsed.calls.iter().zip(&callers) {
-                let Some(caller) = caller else {
-                    continue;
-                };
-                // Take the trailing segment so `a.b.c()` matches `c`.
-                let short = callee
-                    .rsplit(['.', ':'])
-                    .find(|p| !p.is_empty())
-                    .unwrap_or(callee);
-                let Some(targets) = by_name.get(short) else {
-                    continue;
-                };
-                if targets.len() > MAX_SYNTACTIC_CALL_TARGETS {
-                    continue;
+        let by_name = &by_name;
+        let symbols = &graph.symbols;
+        let calls: Vec<Vec<CodeEdge>> = parsed
+            .par_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut out = Vec::new();
+                let in_file: Vec<&CodeSymbol> = symbols[file_ranges[i].clone()].iter().collect();
+                if in_file.is_empty() {
+                    return out;
                 }
-                for target in targets {
-                    if *target == caller.id {
+                // A call belongs to the smallest symbol spanning its line;
+                // attributing it to the file would collapse every caller in
+                // the file into one node.
+                let callers = enclosing_symbols(&in_file, &row.parsed.calls);
+                for ((callee, _line), caller) in row.parsed.calls.iter().zip(&callers) {
+                    let Some(caller) = caller else {
+                        continue;
+                    };
+                    // Take the trailing segment so `a.b.c()` matches `c`.
+                    let short = callee
+                        .rsplit(['.', ':'])
+                        .find(|p| !p.is_empty())
+                        .unwrap_or(callee);
+                    let Some(targets) = by_name.get(short) else {
+                        continue;
+                    };
+                    if targets.len() > MAX_SYNTACTIC_CALL_TARGETS {
                         continue;
                     }
-                    edges.push(CodeEdge {
-                        from: caller.id.0,
-                        to: target.0,
-                        kind: EdgeKind::Call,
-                        weight: 1,
-                        // Name matching only, with no scope or type
-                        // information. Measured recall against a language
-                        // server: 66% on TypeScript, 18% on Python. Labelled
-                        // so callers can decide whether to verify.
-                        confidence: Confidence::Syntactic,
-                    });
+                    for target in targets {
+                        if *target == caller.id {
+                            continue;
+                        }
+                        out.push(CodeEdge {
+                            from: caller.id.0,
+                            to: target.0,
+                            kind: EdgeKind::Call,
+                            weight: 1,
+                            // Name matching only, with no scope or type
+                            // information. Measured recall against a
+                            // language server: 66% on TypeScript, 18% on
+                            // Python. Labelled so callers can decide whether
+                            // to verify.
+                            confidence: Confidence::Syntactic,
+                        });
+                    }
                 }
-            }
+                // Every `from` here is a symbol of file i, and symbol ids
+                // ascend with the file, so per-file sorted runs concatenate
+                // into one sorted run: no global sort over millions of call
+                // edges on every apply.
+                sort_and_merge(&mut out);
+                out
+            })
+            .collect();
+        call_edges.reserve(calls.iter().map(Vec::len).sum());
+        for chunk in calls {
+            call_edges.extend(chunk);
         }
     }
 
@@ -1266,22 +1305,70 @@ fn assemble_graph_with(
         edges.extend(implements);
     }
 
-    // Collapse duplicates into weights, with a stable order.
-    edges.sort_by_key(|e| (e.from, e.to, e.kind as u8));
-    let mut merged: Vec<CodeEdge> = Vec::with_capacity(edges.len());
-    for e in edges {
-        match merged.last_mut() {
-            Some(prev) if prev.from == e.from && prev.to == e.to && prev.kind == e.kind => {
-                prev.weight += 1;
-            }
-            _ => merged.push(e),
-        }
-    }
+    // Collapse duplicates into weights, ordered by `(from, to, kind)`. Every
+    // edge kind has one confidence and weight 1 before merging, so equal keys
+    // are identical and the order among them does not matter. The few
+    // non-call edges are sorted here; the call edges arrive sorted and are
+    // merged in one linear pass.
+    sort_and_merge(&mut edges);
+    debug_assert!(call_edges
+        .windows(2)
+        .all(|w| edge_key(&w[0]) < edge_key(&w[1])));
+    let merged = merge_sorted_edges(edges, call_edges);
     report.import_edges = merged.iter().filter(|e| e.kind == EdgeKind::Import).count();
     graph.edges = merged;
     report.unresolved_imports.sort();
 
     (graph, report, new_cache)
+}
+
+fn edge_key(e: &CodeEdge) -> (u32, u32, u8) {
+    (e.from, e.to, e.kind as u8)
+}
+
+/// Sort `edges` by [`edge_key`] and fold duplicates into their weight.
+fn sort_and_merge(edges: &mut Vec<CodeEdge>) {
+    edges.sort_unstable_by_key(edge_key);
+    edges.dedup_by(|e, prev| {
+        if edge_key(e) == edge_key(prev) {
+            prev.weight += e.weight;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Merge two runs already sorted and deduplicated by [`edge_key`], folding a
+/// key present in both into one edge.
+fn merge_sorted_edges(a: Vec<CodeEdge>, b: Vec<CodeEdge>) -> Vec<CodeEdge> {
+    if b.is_empty() {
+        return a;
+    }
+    if a.is_empty() {
+        return b;
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut a = a.into_iter().peekable();
+    let mut b = b.into_iter().peekable();
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => match edge_key(x).cmp(&edge_key(y)) {
+                std::cmp::Ordering::Less => a.next(),
+                std::cmp::Ordering::Greater => b.next(),
+                std::cmp::Ordering::Equal => {
+                    let mut x = a.next().expect("peeked");
+                    x.weight += b.next().expect("peeked").weight;
+                    Some(x)
+                }
+            },
+            (Some(_), None) => a.next(),
+            (None, Some(_)) => b.next(),
+            (None, None) => break,
+        };
+        out.extend(next);
+    }
+    out
 }
 
 /// Linear-scan threshold of [`enclosing_symbols`]: below it the plain scan is
@@ -2253,6 +2340,66 @@ mod tests {
     }
 
     #[test]
+    fn split_edge_merge_matches_one_global_sort() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            seed = xorshift(seed);
+            (seed % m) as u32
+        };
+        let kinds = [
+            EdgeKind::Import,
+            EdgeKind::Namespace,
+            EdgeKind::Pair,
+            EdgeKind::Inherit,
+        ];
+        let edge = |from, to, kind| CodeEdge {
+            from,
+            to,
+            kind,
+            weight: 1,
+            confidence: Confidence::Scoped,
+        };
+        for _ in 0..50 {
+            let small: Vec<CodeEdge> = (0..next(40))
+                .map(|_| edge(next(30), next(30), kinds[next(4) as usize]))
+                .collect();
+            // Call edges per "file": `from` ranges ascend across files.
+            let mut calls_by_file = Vec::new();
+            for file in 0..5u32 {
+                let run: Vec<CodeEdge> = (0..next(30))
+                    .map(|_| edge(file * 6 + next(6), next(30), EdgeKind::Call))
+                    .collect();
+                calls_by_file.push(run);
+            }
+            let mut all: Vec<CodeEdge> = small.clone();
+            all.extend(calls_by_file.iter().flatten().cloned());
+            all.sort_by_key(|e| (e.from, e.to, e.kind as u8));
+            let mut expected: Vec<CodeEdge> = Vec::new();
+            for e in all {
+                match expected.last_mut() {
+                    Some(p) if p.from == e.from && p.to == e.to && p.kind == e.kind => {
+                        p.weight += 1
+                    }
+                    _ => expected.push(e),
+                }
+            }
+            let mut small = small;
+            sort_and_merge(&mut small);
+            let mut calls = Vec::new();
+            for mut run in calls_by_file {
+                sort_and_merge(&mut run);
+                calls.extend(run);
+            }
+            let got = merge_sorted_edges(small, calls);
+            let key = |e: &CodeEdge| (e.from, e.to, e.kind as u8, e.weight);
+            assert_eq!(
+                got.iter().map(key).collect::<Vec<_>>(),
+                expected.iter().map(key).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn cache_writes_flush_in_bounded_batches() {
         let root = scratch("flush");
         std::fs::create_dir_all(store_path(&root).parent().unwrap()).unwrap();
@@ -2284,7 +2431,10 @@ mod tests {
             let key = store::parse_cache_key(f.language.unwrap(), &f.sha);
             let stored = store.cached_parse(&key).unwrap().expect("stored");
             let held = inc.products.get(&f.path).expect("product");
-            assert_eq!(&stored[..], &store::encode_parsed(&held.parsed).unwrap()[..]);
+            assert_eq!(
+                &stored[..],
+                &store::encode_parsed(&held.parsed).unwrap()[..]
+            );
         }
         std::fs::remove_dir_all(&root).ok();
     }
