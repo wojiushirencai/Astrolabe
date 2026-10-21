@@ -714,8 +714,13 @@ impl LiveBackend {
         };
         // Graph first: the language server is the memory-heavy fallback and
         // is not started when the index alone resolves the name. Renames
-        // (`exact`) always go to the server.
-        let graph = (!exact && refs_graph::graph_first_language(language))
+        // (`exact`) always go to the server. TypeScript: unique top-level
+        // declarations only (`refs_graph_ts::ts_graph_first`).
+        let graph_first = refs_graph::graph_first_language(language)
+            || index.as_deref().is_some_and(|ix| {
+                crate::refs_graph_ts::ts_graph_first(ix, language, symbol.trim())
+            });
+        let graph = (!exact && graph_first)
             .then_some(index.as_deref())
             .flatten()
             .and_then(|ix| {
@@ -1950,6 +1955,61 @@ mod graph_first_tests {
         assert!(info
             .iter()
             .any(|h| h.enclosing.as_ref().is_some_and(|e| e.0 == "R")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unique TS top-level function: answered from the index (barrel
+    /// included), no tsserver started.
+    #[test]
+    fn ts_unique_top_level_answers_from_the_index_without_tsserver() {
+        let dir = std::env::temp_dir().join(format!("astrolabe-lb-tsfirst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/icons")).unwrap();
+        std::fs::create_dir_all(dir.join("src/pages")).unwrap();
+        std::fs::write(
+            dir.join("src/icons/discord.tsx"),
+            "export function IconDiscord() {\n  return null\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/icons/index.ts"),
+            "export * from './discord'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/pages/a.tsx"),
+            "import { IconDiscord } from '../icons'\nexport const A = () => IconDiscord()\n",
+        )
+        .unwrap();
+        let index =
+            Arc::new(crate::index::build_with_options(&dir, false, 1 << 20).expect("index"));
+        let backend =
+            LiveBackend::new(dir.clone()).with_syntax_index(Arc::new(move || Some(index.clone())));
+        let r = backend.references("IconDiscord", None, None, false);
+        assert_eq!(r.confidence, Confidence::Scoped, "{r:?}");
+        let note = r.note.clone().unwrap();
+        assert!(
+            note.contains("未启动语言服务器") && note.contains("转导出"),
+            "{note}"
+        );
+        let got: Vec<String> = r
+            .value
+            .iter()
+            .map(|l| format!("{}:{}", l.path.as_str(), l.range.start.line + 1))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "src/icons/discord.tsx:1",
+                "src/pages/a.tsx:1",
+                "src/pages/a.tsx:2"
+            ]
+        );
+        assert!(!backend.pool.is_resident(Language::TypeScript));
+        assert_eq!(
+            crate::refs_render::complete_source(r.confidence, r.note.as_deref()),
+            Some("索引：定义文件 + 全部导入方及转导出链")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

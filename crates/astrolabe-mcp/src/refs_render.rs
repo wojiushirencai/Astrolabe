@@ -229,7 +229,13 @@ pub(crate) fn complete_source(confidence: Confidence, note: Option<&str>) -> Opt
     match confidence {
         Confidence::Exact => Some("语言服务器解析"),
         Confidence::Scoped if note.contains(GRAPH_ANSWER_MARK) => {
-            Some("索引：定义所在包 + 全部导入方")
+            Some(if note.contains("定义文件") {
+                // TS/JS/Python: the declaring file, its importers and the
+                // re-export chain.
+                "索引：定义文件 + 全部导入方及转导出链"
+            } else {
+                "索引：定义所在包 + 全部导入方"
+            })
         }
         _ => None,
     }
@@ -416,6 +422,17 @@ mod tests {
             assert!(!text.contains("已全列"), "{c:?} {note:?}: {text}");
             assert_eq!(json["complete"], false);
         }
+        // TS index answer: complete, labelled with the re-export chain;
+        // a truncated re-export walk is not complete.
+        let ts = "索引作答（未启动语言服务器）：`f` 全仓唯一定义 @a.ts:1；以下是定义文件、导入它的文件中的代码出现。";
+        let (text, _) = run(h1_like(Confidence::Scoped, Some(ts)), 2_500);
+        assert!(
+            text.contains("（索引：定义文件 + 全部导入方及转导出链）"),
+            "{text}"
+        );
+        let cut = format!("{ts}转导出链超过跟踪上限，结果可能不全。");
+        let (text, _) = run(h1_like(Confidence::Scoped, Some(&cut)), 2_500);
+        assert!(!text.contains("已全列"), "{text}");
         let receiver = format!("{graph}\n[接收者未核] 2 处");
         let (text, _) = run(h1_like(Confidence::Scoped, Some(&receiver)), 2_500);
         assert!(!text.contains("已全列"), "{text}");

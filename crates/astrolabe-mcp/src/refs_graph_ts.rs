@@ -33,6 +33,70 @@ pub(crate) const MAX_DEPTH: usize = 8;
 /// Files a scope may reach before the expansion stops.
 const MAX_FILES: usize = 5_000;
 
+/// `ASTROLABE_TS_GRAPH_FIRST=off` (or `0`/`false`/`no`) keeps the
+/// language server first for TypeScript too.
+pub(crate) const TS_GRAPH_FIRST_ENV: &str = "ASTROLABE_TS_GRAPH_FIRST";
+
+fn ts_graph_first_enabled() -> bool {
+    !std::env::var(TS_GRAPH_FIRST_ENV).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+/// Whether `find_references` for `name` (queried from a file of
+/// `language`) is answered from the index before any language server.
+///
+/// Measured (`docs/find-references-graph-first.md`, batch 7): TS/TSX
+/// top-level declarations with exactly one definition in the repo recall
+/// ≥ 0.999 at precision ≥ 0.993 on aiproxy web and the trpc monorepo.
+/// So: the query is TS-family, the TS/JS/Vue family holds exactly one
+/// declaration of `name`, it sits in a `.ts`/`.tsx` file and is a
+/// Function / Class / Interface / Type / Const. Names with several
+/// definitions, methods and fields keep the language server first, and
+/// so does JavaScript (not switched yet).
+pub(crate) fn ts_graph_first(index: &RepoIndex, language: Language, name: &str) -> bool {
+    use astrolabe_core::types::SymbolKind;
+    if !matches!(language, Language::TypeScript | Language::Tsx) && language != Language::Vue {
+        return false;
+    }
+    if name.is_empty() || !ts_graph_first_enabled() {
+        return false;
+    }
+    let graph = index.graph();
+    let mut decls: Vec<&astrolabe_core::CodeSymbol> = index
+        .names()
+        .by_lower(&name.to_lowercase())
+        .iter()
+        .map(|&i| &graph.symbols[i as usize])
+        .filter(|s| s.name == name)
+        .filter(|s| {
+            index
+                .file(s.file)
+                .and_then(|f| f.language)
+                .is_some_and(is_ts_family)
+        })
+        .collect();
+    decls.sort_by_key(|s| (s.file, s.start_line));
+    decls.dedup_by_key(|s| (s.file, s.start_line));
+    let [decl] = decls.as_slice() else {
+        return false;
+    };
+    matches!(
+        decl.kind,
+        SymbolKind::Function
+            | SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::Type
+            | SymbolKind::Const
+    ) && index
+        .file(decl.file)
+        .and_then(|f| f.language)
+        .is_some_and(|l| matches!(l, Language::TypeScript | Language::Tsx))
+}
+
 /// TS/JS family (the languages whose imports this module parses).
 pub(crate) fn is_ts_family(language: Language) -> bool {
     matches!(
@@ -62,6 +126,9 @@ pub(crate) struct TsScope {
     pub decl_is_member: bool,
     /// Object of that assignment (`app` in `app.handle =`).
     pub decl_base: Option<String>,
+    /// The re-export walk stopped at [`MAX_DEPTH`] / [`MAX_FILES`]: the
+    /// scope may miss files, so the answer must not be called complete.
+    pub truncated: bool,
     /// TS `namespace N {` / `module N {` blocks of the declaring file:
     /// `N.name` reaches a declaration inside one.
     pub containers: HashSet<String>,
@@ -227,6 +294,7 @@ pub(crate) fn ts_scope(
         };
         for &imp in importers.get(&module).into_iter().flatten() {
             if scope.files.len() >= MAX_FILES {
+                scope.truncated = true;
                 break;
             }
             let locals = scope.files.entry(imp).or_default();
@@ -291,6 +359,9 @@ pub(crate) fn ts_scope(
                 }
             }
             if depth + 1 > MAX_DEPTH {
+                if !f.reexports.is_empty() || !f.local_exports.is_empty() {
+                    scope.truncated = true;
+                }
                 continue;
             }
             // What the importer re-exports of it.
@@ -1116,6 +1187,80 @@ mod tests {
             "{got:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_first_gate_only_for_unique_top_level_ts() {
+        let dir = repo(&[
+            (
+                "src/a.ts",
+                "export function solo() {}\nexport class Box {\n  open() {}\n}\nexport function twice() {}\nexport interface Shape { w: number }\n",
+            ),
+            ("src/b.ts", "export function twice() {}\n"),
+            ("lib/c.js", "function jsOnly() {}\nmodule.exports = jsOnly;\n"),
+        ]);
+        let index = crate::index::build(&dir).expect("index");
+        let ts = Language::TypeScript;
+        assert!(ts_graph_first(&index, ts, "solo"));
+        assert!(ts_graph_first(&index, ts, "Box"));
+        assert!(ts_graph_first(&index, ts, "Shape"));
+        assert!(ts_graph_first(&index, Language::Tsx, "solo"));
+        // Several definitions, a method, a field, JavaScript: server first.
+        assert!(!ts_graph_first(&index, ts, "twice"));
+        assert!(!ts_graph_first(&index, ts, "open"));
+        assert!(!ts_graph_first(&index, ts, "w"));
+        assert!(!ts_graph_first(&index, Language::JavaScript, "jsOnly"));
+        assert!(!ts_graph_first(&index, ts, "jsOnly"));
+        assert!(!ts_graph_first(&index, ts, "missing"));
+        // The switch.
+        std::env::set_var(TS_GRAPH_FIRST_ENV, "off");
+        let off = ts_graph_first(&index, ts, "solo");
+        std::env::remove_var(TS_GRAPH_FIRST_ENV);
+        assert!(!off);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deep_reexport_chain_marks_the_scope_truncated() {
+        let mut files: Vec<(String, String)> =
+            vec![("src/l0.ts".into(), "export function deep() {}\n".into())];
+        for i in 1..=MAX_DEPTH + 2 {
+            files.push((
+                format!("src/l{i}.ts"),
+                format!("export * from './l{}'\n", i - 1),
+            ));
+        }
+        files.push((
+            "src/use.ts".into(),
+            format!("import {{ deep }} from './l{}'\ndeep()\n", MAX_DEPTH + 2),
+        ));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let dir = repo(&refs);
+        let index = crate::index::build(&dir).expect("index");
+        let def = index.file_id("src/l0.ts").unwrap();
+        assert!(ts_scope(&index, &dir, def, 1, "deep").truncated);
+        let r = crate::refs_graph::graph_references(
+            &index,
+            &dir,
+            "deep",
+            &astrolabe_core::types::RelPath::new("src/l0.ts"),
+        )
+        .expect("answer");
+        assert!(r.note.unwrap().contains("可能不全"));
+        // A short chain is complete.
+        let dir2 = repo(&[
+            ("src/l0.ts", "export function deep() {}\n"),
+            ("src/l1.ts", "export * from './l0'\n"),
+            ("src/use.ts", "import { deep } from './l1'\ndeep()\n"),
+        ]);
+        let index2 = crate::index::build(&dir2).expect("index");
+        let def2 = index2.file_id("src/l0.ts").unwrap();
+        assert!(!ts_scope(&index2, &dir2, def2, 1, "deep").truncated);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// Measurement dump (batch 7): for `TS_RECALL_REPO` and either

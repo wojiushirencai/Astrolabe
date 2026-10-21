@@ -1766,6 +1766,9 @@ pub(crate) fn graph_references_at(
             "已排除 {members} 处同名的其他标识符（字段/方法访问 `x.{name}`、字面量键 `{name}:`、他包未经导入名的裸名、方法同名的局部变量）。"
         ));
     }
+    if ts.as_ref().is_some_and(|t| t.truncated) {
+        note.push_str("转导出链超过跟踪上限，结果可能不全。");
+    }
     if !unconfirmed.is_empty() {
         note.push_str(&format!(
             "其中 {} 处接收者类型无法从索引判定（未核实，可能是其他类型的同名方法）：{}。",
