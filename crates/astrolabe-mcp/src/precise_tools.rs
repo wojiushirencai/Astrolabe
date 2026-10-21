@@ -145,7 +145,6 @@ pub(crate) struct GetDiagnosticsParams {
     pub budget_tokens: usize,
 }
 
-/// Backend for the precise MCP query tools.
 /// Tool descriptions shared by `PreciseTools` and `AstrolabeServer`, so the
 /// two catalogs cannot drift apart.
 pub(crate) const FIND_REFERENCES_DESC: &str = "精确引用（索引优先，语言服务器兜底）：调用点与用法，改名和调用方分析用它。Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
@@ -153,6 +152,7 @@ pub(crate) const GOTO_DEFINITION_DESC: &str =
     "Jump to definition: 按使用处文件 + 符号名返回定义锚点。";
 pub(crate) const GET_DIAGNOSTICS_DESC: &str = "文件诊断（语法与类型错误），编辑后核对用。";
 
+/// Backend for the precise MCP query tools.
 ///
 /// Production uses `LiveBackend` (on-demand language-server pool). Tests
 /// inject fakes for the missing-server path.
