@@ -54,6 +54,8 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 | `get_diagnostics` | 文件的语法与类型错误。 |
 | `get_languages` | 语言、文件数、代码行数、语言服务器状态，以及索引覆盖情况（见下）。 |
 
+`tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发）。其余参数——`regex`、`exclude`、`count_only`、`context_lines`、`group`、`dedup`、`kind`、`depth`、`substring`、`dry_run_rename`、`character`、`severity`、`offset`、`page`、`budget_tokens`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
+
 **索引覆盖。** 支持语言的文件全部进入索引，包括有语法或编译错误的文件：能解析的符号会保留，出错区域里的符号可能缺失。`get_languages` 报告：
 - 未进入索引的文件：按原因计数（超过大小上限、读取失败、解析超时）；
 - 有语法错误的文件，按类别分别计数：

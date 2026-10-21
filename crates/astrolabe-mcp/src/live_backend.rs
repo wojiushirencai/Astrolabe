@@ -57,6 +57,9 @@ pub(crate) struct LiveBackend {
     /// then take the synchronous `acquire` path so the real error (install
     /// hint) reaches the user instead of an endless "still importing".
     start_failed: Arc<AtomicBool>,
+    /// The session's search_code file cache; `find_references` reads
+    /// through it instead of re-reading each file several times per call.
+    file_cache: Option<Arc<astrolabe_core::cache::FileCache>>,
 }
 
 impl std::fmt::Debug for LiveBackend {
@@ -82,7 +85,14 @@ impl LiveBackend {
             syntax: None,
             starting: Arc::new(AtomicBool::new(false)),
             start_failed: Arc::new(AtomicBool::new(false)),
+            file_cache: None,
         }
+    }
+
+    /// Serve `find_references` file reads from the session's file cache.
+    pub(crate) fn with_file_cache(mut self, cache: Arc<astrolabe_core::cache::FileCache>) -> Self {
+        self.file_cache = Some(cache);
+        self
     }
 
     /// Answer from `index` while a language server is still warming up.
@@ -300,9 +310,12 @@ impl LiveBackend {
                 }
             }
             Ok((result, _)) => result,
-            // The error already carries discovery's install hint; passing it
-            // through verbatim is what makes "not found" actionable.
-            Err(error) => Precise::unknown(Vec::new(), error.to_string()),
+            // No server: answer from the index with one hint line. Only when
+            // the index has nothing either does the install hint stand
+            // alone (verbatim, so "not found" stays actionable).
+            Err(error) => self
+                .references_without_server(language, rel, target, index, &error)
+                .unwrap_or_else(|| Precise::unknown(Vec::new(), error.to_string())),
         };
         // Swift / ObjC servers without an index answer nothing; fall back to
         // a clearly labelled tree-sitter search instead of an empty Unknown.
@@ -583,79 +596,22 @@ impl PreciseCapability for LiveBackend {
         position: Option<Position>,
         exact: bool,
     ) -> Precise<Vec<Location>> {
-        let index = self.syntax.as_ref().and_then(|f| f());
-        let mut notes: Vec<String> = Vec::new();
-        let mut path: Option<String> = path.map(str::to_string);
-        let mut position = position;
-        // A missing / wrong path is fixed from the index when the symbol has
-        // one declaring file; several candidates are listed instead.
-        if let Some(ix) = index.as_deref() {
-            match refs_graph::fix_path(ix, &self.root, symbol, path.as_deref()) {
-                PathFix::Keep => {}
-                PathFix::Use { path: fixed, note } => {
-                    path = Some(fixed);
-                    // The coordinates belonged to the other file.
-                    position = None;
-                    notes.push(note);
-                }
-                PathFix::Ambiguous { note } => return Precise::unknown(Vec::new(), note),
-            }
-        }
-        let language =
-            match server_language_from_opt_path(&self.root, path.as_deref(), "精确引用查询") {
-                Ok(lang) => lang,
-                Err(note) => return Precise::unknown(Vec::new(), note),
-            };
-        let rel = RelPath::new(path.as_deref().expect("language resolved"));
-        // The symbol wins over coordinates that disagree with it.
-        if let Some(pos) = position {
-            let snap = refs_graph::snap_position(&self.root, rel.as_str(), symbol, pos);
-            position = snap.position;
-            notes.extend(snap.note);
-        }
-        let target = match position {
-            Some(position) => SymbolAt::Position(position),
-            None => SymbolAt::Name(symbol),
-        };
-        // Graph first: the language server is the memory-heavy fallback and
-        // is not started when the index alone resolves the name. Renames
-        // (`exact`) always go to the server.
-        let graph = (!exact && refs_graph::graph_first_language(language))
-            .then_some(index.as_deref())
-            .flatten()
-            .and_then(|ix| {
-                let name = symbol.trim();
-                (!name.is_empty())
-                    .then(|| refs_graph::graph_references(ix, &self.root, name, &rel))
-                    .flatten()
-            });
-        let mut result = match graph {
-            Some(result) => result,
-            None => self.server_references(language, &rel, target, index.as_deref()),
-        };
-        if language == Language::Go {
-            if let Some(line) = self.go_implementors_line(&rel, target) {
-                let note = result.note.get_or_insert_with(String::new);
-                if !note.is_empty() && !note.ends_with('\n') {
-                    note.push('\n');
-                }
-                note.push_str(&line);
-            }
-        }
-        if !notes.is_empty() {
-            let mut head = notes.join("\n");
-            if let Some(rest) = result.note.take().filter(|n| !n.is_empty()) {
-                head.push('\n');
-                head.push_str(&rest);
-            }
-            result.note = Some(head);
-        }
-        result
+        refs_graph::with_file_cache(self.file_cache.as_ref(), || {
+            self.references_inner(symbol, path, position, exact)
+        })
     }
 
     fn annotate(&self, symbol: &str, locations: &[Location]) -> Vec<refs_graph::HitInfo> {
         let index = self.syntax.as_ref().and_then(|f| f());
-        refs_graph::annotate(index.as_deref(), &self.root, symbol, locations)
+        refs_graph::with_file_cache(self.file_cache.as_ref(), || {
+            refs_graph::annotate(index.as_deref(), &self.root, symbol, locations)
+        })
+    }
+
+    fn source_lines(&self, path: &str) -> Option<Arc<Vec<String>>> {
+        refs_graph::with_file_cache(self.file_cache.as_ref(), || {
+            refs_graph::read_lines(&self.root, path)
+        })
     }
 
     fn definition(
@@ -715,6 +671,98 @@ impl PreciseCapability for LiveBackend {
 }
 
 impl LiveBackend {
+    fn references_inner(
+        &self,
+        symbol: &str,
+        path: Option<&str>,
+        position: Option<Position>,
+        exact: bool,
+    ) -> Precise<Vec<Location>> {
+        let index = self.syntax.as_ref().and_then(|f| f());
+        let mut notes: Vec<String> = Vec::new();
+        let mut path: Option<String> = path.map(str::to_string);
+        let mut position = position;
+        // A missing / wrong path is fixed from the index when the symbol has
+        // one declaring file; several candidates are listed instead.
+        if let Some(ix) = index.as_deref() {
+            match refs_graph::fix_path(ix, &self.root, symbol, path.as_deref()) {
+                PathFix::Keep => {}
+                PathFix::Use { path: fixed, note } => {
+                    path = Some(fixed);
+                    // The coordinates belonged to the other file.
+                    position = None;
+                    notes.push(note);
+                }
+                PathFix::Ambiguous { note } => return Precise::unknown(Vec::new(), note),
+            }
+        }
+        let language =
+            match server_language_from_opt_path(&self.root, path.as_deref(), "精确引用查询") {
+                Ok(lang) => lang,
+                Err(note) => return Precise::unknown(Vec::new(), note),
+            };
+        let rel = RelPath::new(path.as_deref().expect("language resolved"));
+        // The symbol wins over coordinates that disagree with it.
+        if let Some(pos) = position {
+            let snap = refs_graph::snap_position(&self.root, rel.as_str(), symbol, pos);
+            position = snap.position;
+            notes.extend(snap.note);
+        }
+        let target = match position {
+            Some(position) => SymbolAt::Position(position),
+            None => SymbolAt::Name(symbol),
+        };
+        // Graph first: the language server is the memory-heavy fallback and
+        // is not started when the index alone resolves the name. Renames
+        // (`exact`) always go to the server. TypeScript: unique top-level
+        // declarations only (`refs_graph_ts::ts_graph_first`).
+        let graph_first = refs_graph::graph_first_language(language)
+            || index.as_deref().is_some_and(|ix| {
+                crate::refs_graph_ts::ts_graph_first(ix, language, symbol.trim())
+            })
+            // Python: module-level names with exactly one definition.
+            || (language == Language::Python
+                && index
+                    .as_deref()
+                    .is_some_and(|ix| crate::py_refs::graph_first(ix, &self.root, symbol.trim())));
+        let graph = (!exact && graph_first)
+            .then_some(index.as_deref())
+            .flatten()
+            .and_then(|ix| {
+                let name = symbol.trim();
+                (!name.is_empty())
+                    .then(|| {
+                        let line = position.map(|p| p.line);
+                        refs_graph::graph_references_at(ix, &self.root, name, &rel, line)
+                    })
+                    .flatten()
+            });
+        let mut result = match graph {
+            Some(result) => result,
+            None => self.server_references(language, &rel, target, index.as_deref()),
+        };
+        if language == Language::Go {
+            if let Some(line) = self.go_implementors_line(&rel, target) {
+                let note = result.note.get_or_insert_with(String::new);
+                if !note.is_empty() && !note.ends_with('\n') {
+                    note.push('\n');
+                }
+                note.push_str(&line);
+            }
+        }
+        if !notes.is_empty() {
+            let mut head = notes.join("\n");
+            if let Some(rest) = result.note.take().filter(|n| !n.is_empty()) {
+                head.push('\n');
+                head.push_str(&rest);
+            }
+            result.note = Some(head);
+        }
+        result
+    }
+}
+
+impl LiveBackend {
     fn definition_at(
         &self,
         language: Language,
@@ -734,6 +782,10 @@ impl LiveBackend {
                 );
             }
         };
+        // Index first: the server starts only when the index cannot decide.
+        if let Some(found) = self.index_definition(language, &rel, target) {
+            return found;
+        }
         match self.with_server(language, |server| {
             let result = goto_definition(server, &self.root, &rel, target);
             (result, server.is_none_or(|s| s.is_busy()))
@@ -768,9 +820,616 @@ impl LiveBackend {
                 }
             }
             Ok((result, _)) => self.with_paired_definitions(language, &rel, target, result),
-            Err(error) => Precise::unknown(Vec::new(), error.to_string()),
+            Err(error) => self
+                .definition_without_server(language, &rel, target, &error)
+                .unwrap_or_else(|| Precise::unknown(Vec::new(), error.to_string())),
         }
     }
+}
+
+// ------------------------------------------------------------------
+// Index-first goto_definition and the no-server fallbacks (batch 7, L).
+//
+// The language server is the memory-heavy fallback: gopls 120 MB-1 GB and
+// 1.2-2.2 s for the first call, while the index answers the common case
+// (an unqualified or package-qualified name with one declaration in scope)
+// in about a millisecond. The server is started only when the index has no
+// answer or an ambiguous one: a member access, a possible local binding,
+// several candidate declarations, or none.
+
+/// Most declarations a `symbol`-only index answer lists from the origin file.
+const MAX_INDEX_ANCHORS: usize = 5;
+/// Cap on the hint line carried over from a missing server's error.
+const HINT_CHARS: usize = 160;
+
+impl LiveBackend {
+    /// `goto_definition` from the index alone, or `None` when only the
+    /// language server can decide.
+    fn index_definition(
+        &self,
+        language: Language,
+        rel: &RelPath,
+        target: SymbolAt<'_>,
+    ) -> Option<Precise<Vec<Location>>> {
+        if std::env::var("ASTROLABE_DEFINITION_INDEX_FIRST")
+            .is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no"))
+        {
+            return None;
+        }
+        // Go only for now. Measured against typescript-language-server on
+        // express, a same-file declaration is too often an import binding
+        // (`const { x } = require('./utils')`), so JS / TS / Python keep the
+        // server first; other languages have not been measured.
+        if language != Language::Go {
+            return None;
+        }
+        let index = self.syntax.as_ref().and_then(|f| f())?;
+        let lines = read_lines(&self.root, rel.as_str())?;
+        let (name, line, byte) = match target {
+            SymbolAt::Position(pos) => {
+                let text = lines.get(pos.line as usize)?;
+                let (start, end) = ident_span(text, pos.character)?;
+                (text[start..end].to_string(), pos.line as usize, start)
+            }
+            SymbolAt::Name(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                // The origin file declares it: those declarations are the
+                // answer (what the server returns for each of them too).
+                let own = index_decls(&index, name, |f| f.path == *rel);
+                if !own.is_empty() && own.len() <= MAX_INDEX_ANCHORS {
+                    return Some(index_answer(
+                        &self.root,
+                        &index,
+                        &own,
+                        name,
+                        "声明在该文件内",
+                    ));
+                }
+                if !own.is_empty() {
+                    return None;
+                }
+                let (line, byte) = first_code_occurrence(&lines, name)?;
+                (name.to_string(), line, byte)
+            }
+        };
+        let text = &lines[line];
+        if in_string_or_comment(text, byte, language) {
+            return None;
+        }
+        let symbols = &index.graph().symbols;
+        // Enclosing function / method of the occurrence, for the local
+        // binding check.
+        let origin_id = index
+            .graph()
+            .files
+            .iter()
+            .find(|f| f.path == *rel)
+            .map(|f| f.id)?;
+        let line1 = line as u32 + 1;
+        let enclosing = symbols
+            .iter()
+            .filter(|s| {
+                s.file == origin_id
+                    && matches!(
+                        s.kind,
+                        astrolabe_core::SymbolKind::Function | astrolabe_core::SymbolKind::Method
+                    )
+                    && s.start_line <= line1
+                    && line1 <= s.end_line
+            })
+            .min_by_key(|s| s.end_line - s.start_line);
+        if let Some(f) = enclosing {
+            let from = f.start_line.saturating_sub(1) as usize;
+            if maybe_local(&lines, from, line, &name, true) {
+                return None;
+            }
+        }
+        match qualifier(text, byte) {
+            Qualifier::None => {
+                let dir = dir_of(rel.as_str());
+                let decls: Vec<usize> = index_decls(&index, &name, |f| {
+                    f.language == Some(Language::Go) && dir_of(f.path.as_str()) == dir
+                })
+                .into_iter()
+                .filter(|&i| !is_member(symbols[i].kind))
+                .collect();
+                (decls.len() == 1)
+                    .then(|| index_answer(&self.root, &index, &decls, &name, "同包唯一声明"))
+            }
+            Qualifier::Selector(base) => {
+                let dir = go_package_dir(&index, &self.root, rel, &lines, base)?;
+                let decls: Vec<usize> = index_decls(&index, &name, |f| {
+                    f.language == Some(Language::Go) && dir_of(f.path.as_str()) == dir
+                })
+                .into_iter()
+                .filter(|&i| !is_member(symbols[i].kind))
+                .collect();
+                (decls.len() == 1)
+                    .then(|| index_answer(&self.root, &index, &decls, &name, "按导入包解析"))
+            }
+            // Member access: the receiver's type decides.
+            Qualifier::Member => None,
+        }
+    }
+
+    /// `find_references` when the language server is missing or cannot
+    /// start: Go from the import graph, everything else by whole-word text
+    /// match. `None` when the index has nothing either.
+    fn references_without_server(
+        &self,
+        language: Language,
+        rel: &RelPath,
+        target: SymbolAt<'_>,
+        index: Option<&RepoIndex>,
+        error: &LspError,
+    ) -> Option<Precise<Vec<Location>>> {
+        let name = self.target_name(rel, target)?;
+        let hint = missing_server_line(language, error);
+        if let Some(ix) = index {
+            if let Some(mut graph) = refs_graph::graph_references(ix, &self.root, &name, rel) {
+                if !graph.value.is_empty() {
+                    // Keep the graph's own note (receiver checks, markers
+                    // the completion line keys off); add the hint after it.
+                    let note = graph.note.get_or_insert_with(String::new);
+                    if !note.is_empty() && !note.ends_with('\n') {
+                        note.push('\n');
+                    }
+                    note.push_str(&hint);
+                    return Some(graph);
+                }
+            }
+        }
+        let files = index
+            .and_then(RepoIndex::incremental)
+            .map(|inc| inc.admitted_paths());
+        let text = text_fallback_references_in(&self.root, rel, target, "", files)?;
+        if text.value.is_empty() {
+            return None;
+        }
+        Some(Precise {
+            confidence: Confidence::Syntactic,
+            note: Some(format!(
+                "以下为索引结果（syntactic：同语言文件里 `{name}` 的全词匹配，可能含注释、字符串和同名的其他实体）。\n{hint}"
+            )),
+            value: text.value,
+        })
+    }
+
+    /// `goto_definition` when the language server is missing or cannot
+    /// start: same-name declarations from the index.
+    fn definition_without_server(
+        &self,
+        language: Language,
+        rel: &RelPath,
+        target: SymbolAt<'_>,
+        error: &LspError,
+    ) -> Option<Precise<Vec<Location>>> {
+        let name = self.target_name(rel, target)?;
+        let hits = self.syntactic_definitions(language, rel, &name);
+        if hits.is_empty() {
+            return None;
+        }
+        Some(Precise {
+            confidence: Confidence::Syntactic,
+            note: Some(format!(
+                "以下为索引里的同名声明 {} 处（syntactic：按名字匹配，本文件和 include/import 的文件排在前面）。\n{}",
+                hits.len(),
+                missing_server_line(language, error)
+            )),
+            value: hits.into_iter().map(|(loc, _)| loc).collect(),
+        })
+    }
+}
+
+/// One short line on why the server did not answer and how to get it. Must
+/// not contain the renderer's "server missing" markers, which would append
+/// the long install block to an answer that is not empty.
+fn missing_server_line(language: Language, error: &LspError) -> String {
+    let server = primary_server_name(language);
+    let (what, detail) = match error {
+        LspError::Unavailable(_, hint) => ("未安装", hint.as_str()),
+        LspError::Startup(_, why) => ("启动失败", why.as_str()),
+        _ => ("没有应答", ""),
+    };
+    let mut detail: String = detail
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(HINT_CHARS)
+        .collect();
+    for marker in [
+        "no language server available",
+        "failed to start",
+        "not installed",
+    ] {
+        detail = detail.replace(marker, "unavailable");
+    }
+    if detail.is_empty() {
+        format!("语言服务器 {server} {what}，精确结果需安装后重试。")
+    } else {
+        format!("语言服务器 {server} {what}，精确结果需安装后重试：{detail}")
+    }
+}
+
+fn read_lines(root: &Path, path: &str) -> Option<Vec<String>> {
+    let source = astrolabe_core::text::read_source(&root.join(path)).ok()?;
+    Some(
+        source
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned())
+            .collect(),
+    )
+}
+
+fn dir_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+fn is_member(kind: astrolabe_core::SymbolKind) -> bool {
+    matches!(
+        kind,
+        astrolabe_core::SymbolKind::Method | astrolabe_core::SymbolKind::Field
+    )
+}
+
+/// Byte span of the identifier under UTF-16 column `character`.
+fn ident_span(line: &str, character: u32) -> Option<(usize, usize)> {
+    let mut utf16 = 0u32;
+    let mut at = None;
+    for (b, c) in line.char_indices() {
+        if utf16 >= character {
+            at = Some(b);
+            break;
+        }
+        utf16 += c.len_utf16() as u32;
+    }
+    let at = at?;
+    if !line[at..].chars().next().is_some_and(is_ident_char) {
+        return None;
+    }
+    let start = line[..at]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_ident_char(*c))
+        .last()
+        .map_or(at, |(i, _)| i);
+    let end = line[at..]
+        .char_indices()
+        .find(|(_, c)| !is_ident_char(*c))
+        .map_or(line.len(), |(i, _)| at + i);
+    Some((start, end))
+}
+
+/// `byte` sits inside a string literal or after a line comment on `line`
+/// (single-line view; a block comment line starting with `*` counts too).
+fn in_string_or_comment(line: &str, byte: usize, language: Language) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("/*") || t.starts_with("* ") || t == "*" {
+        return true;
+    }
+    let hash_comment = matches!(
+        language,
+        Language::Python | Language::Ruby | Language::Shell
+    );
+    let mut quote: Option<char> = None;
+    let mut chars = line[..byte].chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' && q != '`' {
+                    chars.next();
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '`' => quote = Some(c),
+                '\'' if language != Language::Rust => quote = Some(c),
+                '/' if chars.peek() == Some(&'/') => return true,
+                '#' if hash_comment => return true,
+                _ => {}
+            },
+        }
+    }
+    quote.is_some()
+}
+
+fn utf16_col(line: &str, byte: usize) -> u32 {
+    line[..byte].encode_utf16().count() as u32
+}
+
+/// First whole-word occurrence of `name` outside an obvious comment line.
+fn first_code_occurrence(lines: &[String], name: &str) -> Option<(usize, usize)> {
+    lines.iter().enumerate().find_map(|(i, l)| {
+        let t = l.trim_start();
+        if ["//", "#", "/*", "*", "--"]
+            .iter()
+            .any(|p| t.starts_with(p))
+        {
+            return None;
+        }
+        refs_graph::word_offsets(l, name).first().map(|&b| (i, b))
+    })
+}
+
+/// Positions in `graph().symbols` of declarations named `name` whose file
+/// passes `keep`.
+fn index_decls(
+    index: &RepoIndex,
+    name: &str,
+    keep: impl Fn(&astrolabe_core::types::CodeFile) -> bool,
+) -> Vec<usize> {
+    let symbols = &index.graph().symbols;
+    let mut out: Vec<usize> = index
+        .names()
+        .by_lower(&name.to_lowercase())
+        .iter()
+        .map(|&i| i as usize)
+        .filter(|&i| symbols[i].name == name)
+        .filter(|&i| index.file(symbols[i].file).is_some_and(&keep))
+        .collect();
+    out.sort_by_key(|&i| {
+        (
+            index.file(symbols[i].file).map(|f| f.path.clone()),
+            symbols[i].start_line,
+        )
+    });
+    out
+}
+
+/// Location of each declaration: its line, at the name when the line shows it.
+fn index_answer(
+    root: &Path,
+    index: &RepoIndex,
+    decls: &[usize],
+    name: &str,
+    why: &str,
+) -> Precise<Vec<Location>> {
+    let symbols = &index.graph().symbols;
+    let units = name.encode_utf16().count() as u32;
+    let mut value = Vec::new();
+    for &i in decls {
+        let s = &symbols[i];
+        let Some(file) = index.file(s.file) else {
+            continue;
+        };
+        let line = s.start_line.saturating_sub(1);
+        let col = read_lines(root, file.path.as_str()).and_then(|ls| {
+            let l = ls.get(line as usize)?;
+            refs_graph::word_offsets(l, name)
+                .first()
+                .map(|&b| utf16_col(l, b))
+        });
+        let (start, end) = match col {
+            Some(c) => (c, c + units),
+            None => (0, 0),
+        };
+        value.push(Location {
+            path: file.path.clone(),
+            range: Range {
+                start: Position {
+                    line,
+                    character: start,
+                },
+                end: Position {
+                    line,
+                    character: end,
+                },
+            },
+        });
+    }
+    Precise {
+        confidence: Confidence::Scoped,
+        note: Some(format!("索引解析（{why}），未启动语言服务器。")),
+        value,
+    }
+}
+
+enum Qualifier<'a> {
+    /// Bare name.
+    None,
+    /// `base.name`, base an identifier.
+    Selector(&'a str),
+    /// `x->name`, `x::name`, `).name`, `this.name`: a member, decided by a type.
+    Member,
+}
+
+fn qualifier(line: &str, byte: usize) -> Qualifier<'_> {
+    let before = line[..byte].trim_end();
+    if before.ends_with("->") || before.ends_with("::") || before.ends_with("?.") {
+        return Qualifier::Member;
+    }
+    let Some(rest) = before.strip_suffix('.') else {
+        return Qualifier::None;
+    };
+    let rest = rest.trim_end();
+    let start = rest
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_ident_char(*c))
+        .last()
+        .map(|(i, _)| i);
+    match start {
+        Some(s) if !rest[..s].trim_end().ends_with(['.', '>', ':']) => {
+            Qualifier::Selector(&rest[s..])
+        }
+        _ => Qualifier::Member,
+    }
+}
+
+const NOT_A_TYPE: &[&str] = &[
+    "return", "case", "yield", "throw", "await", "in", "of", "else", "not", "and", "or", "is",
+    "if", "while", "new", "delete", "go", "defer", "print", "echo", "do", "then",
+];
+const BINDERS: &[&str] = &[
+    "var", "let", "const", "val", "auto", "mut", "my", "local", "final", "global", "nonlocal",
+];
+
+/// `name` may be bound locally in the function starting at line `from`
+/// (0-based) before or at line `to`: a parameter, `:=`, `var x`, `T x =`, …
+/// Errs on the side of "yes" (the server then decides).
+fn maybe_local(lines: &[String], from: usize, to: usize, name: &str, go: bool) -> bool {
+    for (i, line) in lines.iter().enumerate().take(to + 1).skip(from) {
+        for b in refs_graph::word_offsets(line, name) {
+            let before = line[..b].trim_end();
+            let after = line[b + name.len()..].trim_start();
+            if before.ends_with('.') || before.ends_with("->") || after.starts_with('(') {
+                continue;
+            }
+            let prev_word: &str = {
+                let s = before
+                    .char_indices()
+                    .rev()
+                    .take_while(|(_, c)| is_ident_char(*c))
+                    .last()
+                    .map_or(before.len(), |(k, _)| k);
+                &before[s..]
+            };
+            if BINDERS.contains(&prev_word) {
+                return true;
+            }
+            let next = after.chars().next();
+            let next2 = after.chars().nth(1);
+            if go {
+                // `x :=`, `a, x :=`, `for _, x := range`, struct keys `X:`.
+                if let Some(k) = line.find(":=") {
+                    if b < k {
+                        return true;
+                    }
+                }
+                if next == Some(':') && next2 != Some('=') {
+                    return true;
+                }
+                if i == from {
+                    // Parameters / receiver: `x T`, `x, y T`, `x *T`.
+                    if next.is_some_and(|c| is_ident_char(c) || matches!(c, '*' | '[' | ','))
+                        && before.ends_with(['(', ','])
+                    {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            let assigns = next == Some('=') && !matches!(next2, Some('=' | '>'));
+            let annotated = next == Some(':') && next2 != Some(':');
+            if assigns || annotated {
+                return true;
+            }
+            if i == from && matches!(next, Some(',' | ')')) {
+                return true;
+            }
+            // `T x;` / `T x,` / `T x)` (C family, Java, C#).
+            let typed = before
+                .ends_with(|c: char| is_ident_char(c) || matches!(c, '>' | ']' | '*' | '&'))
+                && !NOT_A_TYPE.contains(&prev_word);
+            if typed && matches!(next, Some(';' | ',' | ')' | '=')) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Directory of the Go package `base` names in `origin` (an import of this
+/// repo), from the origin's import edges and its import block.
+fn go_package_dir<'a>(
+    index: &'a RepoIndex,
+    root: &Path,
+    origin: &RelPath,
+    lines: &[String],
+    base: &str,
+) -> Option<&'a str> {
+    let g = index.graph();
+    let origin_id = g.files.iter().find(|f| f.path == *origin)?.id;
+    let mut dirs: Vec<&str> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Import && e.from == origin_id.0)
+        .filter_map(|e| g.files.iter().find(|f| f.id.0 == e.to))
+        .map(|f| dir_of(f.path.as_str()))
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    let imports = go_imports(lines);
+    let mut found: Vec<&str> = Vec::new();
+    for dir in dirs {
+        let Some((alias, _)) = imports.iter().find(|(_, path)| {
+            !dir.is_empty() && (path == dir || path.ends_with(&format!("/{dir}")))
+        }) else {
+            continue;
+        };
+        let local = match alias {
+            Some(a) => a.clone(),
+            None => go_package_name(index, root, dir)
+                .unwrap_or_else(|| dir.rsplit('/').next().unwrap_or(dir).to_string()),
+        };
+        if local == base {
+            found.push(dir);
+        }
+    }
+    match found.as_slice() {
+        [one] => Some(one),
+        _ => None,
+    }
+}
+
+/// `(alias, path)` of every import spec in a Go file.
+fn go_imports(lines: &[String]) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in lines {
+        let t = line.trim();
+        let spec = if in_block {
+            if t.starts_with(')') {
+                in_block = false;
+                continue;
+            }
+            t
+        } else if let Some(rest) = t.strip_prefix("import") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                in_block = true;
+                continue;
+            }
+            rest
+        } else if t.starts_with("func ") || t.starts_with("type ") {
+            break;
+        } else {
+            continue;
+        };
+        let Some(q) = spec.find('"') else { continue };
+        let Some(end) = spec[q + 1..].find('"') else {
+            continue;
+        };
+        let path = spec[q + 1..q + 1 + end].to_string();
+        let alias = spec[..q].trim();
+        out.push(((!alias.is_empty()).then(|| alias.to_string()), path));
+    }
+    out
+}
+
+/// The `package` clause of a Go file in `dir`.
+fn go_package_name(index: &RepoIndex, root: &Path, dir: &str) -> Option<String> {
+    let file = index.graph().files.iter().find(|f| {
+        f.language == Some(Language::Go)
+            && dir_of(f.path.as_str()) == dir
+            && !f.path.as_str().ends_with("_test.go")
+    })?;
+    let lines = read_lines(root, file.path.as_str())?;
+    lines.iter().find_map(|l| {
+        l.trim()
+            .strip_prefix("package ")
+            .map(|p| p.split_whitespace().next().unwrap_or("").to_string())
+    })
 }
 
 #[cfg(test)]
@@ -796,6 +1455,7 @@ mod start_failure_tests {
             syntax: Some(syntax),
             starting: Arc::new(AtomicBool::new(false)),
             start_failed: Arc::new(AtomicBool::new(false)),
+            file_cache: None,
         };
         // First call: warming while the background start runs.
         let first = backend.with_server(Language::Kotlin, |s| s.is_none());
@@ -1303,6 +1963,61 @@ mod graph_first_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Unique TS top-level function: answered from the index (barrel
+    /// included), no tsserver started.
+    #[test]
+    fn ts_unique_top_level_answers_from_the_index_without_tsserver() {
+        let dir = std::env::temp_dir().join(format!("astrolabe-lb-tsfirst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/icons")).unwrap();
+        std::fs::create_dir_all(dir.join("src/pages")).unwrap();
+        std::fs::write(
+            dir.join("src/icons/discord.tsx"),
+            "export function IconDiscord() {\n  return null\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/icons/index.ts"),
+            "export * from './discord'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/pages/a.tsx"),
+            "import { IconDiscord } from '../icons'\nexport const A = () => IconDiscord()\n",
+        )
+        .unwrap();
+        let index =
+            Arc::new(crate::index::build_with_options(&dir, false, 1 << 20).expect("index"));
+        let backend =
+            LiveBackend::new(dir.clone()).with_syntax_index(Arc::new(move || Some(index.clone())));
+        let r = backend.references("IconDiscord", None, None, false);
+        assert_eq!(r.confidence, Confidence::Scoped, "{r:?}");
+        let note = r.note.clone().unwrap();
+        assert!(
+            note.contains("未启动语言服务器") && note.contains("转导出"),
+            "{note}"
+        );
+        let got: Vec<String> = r
+            .value
+            .iter()
+            .map(|l| format!("{}:{}", l.path.as_str(), l.range.start.line + 1))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "src/icons/discord.tsx:1",
+                "src/pages/a.tsx:1",
+                "src/pages/a.tsx:2"
+            ]
+        );
+        assert!(!backend.pool.is_resident(Language::TypeScript));
+        assert_eq!(
+            crate::refs_render::complete_source(r.confidence, r.note.as_deref()),
+            Some("索引：定义文件 + 全部导入方及转导出链")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn empty_note_mentions_kotlin_only_for_kotlin() {
         assert!(empty_note(Language::Kotlin, "引用").contains("Android"));
@@ -1316,5 +2031,526 @@ mod graph_first_tests {
             assert!(!n.contains("Kotlin") && !n.contains("Android"), "{n}");
         }
         assert!(empty_note(Language::Go, "引用").contains("go.mod"));
+    }
+}
+
+#[cfg(test)]
+mod index_first_tests {
+    use super::*;
+
+    fn repo(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("astrolabe-lb-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let p = dir.join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        dir
+    }
+
+    fn index_of(dir: &Path) -> SyntaxIndex {
+        let index = Arc::new(crate::index::build_with_options(dir, false, 1 << 20).expect("index"));
+        Arc::new(move || Some(index.clone()))
+    }
+
+    /// Backend whose discovery finds no server at all (empty PATH).
+    fn serverless(dir: &Path) -> LiveBackend {
+        let pool = LspPool::from_discovery_and_transport(
+            Discovery::new(""),
+            StdioSpawn::new(dir),
+            dir.to_path_buf(),
+            LspPoolConfig::default(),
+        );
+        let mut backend = LiveBackend::new(dir).with_syntax_index(index_of(dir));
+        backend.pool = Arc::new(pool);
+        backend
+    }
+
+    fn at(r: &Precise<Vec<Location>>) -> Vec<String> {
+        r.value
+            .iter()
+            .map(|l| {
+                format!(
+                    "{}:{}:{}",
+                    l.path.as_str(),
+                    l.range.start.line + 1,
+                    l.range.start.character
+                )
+            })
+            .collect()
+    }
+
+    const GO: &[(&str, &str)] = &[
+        ("go.mod", "module example.com/m\n"),
+        (
+            "service/channel.go",
+            "package service\n\n// ShouldDisableChannel decides.\nfunc ShouldDisableChannel() bool { return helper() }\n\nfunc helper() bool { return false }\n\nvar limit = 3\n",
+        ),
+        (
+            "controller/relay.go",
+            "package controller\n\nimport (\n\tsvc \"example.com/m/service\"\n)\n\ntype T struct{ limit int }\n\nfunc (t *T) Area() int { return t.limit }\n\nfunc R(limit int) {\n\t_ = svc.ShouldDisableChannel()\n\tx := T{limit: limit}\n\t_ = x.Area()\n\tconfig := 1\n\t_ = config\n}\n\nvar config = 2\n",
+        ),
+    ];
+
+    /// Go: package-qualified and same-package names are answered from the
+    /// index; gopls is never started (it is on PATH on the box, so a start
+    /// would show as resident).
+    #[test]
+    fn go_definition_is_index_first_and_starts_no_server() {
+        let dir = repo("deffirst", GO);
+        let backend = LiveBackend::new(dir.clone()).with_syntax_index(index_of(&dir));
+        // `svc.ShouldDisableChannel()` (aliased import), by position.
+        let r = backend.definition("controller/relay.go", None, Some(11), Some(10));
+        assert_eq!(r.confidence, Confidence::Scoped, "{r:?}");
+        assert_eq!(at(&r), vec!["service/channel.go:4:5"]);
+        assert!(r.note.as_deref().unwrap().contains("未启动语言服务器"));
+        // Same package, unqualified.
+        let r = backend.definition("service/channel.go", None, Some(3), Some(44));
+        assert_eq!(at(&r), vec!["service/channel.go:6:5"], "{r:?}");
+        assert_eq!(r.confidence, Confidence::Scoped, "{r:?}");
+        // By name only: declared in the file.
+        let r = backend.definition("service/channel.go", Some("limit"), None, None);
+        assert_eq!(at(&r), vec!["service/channel.go:8:4"], "{r:?}");
+        assert_eq!(r.confidence, Confidence::Scoped, "{r:?}");
+        // By name only: first use resolves through the import.
+        let r = backend.definition(
+            "controller/relay.go",
+            Some("ShouldDisableChannel"),
+            None,
+            None,
+        );
+        assert_eq!(at(&r), vec!["service/channel.go:4:5"], "{r:?}");
+        assert_eq!(r.confidence, Confidence::Scoped, "{r:?}");
+        assert!(!backend.pool.is_resident(Language::Go));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cases only the server can decide: a method through a value, a
+    /// parameter, a struct literal key, a local `:=` shadowing a package var.
+    #[test]
+    fn go_index_defers_on_members_locals_and_keys() {
+        let dir = repo("defdefer", GO);
+        let backend = LiveBackend::new(dir.clone()).with_syntax_index(index_of(&dir));
+        let rel = RelPath::new("controller/relay.go");
+        let pos = |line, character| SymbolAt::Position(Position { line, character });
+        // x.Area()
+        assert!(backend
+            .index_definition(Language::Go, &rel, pos(13, 7))
+            .is_none());
+        // T{limit: limit}: the key, then the parameter.
+        assert!(backend
+            .index_definition(Language::Go, &rel, pos(12, 8))
+            .is_none());
+        assert!(backend
+            .index_definition(Language::Go, &rel, pos(12, 16))
+            .is_none());
+        // `_ = config` after `config := 1`, package-level `config` exists.
+        assert!(backend
+            .index_definition(Language::Go, &rel, pos(15, 6))
+            .is_none());
+        // Receiver `t` in `t.limit`.
+        assert!(backend
+            .index_definition(Language::Go, &rel, pos(8, 30))
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const JAVA: &[(&str, &str)] = &[
+        (
+            "src/a/Foo.java",
+            "package a;\n\npublic class Foo {\n    public int bar() { return 1; }\n}\n",
+        ),
+        (
+            "src/b/Use.java",
+            "package b;\n\nimport a.Foo;\n\npublic class Use {\n    int run() {\n        Foo f = new Foo();\n        return f.bar() + helper();\n    }\n    int helper() { return 2; }\n}\n",
+        ),
+    ];
+
+    /// No language server installed: references and definitions come from
+    /// the index with a single short hint line, not `Unknown` + install
+    /// block.
+    #[test]
+    fn missing_server_answers_from_the_index() {
+        let dir = repo("noserver", JAVA);
+        let backend = serverless(&dir);
+        let r = backend.references("Foo", Some("src/b/Use.java"), None, false);
+        assert_ne!(r.confidence, Confidence::Unknown, "{r:?}");
+        let got = at(&r);
+        assert!(
+            got.iter().any(|l| l.starts_with("src/a/Foo.java:3")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter().any(|l| l.starts_with("src/b/Use.java:7")),
+            "{got:?}"
+        );
+        let note = r.note.clone().unwrap();
+        assert!(
+            note.contains("索引作答") && note.contains("jdtls 未安装"),
+            "{note}"
+        );
+        assert_eq!(note.lines().count(), 2, "{note}");
+        assert!(!note.contains("no language server available"), "{note}");
+        // Method through a value: not index-first, server missing → the
+        // index's same-name declarations.
+        let r = backend.definition("src/b/Use.java", None, Some(7), Some(17));
+        assert_eq!(r.confidence, Confidence::Syntactic, "{r:?}");
+        assert_eq!(at(&r), vec!["src/a/Foo.java:4:0"]);
+        assert!(r.note.as_deref().unwrap().contains("未安装"), "{r:?}");
+        // Index-first is Go only; without a server Java still gets the
+        // same-name declarations, origin file first.
+        let r = backend.definition("src/b/Use.java", None, Some(7), Some(25));
+        assert_eq!(r.confidence, Confidence::Syntactic, "{r:?}");
+        assert_eq!(at(&r), vec!["src/b/Use.java:10:0"]);
+        assert!(backend
+            .index_definition(
+                Language::Java,
+                &RelPath::new("src/b/Use.java"),
+                SymbolAt::Name("helper")
+            )
+            .is_none());
+        // Nothing in the index either: the old Unknown + install hint.
+        let r = backend.references("NoSuchThing", Some("src/b/Use.java"), None, false);
+        assert_eq!(r.confidence, Confidence::Unknown, "{r:?}");
+        assert!(r.note.unwrap().contains("no language server available"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qualifier_and_local_detection() {
+        assert!(matches!(qualifier("a.b", 2), Qualifier::Selector("a")));
+        assert!(matches!(qualifier("x.y.b", 4), Qualifier::Member));
+        assert!(matches!(qualifier("p->b", 3), Qualifier::Member));
+        assert!(matches!(qualifier("A::b", 3), Qualifier::Member));
+        assert!(matches!(qualifier("f(b)", 2), Qualifier::None));
+        let l = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Java local, C param, Python param, TS let.
+        assert!(maybe_local(
+            &l(&["void f() {", "  Config cfg = x;", "  use(cfg);"]),
+            0,
+            2,
+            "cfg",
+            false
+        ));
+        assert!(maybe_local(
+            &l(&["int f(int n) {", "  return n;"]),
+            0,
+            1,
+            "n",
+            false
+        ));
+        assert!(maybe_local(
+            &l(&["def f(a, b):", "    return a"]),
+            0,
+            1,
+            "a",
+            false
+        ));
+        assert!(maybe_local(
+            &l(&["function f() {", "  let v: T = 1;", "  g(v)"]),
+            0,
+            2,
+            "v",
+            false
+        ));
+        // Plain uses are not bindings.
+        assert!(!maybe_local(
+            &l(&["void f() {", "  return helper(LIMIT);"]),
+            0,
+            1,
+            "LIMIT",
+            false
+        ));
+        assert!(!maybe_local(
+            &l(&["void f() {", "  x = obj.cfg;"]),
+            0,
+            1,
+            "cfg",
+            false
+        ));
+        assert!(!maybe_local(
+            &l(&["func f() {", "\treturn Limit + 1"]),
+            0,
+            1,
+            "Limit",
+            true
+        ));
+    }
+
+    #[test]
+    fn strings_and_comments_are_not_identifiers() {
+        let go = Language::Go;
+        let l = "\tx = append(x, \"Name\") // Name";
+        assert!(in_string_or_comment(l, l.find("Name").unwrap(), go));
+        assert!(in_string_or_comment(l, l.rfind("Name").unwrap(), go));
+        assert!(!in_string_or_comment(l, l.find("append").unwrap(), go));
+        let l = "s := `a ${Name}` + Name";
+        assert!(in_string_or_comment(l, l.find("Name").unwrap(), go));
+        assert!(!in_string_or_comment(l, l.rfind("Name").unwrap(), go));
+        let l = "x = 'it\\'s' + Name  # Name";
+        assert!(!in_string_or_comment(
+            l,
+            l.find("Name").unwrap(),
+            Language::Python
+        ));
+        assert!(in_string_or_comment(
+            l,
+            l.rfind("Name").unwrap(),
+            Language::Python
+        ));
+        // Rust lifetimes are not quotes.
+        let l = "fn f<'a>(x: &'a Name) {}";
+        assert!(!in_string_or_comment(
+            l,
+            l.find("Name").unwrap(),
+            Language::Rust
+        ));
+    }
+
+    #[test]
+    fn hint_line_is_short_and_marker_free() {
+        let e = LspError::Unavailable(
+            Language::Java,
+            "no language server available: brew install jdtls\nsecond line\nthird".into(),
+        );
+        let line = missing_server_line(Language::Java, &e);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.contains("brew install jdtls") && !line.contains("no language server available")
+        );
+        let e = LspError::Startup(Language::Go, "x".repeat(500));
+        assert!(missing_server_line(Language::Go, &e).chars().count() < HINT_CHARS + 40);
+    }
+}
+
+/// Index-first `goto_definition` against the language server (batch 7).
+/// Ignored: needs a server and a corpus. `DEF_INDEX_REPO=/abs/repo`,
+/// `DEF_INDEX_EXT=.go`, `DEF_INDEX_N=300`. Prints a summary line.
+#[cfg(test)]
+mod def_index_harness {
+    use super::*;
+
+    const KEYWORDS: &[&str] = &[
+        "break",
+        "case",
+        "chan",
+        "const",
+        "continue",
+        "default",
+        "defer",
+        "else",
+        "fallthrough",
+        "for",
+        "func",
+        "go",
+        "goto",
+        "if",
+        "import",
+        "interface",
+        "map",
+        "package",
+        "range",
+        "return",
+        "select",
+        "struct",
+        "switch",
+        "type",
+        "var",
+        "nil",
+        "true",
+        "false",
+        "err",
+        "self",
+        "this",
+        "new",
+        "class",
+        "public",
+        "private",
+        "static",
+        "void",
+        "int",
+        "string",
+        "bool",
+        "def",
+        "let",
+        "fn",
+        "pub",
+        "mut",
+        "impl",
+        "use",
+        "match",
+        "in",
+        "not",
+        "and",
+        "or",
+    ];
+
+    #[test]
+    #[ignore = "needs a language server and a corpus (DEF_INDEX_REPO)"]
+    fn index_definition_vs_server() {
+        let Some(root) = std::env::var_os("DEF_INDEX_REPO").map(PathBuf::from) else {
+            return;
+        };
+        let ext = std::env::var("DEF_INDEX_EXT").unwrap_or_else(|_| ".go".into());
+        let n: usize = std::env::var("DEF_INDEX_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let calls_only = std::env::var_os("DEF_INDEX_CALLS").is_some();
+        let by_name = std::env::var_os("DEF_INDEX_BYNAME").is_some();
+        let index = Arc::new(crate::index::build(&root).expect("index"));
+        let g = index.graph();
+        let mut pool: Vec<(RelPath, u32, u32)> = Vec::new();
+        for s in &g.symbols {
+            if !matches!(
+                s.kind,
+                astrolabe_core::SymbolKind::Function | astrolabe_core::SymbolKind::Method
+            ) {
+                continue;
+            }
+            let Some(f) = index.file(s.file) else {
+                continue;
+            };
+            let p = f.path.as_str();
+            if !p.ends_with(&ext) || p.ends_with("_test.go") {
+                continue;
+            }
+            let Some(lines) = read_lines(&root, p) else {
+                continue;
+            };
+            for li in s.start_line..s.end_line.min(s.start_line + 40) {
+                let Some(line) = lines.get(li as usize) else {
+                    break;
+                };
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                let bytes: Vec<(usize, char)> = line.char_indices().collect();
+                let mut k = 0;
+                while k < bytes.len() {
+                    let (i, c) = bytes[k];
+                    if is_ident_char(c)
+                        && !c.is_ascii_digit()
+                        && (i == 0 || !is_ident_char(line[..i].chars().last().unwrap()))
+                    {
+                        let end = line[i..]
+                            .find(|c: char| !is_ident_char(c))
+                            .map_or(line.len(), |e| i + e);
+                        let word = &line[i..end];
+                        let call = line[end..].starts_with('(');
+                        if word.len() >= 3 && !KEYWORDS.contains(&word) && (call || !calls_only) {
+                            pool.push((f.path.clone(), li, utf16_col(line, i)));
+                        }
+                        while k < bytes.len() && bytes[k].0 < end {
+                            k += 1;
+                        }
+                        continue;
+                    }
+                    k += 1;
+                }
+            }
+        }
+        let step = (pool.len() / n.max(1)).max(1);
+        let cases: Vec<_> = pool.into_iter().step_by(step).take(n).collect();
+        let backend = LiveBackend::new(&root).with_syntax_index(Arc::new({
+            let index = Arc::clone(&index);
+            move || Some(Arc::clone(&index))
+        }));
+        let lang = server_language(&root, cases[0].0.as_str()).unwrap();
+        // Cold start of the server: what the first goto_definition used to cost.
+        let t = std::time::Instant::now();
+        let _ = backend.with_server(lang, |_| ());
+        let cold = t.elapsed();
+        let (mut answered, mut agree, mut deferred) = (0usize, 0usize, 0usize);
+        let mut deferred_in_repo = 0usize;
+        let (mut t_index, mut t_server) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let mut wrong: Vec<String> = Vec::new();
+        for (path, line, character) in &cases {
+            let word = identifier_at(
+                &root,
+                path,
+                Position {
+                    line: *line,
+                    character: *character,
+                },
+            )
+            .unwrap_or_default();
+            let target = if by_name {
+                SymbolAt::Name(&word)
+            } else {
+                SymbolAt::Position(Position {
+                    line: *line,
+                    character: *character,
+                })
+            };
+            let t = std::time::Instant::now();
+            let ix = backend.index_definition(lang, path, target);
+            t_index += t.elapsed();
+            let t = std::time::Instant::now();
+            let srv = backend
+                .with_server(lang, |s| goto_definition(s, &root, path, target))
+                .expect("server");
+            t_server += t.elapsed();
+            let Some(ix) = ix else {
+                deferred += 1;
+                if !srv.value.is_empty() {
+                    deferred_in_repo += 1;
+                    if std::env::var_os("DEF_INDEX_SHOW_DEFERRED").is_some() {
+                        let word = identifier_at(
+                            &root,
+                            path,
+                            Position {
+                                line: *line,
+                                character: *character,
+                            },
+                        );
+                        let text = read_lines(&root, path.as_str())
+                            .and_then(|l| l.get(*line as usize).cloned())
+                            .unwrap_or_default();
+                        println!(
+                            "DEFER\t{}:{} {:?}\t{}",
+                            path.as_str(),
+                            line + 1,
+                            word,
+                            text.trim()
+                        );
+                    }
+                }
+                continue;
+            };
+            answered += 1;
+            let key = |l: &Location| (l.path.as_str().to_string(), l.range.start.line);
+            let a: BTreeSet<_> = ix.value.iter().map(key).collect();
+            let b: BTreeSet<_> = srv.value.iter().map(key).collect();
+            if a == b {
+                agree += 1;
+            } else if wrong.len() < 15 {
+                let word = identifier_at(
+                    &root,
+                    path,
+                    Position {
+                        line: *line,
+                        character: *character,
+                    },
+                );
+                wrong.push(format!(
+                    "{}:{}:{} {:?} index={a:?} server={b:?}",
+                    path.as_str(),
+                    line + 1,
+                    character,
+                    word
+                ));
+            }
+        }
+        for w in &wrong {
+            println!("WRONG\t{w}");
+        }
+        println!(
+            "SUMMARY\tcases={}\tindex_answered={answered}\tagree={agree}\tdeferred={deferred}\tdeferred_server_found={deferred_in_repo}\tserver_cold_start={cold:?}\tindex_total={t_index:?}\tserver_total={t_server:?}",
+            cases.len()
+        );
+        backend.pool.shutdown();
     }
 }

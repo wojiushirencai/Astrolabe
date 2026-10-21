@@ -7,14 +7,17 @@
 //! `{confidence, budget_tokens}`. Named contexts (`--context` /
 //! `ASTROLABE_CONTEXT`) and `ASTROLABE_STRUCTURED` can turn it on.
 
+mod alloc;
 mod cli;
 mod code_mask;
 mod context;
 mod context_page;
 mod coverage;
+mod diag_env;
 mod ensure_ls;
 mod explain;
 mod knobs;
+mod line_scan;
 mod session;
 // hooks / instructions 对 bin（main.rs 的子命令分发）公开：hook 协议入口
 // 不经 ServerHandler，直接调用模块函数。
@@ -25,7 +28,10 @@ mod live_backend;
 mod loop_guard;
 mod openai_schema;
 mod precise_tools;
+mod py_refs;
 mod refs_graph;
+mod refs_graph_ts;
+mod refs_render;
 mod reindex;
 mod root;
 pub mod roots;

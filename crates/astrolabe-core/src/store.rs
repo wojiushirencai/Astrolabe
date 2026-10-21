@@ -105,8 +105,15 @@ impl FileStamp {
 }
 
 /// Prefix shared by every [`parse_cache_key`] written by this binary.
+///
+/// Deliberately free of the crate version: a release that changes neither
+/// the extractor nor the payload encoding keeps every cached parse (it used
+/// to re-parse the whole repository on each upgrade and leave the previous
+/// generation's keys behind). Invalidation is explicit instead:
+/// [`EXTRACTOR_VERSION`] for what is extracted, [`CACHE_FORMAT_VERSION`] for
+/// how it is encoded.
 pub fn parse_cache_key_prefix() -> String {
-    format!("x{EXTRACTOR_VERSION}-v{}:", env!("CARGO_PKG_VERSION"))
+    format!("x{EXTRACTOR_VERSION}-f{CACHE_FORMAT_VERSION}:")
 }
 
 impl Store {
@@ -127,6 +134,15 @@ impl Store {
             }
             Err(error) => return Err(classify_open_error(error)),
         };
+        // Fast path: an up-to-date database with every table needs no write
+        // transaction. A writable open used to commit (and fsync) on every
+        // incremental apply even though nothing changed.
+        if Self::is_current(&db)? {
+            return Ok(Self {
+                db: Db::Rw(db),
+                read_only: false,
+            });
+        }
         let write = db.begin_write().map_err(classify_txn_error)?;
         {
             let mut meta = write.open_table(META).map_err(backend)?;
@@ -158,6 +174,39 @@ impl Store {
             db: Db::Rw(db),
             read_only: false,
         })
+    }
+
+    /// Whether `db` already carries the current schema version and every
+    /// table, so [`Self::open`] can skip its setup write. A version mismatch
+    /// is `false`; the write path then reports it.
+    fn is_current(db: &Database) -> Result<bool, StoreError> {
+        let read = db.begin_read().map_err(classify_txn_error)?;
+        let version = match read.open_table(META) {
+            Ok(meta) => meta
+                .get(VERSION_KEY)
+                .map_err(backend)?
+                .map(|value| value.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(backend(error)),
+        };
+        if version != Some(SCHEMA_VERSION) {
+            return Ok(false);
+        }
+        fn exists<K: redb::Key + 'static>(
+            read: &redb::ReadTransaction,
+            table: TableDefinition<K, &[u8]>,
+        ) -> Result<bool, StoreError> {
+            match read.open_table(table) {
+                Ok(_) => Ok(true),
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+                Err(error) => Err(backend(error)),
+            }
+        }
+        Ok(exists(&read, FILES)?
+            && exists(&read, SYMBOLS)?
+            && exists(&read, EDGES)?
+            && exists(&read, PARSE_CACHE)?
+            && exists(&read, FILE_STAMPS)?)
     }
 
     /// Open an existing store without creating or modifying anything.
@@ -445,6 +494,16 @@ impl Store {
         }
     }
 
+    /// Rewrite the file without its free pages (see
+    /// [`Self::prune_parse_cache`]). Needs exclusive use of the handle: no
+    /// transaction may be open.
+    pub fn compact(&mut self) -> Result<bool, StoreError> {
+        match &mut self.db {
+            Db::Rw(db) => db.compact().map_err(backend),
+            Db::Ro(_) => Err(StoreError::Backend("store opened read-only".to_string())),
+        }
+    }
+
     /// Number of parse-cache entries (diagnostics and tests).
     pub fn parse_cache_len(&self) -> Result<u64, StoreError> {
         let read = self.db.begin_read().map_err(backend)?;
@@ -524,7 +583,7 @@ impl Store {
             {
                 let mut table = write.open_table(FILE_STAMPS).map_err(backend)?;
                 for (path, stamp) in chunk {
-                    let value = serde_json::to_vec(stamp).map_err(backend)?;
+                    let value = encode_stamp(stamp);
                     table
                         .insert(path.as_str(), value.as_slice())
                         .map_err(backend)?;
@@ -547,7 +606,7 @@ impl Store {
         Ok(table
             .get(path)
             .map_err(backend)?
-            .and_then(|value| serde_json::from_slice(value.value()).ok()))
+            .and_then(|value| decode_stamp(value.value())))
     }
 
     /// Cached parse result keyed by content hash, so an unchanged file is
@@ -570,33 +629,243 @@ impl Store {
 /// symbols extracted by the old version until each file is edited.
 pub const EXTRACTOR_VERSION: u32 = 6;
 
-/// Cache key for a parsed file: extractor version, crate version, language
+/// Encoding of parse-cache payloads and file stamps.
+///
+/// Bump when [`encode_parsed`] / the stamp encoding changes layout. It is part
+/// of every key prefix, so old payloads are never decoded by a new reader
+/// (they become cache misses and the next full scan prunes them).
+///
+/// History: 1 = serde_json (keys also carried the crate version), 2 =
+/// compact varint binary.
+pub const CACHE_FORMAT_VERSION: u32 = 2;
+
+/// First byte of a binary parse payload; the second is the format version.
+const PARSED_MAGIC: u8 = 0xA5;
+/// First byte of a binary file stamp; the second is the format version.
+const STAMP_MAGIC: u8 = 0xA6;
+
+/// Cache key for a parsed file: extractor version, payload format, language
 /// and content hash.
 ///
 /// The store table is a flat string map, so the language prefix keeps two
 /// files that happen to share bytes (a renamed `.js` → `.ts`, a copied
 /// snippet) from handing each other the wrong query results. The version
-/// prefix makes every release (and every extractor bump between releases)
-/// re-parse instead of reusing stale symbols.
+/// prefix makes an extractor or encoding change re-parse instead of reusing
+/// stale symbols.
 pub fn parse_cache_key(language: Language, sha: &str) -> String {
     format!(
-        "x{EXTRACTOR_VERSION}-v{}:{}:{sha}",
-        env!("CARGO_PKG_VERSION"),
+        "x{EXTRACTOR_VERSION}-f{CACHE_FORMAT_VERSION}:{}:{sha}",
         language.name()
     )
 }
 
 /// Serialize a [`crate::parse::ParsedFile`] for [`PARSE_CACHE`].
+///
+/// Compact binary (LEB128 varints, length-prefixed UTF-8, no field names, no
+/// placeholder ids): several times smaller and faster to decode than the
+/// JSON it replaced, which dominated warm starts on large repositories.
 pub fn encode_parsed(parsed: &crate::parse::ParsedFile) -> Result<Vec<u8>, StoreError> {
-    serde_json::to_vec(&ParsedWire::from(parsed)).map_err(backend)
+    let mut size = 8 + parsed.imports.iter().map(|i| i.len() + 2).sum::<usize>();
+    size += parsed
+        .symbols
+        .iter()
+        .map(|s| s.name.len() + s.signature.len() + 10)
+        .sum::<usize>();
+    size += parsed.calls.iter().map(|(c, _)| c.len() + 5).sum::<usize>();
+    let mut out = Vec::with_capacity(size);
+    out.push(PARSED_MAGIC);
+    out.push(CACHE_FORMAT_VERSION as u8);
+    out.push(u8::from(parsed.partial) | (u8::from(parsed.c_family_rewrite) << 1));
+    put_varint(&mut out, parsed.symbols.len() as u64);
+    for symbol in &parsed.symbols {
+        put_str(&mut out, &symbol.name);
+        out.push(symbol_kind_to_u8(symbol.kind) | (u8::from(symbol.exported) << 7));
+        put_str(&mut out, &symbol.signature);
+        put_varint(&mut out, u64::from(symbol.start_line));
+        // Spans are short; the delta keeps most end lines in one byte.
+        put_varint(
+            &mut out,
+            u64::from(symbol.end_line.wrapping_sub(symbol.start_line)),
+        );
+    }
+    put_varint(&mut out, parsed.imports.len() as u64);
+    for import in &parsed.imports {
+        put_str(&mut out, import);
+    }
+    put_varint(&mut out, parsed.calls.len() as u64);
+    for (callee, line) in &parsed.calls {
+        put_str(&mut out, callee);
+        put_varint(&mut out, u64::from(*line));
+    }
+    Ok(out)
 }
 
-/// Inverse of [`encode_parsed`]. A corrupt or stale payload is a cache miss
-/// at the call site, not an index failure.
+/// Inverse of [`encode_parsed`]. A corrupt, truncated or foreign-format
+/// payload is a cache miss at the call site, not an index failure.
 pub fn decode_parsed(bytes: &[u8]) -> Result<crate::parse::ParsedFile, StoreError> {
-    serde_json::from_slice::<ParsedWire>(bytes)
-        .map(crate::parse::ParsedFile::from)
-        .map_err(backend)
+    let mut r = WireReader::new(bytes);
+    if r.byte()? != PARSED_MAGIC || r.byte()? != CACHE_FORMAT_VERSION as u8 {
+        return Err(StoreError::Backend(
+            "parse payload: unknown format".to_string(),
+        ));
+    }
+    let flags = r.byte()?;
+    let n = r.len()?;
+    let mut symbols = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.string()?;
+        let tag = r.byte()?;
+        let signature = r.string()?;
+        let start_line = r.u32()?;
+        let end_line = start_line.wrapping_add(r.u32()?);
+        symbols.push(CodeSymbol {
+            id: SymbolId(0),
+            file: FileId(0),
+            name,
+            kind: symbol_kind_from_u8(tag & 0x7f),
+            signature,
+            start_line,
+            end_line,
+            exported: tag & 0x80 != 0,
+        });
+    }
+    let n = r.len()?;
+    let mut imports = Vec::with_capacity(n);
+    for _ in 0..n {
+        imports.push(r.string()?);
+    }
+    let n = r.len()?;
+    let mut calls = Vec::with_capacity(n);
+    for _ in 0..n {
+        let callee = r.string()?;
+        calls.push((callee, r.u32()?));
+    }
+    r.finish()?;
+    Ok(crate::parse::ParsedFile {
+        symbols,
+        imports,
+        calls,
+        partial: flags & 1 != 0,
+        c_family_rewrite: flags & 2 != 0,
+    })
+}
+
+fn encode_stamp(stamp: &FileStamp) -> Vec<u8> {
+    let mut out = Vec::with_capacity(stamp.key.len() + stamp.sha.len() + 32);
+    out.push(STAMP_MAGIC);
+    out.push(CACHE_FORMAT_VERSION as u8);
+    put_varint(&mut out, (stamp.mtime_ns >> 64) as u64);
+    put_varint(&mut out, stamp.mtime_ns as u64);
+    put_varint(&mut out, stamp.len);
+    put_str(&mut out, &stamp.key);
+    put_str(&mut out, &stamp.sha);
+    put_varint(&mut out, u64::from(stamp.loc));
+    out.push(stamp.language);
+    out
+}
+
+/// `None` for anything but a current-format stamp (an older binary's JSON
+/// stamp is simply "no stamp": the file is re-read once and re-stamped).
+fn decode_stamp(bytes: &[u8]) -> Option<FileStamp> {
+    let mut r = WireReader::new(bytes);
+    if r.byte().ok()? != STAMP_MAGIC || r.byte().ok()? != CACHE_FORMAT_VERSION as u8 {
+        return None;
+    }
+    let hi = r.varint().ok()?;
+    let lo = r.varint().ok()?;
+    let stamp = FileStamp {
+        mtime_ns: (u128::from(hi) << 64) | u128::from(lo),
+        len: r.varint().ok()?,
+        key: r.string().ok()?,
+        sha: r.string().ok()?,
+        loc: r.u32().ok()?,
+        language: r.byte().ok()?,
+    };
+    r.finish().ok()?;
+    Some(stamp)
+}
+
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_varint(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Bounds-checked cursor over a binary payload. Every failure is a
+/// [`StoreError::Backend`] the caller treats as a cache miss.
+struct WireReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> WireReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn truncated() -> StoreError {
+        StoreError::Backend("parse payload: truncated".to_string())
+    }
+
+    fn byte(&mut self) -> Result<u8, StoreError> {
+        let b = *self.buf.get(self.pos).ok_or_else(Self::truncated)?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn varint(&mut self) -> Result<u64, StoreError> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.byte()?;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(StoreError::Backend("parse payload: bad varint".to_string()))
+    }
+
+    fn u32(&mut self) -> Result<u32, StoreError> {
+        u32::try_from(self.varint()?)
+            .map_err(|_| StoreError::Backend("parse payload: value out of range".to_string()))
+    }
+
+    /// A length that must fit in what is left of the buffer (each element is
+    /// at least one byte), so a corrupt count cannot trigger a huge
+    /// allocation.
+    fn len(&mut self) -> Result<usize, StoreError> {
+        let n = self.varint()?;
+        if n > (self.buf.len() - self.pos) as u64 {
+            return Err(Self::truncated());
+        }
+        Ok(n as usize)
+    }
+
+    fn string(&mut self) -> Result<String, StoreError> {
+        let n = self.len()?;
+        let bytes = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| StoreError::Backend("parse payload: invalid utf-8".to_string()))
+    }
+
+    fn finish(&self) -> Result<(), StoreError> {
+        if self.pos == self.buf.len() {
+            Ok(())
+        } else {
+            Err(StoreError::Backend(
+                "parse payload: trailing bytes".to_string(),
+            ))
+        }
+    }
 }
 
 fn backend(error: impl std::fmt::Display) -> StoreError {
@@ -719,45 +988,6 @@ pub fn language_to_u8(language: Language) -> u8 {
         Language::Shell => 18,
         Language::Ruby => 19,
         Language::Lua => 20,
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct ParsedWire {
-    symbols: Vec<SymbolWire>,
-    imports: Vec<String>,
-    calls: Vec<(String, u32)>,
-    /// Parsed with syntax errors (still in the index). Cached like a clean
-    /// parse so a file that stays broken is not re-parsed on every start;
-    /// the flag rides along so the coverage report survives a cache hit.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    partial: bool,
-    /// C / C++ parse of the `cfamily` rewrite (see `ParsedFile`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    c_family_rewrite: bool,
-}
-
-impl From<&crate::parse::ParsedFile> for ParsedWire {
-    fn from(parsed: &crate::parse::ParsedFile) -> Self {
-        Self {
-            symbols: parsed.symbols.iter().map(SymbolWire::from).collect(),
-            imports: parsed.imports.clone(),
-            calls: parsed.calls.clone(),
-            partial: parsed.partial,
-            c_family_rewrite: parsed.c_family_rewrite,
-        }
-    }
-}
-
-impl From<ParsedWire> for crate::parse::ParsedFile {
-    fn from(parsed: ParsedWire) -> Self {
-        crate::parse::ParsedFile {
-            symbols: parsed.symbols.into_iter().map(CodeSymbol::from).collect(),
-            imports: parsed.imports,
-            calls: parsed.calls,
-            partial: parsed.partial,
-            c_family_rewrite: parsed.c_family_rewrite,
-        }
     }
 }
 
@@ -1125,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_flag_round_trips_and_defaults_to_clean() {
+    fn partial_flag_round_trips_and_legacy_json_is_a_miss() {
         let mut parsed = crate::parse::ParsedFile {
             symbols: vec![],
             imports: vec![],
@@ -1136,12 +1366,162 @@ mod tests {
         let bytes = encode_parsed(&parsed).unwrap();
         assert!(decode_parsed(&bytes).unwrap().partial);
         parsed.partial = false;
+        parsed.c_family_rewrite = true;
         let clean = encode_parsed(&parsed).unwrap();
-        assert!(!decode_parsed(&clean).unwrap().partial);
-        // Clean payloads do not carry the field at all.
-        assert!(!String::from_utf8_lossy(&clean).contains("partial"));
+        let back = decode_parsed(&clean).unwrap();
+        assert!(!back.partial && back.c_family_rewrite);
+        // A format-1 (JSON) payload is rejected, never misread.
         let legacy = br#"{"symbols":[],"imports":[],"calls":[]}"#;
-        assert!(!decode_parsed(legacy).unwrap().partial);
+        assert!(decode_parsed(legacy).is_err());
+    }
+
+    #[test]
+    fn binary_payload_round_trips_and_rejects_corruption() {
+        let parsed = crate::parse::ParsedFile {
+            symbols: vec![
+                CodeSymbol {
+                    id: SymbolId(0),
+                    file: FileId(0),
+                    name: "Ünïcode_名".into(),
+                    kind: SymbolKind::Variable,
+                    signature: "let x = \"y\";".into(),
+                    start_line: 300_000,
+                    end_line: 300_200,
+                    exported: true,
+                },
+                CodeSymbol {
+                    id: SymbolId(0),
+                    file: FileId(0),
+                    name: String::new(),
+                    kind: SymbolKind::Field,
+                    signature: String::new(),
+                    start_line: 1,
+                    end_line: 1,
+                    exported: false,
+                },
+            ],
+            imports: vec!["a/b".into(), String::new()],
+            calls: vec![("x.y".into(), u32::MAX)],
+            partial: false,
+            c_family_rewrite: false,
+        };
+        let bytes = encode_parsed(&parsed).unwrap();
+        let back = decode_parsed(&bytes).unwrap();
+        assert_eq!(encode_parsed(&back).unwrap(), bytes);
+        assert_eq!(back.symbols[0].name, "Ünïcode_名");
+        assert_eq!(back.symbols[0].end_line, 300_200);
+        assert_eq!(back.symbols[1].kind, SymbolKind::Field);
+        assert!(back.symbols[0].exported && !back.symbols[1].exported);
+        assert_eq!(back.calls, parsed.calls);
+        assert_eq!(back.imports, parsed.imports);
+        // Every truncation and a trailing byte are errors, not panics.
+        for cut in 0..bytes.len() {
+            assert!(decode_parsed(&bytes[..cut]).is_err(), "cut {cut}");
+        }
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(decode_parsed(&long).is_err());
+        // A huge count cannot allocate past the buffer.
+        let mut huge = bytes[..3].to_vec();
+        huge.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert!(decode_parsed(&huge).is_err());
+    }
+
+    #[test]
+    fn file_stamp_round_trips_in_the_current_format_only() {
+        let stamp = FileStamp {
+            mtime_ns: (1u128 << 70) + 12_345,
+            len: 9_000_000_000,
+            key: parse_cache_key(Language::Rust, "deadbeef"),
+            sha: "deadbeef".into(),
+            loc: 77,
+            language: language_to_u8(Language::Rust),
+        };
+        assert_eq!(decode_stamp(&encode_stamp(&stamp)), Some(stamp.clone()));
+        let json = serde_json::to_vec(&stamp).unwrap();
+        assert_eq!(decode_stamp(&json), None);
+        let dir = TestDir::new("stamp");
+        let store = Store::open(&dir.db()).unwrap();
+        store
+            .put_file_stamps(&[("src/a.rs".into(), stamp.clone())])
+            .unwrap();
+        assert_eq!(store.file_stamp("src/a.rs").unwrap(), Some(stamp));
+    }
+
+    #[test]
+    fn reopening_a_current_store_skips_the_setup_write() {
+        let dir = TestDir::new("fast-open");
+        drop(Store::open(&dir.db()).unwrap());
+        let db = Database::create(dir.db()).unwrap();
+        assert!(Store::is_current(&db).unwrap());
+        drop(db);
+        // Still a working writable store.
+        let store = Store::open(&dir.db()).unwrap();
+        store.put_cached_parse("k", b"v").unwrap();
+        assert_eq!(store.parse_cache_len().unwrap(), 1);
+    }
+
+    /// Sources covering the common constructs of every extractor, for
+    /// [`extractor_output_matches_its_version`].
+    const EXTRACTOR_PROBES: &[(Language, &str, &str)] = &[
+        (Language::Python, "m.py", "import os\nfrom a.b import c\n\nclass K(Base):\n    X = 1\n    def m(self):\n        return helper(os.path)\n\ndef helper(p):\n    return K().m()\n"),
+        (Language::Go, "m.go", "package m\n\nimport (\n\t\"fmt\"\n\tx \"example.com/x\"\n)\n\ntype S struct{ A int }\ntype I interface{ M() }\n\nconst C = 1\n\nfunc (s *S) M() { fmt.Println(x.F()) }\nfunc New() *S { return &S{} }\n"),
+        (Language::Java, "M.java", "package p;\nimport java.util.List;\npublic class M extends B implements I {\n  private int f;\n  public M() {}\n  public void run(List<String> xs) { helper(xs); }\n  interface Inner { void x(); }\n  enum E { A, B }\n}\n"),
+        (Language::Rust, "m.rs", "use crate::a::{b, c};\nmod inner;\npub struct S { f: u32 }\npub enum E { A, B }\npub trait T { fn t(&self); }\nimpl T for S { fn t(&self) { helper(self.f); } }\npub const C: u32 = 1;\nfn helper(x: u32) -> u32 { x }\nmacro_rules! m { () => {} }\n"),
+        (Language::TypeScript, "m.ts", "import { a } from './a';\nimport * as b from 'b';\nexport interface I { x: number }\nexport type T = I | null;\nexport enum E { A }\nexport class K implements I { x = 1; m(): void { a(b.c()); } }\nexport function f(): T { return null; }\nexport const g = () => f();\n"),
+        (Language::Tsx, "m.tsx", "import React from 'react';\nexport function App(props: { n: number }) {\n  const v = useThing();\n  return <div onClick={() => go(v)}>{props.n}</div>;\n}\nexport const Button = () => <b>{go(1)}</b>;\nexport default App;\n"),
+        (Language::JavaScript, "m.js", "const fs = require('fs');\nimport x from './x.js';\nclass K { m() { return fs.readFileSync(x); } }\nfunction f() { return new K().m(); }\nmodule.exports = { f };\n"),
+        (Language::C, "m.c", "#include <stdio.h>\n#include \"m.h\"\n#define N 3\nstruct S { int a; };\ntypedef struct S S_t;\nenum E { A, B };\nstatic int helper(int x) { return x; }\nint main(void) { printf(\"%d\", helper(N)); return 0; }\n"),
+        (Language::Cpp, "m.cpp", "#include <vector>\nnamespace n {\nclass K : public B {\n public:\n  K();\n  void m() const { helper(); }\n};\ntemplate <typename T> T id(T t) { return t; }\n}\nusing V = std::vector<int>;\n"),
+        (Language::ObjC, "m.m", "#import \"m.h\"\n@interface K : NSObject\n- (void)run;\n@end\n@implementation K\n- (void)run { [self helper]; }\n@end\n"),
+        (Language::Swift, "m.swift", "import Foundation\nprotocol P { func p() }\nstruct S: P { let a: Int\n  func p() { helper(a) } }\nclass K { var v = 1\n  init() {} }\nenum E { case a, b }\nfunc helper(_ x: Int) {}\n"),
+        (Language::Php, "m.php", "<?php\nnamespace App;\nuse Foo\\Bar;\ninterface I { public function i(); }\nclass K extends Bar implements I {\n  const C = 1;\n  public function i() { return helper($this); }\n}\nfunction helper($x) { return $x; }\n"),
+        (Language::Dart, "m.dart", "import 'package:a/a.dart';\nabstract class I { void i(); }\nclass K extends B implements I {\n  final int v;\n  K(this.v);\n  @override\n  void i() { helper(v); }\n}\nvoid helper(int x) {}\nenum E { a, b }\n"),
+        (Language::CSharp, "M.cs", "using System;\nusing Foo.Bar;\nnamespace App {\n  public interface I { void M(); }\n  public class K : B, I {\n    public int P { get; set; }\n    public void M() { Helper(P); }\n    private static void Helper(int x) {}\n  }\n  public enum E { A, B }\n  public record R(int X);\n}\n"),
+        (Language::VisualBasic, "M.vb", "Imports System\nNamespace App\n  Public Class K\n    Public Property P As Integer\n    Public Sub M()\n      Helper(P)\n    End Sub\n    Private Function Helper(x As Integer) As Integer\n      Return x\n    End Function\n  End Class\nEnd Namespace\n"),
+        (Language::Kotlin, "m.kt", "package p\n\nimport a.b.C\n\ninterface I {\n    fun i()\n}\n\nclass K : I {\n    override fun i() {\n        helper(1)\n    }\n}\n\nfun helper(x: Int): Int {\n    return x\n}\n\nobject O\n"),
+        (Language::Shell, "m.sh", "#!/bin/bash\nsource ./lib.sh\nreadonly N=3\nhelper() { echo \"$1\"; }\nfunction main {\n  helper \"$N\"\n}\nmain \"$@\"\n"),
+        (Language::Ruby, "m.rb", "require 'json'\nrequire_relative 'a'\nmodule M\n  class K < Base\n    C = 1\n    def m\n      helper(C)\n    end\n    def self.s; end\n  end\nend\ndef helper(x) = x\n"),
+        (Language::Lua, "m.lua", "local a = require('a')\nlocal M = {}\nfunction M.f(x) return a.g(x) end\nlocal function helper(y) return y end\nfunction M:m() return helper(self) end\nreturn M\n"),
+    ];
+
+    /// What [`EXTRACTOR_PROBES`] extract under the current [`EXTRACTOR_VERSION`].
+    /// See [`extractor_output_matches_its_version`].
+    const EXTRACTOR_FINGERPRINT: (u32, u64) = (6, 0x1240_3a72_764b_e436);
+
+    /// Guard for the explicit cache versioning. The parse cache is no longer
+    /// invalidated by every release, so an extractor change that forgets to
+    /// bump [`EXTRACTOR_VERSION`] would keep serving the old symbols from
+    /// every user's cache. If this fails: bump `EXTRACTOR_VERSION` (when the
+    /// change is intended) and paste the printed fingerprint.
+    #[test]
+    fn extractor_output_matches_its_version() {
+        let pool = crate::parse::ParserPool::new();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        for (language, path, source) in EXTRACTOR_PROBES {
+            let parsed = pool
+                .parse(*language, &RelPath::new(*path), source)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert!(
+                parsed.symbols.len() >= 2 && !parsed.partial,
+                "{path}: probe must parse cleanly and extract enough to guard anything"
+            );
+            feed(language.name().as_bytes());
+            feed(&encode_parsed(&parsed).unwrap());
+        }
+        let expected = EXTRACTOR_FINGERPRINT;
+        assert_eq!(
+            (EXTRACTOR_VERSION, hash),
+            expected,
+            "extractor output changed: if intended, bump EXTRACTOR_VERSION \
+             and set EXTRACTOR_FINGERPRINT to ({EXTRACTOR_VERSION}, {hash:#018x})"
+        );
     }
 
     #[test]
@@ -1151,10 +1531,19 @@ mod tests {
             key.ends_with(&format!(":{}:abc", Language::Go.name())),
             "{key}"
         );
+        assert!(key.starts_with(&parse_cache_key_prefix()), "{key}");
         assert!(key.contains(&format!("x{EXTRACTOR_VERSION}")), "{key}");
-        assert!(key.contains(env!("CARGO_PKG_VERSION")), "{key}");
+        assert!(key.contains(&format!("-f{CACHE_FORMAT_VERSION}:")), "{key}");
+        // A release must not invalidate the cache by itself: the crate
+        // version is not part of the key.
+        assert!(
+            !key.contains(&format!("-v{}", env!("CARGO_PKG_VERSION"))),
+            "{key}"
+        );
         // A key written by a pre-versioned binary must never be hit.
         assert_ne!(key, format!("{}:abc", Language::Go.name()));
+        // Nor one written by the JSON-format binaries (`x{N}-v{crate}:`).
+        assert!(!key.starts_with(&format!("x{EXTRACTOR_VERSION}-v")));
     }
 
     #[test]

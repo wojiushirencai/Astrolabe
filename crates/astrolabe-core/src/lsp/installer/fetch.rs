@@ -19,15 +19,20 @@ impl Fetcher for UreqFetcher {
         } else {
             self.timeout_secs
         });
-        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
-        let response = agent
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .build()
+            .into();
+        let mut response = agent
             .get(url)
             .call()
             .map_err(|e| format!("HTTP GET {url}: {e}"))?;
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut bytes)
+        // Language-server archives exceed ureq's default 10 MB body limit.
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(u64::MAX)
+            .read_to_vec()
             .map_err(|e| format!("read body {url}: {e}"))?;
         Ok(bytes)
     }

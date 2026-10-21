@@ -17,7 +17,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
+use astrolabe_core::cache::FileCache;
 use astrolabe_core::lsp::{Location, Position, Precise, Range};
 use astrolabe_core::types::{
     CodeSymbol, Confidence, EdgeKind, FileId, Language, RelPath, SymbolKind,
@@ -33,27 +35,46 @@ const MAX_GRAPH_HITS: usize = 2_000;
 /// Source line text kept per hit.
 pub(crate) const HIT_TEXT_CHARS: usize = 120;
 
-/// Languages whose `find_references` is answered from the index first.
+/// Languages whose `find_references` is answered from the index first for
+/// every symbol kind: Go.
 ///
 /// Chosen by measurement against the language servers
 /// (`docs/find-references-graph-first.md`): on cobra / aiproxy / aicon the
-/// Go answer recalled every gopls hit (precision ≥ 0.996). TypeScript /
-/// JavaScript and Python keep the language server first: members reached
-/// through attributes (`self.x.method`, `exports.x`) are not tied to the
-/// declaring file by the import graph, which measurably cost recall
-/// (Python 0.78) or precision (JS 0.70).
+/// Go answer recalled every gopls hit (precision ≥ 0.996).
+///
+/// TypeScript/TSX and Python are index-first only for top-level names
+/// with exactly one definition in the repo (batch 7, measured against
+/// LanguageService / pyright baselines): see
+/// [`crate::refs_graph_ts::ts_graph_first`] and `py_refs::graph_first`.
+/// Their methods and fields, names with several definitions, and
+/// JavaScript keep the language server first.
 pub(crate) fn graph_first_language(language: Language) -> bool {
     matches!(language, Language::Go)
 }
 
-fn read_lines(root: &Path, path: &str) -> Option<Vec<String>> {
+thread_local! {
+    /// Session file cache for the reads of one `find_references` call (see
+    /// [`with_file_cache`]); `None` reads from disk.
+    static FILE_CACHE: std::cell::RefCell<Option<Arc<FileCache>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with [`read_lines`] served from `cache` (the session's
+/// search_code cache, keyed by repo-relative path, mtime/len-checked), so
+/// fix_path / snap / graph / annotate stop re-reading the same files.
+pub(crate) fn with_file_cache<R>(cache: Option<&Arc<FileCache>>, f: impl FnOnce() -> R) -> R {
+    let prev = FILE_CACHE.with(|c| c.replace(cache.cloned()));
+    let out = f();
+    FILE_CACHE.with(|c| *c.borrow_mut() = prev);
+    out
+}
+
+pub(crate) fn read_lines(root: &Path, path: &str) -> Option<Arc<Vec<String>>> {
+    if let Some(cache) = FILE_CACHE.with(|c| c.borrow().clone()) {
+        return crate::index::load_source_lines(&cache, root, path).map(|(lines, _)| lines);
+    }
     let source = astrolabe_core::text::read_source(&root.join(path)).ok()?;
-    Some(
-        source
-            .split('\n')
-            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned())
-            .collect(),
-    )
+    Some(Arc::new(source.lines().map(str::to_owned).collect()))
 }
 
 fn is_ident(c: char) -> bool {
@@ -115,6 +136,7 @@ pub(crate) enum HitKind {
 fn classify(path: &str, lines: &[String], hits: &[(usize, usize)]) -> Vec<HitKind> {
     let all_masked = crate::code_mask::code_mask(path, lines, false);
     let comments = crate::code_mask::code_mask(path, lines, true);
+    let python = path.ends_with(".py") || path.ends_with(".pyi");
     hits.iter()
         .map(|&(line, byte)| {
             let at = |m: &Option<Vec<Vec<bool>>>| {
@@ -127,7 +149,12 @@ fn classify(path: &str, lines: &[String], hits: &[(usize, usize)]) -> Vec<HitKin
             if !at(&comments) {
                 HitKind::Comment
             } else if !at(&all_masked) {
-                HitKind::Str
+                // Python forward references (`x: "Foo"`) are code.
+                if python && crate::py_refs::type_string_in(lines, line, byte) {
+                    HitKind::Code
+                } else {
+                    HitKind::Str
+                }
             } else {
                 HitKind::Code
             }
@@ -459,31 +486,907 @@ fn selector_base(line: &str, byte: usize) -> Option<&str> {
     Some(&before[start..])
 }
 
-/// The index's answer to "references of `name`", when it is unambiguous:
-/// exactly one same-family declaration of `name` in the repo. `None`
-/// otherwise (the caller then asks the language server).
+/// All Go imports in `lines`: `(local name, import path)`. `_` and `.`
+/// imports are left out (no selector reaches them).
+fn go_imports(lines: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in lines {
+        let t = line.trim();
+        let spec = if in_block {
+            if t.starts_with(')') {
+                in_block = false;
+                continue;
+            }
+            t
+        } else if let Some(rest) = t.strip_prefix("import") {
+            let rest = rest.trim();
+            if let Some(inner) = rest.strip_prefix('(') {
+                in_block = true;
+                inner.trim()
+            } else {
+                rest
+            }
+        } else if t.starts_with("func ") || t.starts_with("type ") || t.starts_with("var ") {
+            break;
+        } else {
+            continue;
+        };
+        let Some(q) = spec.find('"') else { continue };
+        let Some(end) = spec[q + 1..].find('"') else {
+            continue;
+        };
+        let path = &spec[q + 1..q + 1 + end];
+        let alias = spec[..q].trim();
+        if alias == "_" || alias == "." {
+            continue;
+        }
+        let local = if alias.is_empty() {
+            go_default_local(path)
+        } else {
+            alias.to_string()
+        };
+        out.push((local, path.to_string()));
+    }
+    out
+}
+
+/// Local name of an un-aliased import (`yaml` for `gopkg.in/yaml.v3`).
+fn go_default_local(path: &str) -> String {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    let last =
+        if last.len() > 1 && last.starts_with('v') && last[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            path.rsplit('/').nth(1).unwrap_or(last)
+        } else {
+            last
+        };
+    let last = last.split('.').next().unwrap_or(last);
+    last.trim_start_matches("go-").replace('-', "_")
+}
+
+/// The import path is the package at `def_dir` (same rule as
+/// [`go_foreign_imports`]).
+fn go_import_is_def(path: &str, def_import: Option<&str>, def_dir: &str) -> bool {
+    def_import.is_some_and(|d| path == d)
+        || (def_import.is_none()
+            && !def_dir.is_empty()
+            && path.rsplit('/').next() == def_dir.rsplit('/').next())
+}
+
+/// `module` of the nearest `go.mod` enclosing `dir`.
+fn go_module(root: &Path, dir: &str) -> Option<String> {
+    let mut d = dir;
+    loop {
+        let go_mod = if d.is_empty() {
+            root.join("go.mod")
+        } else {
+            root.join(d).join("go.mod")
+        };
+        if let Ok(text) = std::fs::read_to_string(go_mod) {
+            return text.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("module")
+                    .map(|m| m.trim().trim_matches('"').to_string())
+                    .filter(|m| !m.is_empty())
+            });
+        }
+        if d.is_empty() {
+            return None;
+        }
+        d = dir_of(d);
+    }
+}
+
+// ------------------------------------------------ Go receiver resolution
+
+/// Byte index of the bracket closing the one at `open`.
+fn close_of(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split at `sep` outside brackets.
+fn split_top(s: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut from = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                out.push(&s[from..i]);
+                from = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[from..]);
+    out
+}
+
+fn is_ident_str(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// A Go type expression as `(package qualifier, type name)`: `*pkg.T[X]`
+/// is `(Some(pkg), T)`. `None` for slices, maps, funcs, literals.
+fn go_type_name(t: &str) -> Option<(Option<String>, String)> {
+    let t = t
+        .trim()
+        .trim_start_matches("...")
+        .trim_start_matches(['*', '&'])
+        .trim();
+    let head = t
+        .split(|c: char| matches!(c, '[' | '{' | '(' | ')' | ',' | ';') || c.is_whitespace())
+        .next()?;
+    let (pkg, name) = match head.split_once('.') {
+        Some((p, n)) => (Some(p), n),
+        None => (None, head),
+    };
+    if !is_ident_str(name) || pkg.is_some_and(|p| !is_ident_str(p)) {
+        return None;
+    }
+    if pkg.is_none() && matches!(name, "map" | "chan" | "func" | "struct" | "interface") {
+        return None;
+    }
+    Some((pkg.map(str::to_string), name.to_string()))
+}
+
+/// Receiver type of a Go method signature (`Command` for
+/// `func (c *Command) Execute() error`). `None` for interface methods.
+fn go_receiver_type(signature: &str) -> Option<String> {
+    let s = signature.trim().strip_prefix("func")?.trim_start();
+    if !s.starts_with('(') {
+        return None;
+    }
+    let inner = &s[1..close_of(s, 0)?];
+    let ty = inner
+        .trim()
+        .rsplit_once(|c: char| c.is_whitespace())
+        .map_or(inner, |(_, t)| t);
+    go_type_name(ty).map(|(_, n)| n)
+}
+
+/// One `func` on a line: receiver list, parameter list, result text.
+struct FuncParts<'a> {
+    receiver: Option<&'a str>,
+    params: &'a str,
+    results: &'a str,
+}
+
+/// Every `func` (declarations and literals) on `text`.
+fn go_func_parts(text: &str) -> Vec<FuncParts<'_>> {
+    let mut out = Vec::new();
+    for off in word_offsets(text, "func") {
+        let mut s = &text[off + 4..];
+        let lead = s.len() - s.trim_start().len();
+        s = &s[lead..];
+        let mut receiver = None;
+        if s.starts_with('(') {
+            let Some(close) = close_of(s, 0) else {
+                continue;
+            };
+            let after = s[close + 1..].trim_start();
+            let name_len = after.find(|c: char| !is_ident(c)).unwrap_or(after.len());
+            if name_len > 0 && after[name_len..].trim_start().starts_with(['(', '[']) {
+                receiver = Some(&s[1..close]);
+                s = &after[name_len..];
+            }
+        } else {
+            let name_len = s.find(|c: char| !is_ident(c)).unwrap_or(s.len());
+            s = &s[name_len..];
+        }
+        s = s.trim_start();
+        if s.starts_with('[') {
+            let Some(close) = close_of(s, 0) else {
+                continue;
+            };
+            s = s[close + 1..].trim_start();
+        }
+        if !s.starts_with('(') {
+            continue;
+        }
+        let Some(close) = close_of(s, 0) else {
+            continue;
+        };
+        let params = &s[1..close];
+        let rest = &s[close + 1..];
+        let results = rest.split('{').next().unwrap_or(rest).trim();
+        out.push(FuncParts {
+            receiver,
+            params,
+            results,
+        });
+    }
+    out
+}
+
+/// Type text of parameter `x` in a Go parameter list (`a, x *T, n int`).
+fn go_param_type<'a>(params: &'a str, x: &str) -> Option<&'a str> {
+    let mut pending: Vec<&str> = Vec::new();
+    for seg in split_top(params, ',') {
+        let seg = seg.trim();
+        match seg.split_once(|c: char| c.is_whitespace()) {
+            Some((name, ty)) if is_ident_str(name) => {
+                if name == x || pending.contains(&x) {
+                    return Some(ty.trim());
+                }
+                pending.clear();
+            }
+            _ => pending.push(seg),
+        }
+    }
+    None
+}
+
+/// `idx`-th result type of a Go result list (`*T`, `(T, error)`,
+/// `(c *T, err error)`).
+fn go_result_type(results: &str, idx: usize) -> Option<&str> {
+    let r = results.trim();
+    if let Some(inner) = r.strip_prefix('(') {
+        let inner = &inner[..close_of(r, 0)? - 1];
+        let seg = split_top(inner, ',').into_iter().nth(idx)?.trim();
+        Some(match seg.split_once(|c: char| c.is_whitespace()) {
+            Some((name, ty)) if is_ident_str(name) && !ty.trim().is_empty() => ty.trim(),
+            _ => seg,
+        })
+    } else {
+        (idx == 0 && !r.is_empty()).then_some(r)
+    }
+}
+
+/// How the name `x` is bound before `(line, byte)`.
+enum Binding {
+    /// Declared type text (parameter, `var x T`).
+    Type(String),
+    /// Initializer expression; the variable is its `idx`-th value.
+    Expr(String, usize),
+    /// Bound, but not resolvable (`range`, type switch…).
+    Opaque,
+}
+
+/// Nearest binding of `x` above `(line, byte)`, up to and including the
+/// enclosing top-level `func` line.
+fn go_local_binding(lines: &[String], line: usize, byte: usize, x: &str) -> Option<Binding> {
+    let last = line.min(lines.len().checked_sub(1)?);
+    for i in (0..=last).rev() {
+        let full = &lines[i];
+        let text = if i == line {
+            &full[..byte.min(full.len())]
+        } else {
+            full.as_str()
+        };
+        if let Some(b) = binding_on_line(text, x) {
+            return Some(b);
+        }
+        if full.starts_with("func ") {
+            break;
+        }
+    }
+    None
+}
+
+fn binding_on_line(text: &str, x: &str) -> Option<Binding> {
+    if word_offsets(text, x).is_empty() {
+        return None;
+    }
+    // Parameters and receivers of a func on this line.
+    for parts in go_func_parts(text) {
+        if let Some(t) = parts.receiver.and_then(|r| go_param_type(r, x)) {
+            return Some(Binding::Type(t.to_string()));
+        }
+        if let Some(t) = go_param_type(parts.params, x) {
+            return Some(Binding::Type(t.to_string()));
+        }
+    }
+    // `a, x := expr` (also inside `if` / `for` / `switch` headers).
+    for (pos, _) in text.match_indices(":=") {
+        let lhs = &text[..pos];
+        let lhs = lhs.rsplit([';', '(', '{']).next().unwrap_or(lhs).trim();
+        let lhs = ["if ", "for ", "switch ", "case "]
+            .iter()
+            .find_map(|k| lhs.strip_prefix(k))
+            .unwrap_or(lhs);
+        let names: Vec<&str> = lhs.split(',').map(str::trim).collect();
+        if !names.iter().all(|n| is_ident_str(n)) {
+            continue;
+        }
+        let Some(idx) = names.iter().position(|n| *n == x) else {
+            continue;
+        };
+        let rhs = text[pos + 2..].trim();
+        let rhs = split_top(rhs, ';')[0].trim();
+        if rhs.starts_with("range ") || rhs.contains(".(type)") {
+            return Some(Binding::Opaque);
+        }
+        return Some(Binding::Expr(rhs.to_string(), idx));
+    }
+    // `var x T`, `var x = expr`, `var x, y T`.
+    let t = text.trim_start();
+    if let Some(rest) = t.strip_prefix("var ") {
+        return var_spec_binding(rest, x);
+    }
+    None
+}
+
+/// `x T`, `x = expr`, `x, y T = a, b` (a var spec without `var`).
+fn var_spec_binding(spec: &str, x: &str) -> Option<Binding> {
+    let (left, init) = match split_top(spec, '=').as_slice() {
+        [l, r, ..] => (*l, Some(*r)),
+        [l] => (*l, None),
+        _ => return None,
+    };
+    // Names are a comma list; the type follows the last name.
+    let mut names = Vec::new();
+    let mut rest = left.trim();
+    loop {
+        let n = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
+        names.push(&rest[..n]);
+        rest = rest[n..].trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            rest = r.trim_start();
+        } else {
+            break;
+        }
+    }
+    let ty = rest.trim();
+    let idx = names.iter().position(|n| *n == x)?;
+    if !ty.is_empty() {
+        return Some(Binding::Type(ty.to_string()));
+    }
+    let init = init?.trim();
+    Some(Binding::Expr(init.to_string(), idx))
+}
+
+/// A resolved receiver type, relative to the declaring package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GoTy {
+    /// Named type `name` of package directory `dir`.
+    Named { dir: String, name: String },
+    /// Type of a package outside the repo (stdlib, third party).
+    External,
+    /// Built-in non-interface type: has no methods.
+    Builtin,
+}
+
+/// Verdict on one `x.Method` hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recv {
+    Ours,
+    Other,
+    Unknown,
+}
+
+const GO_BUILTINS: &[&str] = &[
+    "bool",
+    "string",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+    "byte",
+    "rune",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+];
+
+/// Shared state for resolving receivers of one method's hits.
+struct GoRecv<'a> {
+    index: &'a RepoIndex,
+    root: &'a Path,
+    def_dir: &'a str,
+    def_import: Option<&'a str>,
+    module: Option<String>,
+    /// Directories holding Go files.
+    go_dirs: HashSet<String>,
+    /// Receiver type of the method being searched.
+    recv: &'a str,
+    method: &'a str,
+    files: HashMap<String, Option<Arc<Vec<String>>>>,
+}
+
+impl<'a> GoRecv<'a> {
+    fn lines(&mut self, path: &str) -> Option<Arc<Vec<String>>> {
+        self.files
+            .entry(path.to_string())
+            .or_insert_with(|| read_lines(self.root, path))
+            .clone()
+    }
+
+    /// `(qualifier, name)` as written in a file of package `dir` with
+    /// `imports`, as a [`GoTy`].
+    fn ty_in(
+        &self,
+        dir: &str,
+        imports: &[(String, String)],
+        parsed: (Option<String>, String),
+    ) -> Option<GoTy> {
+        let (pkg, name) = parsed;
+        match pkg {
+            None if GO_BUILTINS.contains(&name.as_str()) => Some(GoTy::Builtin),
+            None => Some(GoTy::Named {
+                dir: dir.to_string(),
+                name,
+            }),
+            Some(p) => {
+                let (_, path) = imports.iter().find(|(l, _)| *l == p)?;
+                if go_import_is_def(path, self.def_import, self.def_dir) {
+                    return Some(GoTy::Named {
+                        dir: self.def_dir.to_string(),
+                        name,
+                    });
+                }
+                // In-repo packages may embed our type: not resolved further.
+                (!self.in_repo(path)).then_some(GoTy::External)
+            }
+        }
+    }
+
+    /// The import path names a package of this repo (any module of it,
+    /// vendored copies included): the path is under the declaring module,
+    /// or its last two segments (one, for one-segment paths) are a Go
+    /// directory of the repo.
+    fn in_repo(&self, path: &str) -> bool {
+        if self
+            .module
+            .as_deref()
+            .is_some_and(|m| path == m || path.starts_with(&format!("{m}/")))
+        {
+            return true;
+        }
+        let segs: Vec<&str> = path.split('/').collect();
+        let min = segs.len().min(2);
+        (min..=segs.len()).any(|n| {
+            let suffix = segs[segs.len() - n..].join("/");
+            self.go_dirs.contains(&suffix)
+                || self
+                    .go_dirs
+                    .iter()
+                    .any(|d| d.ends_with(&format!("/{suffix}")))
+        })
+    }
+
+    fn verdict(&self, ty: Option<GoTy>) -> Recv {
+        match ty {
+            Some(GoTy::External | GoTy::Builtin) => Recv::Other,
+            Some(GoTy::Named { dir, name }) => {
+                if dir == self.def_dir && name == self.recv {
+                    Recv::Ours
+                } else if self.has_own_method(&dir, &name) {
+                    // Its own method of that name shadows any embedded one.
+                    Recv::Other
+                } else {
+                    // Could embed our type, or be an interface.
+                    Recv::Unknown
+                }
+            }
+            None => Recv::Unknown,
+        }
+    }
+
+    fn has_own_method(&self, dir: &str, ty: &str) -> bool {
+        declarations(self.index, self.method, Some(Language::Go))
+            .iter()
+            .any(|s| {
+                s.kind == SymbolKind::Method
+                    && go_receiver_type(&s.signature).as_deref() == Some(ty)
+                    && self
+                        .index
+                        .file(s.file)
+                        .is_some_and(|f| dir_of(f.path.as_str()) == dir)
+            })
+    }
+
+    /// Type of the receiver `base` of the hit at `(line, byte)` of `path`.
+    fn base_type(&mut self, path: &str, line: usize, byte: usize, base: &str) -> Option<GoTy> {
+        let lines = self.lines(path)?;
+        let dir = dir_of(path).to_string();
+        let imports = go_imports(&lines);
+        let base_start = byte.checked_sub(base.len() + 1)?;
+        let before = &lines[line][..base_start];
+        if before.ends_with('.') {
+            return self.field_type(base);
+        }
+        if base == self.recv && dir == self.def_dir {
+            // Method expression `Command.Execute`.
+            return Some(GoTy::Named {
+                dir,
+                name: base.to_string(),
+            });
+        }
+        self.var_type(&lines, &dir, &imports, line, base_start, base, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn var_type(
+        &mut self,
+        lines: &[String],
+        dir: &str,
+        imports: &[(String, String)],
+        line: usize,
+        byte: usize,
+        x: &str,
+        depth: u32,
+    ) -> Option<GoTy> {
+        if depth > 3 {
+            return None;
+        }
+        let binding = go_local_binding(lines, line, byte, x).or_else(|| self.package_var(dir, x));
+        match binding? {
+            Binding::Opaque => None,
+            Binding::Type(t) => self.ty_in(dir, imports, go_type_name(&t)?),
+            Binding::Expr(e, idx) => self.expr_type(lines, dir, imports, line, &e, idx, depth),
+        }
+    }
+
+    /// Package-level `var x …` of package `dir`, from the index.
+    fn package_var(&mut self, dir: &str, x: &str) -> Option<Binding> {
+        let decl = declarations(self.index, x, Some(Language::Go))
+            .into_iter()
+            .find(|s| {
+                s.kind == SymbolKind::Variable
+                    && self
+                        .index
+                        .file(s.file)
+                        .is_some_and(|f| dir_of(f.path.as_str()) == dir)
+            })?;
+        let sig = decl.signature.trim();
+        let spec = sig.strip_prefix("var ").unwrap_or(sig);
+        match var_spec_binding(spec, x)? {
+            // The signature stops at `{`: `x = &T{…}` reads `x = &T`.
+            Binding::Expr(e, idx) if e.starts_with('&') && !e.contains('(') => {
+                Some(Binding::Type(e.to_string()).then_idx(idx))
+            }
+            Binding::Expr(e, _) if !e.contains('(') => Some(Binding::Opaque),
+            b => Some(b),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expr_type(
+        &mut self,
+        lines: &[String],
+        dir: &str,
+        imports: &[(String, String)],
+        line: usize,
+        expr: &str,
+        idx: usize,
+        depth: u32,
+    ) -> Option<GoTy> {
+        let e = expr.trim();
+        let e = e.strip_prefix('&').unwrap_or(e).trim();
+        if let Some(inner) = e.strip_prefix("new(") {
+            return (idx == 0)
+                .then(|| self.ty_in(dir, imports, go_type_name(inner)?))
+                .flatten();
+        }
+        if is_ident_str(e) {
+            // `x := y`: y's type.
+            return (idx == 0)
+                .then(|| self.var_type(lines, dir, imports, line, 0, e, depth + 1))
+                .flatten();
+        }
+        // `x := a.b.field`: the field's type (when not `pkg.Var`).
+        let parts: Vec<&str> = e.split('.').collect();
+        if parts.len() >= 2 && parts.iter().all(|p| is_ident_str(p)) {
+            if idx != 0 || imports.iter().any(|(l, _)| l == parts[0]) {
+                return None;
+            }
+            return self.field_type(parts[parts.len() - 1]);
+        }
+        let open = e.find(['{', '('])?;
+        let head = e[..open].trim();
+        if e[open..].starts_with('{') {
+            if idx != 0 {
+                return None;
+            }
+            return self.ty_in(dir, imports, go_type_name(head)?);
+        }
+        // A call: `F(…)`, `pkg.F(…)`, `T(x)` conversion.
+        if head == "func" {
+            return None;
+        }
+        match head.split_once('.') {
+            Some((p, f)) if is_ident_str(p) && is_ident_str(f) => {
+                if let Some((_, path)) = imports.iter().find(|(l, _)| l == p) {
+                    if go_import_is_def(path, self.def_import, self.def_dir) {
+                        let def_dir = self.def_dir.to_string();
+                        return self.func_result(&def_dir, f, idx);
+                    }
+                    return (!self.in_repo(path)).then_some(GoTy::External);
+                }
+                // `v.M(…)`: M's result, when v's type and M are known.
+                if idx > 0 || depth >= 3 {
+                    return None;
+                }
+                match self.var_type(lines, dir, imports, line, 0, p, depth + 1)? {
+                    GoTy::Named {
+                        dir: tdir,
+                        name: ty,
+                    } => self.method_result(&tdir, &ty, f),
+                    _ => None,
+                }
+            }
+            None if is_ident_str(head) => {
+                // Local func value `f := func() *T {…}` first, then the package.
+                if let Some(Binding::Expr(rhs, 0)) = go_local_binding(lines, line, 0, head) {
+                    if let Some(parts) = go_func_parts(&rhs).into_iter().next() {
+                        let t = go_result_type(parts.results, idx)?;
+                        return self.ty_in(dir, imports, go_type_name(t)?);
+                    }
+                }
+                if let Some(t) = self.func_result(dir, head, idx) {
+                    return Some(t);
+                }
+                // Conversion to a named type: `T(x)`.
+                let ty = self.ty_in(dir, imports, (None, head.to_string()))?;
+                let is_type = declarations(self.index, head, Some(Language::Go))
+                    .iter()
+                    .any(|s| {
+                        matches!(
+                            s.kind,
+                            SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Type
+                        ) && self
+                            .index
+                            .file(s.file)
+                            .is_some_and(|f| dir_of(f.path.as_str()) == dir)
+                    });
+                (is_type && idx == 0).then_some(ty)
+            }
+            _ => None,
+        }
+    }
+
+    /// `idx`-th result type of function `f` of package `dir`.
+    fn func_result(&mut self, dir: &str, f: &str, idx: usize) -> Option<GoTy> {
+        let decls = declarations(self.index, f, Some(Language::Go));
+        let decl = decls.iter().find(|s| {
+            s.kind == SymbolKind::Function
+                && self
+                    .index
+                    .file(s.file)
+                    .is_some_and(|fl| dir_of(fl.path.as_str()) == dir)
+        })?;
+        let path = self.index.file(decl.file)?.path.as_str().to_string();
+        let parts = go_func_parts(&decl.signature).into_iter().next()?;
+        let t = go_result_type(parts.results, idx)?.to_string();
+        let lines = self.lines(&path)?;
+        let imports = go_imports(&lines);
+        self.ty_in(dir, &imports, go_type_name(&t)?)
+    }
+
+    /// First result type of method `m` of type `ty` in package `dir`.
+    fn method_result(&mut self, dir: &str, ty: &str, m: &str) -> Option<GoTy> {
+        let decls = declarations(self.index, m, Some(Language::Go));
+        let decl = decls.iter().find(|s| {
+            s.kind == SymbolKind::Method
+                && go_receiver_type(&s.signature).as_deref() == Some(ty)
+                && self
+                    .index
+                    .file(s.file)
+                    .is_some_and(|fl| dir_of(fl.path.as_str()) == dir)
+        })?;
+        let path = self.index.file(decl.file)?.path.as_str().to_string();
+        let parts = go_func_parts(&decl.signature).into_iter().next()?;
+        let t = go_result_type(parts.results, 0)?.to_string();
+        let lines = self.lines(&path)?;
+        let imports = go_imports(&lines);
+        self.ty_in(dir, &imports, go_type_name(&t)?)
+    }
+
+    /// Type of struct field `name`, when every Go field of that name in
+    /// the repo agrees.
+    fn field_type(&mut self, name: &str) -> Option<GoTy> {
+        let fields: Vec<(String, String)> = declarations(self.index, name, Some(Language::Go))
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Field)
+            .filter_map(|s| {
+                let path = self.index.file(s.file)?.path.as_str().to_string();
+                Some((path, s.signature.clone()))
+            })
+            .collect();
+        let mut agreed: Option<GoTy> = None;
+        for (path, sig) in fields {
+            let rest = sig.trim().strip_prefix(name)?.trim();
+            let lines = self.lines(&path)?;
+            let imports = go_imports(&lines);
+            let ty = self.ty_in(dir_of(&path), &imports, go_type_name(rest)?)?;
+            match &agreed {
+                None => agreed = Some(ty),
+                Some(a) if *a == ty => {}
+                Some(_) => return None,
+            }
+        }
+        agreed
+    }
+}
+
+impl Binding {
+    fn then_idx(self, idx: usize) -> Binding {
+        match self {
+            Binding::Type(t) if idx == 0 => Binding::Type(t),
+            Binding::Type(_) => Binding::Opaque,
+            b => b,
+        }
+    }
+}
+
+/// Pick the declaration `find_references` is about when the name has
+/// several: the one at `line` of `origin`, the only one in `origin`, the
+/// only one in `origin`'s Go package, or the only one in a package
+/// `origin` imports. `None` when that still leaves a choice.
+fn choose_declaration<'a>(
+    index: &RepoIndex,
+    decls: &[&'a CodeSymbol],
+    origin: &RelPath,
+    line: Option<u32>,
+    go: bool,
+) -> Option<&'a CodeSymbol> {
+    if let [only] = decls {
+        return Some(only);
+    }
+    // Other languages keep the old rule: one declaration or the server.
+    if !go {
+        return None;
+    }
+    let path_of = |s: &CodeSymbol| index.file(s.file).map(|f| f.path.as_str().to_string());
+    // Struct fields lose to a type / func of the same name.
+    let pick = |c: Vec<&'a CodeSymbol>| -> Option<&'a CodeSymbol> {
+        if let [one] = c.as_slice() {
+            return Some(one);
+        }
+        let non_field: Vec<_> = c.iter().filter(|s| s.kind != SymbolKind::Field).collect();
+        match non_field.as_slice() {
+            [one] => Some(**one),
+            _ => None,
+        }
+    };
+    let in_file: Vec<&CodeSymbol> = decls
+        .iter()
+        .copied()
+        .filter(|s| path_of(s).as_deref() == Some(origin.as_str()))
+        .collect();
+    if let Some(line) = line.map(|l| l + 1) {
+        let at = in_file
+            .iter()
+            .copied()
+            .filter(|s| s.start_line <= line && line <= s.end_line.max(s.start_line))
+            .min_by_key(|s| s.end_line.saturating_sub(s.start_line));
+        if at.is_some() {
+            return at;
+        }
+    }
+    if !in_file.is_empty() {
+        return pick(in_file);
+    }
+    let origin_dir = dir_of(origin.as_str());
+    let in_pkg: Vec<&CodeSymbol> = decls
+        .iter()
+        .copied()
+        .filter(|s| path_of(s).is_some_and(|p| dir_of(&p) == origin_dir))
+        .collect();
+    if !in_pkg.is_empty() {
+        return pick(in_pkg);
+    }
+    // A caller file: the declaration in a package it imports.
+    let graph = index.graph();
+    let origin_id = graph.files.iter().find(|f| f.path == *origin)?.id.0;
+    let imported_dirs: HashSet<String> = graph
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Import && e.from == origin_id)
+        .filter_map(|e| index.file(FileId(e.to)))
+        .map(|f| dir_of(f.path.as_str()).to_string())
+        .collect();
+    let imported: Vec<&CodeSymbol> = decls
+        .iter()
+        .copied()
+        .filter(|s| path_of(s).is_some_and(|p| imported_dirs.contains(dir_of(&p))))
+        .collect();
+    if imported.is_empty() {
+        return None;
+    }
+    pick(imported)
+}
+
+/// `name` at `byte` is a composite-literal key (`{Name: v`, `, Name: v`,
+/// or a line of its own `Name: v,`), not `case Name:` or a label.
+fn go_literal_key(line: &str, byte: usize, name: &str) -> bool {
+    let after = line[byte + name.len()..].trim_start();
+    if !after.starts_with(':') || after.starts_with(":=") {
+        return false;
+    }
+    let before = line[..byte].trim_end();
+    if before.is_empty() {
+        // `Name: v,` alone on a line: a key, unless it is a label (a label
+        // is followed by nothing or a statement, not a value and a comma).
+        return after.trim_end().ends_with(',') || after.trim_end().ends_with('{');
+    }
+    before.ends_with('{') || before.ends_with(',')
+}
+
+/// Max `path:line` entries listed per category in the note.
+const NOTE_LIST: usize = 8;
+
+fn list_hits(hits: &[(String, usize)]) -> String {
+    let mut s: Vec<String> = hits
+        .iter()
+        .take(NOTE_LIST)
+        .map(|(p, l)| format!("{p}:{}", l + 1))
+        .collect();
+    if hits.len() > NOTE_LIST {
+        s.push(format!("…共 {} 处", hits.len()));
+    }
+    s.join("、")
+}
+
+/// The index's answer to "references of `name`", when it can tell which
+/// declaration is meant: the only same-family declaration of `name`, or,
+/// with several, the one `origin` (and `line`, 0-based) points at (see
+/// [`choose_declaration`]). `None` otherwise (the caller then asks the
+/// language server).
 ///
 /// Go: occurrences in the declaring package (its directory) and, for an
-/// exported name, in files whose import edges reach that package. Other
-/// languages: the declaring file and the files importing it. Comments and
-/// strings are excluded; hits come back sorted by path and position.
+/// exported name, in files whose import edges reach that package. A Go
+/// method's `x.Name` hits are checked against the receiver type (`x`'s
+/// parameter / `var` / `:=` / field type from the source and the index):
+/// other types' same-named methods are dropped, unresolvable receivers are
+/// kept and listed as unconfirmed. Top-level names drop `x.Name` member
+/// accesses. Other languages: the declaring file and the files importing
+/// it. Comments and strings are excluded; hits come back sorted by path and
+/// position.
 pub(crate) fn graph_references(
     index: &RepoIndex,
     root: &Path,
     name: &str,
     origin: &RelPath,
 ) -> Option<Precise<Vec<Location>>> {
+    graph_references_at(index, root, name, origin, None)
+}
+
+/// [`graph_references`] with the caller's 0-based `line` in `origin`, which
+/// picks among several declarations in that file.
+pub(crate) fn graph_references_at(
+    index: &RepoIndex,
+    root: &Path,
+    name: &str,
+    origin: &RelPath,
+    line: Option<u32>,
+) -> Option<Precise<Vec<Location>>> {
     let language = Language::from_path(origin)?;
+    let go = language == Language::Go;
     let decls = declarations(index, name, Some(language));
-    let [decl] = decls.as_slice() else {
-        return None;
-    };
+    let decl = choose_declaration(index, &decls, origin, line, go)?;
     let graph = index.graph();
     let def_file = index.file(decl.file)?;
     let def_path = def_file.path.as_str();
     let def_dir = dir_of(def_path);
     let exported = name.chars().next().is_some_and(char::is_uppercase);
-    let go = language == Language::Go;
     // Files whose imports reach the declaration (Go: any file of the package).
     let targets: HashSet<u32> = graph
         .files
@@ -503,6 +1406,17 @@ pub(crate) fn graph_references(
         .filter(|e| e.kind == EdgeKind::Import && targets.contains(&e.to))
         .map(|e| e.from)
         .collect();
+    // TS/JS: also barrel re-exports and renamed bindings (refs_graph_ts).
+    let ts = (!go && crate::refs_graph_ts::is_ts_family(language))
+        .then(|| crate::refs_graph_ts::ts_scope(index, root, decl.file, decl.start_line, name));
+    // Python: also `__init__` / `__all__` re-exports and `as` aliases (py_refs).
+    let py = (language == Language::Python)
+        .then(|| crate::py_refs::python_scope(index, root, decl.file, name));
+    // Python methods / attributes: receivers checked against the class.
+    let py_member = py
+        .as_ref()
+        .filter(|_| decl.kind != SymbolKind::Class)
+        .and_then(|(s, _)| crate::py_refs::PyMember::new(index, root, decl, name, s));
     let mut files: Vec<&RelPath> = graph
         .files
         .iter()
@@ -511,40 +1425,220 @@ pub(crate) fn graph_references(
             if go {
                 dir_of(f.path.as_str()) == def_dir || (exported && importers.contains(&f.id.0))
             } else {
-                f.id == decl.file || importers.contains(&f.id.0)
+                f.id == decl.file
+                    || importers.contains(&f.id.0)
+                    || ts.as_ref().is_some_and(|t| t.contains(f.id.0))
+                    || py.as_ref().is_some_and(|(s, _)| s.contains_key(&f.id.0))
+                    || py_member
+                        .as_ref()
+                        .is_some_and(|m| m.extra_files.contains(&f.id.0))
             }
         })
         .map(|f| &f.path)
         .collect();
     files.sort();
     let def_import = go.then(|| go_import_path(root, def_dir)).flatten();
+    // Go methods: hits are checked against the receiver type.
+    let method_recv = (go && decl.kind == SymbolKind::Method)
+        .then(|| go_receiver_type(&decl.signature))
+        .flatten();
+    let interface_method = go && decl.kind == SymbolKind::Method && method_recv.is_none();
+    // Top-level Go names are reached bare or as `pkg.Name`, never `x.Name`.
+    let top_level = go && !matches!(decl.kind, SymbolKind::Method | SymbolKind::Field);
+    let mut resolver = method_recv.as_deref().map(|recv| GoRecv {
+        index,
+        root,
+        def_dir,
+        def_import: def_import.as_deref(),
+        module: go_module(root, def_dir),
+        go_dirs: graph
+            .files
+            .iter()
+            .filter(|f| f.language == Some(Language::Go))
+            .map(|f| dir_of(f.path.as_str()).to_string())
+            .collect(),
+        recv,
+        method: name,
+        files: HashMap::new(),
+    });
+    // Same-named declarations other than `decl`, by (path, 1-based line).
+    let others: HashMap<(String, u32), &CodeSymbol> = decls
+        .iter()
+        .filter(|s| !std::ptr::eq(**s, decl))
+        .filter_map(|s| {
+            Some((
+                (index.file(s.file)?.path.as_str().to_string(), s.start_line),
+                *s,
+            ))
+        })
+        .collect();
     let name_units = name.encode_utf16().count() as u32;
     let mut hits = Vec::new();
+    let mut other_type: Vec<(String, usize)> = Vec::new();
+    let mut unconfirmed: Vec<(String, usize)> = Vec::new();
+    let mut members = 0usize;
     for path in files {
         let Some(lines) = read_lines(root, path.as_str()) else {
             continue;
         };
+        // The name, plus (TS/JS) the local aliases it has in this file.
+        let words: Vec<&str> = match (&ts, index.file_id(path.as_str())) {
+            (Some(t), Some(id)) => t.words(id.0, name),
+            (None, Some(id)) => match py.as_ref().and_then(|(s, _)| s.get(&id.0)) {
+                Some(w) => w.iter().map(String::as_str).collect(),
+                None => vec![name],
+            },
+            _ => vec![name],
+        };
+        let mut alias_units: HashMap<(usize, usize), u32> = HashMap::new();
         let mut found: Vec<(usize, usize)> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
-            for b in word_offsets(line, name) {
-                found.push((i, b));
+            for w in &words {
+                for b in word_offsets(line, w) {
+                    found.push((i, b));
+                    if *w != name {
+                        alias_units.insert((i, b), w.encode_utf16().count() as u32);
+                    }
+                }
             }
         }
+        found.sort_unstable();
+        found.dedup();
         if found.is_empty() {
             continue;
         }
         let kinds = classify(path.as_str(), &lines, &found);
-        let foreign = if go {
-            go_foreign_imports(&lines, def_import.as_deref(), def_dir)
+        let dot_import = go
+            && lines
+                .iter()
+                .any(|l| l.trim_start().starts_with(". \"") || l.contains("import . \""));
+        let (foreign, ours_locals) = if go {
+            let imports = go_imports(&lines);
+            let ours: HashSet<String> = imports
+                .iter()
+                .filter(|(_, p)| go_import_is_def(p, def_import.as_deref(), def_dir))
+                .map(|(l, _)| l.clone())
+                .collect();
+            (
+                go_foreign_imports(&lines, def_import.as_deref(), def_dir),
+                ours,
+            )
         } else {
-            HashSet::new()
+            (HashSet::new(), HashSet::new())
         };
+        let mut first_on_line: HashSet<usize> = HashSet::new();
         for ((line, byte), kind) in found.into_iter().zip(kinds) {
+            let first = first_on_line.insert(line);
             if kind != HitKind::Code {
                 continue;
             }
-            if selector_base(&lines[line], byte).is_some_and(|b| foreign.contains(b)) {
+            let base = selector_base(&lines[line], byte);
+            if base.is_some_and(|b| foreign.contains(b)) {
                 continue;
+            }
+            let is_decl =
+                first && def_path == path.as_str() && decl.start_line as usize == line + 1;
+            let other_decl = (go && first)
+                .then(|| others.get(&(path.as_str().to_string(), line as u32 + 1)))
+                .flatten();
+            if let Some(o) = other_decl {
+                // Another declaration's own name: not a reference to ours,
+                // except an embedded field (`*Command` in a struct).
+                let embedded =
+                    o.kind == SymbolKind::Field && o.signature.split_whitespace().count() == 1;
+                if !embedded {
+                    continue;
+                }
+            }
+            // TS/JS object-literal key / type member `name: …` (after `{`,
+            // `,` or at line start): a property, not the declaration
+            // (`{ smootherstep: smootherstep }`, `interface I { name: T }`).
+            if ts.is_some()
+                && !is_decl
+                && base.is_none()
+                && crate::refs_graph_ts::is_object_key(&lines[line], byte)
+            {
+                members += 1;
+                continue;
+            }
+            // TS/JS top-level declarations: `x.name` is ours only through a
+            // module object (`ns.name`, `require(...).name` bound to a local).
+            // A declaration made by property assignment (`app.x = function
+            // x(`) is reached as `obj.x`; a bare `x` in its file is not it.
+            if let Some(t) = &ts {
+                let member_kind = matches!(decl.kind, SymbolKind::Method | SymbolKind::Field);
+                let reached = match base {
+                    Some(b) => {
+                        member_kind
+                            || index.file_id(path.as_str()).is_some_and(|f| {
+                                t.member_reaches(f.0, b, path.as_str() == def_path)
+                            })
+                    }
+                    None => member_kind || t.bare_reaches(path.as_str() == def_path),
+                };
+                if !reached {
+                    members += 1;
+                    continue;
+                }
+            }
+            if go && !is_decl && base.is_none() && go_literal_key(&lines[line], byte, name) {
+                // `Name: v` in a composite literal is a field key.
+                members += 1;
+                continue;
+            }
+            if top_level {
+                let reached = match base {
+                    Some(b) => ours_locals.contains(b),
+                    // Another package names it `pkg.Name` (unless dot-imported).
+                    None => dir_of(path.as_str()) == def_dir || dot_import,
+                };
+                if !reached {
+                    members += 1;
+                    continue;
+                }
+            }
+            if let (Some(m), Some(id)) = (py_member.as_ref(), index.file_id(path.as_str())) {
+                if !is_decl {
+                    use crate::py_refs::PyVerdict;
+                    match m.verdict(id.0, &lines, line, byte) {
+                        PyVerdict::Ours => {}
+                        PyVerdict::Other => {
+                            other_type.push((path.as_str().to_string(), line));
+                            continue;
+                        }
+                        PyVerdict::Bare => {
+                            members += 1;
+                            continue;
+                        }
+                        PyVerdict::Unknown => unconfirmed.push((path.as_str().to_string(), line)),
+                    }
+                }
+            }
+            if let Some(r) = resolver.as_mut() {
+                if !is_decl {
+                    let verdict = match base {
+                        Some(b) => {
+                            let ty = r.base_type(path.as_str(), line, byte, b);
+                            r.verdict(ty)
+                        }
+                        // `f().M`, `xs[i].M`, `(*T).M`: not resolved.
+                        None if lines[line][..byte].ends_with('.') => Recv::Unknown,
+                        // A bare name is never a method reference: a local
+                        // variable / parameter / label of the same name.
+                        None => {
+                            members += 1;
+                            continue;
+                        }
+                    };
+                    match verdict {
+                        Recv::Ours => {}
+                        Recv::Other => {
+                            other_type.push((path.as_str().to_string(), line));
+                            continue;
+                        }
+                        Recv::Unknown => unconfirmed.push((path.as_str().to_string(), line)),
+                    }
+                }
             }
             let character = utf16_col(&lines[line], byte);
             let start = Position {
@@ -553,7 +1647,11 @@ pub(crate) fn graph_references(
             };
             let end = Position {
                 line: line as u32,
-                character: character + name_units,
+                character: character
+                    + alias_units
+                        .get(&(line, byte))
+                        .copied()
+                        .unwrap_or(name_units),
             };
             hits.push(Location {
                 path: path.clone(),
@@ -567,28 +1665,139 @@ pub(crate) fn graph_references(
     if hits.is_empty() {
         return None;
     }
+    let pkg = if def_dir.is_empty() { "." } else { def_dir };
     let scope = if go {
         if exported {
-            format!(
-                "包 {}/ 内及导入该包的文件",
-                if def_dir.is_empty() { "." } else { def_dir }
-            )
+            format!("包 {pkg}/ 内及导入该包的文件")
         } else {
-            format!(
-                "包 {}/ 内（未导出名）",
-                if def_dir.is_empty() { "." } else { def_dir }
-            )
+            format!("包 {pkg}/ 内（未导出名）")
         }
+    } else if let Some(t) = ts
+        .as_ref()
+        .filter(|t| t.barrels > 0 || !t.aliases().is_empty())
+    {
+        let mut s = "定义文件、导入它的文件".to_string();
+        if t.barrels > 0 {
+            s += &format!("，以及经 {} 个转导出（barrel）文件到达的文件", t.barrels);
+        }
+        let aliases = t.aliases();
+        if !aliases.is_empty() {
+            let shown: Vec<String> = aliases.iter().take(5).map(|a| format!("`{a}`")).collect();
+            s += &format!("（含改名绑定 {}）", shown.join("、"));
+        }
+        s
+    } else if let Some((scope, via)) = py.as_ref() {
+        let mut s = "定义文件及导入它的文件".to_string();
+        if !via.is_empty() {
+            let shown: Vec<&str> = via.iter().take(3).map(String::as_str).collect();
+            s += &format!(
+                "，以及经 {} 个转导出模块（{}）到达的文件",
+                via.len(),
+                shown.join("、")
+            );
+        }
+        let aliases: BTreeSet<&str> = scope
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .filter(|a| *a != name)
+            .collect();
+        if !aliases.is_empty() {
+            let shown: Vec<String> = aliases.iter().take(5).map(|a| format!("`{a}`")).collect();
+            s += &format!("（含 as 改名 {}）", shown.join("、"));
+        }
+        if via.truncated {
+            s += "（转导出链超过跟踪上限，结果可能不全）";
+        }
+        s
     } else {
         "定义文件及导入它的文件".to_string()
     };
+    let at = format!("@{def_path}:{}", decl.start_line);
+    let what = if let Some(recv) = &method_recv {
+        format!("`{name}` 是 `{recv}` 的方法，定义 {at}")
+    } else if interface_method {
+        format!("`{name}` 是接口方法，定义 {at}")
+    } else if decls.len() == 1 {
+        format!("`{name}` 全仓唯一定义 {at}")
+    } else {
+        let rest: Vec<&&CodeSymbol> = decls.iter().filter(|s| !std::ptr::eq(**s, decl)).collect();
+        let fields = rest.iter().filter(|s| s.kind == SymbolKind::Field).count();
+        let mut elsewhere: Vec<String> = rest
+            .iter()
+            .filter(|s| s.kind != SymbolKind::Field)
+            .filter_map(|s| {
+                index
+                    .file(s.file)
+                    .map(|f| format!("{}:{}", f.path.as_str(), s.start_line))
+            })
+            .take(3)
+            .collect();
+        let shown_more = rest.len() - fields > 3;
+        if shown_more {
+            elsewhere.push("…".to_string());
+        }
+        let fields = if fields > 0 {
+            format!("，其中结构体字段 {fields} 处")
+        } else {
+            String::new()
+        };
+        let listed = if elsewhere.is_empty() {
+            String::new()
+        } else {
+            format!("：{}", elsewhere.join("、"))
+        };
+        format!(
+            "`{name}` 另有 {} 处同名定义{fields}{listed}；已按 path 选定 {at}",
+            rest.len()
+        )
+    };
+    let mut note = format!(
+        "索引作答（未启动语言服务器）：{what}；以下是{scope}中的代码出现，已排除注释和字符串"
+    );
+    if method_recv.is_some() {
+        note.push_str("，已按接收者类型核对");
+    }
+    if py.is_some() {
+        note.push_str("（字符串形式的类型注解 `x: \"Foo\"` 按代码计）");
+    }
+    if let Some(m) = &py_member {
+        note.push_str(&format!(
+            "，`x.{name}` 已按接收者类核对（定义类 `{}` 及其子类；另查了 {} 个未导入定义文件但出现 `.{name}` 的文件）",
+            m.class,
+            m.extra_files.len()
+        ));
+    }
+    note.push('。');
+    if interface_method {
+        note.push_str("调用经接口分派，未按接收者类型核对。");
+    }
+    if !other_type.is_empty() {
+        note.push_str(&format!(
+            "已排除 {} 处其他类型的同名方法调用：{}。",
+            other_type.len(),
+            list_hits(&other_type)
+        ));
+    }
+    if members > 0 {
+        note.push_str(&format!(
+            "已排除 {members} 处同名的其他标识符（字段/方法访问 `x.{name}`、字面量键 `{name}:`、他包未经导入名的裸名、方法同名的局部变量）。"
+        ));
+    }
+    if ts.as_ref().is_some_and(|t| t.truncated) {
+        note.push_str("转导出链超过跟踪上限，结果可能不全。");
+    }
+    if !unconfirmed.is_empty() {
+        note.push_str(&format!(
+            "其中 {} 处接收者类型无法从索引判定（未核实，可能是其他类型的同名方法）：{}。",
+            unconfirmed.len(),
+            list_hits(&unconfirmed)
+        ));
+    }
     Some(Precise {
         value: hits,
         confidence: Confidence::Scoped,
-        note: Some(format!(
-            "索引作答（未启动语言服务器）：`{name}` 全仓唯一定义 @{def_path}:{}；以下是{scope}中的代码出现，已排除注释和字符串。",
-            decl.start_line
-        )),
+        note: Some(note),
     })
 }
 
@@ -999,14 +2208,19 @@ mod tests {
         );
         assert_eq!(r.confidence, Confidence::Scoped);
         assert!(r.note.unwrap().contains("未启动语言服务器"));
-        // Ambiguous: two declarations → defer to the language server.
+        // Two declarations: the path picks one; a path that reaches
+        // neither defers to the language server.
         let dir2 = repo(&[
             ("go.mod", "module example.com/m\n"),
             ("a/x.go", "package a\n\nfunc Dup() {}\n"),
             ("b/y.go", "package b\n\nfunc Dup() {}\n"),
+            ("c/z.go", "package c\n\nfunc Z() {}\n"),
         ]);
         let ix2 = index(&dir2);
-        assert!(graph_references(&ix2, &dir2, "Dup", &RelPath::new("a/x.go")).is_none());
+        let r = graph_references(&ix2, &dir2, "Dup", &RelPath::new("a/x.go")).expect("by path");
+        assert_eq!(r.value.len(), 1);
+        assert_eq!(r.value[0].path.as_str(), "a/x.go");
+        assert!(graph_references(&ix2, &dir2, "Dup", &RelPath::new("c/z.go")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }
@@ -1053,5 +2267,313 @@ mod tests {
         assert_eq!(bare[0].kind, HitKind::Comment);
         assert!(bare[2].enclosing.is_none() && bare[2].text.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Manual probe on a real tree: `ASTRO_PROBE=root|path|symbol[|line]`.
+    #[test]
+    #[ignore = "manual probe on a local corpus"]
+    fn probe_graph_references() {
+        let Ok(spec) = std::env::var("ASTRO_PROBE") else {
+            return;
+        };
+        let parts: Vec<&str> = spec.split('|').collect();
+        let root = Path::new(parts[0]);
+        let ix = index(root);
+        let line = parts.get(3).and_then(|l| l.parse().ok());
+        let r = graph_references_at(&ix, root, parts[2], &RelPath::new(parts[1]), line);
+        match r {
+            None => println!("PROBE none"),
+            Some(r) => {
+                println!("PROBE note: {}", r.note.unwrap_or_default());
+                for l in r.value {
+                    println!("PROBE {}:{}", l.path.as_str(), l.range.start.line + 1);
+                }
+            }
+        }
+    }
+
+    /// Manual sweep: every Go method of `ASTRO_SWEEP=root`, with its
+    /// graph note (receiver verdicts) and hit count.
+    #[test]
+    #[ignore = "manual sweep on a local corpus"]
+    fn sweep_go_methods() {
+        let Ok(root) = std::env::var("ASTRO_SWEEP") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let ix = index(root);
+        let mut seen = HashSet::new();
+        for s in ix
+            .graph()
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+        {
+            let Some(f) = ix.file(s.file) else { continue };
+            if f.language != Some(Language::Go) || !seen.insert((s.file, s.name.clone())) {
+                continue;
+            }
+            let r = graph_references_at(&ix, root, &s.name, &f.path, Some(s.start_line - 1));
+            match r {
+                None => println!("SWEEP\t{}\t{}\tnone", f.path.as_str(), s.name),
+                Some(r) => println!(
+                    "SWEEP\t{}\t{}\t{}\t{}",
+                    f.path.as_str(),
+                    s.name,
+                    r.value.len(),
+                    r.note.unwrap_or_default()
+                ),
+            }
+        }
+    }
+
+    fn hit_lines(r: &Precise<Vec<Location>>) -> Vec<String> {
+        r.value
+            .iter()
+            .map(|l| format!("{}:{}", l.path.as_str(), l.range.start.line + 1))
+            .collect()
+    }
+
+    /// Batch 6 N1: `(*Command).Execute` vs text/template's `t.Execute`,
+    /// another local type's own `Execute`, and receivers the index cannot
+    /// type.
+    #[test]
+    fn go_method_refs_are_filtered_by_receiver_type() {
+        let dir = repo(&[
+            ("go.mod", "module github.com/spf13/cobra\n"),
+            (
+                "command.go",
+                "package cobra\n\ntype Command struct {\n\tparent *Command\n}\n\nfunc (c *Command) ExecuteContext() error {\n\treturn c.Execute()\n}\n\nfunc (c *Command) Execute() error {\n\treturn nil\n}\n\nfunc (c *Command) Root() *Command { return c }\n",
+            ),
+            (
+                "cobra.go",
+                "package cobra\n\nimport (\n\t\"io\"\n\t\"text/template\"\n)\n\nfunc tmpl(text string) func(io.Writer, any) error {\n\treturn func(w io.Writer, data any) error {\n\t\tt := template.New(\"top\")\n\t\treturn t.Execute(w, data)\n\t}\n}\n",
+            ),
+            (
+                "runner.go",
+                "package cobra\n\ntype runner struct{}\n\nfunc (r *runner) Execute() error { return nil }\n\nfunc useRunner() {\n\tr := &runner{}\n\t_ = r.Execute()\n}\n",
+            ),
+            (
+                "command_test.go",
+                "package cobra\n\nimport \"testing\"\n\nfunc TestRoot(t *testing.T) {\n\troot := &Command{}\n\t// root.Execute() in a comment\n\tif err := root.Execute(); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tgetCmd := func() *Command {\n\t\treturn &Command{}\n\t}\n\tc := getCmd()\n\t_ = c.Execute()\n\tp := root.parent\n\t_ = p.Execute()\n\tvar v *Command\n\t_ = v.Execute()\n\tw := root.Root()\n\t_ = w.Execute()\n\tfor _, x := range all {\n\t\t_ = x.Execute()\n\t}\n}\n\nvar all []*Command\n\nfunc helper(Execute func() error) error {\n\treturn Execute()\n}\n",
+            ),
+        ]);
+        let ix = index(&dir);
+        let r = graph_references(&ix, &dir, "Execute", &RelPath::new("command.go"))
+            .expect("chosen by path");
+        assert_eq!(
+            hit_lines(&r),
+            vec![
+                "command.go:8",
+                "command.go:11",
+                "command_test.go:8",
+                "command_test.go:15",
+                "command_test.go:17",
+                "command_test.go:19",
+                "command_test.go:21",
+                "command_test.go:23",
+            ]
+        );
+        let note = r.note.unwrap();
+        assert!(note.contains("是 `Command` 的方法"), "{note}");
+        assert!(!note.contains("全仓唯一"), "{note}");
+        assert!(note.contains("已排除 2 处其他类型的同名方法调用"), "{note}");
+        assert!(
+            note.contains("cobra.go:11") && note.contains("runner.go:9"),
+            "{note}"
+        );
+        // `helper`'s parameter named `Execute`: a bare name, not the method.
+        assert!(note.contains("已排除 2 处同名的其他标识符"), "{note}");
+        // A `range` variable is not typed: kept, flagged unconfirmed.
+        assert!(note.contains("1 处接收者类型无法从索引判定"), "{note}");
+        assert!(note.contains("command_test.go:23"), "{note}");
+        // The other type's method, chosen by its file.
+        let r = graph_references(&ix, &dir, "Execute", &RelPath::new("runner.go")).unwrap();
+        assert_eq!(
+            hit_lines(&r),
+            vec!["command_test.go:23", "runner.go:5", "runner.go:9"]
+        );
+        assert!(r.note.unwrap().contains("是 `runner` 的方法"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two methods of one name in one file: the caller's line picks.
+    #[test]
+    fn go_same_file_methods_are_picked_by_line() {
+        let dir = repo(&[
+            ("go.mod", "module example.com/m\n"),
+            (
+                "p/a.go",
+                "package p\n\ntype A struct{}\ntype B struct{}\n\nfunc (a A) Name() string { return \"a\" }\n\nfunc (b B) Name() string { return \"b\" }\n\nfunc use() {\n\tx := A{}\n\ty := B{}\n\t_ = x.Name() + y.Name()\n}\n",
+            ),
+        ]);
+        let ix = index(&dir);
+        let origin = RelPath::new("p/a.go");
+        // No line: two candidates in the file → language server.
+        assert!(graph_references(&ix, &dir, "Name", &origin).is_none());
+        let r = graph_references_at(&ix, &dir, "Name", &origin, Some(7)).expect("line 8");
+        assert_eq!(hit_lines(&r), vec!["p/a.go:8", "p/a.go:13"]);
+        assert_eq!(r.value[1].range.start.character, 18);
+        let r = graph_references_at(&ix, &dir, "Name", &origin, Some(5)).expect("line 6");
+        assert_eq!(hit_lines(&r), vec!["p/a.go:6", "p/a.go:13"]);
+        assert_eq!(r.value[1].range.start.character, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Batch 6 E1 / N3: the name is declared in two packages and the path
+    /// says which; gopls used to be started for these.
+    #[test]
+    fn go_duplicate_declarations_are_disambiguated_by_path() {
+        let dir = repo(&[
+            ("src/go.mod", "module aicon\n"),
+            (
+                "src/server/srv/push/quiet.go",
+                "package push\n\nconst (\n\tViaQuietDropped = \"quiet_dropped\"\n)\n",
+            ),
+            (
+                "src/server/srv/push/quiet_test.go",
+                "package push_test\n\nimport (\n\t\"testing\"\n\n\t\"aicon/server/srv/push\"\n)\n\nfunc TestQ(t *testing.T) {\n\tif push.ViaQuietDropped != \"quiet_dropped\" {\n\t\tt.Fatal(push.ViaQuietDropped)\n\t}\n}\n",
+            ),
+            (
+                "src/daemon/internal/signaling/wake.go",
+                "package signaling\n\nconst ViaQuietDropped = \"dropped\"\n\nfunc W() string { return ViaQuietDropped }\n",
+            ),
+            (
+                "src/server/api/h.go",
+                "package api\n\nimport \"aicon/server/srv/push\"\n\nfunc H() string { return push.ViaQuietDropped }\n",
+            ),
+        ]);
+        let ix = index(&dir);
+        let r = graph_references(
+            &ix,
+            &dir,
+            "ViaQuietDropped",
+            &RelPath::new("src/server/srv/push/quiet.go"),
+        )
+        .expect("path picks push");
+        assert_eq!(
+            hit_lines(&r),
+            vec![
+                "src/server/api/h.go:5",
+                "src/server/srv/push/quiet.go:4",
+                "src/server/srv/push/quiet_test.go:10",
+                "src/server/srv/push/quiet_test.go:11",
+            ]
+        );
+        let note = r.note.unwrap();
+        assert!(note.contains("另有 1 处同名定义"), "{note}");
+        assert!(
+            note.contains("src/daemon/internal/signaling/wake.go:3"),
+            "{note}"
+        );
+        assert!(!note.contains("全仓唯一"), "{note}");
+        // A caller file: the declaration in the package it imports.
+        let r = graph_references(
+            &ix,
+            &dir,
+            "ViaQuietDropped",
+            &RelPath::new("src/server/api/h.go"),
+        )
+        .expect("imported package");
+        assert!(hit_lines(&r).contains(&"src/server/srv/push/quiet.go:4".to_string()));
+        // The other package's own.
+        let r = graph_references(
+            &ix,
+            &dir,
+            "ViaQuietDropped",
+            &RelPath::new("src/daemon/internal/signaling/wake.go"),
+        )
+        .unwrap();
+        assert_eq!(
+            hit_lines(&r),
+            vec![
+                "src/daemon/internal/signaling/wake.go:3",
+                "src/daemon/internal/signaling/wake.go:5"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N3 shape: an interface type also used as a struct field name and a
+    /// composite-literal key; only the type's uses are references.
+    #[test]
+    fn go_type_refs_skip_same_named_fields_and_keys() {
+        let dir = repo(&[
+            ("go.mod", "module example.com/m\n"),
+            (
+                "oauth/provider.go",
+                "package oauth\n\ntype Provider interface {\n\tName() string\n}\n\nvar providers = map[string]Provider{}\n",
+            ),
+            (
+                "providerauth/types.go",
+                "package providerauth\n\ntype Provider interface {\n\tID() string\n}\n",
+            ),
+            (
+                "controller/oauth.go",
+                "package controller\n\nimport \"example.com/m/oauth\"\n\ntype req struct {\n\tProvider string\n}\n\nfunc bind(p oauth.Provider, r req) req {\n\tr.Provider = p.Name()\n\treturn req{Provider: r.Provider}\n}\n",
+            ),
+        ]);
+        let ix = index(&dir);
+        let r = graph_references(&ix, &dir, "Provider", &RelPath::new("oauth/provider.go"))
+            .expect("path picks oauth");
+        assert_eq!(
+            hit_lines(&r),
+            vec![
+                "controller/oauth.go:9",
+                "oauth/provider.go:3",
+                "oauth/provider.go:7"
+            ]
+        );
+        let note = r.note.unwrap();
+        assert!(note.contains("其中结构体字段 1 处"), "{note}");
+        assert!(note.contains("已排除 3 处同名的其他标识符"), "{note}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_signature_helpers() {
+        assert_eq!(
+            go_receiver_type("func (c *Command) Execute() error").as_deref(),
+            Some("Command")
+        );
+        assert_eq!(
+            go_receiver_type("func (s *Set[T]) Add(v T)").as_deref(),
+            Some("Set")
+        );
+        assert_eq!(
+            go_receiver_type("func (Command) X()").as_deref(),
+            Some("Command")
+        );
+        assert_eq!(go_receiver_type("Execute() error"), None);
+        assert_eq!(go_receiver_type("func Execute() error"), None);
+        let parts = go_func_parts("\tRun: func(cmd *Command, args []string) {");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(go_param_type(parts[0].params, "cmd"), Some("*Command"));
+        assert_eq!(go_param_type(parts[0].params, "args"), Some("[]string"));
+        assert_eq!(go_param_type("a, b *T, n int", "a"), Some("*T"));
+        assert_eq!(go_param_type("a, b *T, n int", "n"), Some("int"));
+        assert_eq!(go_param_type("int, string", "int"), None);
+        let parts =
+            go_func_parts("func (c *Command) Find(args []string) (*Command, []string, error) {");
+        assert_eq!(parts[0].receiver, Some("c *Command"));
+        assert_eq!(go_result_type(parts[0].results, 0), Some("*Command"));
+        assert_eq!(go_result_type(parts[0].results, 2), Some("error"));
+        assert_eq!(
+            go_result_type("(c *Command, err error)", 0),
+            Some("*Command")
+        );
+        assert_eq!(
+            go_type_name("*template.Template"),
+            Some((Some("template".into()), "Template".into()))
+        );
+        assert_eq!(go_type_name("[]string"), None);
+        assert!(go_literal_key(
+            "\treturn req{Provider: r.Provider}",
+            12,
+            "Provider"
+        ));
+        assert!(go_literal_key("\t\tProvider: name,", 2, "Provider"));
+        assert!(!go_literal_key("\tcase Provider:", 6, "Provider"));
+        assert!(!go_literal_key("\tx := Provider", 6, "Provider"));
     }
 }

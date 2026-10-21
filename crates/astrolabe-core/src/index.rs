@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use moka::sync::Cache;
 use rayon::prelude::*;
 
 use crate::graph::CodeGraph;
@@ -179,12 +178,10 @@ struct ParsedRow {
     language: Language,
     sha: String,
     loc: u32,
-    parsed: ParsedFile,
-    /// The cache encoding of `parsed`, produced once (by the parse thread, or
-    /// read back from the store) and shared by the persistent store write and
-    /// the in-memory product cache, so a cold start holds one copy of it and
-    /// never re-encodes. `None` when encoding failed.
-    encoded: Option<Arc<[u8]>>,
+    /// Shared with the in-memory product cache: an incremental apply reuses
+    /// an unchanged file's parse as-is (no decode, no copy of its imports
+    /// and calls); only its symbols are cloned into the new graph.
+    parsed: Arc<ParsedFile>,
 }
 
 #[derive(Clone)]
@@ -192,53 +189,175 @@ struct CachedProduct {
     language: Language,
     sha: String,
     loc: u32,
-    encoded: Arc<[u8]>,
+    parsed: Arc<ParsedFile>,
+    /// Estimated heap footprint of `parsed`, computed once for the weigher.
+    weight: u32,
 }
 
-/// Byte-capped LRU of encoded [`ParsedFile`] products, keyed by repo-relative
-/// path. Values are cheap to clone (`Arc` bytes). A new cache is filled on
-/// each incremental apply so a retained previous [`IncrementalIndex`] is
-/// not mutated.
+/// Approximate heap bytes of a decoded parse (strings plus vector slots).
+fn parsed_weight(parsed: &ParsedFile) -> usize {
+    let symbols: usize = parsed
+        .symbols
+        .iter()
+        .map(|s| std::mem::size_of::<CodeSymbol>() + s.name.len() + s.signature.len())
+        .sum();
+    let imports: usize = parsed
+        .imports
+        .iter()
+        .map(|i| std::mem::size_of::<String>() + i.len())
+        .sum();
+    let calls: usize = parsed
+        .calls
+        .iter()
+        .map(|(c, _)| std::mem::size_of::<(String, u32)>() + c.len())
+        .sum();
+    std::mem::size_of::<ParsedFile>() + symbols + imports + calls
+}
+
+/// Byte-capped LRU of decoded [`ParsedFile`] products, keyed by repo-relative
+/// path. Values are cheap to clone (`Arc`). They used to be the JSON cache
+/// encoding, which every apply decoded again for every unchanged file; that
+/// decode was a fifth of the cost of a one-file edit on a large repository.
+/// A new cache is filled on each incremental apply so a retained previous
+/// [`IncrementalIndex`] is not mutated.
 struct ParseProductCache {
-    inner: Cache<RelPath, CachedProduct>,
+    budget: u64,
+    bytes: u64,
+    /// Apply number that produced this cache; entries carry the generation
+    /// in which their file was last parsed.
+    generation: u64,
+    entries: HashMap<RelPath, (CachedProduct, u64), FxBuild>,
 }
 
 impl ParseProductCache {
-    fn new(budget_bytes: u64) -> Self {
-        let budget = budget_bytes.max(1);
-        let inner = Cache::builder()
-            .max_capacity(budget)
-            .weigher(|path: &RelPath, value: &CachedProduct| -> u32 {
-                let bytes = path
-                    .as_str()
-                    .len()
-                    .saturating_add(value.sha.len())
-                    .saturating_add(value.encoded.len())
-                    .saturating_add(std::mem::size_of::<CachedProduct>());
-                u32::try_from(bytes).unwrap_or(u32::MAX).max(1)
-            })
-            .build();
-        Self { inner }
+    fn new(budget_bytes: u64, generation: u64) -> Self {
+        Self {
+            budget: budget_bytes.max(1),
+            bytes: 0,
+            generation,
+            entries: HashMap::default(),
+        }
+    }
+
+    fn entry_bytes(path: &RelPath, value: &CachedProduct) -> u64 {
+        (path.as_str().len()
+            + value.sha.len()
+            + value.weight as usize
+            + std::mem::size_of::<CachedProduct>()) as u64
     }
 
     fn get(&self, path: &RelPath) -> Option<CachedProduct> {
-        self.inner.get(path)
+        self.entries.get(path).map(|(product, _)| product.clone())
     }
 
-    fn insert(&self, path: RelPath, product: CachedProduct) {
-        self.inner.insert(path, product);
+    /// A product parsed in this cache's generation.
+    fn insert(&mut self, path: RelPath, product: CachedProduct) {
+        let generation = self.generation;
+        self.insert_at(path, product, generation);
     }
 
-    fn run_pending(&self) {
-        self.inner.run_pending_tasks();
+    /// Carry a product over from an earlier cache, keeping its age.
+    fn insert_at(&mut self, path: RelPath, product: CachedProduct, generation: u64) {
+        self.bytes += Self::entry_bytes(&path, &product);
+        if let Some((old, _)) = self.entries.insert(path.clone(), (product, generation)) {
+            self.bytes -= Self::entry_bytes(&path, &old);
+        }
+    }
+
+    fn generation_of(&self, path: &RelPath) -> Option<u64> {
+        self.entries.get(path).map(|(_, generation)| *generation)
+    }
+
+    /// Enforce the byte budget: drop the products parsed longest ago (files
+    /// edited recently are the likeliest to be edited again), path order
+    /// breaking ties so eviction is deterministic. An evicted file is simply
+    /// re-read and re-parsed by the next apply.
+    fn run_pending(&mut self) {
+        if self.bytes <= self.budget {
+            return;
+        }
+        let mut order: Vec<(u64, RelPath, u64)> = self
+            .entries
+            .iter()
+            .map(|(path, (product, generation))| {
+                (*generation, path.clone(), Self::entry_bytes(path, product))
+            })
+            .collect();
+        order.sort_unstable();
+        for (_, path, bytes) in order {
+            if self.bytes <= self.budget {
+                break;
+            }
+            self.entries.remove(&path);
+            self.bytes -= bytes;
+        }
     }
 
     #[cfg(test)]
     fn weighted_size(&self) -> u64 {
-        self.run_pending();
-        self.inner.weighted_size()
+        self.bytes
     }
 }
+
+/// FxHash (rustc's hasher): the assembly maps are keyed by repository paths
+/// and symbol names, rebuilt on every apply, and SipHash was a visible share
+/// of a one-file edit. Not DoS-resistant, which a local index does not need.
+#[derive(Default, Clone, Copy)]
+struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
 
 fn declared_excludes(resolvers: &ResolverSet) -> Vec<String> {
     [
@@ -395,7 +514,7 @@ fn discover(
     let scanned = scan::scan(root, &opts.scan);
     let files = scan::to_index(root, &scanned);
     let resolvers = ResolverSet::detect(&files);
-    let (scanned, files, dropped) = apply_declared_excludes(root, scanned, &resolvers);
+    let (scanned, files, dropped) = apply_declared_excludes(root, scanned, files, &resolvers);
     (scanned, files, resolvers, dropped)
 }
 
@@ -415,6 +534,7 @@ fn dropped_sources(before: &[RelPath], after: &[RelPath]) -> Vec<RelPath> {
 fn apply_declared_excludes(
     root: &Path,
     scanned: ScanResult,
+    files: FileIndex,
     resolvers: &ResolverSet,
 ) -> (ScanResult, FileIndex, Vec<RelPath>) {
     // Build output can sit outside the default exclude list — Cargo's
@@ -423,16 +543,21 @@ fn apply_declared_excludes(
     // than walked twice. Detection itself stays valid: dropping generated
     // files cannot invalidate the build config we already read.
     let excludes = declared_excludes(resolvers);
+    // `files` is the index of `scanned` as passed in; it is rebuilt only
+    // when an exclude actually removed something (rebuilding it was a
+    // visible share of every incremental apply).
     if excludes.is_empty() {
-        let files = scan::to_index(root, &scanned);
-        (scanned, files, Vec::new())
-    } else {
-        let before = scanned.files.clone();
-        let scanned = scan::apply_excludes(scanned, &excludes);
-        let dropped = dropped_sources(&before, &scanned.files);
-        let files = scan::to_index(root, &scanned);
-        (scanned, files, dropped)
+        return (scanned, files, Vec::new());
     }
+    let before_len = scanned.files.len();
+    let before = scanned.files.clone();
+    let scanned = scan::apply_excludes(scanned, &excludes);
+    if scanned.files.len() == before_len {
+        return (scanned, files, Vec::new());
+    }
+    let dropped = dropped_sources(&before, &scanned.files);
+    let files = scan::to_index(root, &scanned);
+    (scanned, files, dropped)
 }
 
 /// `(mtime, len)` of a file as observed before it was read.
@@ -555,8 +680,7 @@ fn stamp_hit(
         language,
         sha: stamp.sha,
         loc: stamp.loc,
-        parsed,
-        encoded: Some(Arc::from(bytes)),
+        parsed: Arc::new(parsed),
     })
 }
 
@@ -605,7 +729,6 @@ fn parse_one(
     cache_writes: &CacheWrites,
     cache_hits: &AtomicUsize,
     side: &ParseSide,
-    keep_encoded: bool,
 ) -> Option<ParsedRow> {
     let by_path = Language::from_path(path);
     // Extension-less files may still be scripts (`#!/usr/bin/env bash`);
@@ -624,10 +747,7 @@ fn parse_one(
         .ok()
         .and_then(|m| FileStat::of(&m));
     if let (Some(store), Some(stat)) = (store, stat.as_ref()) {
-        if let Some(mut row) = stamp_hit(store, path, stat, side, cache_hits) {
-            if !keep_encoded {
-                row.encoded = None;
-            }
+        if let Some(row) = stamp_hit(store, path, stat, side, cache_hits) {
             if row.parsed.partial {
                 note_partial(failures, path, &row.parsed);
             }
@@ -672,8 +792,7 @@ fn parse_one(
                         language,
                         sha,
                         loc,
-                        parsed,
-                        encoded: keep_encoded.then(|| Arc::from(bytes)),
+                        parsed: Arc::new(parsed),
                     });
                 }
                 Err(error) => {
@@ -697,7 +816,6 @@ fn parse_one(
 
     match pool.parse(language, path, &source) {
         Ok(parsed) => {
-            let mut encoded = None;
             if parsed.partial {
                 // Syntax errors: symbols/imports/calls may be incomplete.
                 // Keep what was extracted and surface it. The product is
@@ -708,15 +826,13 @@ fn parse_one(
                 // parse errors are `Err` below and are never cached.
                 note_partial(failures, path, &parsed);
             }
-            if store.is_some() || keep_encoded {
+            // Only a writable store needs the encoding; the in-memory product
+            // keeps the decoded parse.
+            if let Some(store) = store.filter(|s| !s.is_read_only()) {
                 match store::encode_parsed(&parsed) {
                     Ok(bytes) => {
-                        let bytes: Arc<[u8]> = Arc::from(bytes);
-                        if let Some(store) = store {
-                            side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
-                            cache_writes.push(store, cache_key, Arc::clone(&bytes));
-                        }
-                        encoded = keep_encoded.then_some(bytes);
+                        side.note_stamp(path, stat.as_ref(), &cache_key, &sha, loc, language);
+                        cache_writes.push(store, cache_key, Arc::from(bytes));
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -732,8 +848,7 @@ fn parse_one(
                 language,
                 sha,
                 loc,
-                parsed,
-                encoded,
+                parsed: Arc::new(parsed),
             })
         }
         Err(error) => {
@@ -749,8 +864,7 @@ fn parse_one(
 /// Encoded parses waiting for the next store write. Bounded: once the pending
 /// bytes pass [`CACHE_FLUSH_BYTES`] a parse thread flushes them, so a cold
 /// start never accumulates the whole repo's encoding just to write it at the
-/// end. The `Arc`s are shared with the in-memory product cache, so pending
-/// entries cost no extra memory while that cache still holds them.
+/// end.
 /// `(entries, total bytes)` not yet written.
 type PendingWrites = (Vec<(String, Arc<[u8]>)>, usize);
 
@@ -823,7 +937,7 @@ impl CacheWrites {
 
 fn persist_cache_writes(
     root: &Path,
-    store: Option<&Store>,
+    store: Option<&mut Store>,
     cache_writes: CacheWrites,
     cache_hits: AtomicUsize,
     side: ParseSide,
@@ -859,13 +973,36 @@ fn persist_cache_writes(
             .expect("live paths poisoned")
             .into_iter()
             .collect();
-        match store.prune_parse_cache(&live_keys, &live_paths) {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(removed, "parse cache pruned");
-            }
-            Ok(_) => {}
+        let removed = match store.prune_parse_cache(&live_keys, &live_paths) {
+            Ok(removed) => removed,
             Err(error) => {
                 tracing::warn!(error = %error, "parse cache prune failed; index is still valid");
+                0
+            }
+        };
+        if removed > 0 {
+            tracing::info!(removed, "parse cache pruned");
+        }
+        // redb reuses freed pages but never returns them. After an upgrade
+        // (every old-format entry dead at once) the file would keep the
+        // previous generation's size on top of the new one, and a cold build
+        // leaves the slack of its batched commits. Compact when a large share
+        // of the table was removed or rewritten: a one-off after a format or
+        // extractor change or a cold build (tens of ms), never on a warm start.
+        let churn = removed.max(stored);
+        if churn >= COMPACT_MIN_CHURN && churn * 4 >= removed + live_keys.len() {
+            let started = std::time::Instant::now();
+            match store.compact() {
+                Ok(_) => tracing::info!(
+                    removed,
+                    stored,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "parse cache compacted"
+                ),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "parse cache compaction failed; index is still valid"
+                ),
             }
         }
     }
@@ -876,6 +1013,10 @@ fn persist_cache_writes(
         "parse cache"
     );
 }
+
+/// Removed or written entries that make a compaction worthwhile (and at
+/// least a quarter of the table).
+const COMPACT_MIN_CHURN: usize = 256;
 
 /// Parse every path that has a known language. Failures are collected, never
 /// swallowed. A disk-store cache hit skips tree-sitter; FileId assignment
@@ -888,9 +1029,8 @@ fn parse_paths(
     paths: &[RelPath],
     opts: &IndexOptions,
     full_scan: bool,
-    keep_encoded: bool,
 ) -> ParseOutcome {
-    parse_paths_cancellable(root, paths, opts, full_scan, keep_encoded, None)
+    parse_paths_cancellable(root, paths, opts, full_scan, None)
         .expect("parse without a cancel token always completes")
 }
 
@@ -907,11 +1047,10 @@ fn parse_paths_cancellable(
     paths: &[RelPath],
     opts: &IndexOptions,
     full_scan: bool,
-    keep_encoded: bool,
     cancel: Option<&AtomicBool>,
 ) -> Option<ParseOutcome> {
     let pool = ParserPool::new();
-    let store = open_store(root, opts);
+    let mut store = open_store(root, opts);
     let side = ParseSide::new(store.as_ref(), full_scan);
     let failures = Mutex::new(Vec::new());
     let cache_writes = CacheWrites::new();
@@ -931,7 +1070,6 @@ fn parse_paths_cancellable(
                 &cache_writes,
                 &cache_hits,
                 &side,
-                keep_encoded,
             )
         })
         .collect();
@@ -940,7 +1078,7 @@ fn parse_paths_cancellable(
     }
     persist_cache_writes(
         root,
-        store.as_ref(),
+        store.as_mut(),
         cache_writes,
         cache_hits,
         side,
@@ -956,55 +1094,36 @@ struct ParseOutcome {
     failures: Vec<(RelPath, String)>,
 }
 
-fn insert_product(cache: &ParseProductCache, row: &ParsedRow) {
-    // Reuse the encoding made on the parse thread; encode only when absent
-    // (no store and no product requested, or an encode failure).
-    let encoded = match &row.encoded {
-        Some(bytes) => Ok(Arc::clone(bytes)),
-        None => store::encode_parsed(&row.parsed).map(Arc::from),
-    };
-    match encoded {
-        Ok(encoded) => cache.insert(
-            row.path.clone(),
-            CachedProduct {
-                language: row.language,
-                sha: row.sha.clone(),
-                loc: row.loc,
-                encoded,
-            },
-        ),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                path = %row.path.as_str(),
-                "parse product encode failed; file will be re-parsed on next incremental apply"
-            );
-        }
-    }
+fn insert_product(cache: &mut ParseProductCache, row: &ParsedRow) {
+    cache.insert(
+        row.path.clone(),
+        CachedProduct {
+            language: row.language,
+            sha: row.sha.clone(),
+            loc: row.loc,
+            parsed: Arc::clone(&row.parsed),
+            weight: u32::try_from(parsed_weight(&row.parsed)).unwrap_or(u32::MAX),
+        },
+    );
 }
 
 fn fill_products(rows: &[ParsedRow], budget_bytes: u64) -> ParseProductCache {
-    let products = ParseProductCache::new(budget_bytes);
+    let mut products = ParseProductCache::new(budget_bytes, 0);
     for row in rows {
-        insert_product(&products, row);
+        insert_product(&mut products, row);
     }
     products.run_pending();
     products
 }
 
-fn row_from_product(
-    path: RelPath,
-    product: &CachedProduct,
-) -> Result<ParsedRow, store::StoreError> {
-    let parsed = store::decode_parsed(&product.encoded)?;
-    Ok(ParsedRow {
+fn row_from_product(path: RelPath, product: &CachedProduct) -> ParsedRow {
+    ParsedRow {
         path,
         language: product.language,
         sha: product.sha.clone(),
         loc: product.loc,
-        parsed,
-        encoded: None,
-    })
+        parsed: Arc::clone(&product.parsed),
+    }
 }
 
 /// Parallel collection order is not stable; sort before assigning ids so
@@ -1057,7 +1176,8 @@ fn assemble_graph_with(
     report.files_parsed = parsed.len();
 
     let mut graph = CodeGraph::default();
-    let mut index_of = HashMap::new();
+    let mut index_of: HashMap<RelPath, FileId, FxBuild> =
+        HashMap::with_capacity_and_hasher(parsed.len(), FxBuild::default());
     for (i, row) in parsed.iter().enumerate() {
         let id = FileId(i as u32);
         index_of.insert(row.path.clone(), id);
@@ -1073,21 +1193,37 @@ fn assemble_graph_with(
     // Symbols move into the graph (no second copy of every name/signature);
     // nothing below reads `row.parsed.symbols`. The cache encoding is not
     // needed past this point either.
-    let mut next_symbol = 0u32;
-    graph
-        .symbols
-        .reserve(parsed.iter().map(|r| r.parsed.symbols.len()).sum());
-    for row in &mut parsed {
-        let file = index_of[&row.path];
-        row.encoded = None;
-        for sym in std::mem::take(&mut row.parsed.symbols) {
-            graph.symbols.push(CodeSymbol {
-                id: SymbolId(next_symbol),
-                file,
-                ..sym
-            });
-            next_symbol += 1;
-        }
+    // Rows are sorted by path and FileId(i) is row i, so symbols stay grouped
+    // by file in file order; `file_ranges[i]` is file i's slice. Cloned (not
+    // moved) because the parse is shared with the product cache, in parallel
+    // because this is a copy of every symbol of the repository per apply.
+    let mut file_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(parsed.len());
+    let mut next_symbol = 0usize;
+    for row in &parsed {
+        let n = row.parsed.symbols.len();
+        file_ranges.push(next_symbol..next_symbol + n);
+        next_symbol += n;
+    }
+    let per_file: Vec<Vec<CodeSymbol>> = parsed
+        .par_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let base = file_ranges[i].start;
+            row.parsed
+                .symbols
+                .iter()
+                .enumerate()
+                .map(|(k, sym)| CodeSymbol {
+                    id: SymbolId((base + k) as u32),
+                    file: FileId(i as u32),
+                    ..sym.clone()
+                })
+                .collect()
+        })
+        .collect();
+    graph.symbols.reserve(next_symbol);
+    for chunk in per_file {
+        graph.symbols.extend(chunk);
     }
     report.symbols = graph.symbols.len();
 
@@ -1095,39 +1231,48 @@ fn assemble_graph_with(
     // looks like it points inside the repo — stdlib and third-party imports
     // resolving to None is the correct answer, not a gap.
     let mut edges = Vec::new();
-    for row in &parsed {
+    // Resolution is per file and read-only, so it runs in parallel; edges,
+    // the report and the cache are merged below in file order, keeping the
+    // output deterministic.
+    let entries: Vec<Arc<FileResolutions>> = parsed
+        .par_iter()
+        .map(|row| {
+            // Path language first (keeps `.h` on the C resolver); content-sniffed
+            // language only for extension-less shebang scripts.
+            let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
+            let cached = reuse.as_ref().and_then(|r| {
+                let entry = r.cache.by_path.get(&row.path)?;
+                let same = entry.lang == import_lang
+                    && !r.changed.contains(&resolver_owner(import_lang))
+                    && entry.items.len() == row.parsed.imports.len()
+                    && entry
+                        .items
+                        .iter()
+                        .zip(&row.parsed.imports)
+                        .all(|((spec, _), now)| spec == now);
+                same.then(|| Arc::clone(entry))
+            });
+            let entry = cached.unwrap_or_else(|| {
+                Arc::new(FileResolutions {
+                    lang: import_lang,
+                    items: row
+                        .parsed
+                        .imports
+                        .iter()
+                        .map(|spec| {
+                            (
+                                spec.clone(),
+                                resolvers.resolve_import_as(import_lang, &row.path, spec, files),
+                            )
+                        })
+                        .collect(),
+                })
+            });
+            entry
+        })
+        .collect();
+    for (row, entry) in parsed.iter().zip(entries) {
         let from = index_of[&row.path];
-        // Path language first (keeps `.h` on the C resolver); content-sniffed
-        // language only for extension-less shebang scripts.
-        let import_lang = Language::from_path(&row.path).unwrap_or(row.language);
-        let cached = reuse.as_ref().and_then(|r| {
-            let entry = r.cache.by_path.get(&row.path)?;
-            let same = entry.lang == import_lang
-                && !r.changed.contains(&resolver_owner(import_lang))
-                && entry.items.len() == row.parsed.imports.len()
-                && entry
-                    .items
-                    .iter()
-                    .zip(&row.parsed.imports)
-                    .all(|((spec, _), now)| spec == now);
-            same.then(|| Arc::clone(entry))
-        });
-        let entry = cached.unwrap_or_else(|| {
-            Arc::new(FileResolutions {
-                lang: import_lang,
-                items: row
-                    .parsed
-                    .imports
-                    .iter()
-                    .map(|spec| {
-                        (
-                            spec.clone(),
-                            resolvers.resolve_import_as(import_lang, &row.path, spec, files),
-                        )
-                    })
-                    .collect(),
-            })
-        });
         for (spec, resolution) in &entry.items {
             match resolution {
                 ImportResolution::Files(targets) => {
@@ -1212,61 +1357,87 @@ fn assemble_graph_with(
     // `EdgeKind::Pair`): lets queries hop from a declaration to its body.
     edges.extend(crate::resolvers::c_cpp::pair_edges(&graph.files));
 
+    let mut call_edges: Vec<CodeEdge> = Vec::new();
     if opts.call_edges {
         // Import edges join files; call edges join symbols. Both endpoints are
         // plain u32, so the distinction lives in `kind` — callers must read it
         // before interpreting `from`/`to`.
-        let mut by_name: HashMap<&str, Vec<SymbolId>> = HashMap::new();
+        let mut by_name: HashMap<&str, Vec<SymbolId>, FxBuild> =
+            HashMap::with_capacity_and_hasher(graph.symbols.len(), FxBuild::default());
         for s in &graph.symbols {
             by_name.entry(s.name.as_str()).or_default().push(s.id);
         }
-        let mut symbols_by_file: HashMap<FileId, Vec<&CodeSymbol>> = HashMap::new();
-        for s in &graph.symbols {
-            symbols_by_file.entry(s.file).or_default().push(s);
-        }
-
-        for row in &parsed {
-            let file = index_of[&row.path];
-            let in_file = symbols_by_file.get(&file);
-            // A call belongs to the smallest symbol spanning its line;
-            // attributing it to the file would collapse every caller in
-            // the file into one node.
-            let callers: Vec<Option<&CodeSymbol>> = match in_file {
-                Some(syms) => enclosing_symbols(syms, &row.parsed.calls),
-                None => Vec::new(),
-            };
-            for ((callee, _line), caller) in row.parsed.calls.iter().zip(&callers) {
-                let Some(caller) = caller else {
-                    continue;
-                };
-                // Take the trailing segment so `a.b.c()` matches `c`.
-                let short = callee
-                    .rsplit(['.', ':'])
-                    .find(|p| !p.is_empty())
-                    .unwrap_or(callee);
-                let Some(targets) = by_name.get(short) else {
-                    continue;
-                };
-                if targets.len() > MAX_SYNTACTIC_CALL_TARGETS {
-                    continue;
+        let by_name = &by_name;
+        let symbols = &graph.symbols;
+        let calls: Vec<Vec<CodeEdge>> = parsed
+            .par_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut out = Vec::new();
+                let in_file: Vec<&CodeSymbol> = symbols[file_ranges[i].clone()].iter().collect();
+                if in_file.is_empty() {
+                    return out;
                 }
-                for target in targets {
-                    if *target == caller.id {
+                // A call belongs to the smallest symbol spanning its line;
+                // attributing it to the file would collapse every caller in
+                // the file into one node.
+                let callers = enclosing_symbols(&in_file, &row.parsed.calls);
+                // (caller, its candidate targets) per call. Sorting these
+                // (one per call) and then each caller's target ids (u32s)
+                // emits the edges already ordered by `(from, to)`, far
+                // cheaper than sorting the edges themselves.
+                let mut by_caller: Vec<(u32, &[SymbolId])> = Vec::new();
+                for ((callee, _line), caller) in row.parsed.calls.iter().zip(&callers) {
+                    let Some(caller) = caller else {
+                        continue;
+                    };
+                    // Take the trailing segment so `a.b.c()` matches `c`.
+                    let short = callee
+                        .rsplit(['.', ':'])
+                        .find(|p| !p.is_empty())
+                        .unwrap_or(callee);
+                    let Some(targets) = by_name.get(short) else {
+                        continue;
+                    };
+                    if targets.len() > MAX_SYNTACTIC_CALL_TARGETS {
                         continue;
                     }
-                    edges.push(CodeEdge {
-                        from: caller.id.0,
-                        to: target.0,
-                        kind: EdgeKind::Call,
-                        weight: 1,
-                        // Name matching only, with no scope or type
-                        // information. Measured recall against a language
-                        // server: 66% on TypeScript, 18% on Python. Labelled
-                        // so callers can decide whether to verify.
-                        confidence: Confidence::Syntactic,
-                    });
+                    by_caller.push((caller.id.0, targets.as_slice()));
                 }
-            }
+                by_caller.sort_by_key(|(caller, _)| *caller);
+                let mut to: Vec<u32> = Vec::new();
+                for group in by_caller.chunk_by(|a, b| a.0 == b.0) {
+                    let from = group[0].0;
+                    to.clear();
+                    for (_, targets) in group {
+                        to.extend(targets.iter().map(|t| t.0).filter(|&t| t != from));
+                    }
+                    to.sort_unstable();
+                    for run in to.chunk_by(|a, b| a == b) {
+                        out.push(CodeEdge {
+                            from,
+                            to: run[0],
+                            kind: EdgeKind::Call,
+                            weight: run.len() as u32,
+                            // Name matching only, with no scope or type
+                            // information. Measured recall against a
+                            // language server: 66% on TypeScript, 18% on
+                            // Python. Labelled so callers can decide whether
+                            // to verify.
+                            confidence: Confidence::Syntactic,
+                        });
+                    }
+                }
+                // Every `from` here is a symbol of file i, and symbol ids
+                // ascend with the file, so per-file sorted runs concatenate
+                // into one sorted run: no global sort over millions of call
+                // edges on every apply.
+                out
+            })
+            .collect();
+        call_edges.reserve(calls.iter().map(Vec::len).sum());
+        for chunk in calls {
+            call_edges.extend(chunk);
         }
     }
 
@@ -1278,22 +1449,70 @@ fn assemble_graph_with(
         edges.extend(implements);
     }
 
-    // Collapse duplicates into weights, with a stable order.
-    edges.sort_by_key(|e| (e.from, e.to, e.kind as u8));
-    let mut merged: Vec<CodeEdge> = Vec::with_capacity(edges.len());
-    for e in edges {
-        match merged.last_mut() {
-            Some(prev) if prev.from == e.from && prev.to == e.to && prev.kind == e.kind => {
-                prev.weight += 1;
-            }
-            _ => merged.push(e),
-        }
-    }
+    // Collapse duplicates into weights, ordered by `(from, to, kind)`. Every
+    // edge kind has one confidence and weight 1 before merging, so equal keys
+    // are identical and the order among them does not matter. The few
+    // non-call edges are sorted here; the call edges arrive sorted and are
+    // merged in one linear pass.
+    sort_and_merge(&mut edges);
+    debug_assert!(call_edges
+        .windows(2)
+        .all(|w| edge_key(&w[0]) < edge_key(&w[1])));
+    let merged = merge_sorted_edges(edges, call_edges);
     report.import_edges = merged.iter().filter(|e| e.kind == EdgeKind::Import).count();
     graph.edges = merged;
     report.unresolved_imports.sort();
 
     (graph, report, new_cache)
+}
+
+fn edge_key(e: &CodeEdge) -> (u32, u32, u8) {
+    (e.from, e.to, e.kind as u8)
+}
+
+/// Sort `edges` by [`edge_key`] and fold duplicates into their weight.
+fn sort_and_merge(edges: &mut Vec<CodeEdge>) {
+    edges.sort_unstable_by_key(edge_key);
+    edges.dedup_by(|e, prev| {
+        if edge_key(e) == edge_key(prev) {
+            prev.weight += e.weight;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Merge two runs already sorted and deduplicated by [`edge_key`], folding a
+/// key present in both into one edge.
+fn merge_sorted_edges(a: Vec<CodeEdge>, b: Vec<CodeEdge>) -> Vec<CodeEdge> {
+    if b.is_empty() {
+        return a;
+    }
+    if a.is_empty() {
+        return b;
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut a = a.into_iter().peekable();
+    let mut b = b.into_iter().peekable();
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => match edge_key(x).cmp(&edge_key(y)) {
+                std::cmp::Ordering::Less => a.next(),
+                std::cmp::Ordering::Greater => b.next(),
+                std::cmp::Ordering::Equal => {
+                    let mut x = a.next().expect("peeked");
+                    x.weight += b.next().expect("peeked").weight;
+                    Some(x)
+                }
+            },
+            (Some(_), None) => a.next(),
+            (None, Some(_)) => b.next(),
+            (None, None) => break,
+        };
+        out.extend(next);
+    }
+    out
 }
 
 /// Linear-scan threshold of [`enclosing_symbols`]: below it the plain scan is
@@ -1377,7 +1596,7 @@ pub fn index_repo(root: &Path, opts: &IndexOptions) -> (CodeGraph, IndexReport) 
         too_large: too_large_sources(root, &scanned),
         ..IndexReport::default()
     };
-    let outcome = parse_paths(root, &scanned.files, opts, true, false);
+    let outcome = parse_paths(root, &scanned.files, opts, true);
     (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
     assemble_graph(outcome.parsed, &files, &resolvers, opts, report)
 }
@@ -1458,7 +1677,9 @@ impl IncrementalIndex {
         if cancelled() {
             return None;
         }
+        let started = std::time::Instant::now();
         let (scanned, files, resolvers, excluded_sources) = discover(root, opts);
+        let discovered = started.elapsed();
         if cancelled() {
             return None;
         }
@@ -1467,15 +1688,23 @@ impl IncrementalIndex {
             too_large: too_large_sources(root, &scanned),
             ..IndexReport::default()
         };
-        let outcome = parse_paths_cancellable(root, &scanned.files, opts, true, true, cancel)?;
+        let outcome = parse_paths_cancellable(root, &scanned.files, opts, true, cancel)?;
         let failures = outcome.failures.clone();
         (report.parse_failures, report.partial_parses) = split_partial(&outcome.failures);
+        let parsed_at = started.elapsed();
         let products = fill_products(&outcome.parsed, opts.parse_cache_bytes);
         if cancelled() {
             return None;
         }
         let (graph, report, resolutions) =
             assemble_graph_with(outcome.parsed, &files, &resolvers, opts, report, None, true);
+        tracing::info!(
+            files = graph.files.len(),
+            discover_ms = discovered.as_millis() as u64,
+            parse_ms = (parsed_at - discovered).as_millis() as u64,
+            assemble_ms = (started.elapsed() - parsed_at).as_millis() as u64,
+            "index build"
+        );
         if cancelled() {
             return None;
         }
@@ -1582,7 +1811,8 @@ pub fn index_repo_incremental(
     } else {
         (ResolverSet::detect(&file_index), None)
     };
-    let (scanned, file_index, newly_dropped) = apply_declared_excludes(root, scanned, &resolvers);
+    let (scanned, file_index, newly_dropped) =
+        apply_declared_excludes(root, scanned, file_index, &resolvers);
     let mut excluded_sources: BTreeSet<RelPath> = previous
         .excluded_sources
         .iter()
@@ -1642,32 +1872,20 @@ pub fn index_repo_incremental(
             continue;
         }
         if let Some(product) = previous.products.get(path) {
-            match row_from_product(path.clone(), &product) {
-                Ok(row) => {
-                    // A partial parse keeps its product (the flag travels in
-                    // the encoded payload); carry it so the report stays stable.
-                    let previous_reason = previous_failures
-                        .get(path)
-                        .map(|r| r.as_str())
-                        .filter(|r| is_partial_reason(r));
-                    if row.parsed.partial {
-                        failures.push((path.clone(), partial_reason(&row.parsed).to_owned()));
-                    } else if let Some(reason) = previous_reason {
-                        failures.push((path.clone(), reason.to_owned()));
-                    }
-                    reused_products.push((path.clone(), product));
-                    reused.push(row);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        path = %path.as_str(),
-                        "in-memory parse product ignored; re-parsing"
-                    );
-                    lru_misses += 1;
-                    to_parse.push(path.clone());
-                }
+            let row = row_from_product(path.clone(), &product);
+            // A partial parse keeps its product (the flag travels in the
+            // product); carry it so the report stays stable.
+            let previous_reason = previous_failures
+                .get(path)
+                .map(|r| r.as_str())
+                .filter(|r| is_partial_reason(r));
+            if row.parsed.partial {
+                failures.push((path.clone(), partial_reason(&row.parsed).to_owned()));
+            } else if let Some(reason) = previous_reason {
+                failures.push((path.clone(), reason.to_owned()));
             }
+            reused_products.push((path.clone(), product));
+            reused.push(row);
         } else if let Some(reason) = previous_failures.get(path) {
             let tries = previous.failure_retries.get(path).copied().unwrap_or(0);
             if is_transient_failure(reason) && tries < MAX_FAILURE_RETRIES {
@@ -1687,7 +1905,7 @@ pub fn index_repo_incremental(
     }
 
     let reused_count = reused.len();
-    let outcome = parse_paths(root, &to_parse, opts, false, true);
+    let outcome = parse_paths(root, &to_parse, opts, false);
     let parsed_count = outcome.parsed.len();
     for (path, _) in &outcome.failures {
         if let Some(tries) = retried.get(path) {
@@ -1708,12 +1926,14 @@ pub fn index_repo_incremental(
         "incremental index"
     );
 
-    let products = ParseProductCache::new(opts.parse_cache_bytes);
+    let mut products =
+        ParseProductCache::new(opts.parse_cache_bytes, previous.products.generation + 1);
     for (path, product) in reused_products {
-        products.insert(path, product);
+        let generation = previous.products.generation_of(&path).unwrap_or(0);
+        products.insert_at(path, product, generation);
     }
     for row in &outcome.parsed {
-        insert_product(&products, row);
+        insert_product(&mut products, row);
     }
     products.run_pending();
 
@@ -2277,6 +2497,90 @@ mod tests {
     }
 
     #[test]
+    fn product_cache_evicts_oldest_generation_first_and_tracks_bytes() {
+        let product = |n: usize| CachedProduct {
+            language: Language::Go,
+            sha: "s".into(),
+            loc: 1,
+            parsed: Arc::new(ParsedFile::default()),
+            weight: n as u32,
+        };
+        let one = ParseProductCache::entry_bytes(&RelPath::new("a"), &product(100));
+        let mut cache = ParseProductCache::new(2 * one, 5);
+        cache.insert_at(RelPath::new("a"), product(100), 1);
+        cache.insert_at(RelPath::new("b"), product(100), 3);
+        cache.insert(RelPath::new("c"), product(100));
+        // Replacing an entry does not double count it.
+        cache.insert(RelPath::new("c"), product(100));
+        assert_eq!(cache.weighted_size(), 3 * one);
+        cache.run_pending();
+        assert_eq!(cache.weighted_size(), 2 * one);
+        assert!(cache.get(&RelPath::new("a")).is_none(), "oldest evicted");
+        assert!(cache.get(&RelPath::new("b")).is_some());
+        assert_eq!(cache.generation_of(&RelPath::new("c")), Some(5));
+    }
+
+    #[test]
+    fn split_edge_merge_matches_one_global_sort() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            seed = xorshift(seed);
+            (seed % m) as u32
+        };
+        let kinds = [
+            EdgeKind::Import,
+            EdgeKind::Namespace,
+            EdgeKind::Pair,
+            EdgeKind::Inherit,
+        ];
+        let edge = |from, to, kind| CodeEdge {
+            from,
+            to,
+            kind,
+            weight: 1,
+            confidence: Confidence::Scoped,
+        };
+        for _ in 0..50 {
+            let small: Vec<CodeEdge> = (0..next(40))
+                .map(|_| edge(next(30), next(30), kinds[next(4) as usize]))
+                .collect();
+            // Call edges per "file": `from` ranges ascend across files.
+            let mut calls_by_file = Vec::new();
+            for file in 0..5u32 {
+                let run: Vec<CodeEdge> = (0..next(30))
+                    .map(|_| edge(file * 6 + next(6), next(30), EdgeKind::Call))
+                    .collect();
+                calls_by_file.push(run);
+            }
+            let mut all: Vec<CodeEdge> = small.clone();
+            all.extend(calls_by_file.iter().flatten().cloned());
+            all.sort_by_key(|e| (e.from, e.to, e.kind as u8));
+            let mut expected: Vec<CodeEdge> = Vec::new();
+            for e in all {
+                match expected.last_mut() {
+                    Some(p) if p.from == e.from && p.to == e.to && p.kind == e.kind => {
+                        p.weight += 1
+                    }
+                    _ => expected.push(e),
+                }
+            }
+            let mut small = small;
+            sort_and_merge(&mut small);
+            let mut calls = Vec::new();
+            for mut run in calls_by_file {
+                sort_and_merge(&mut run);
+                calls.extend(run);
+            }
+            let got = merge_sorted_edges(small, calls);
+            let key = |e: &CodeEdge| (e.from, e.to, e.kind as u8, e.weight);
+            assert_eq!(
+                got.iter().map(key).collect::<Vec<_>>(),
+                expected.iter().map(key).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn cache_writes_flush_in_bounded_batches() {
         let root = scratch("flush");
         std::fs::create_dir_all(store_path(&root).parent().unwrap()).unwrap();
@@ -2297,18 +2601,21 @@ mod tests {
     }
 
     #[test]
-    fn cold_build_products_reuse_cache_encoding() {
+    fn cold_build_products_match_the_store() {
         let root = scratch("reuse-enc");
         write(&root, "a.py", "def a():\n    return 1\n");
         write(&root, "b.go", "package b\nfunc B() {}\n");
         let inc = IncrementalIndex::build(&root, &IndexOptions::default());
-        // The product bytes held in memory equal what the store holds.
+        // The decoded product held in memory is what the store holds.
         let store = Store::open(&store_path(&root)).unwrap();
         for f in &inc.graph.files {
             let key = store::parse_cache_key(f.language.unwrap(), &f.sha);
             let stored = store.cached_parse(&key).unwrap().expect("stored");
             let held = inc.products.get(&f.path).expect("product");
-            assert_eq!(&stored[..], &held.encoded[..]);
+            assert_eq!(
+                &stored[..],
+                &store::encode_parsed(&held.parsed).unwrap()[..]
+            );
         }
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3224,6 +3531,36 @@ mod persist_audit_tests {
     }
 
     #[test]
+    fn upgrade_prune_compacts_the_store_file() {
+        let root = scratch("prune-compact");
+        write_old(&root, "a.py", "def a():\n    pass\n");
+        let opts = IndexOptions::default();
+        IncrementalIndex::build(&root, &opts);
+        {
+            // A previous format's generation: many dead entries at once.
+            let s = Store::open(&store_path(&root)).unwrap();
+            let junk = vec![b'j'; 8 * 1024];
+            let keys: Vec<String> = (0..COMPACT_MIN_CHURN + 50)
+                .map(|i| format!("x6-v0.15.0:python:{i:016x}"))
+                .collect();
+            s.put_cached_parses(keys.iter().map(|k| (k.as_str(), junk.as_slice())))
+                .unwrap();
+        }
+        let bloated = std::fs::metadata(store_path(&root)).unwrap().len();
+        IncrementalIndex::build(&root, &opts);
+        assert_eq!(stored_entries(&root), 1);
+        let compacted = std::fs::metadata(store_path(&root)).unwrap().len();
+        assert!(
+            compacted * 2 < bloated,
+            "file must shrink after the upgrade prune: {bloated} -> {compacted}"
+        );
+        // Still a working cache.
+        let again = IncrementalIndex::build(&root, &opts);
+        assert!(again.graph.symbols.iter().any(|s| s.name == "a"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn incremental_apply_never_prunes_unrelated_entries() {
         let root = scratch("prune-inc");
         write_old(&root, "a.py", "def a():\n    pass\n");
@@ -3457,7 +3794,7 @@ mod persist_audit_tests {
     fn with_failure(root: &Path, opts: &IndexOptions, reason: &str, tries: u8) -> IncrementalIndex {
         let mut prev = IncrementalIndex::build(root, opts);
         // Pretend the last apply failed on a.py and kept no product for it.
-        prev.products = ParseProductCache::new(1 << 20);
+        prev.products = ParseProductCache::new(1 << 20, 0);
         prev.failures = vec![(RelPath::new("a.py"), reason.to_owned())];
         prev.failure_retries.insert(RelPath::new("a.py"), tries);
         prev
@@ -3813,7 +4150,7 @@ mod cancel_tests {
         write(&root, "c.go", "package p\nfunc C() {}\n");
         let paths = vec![RelPath::new("a.go"), RelPath::new("c.go")];
         let cancel = AtomicBool::new(true);
-        assert!(parse_paths_cancellable(&root, &paths, &opts, true, true, Some(&cancel)).is_none());
+        assert!(parse_paths_cancellable(&root, &paths, &opts, true, Some(&cancel)).is_none());
         assert_eq!(
             store_len(&root),
             before,
@@ -3822,7 +4159,7 @@ mod cancel_tests {
         assert!(!has_stamp(&root, "c.go"), "cancelled parse wrote a stamp");
 
         // Control: the same parse, not cancelled, prunes b and stores c.
-        let done = parse_paths(&root, &paths, &opts, true, true);
+        let done = parse_paths(&root, &paths, &opts, true);
         assert_eq!(done.parsed.len(), 2);
         assert_eq!(store_len(&root), 2);
         assert!(has_stamp(&root, "c.go"));

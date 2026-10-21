@@ -277,10 +277,8 @@ fn enclosing_symbol(index: &RepoIndex, path: &str, line: usize) -> Option<CodeSy
     let file = index.file_id(path)?;
     let line = line as u32;
     index
-        .graph()
-        .symbols
-        .iter()
-        .filter(|s| s.file == file && s.start_line <= line && line <= s.end_line)
+        .file_symbols(file)
+        .filter(|s| s.start_line <= line && line <= s.end_line)
         .filter(|s| s.end_line >= s.start_line + 2)
         .min_by_key(|s| s.end_line - s.start_line)
         .cloned()
@@ -308,31 +306,37 @@ fn is_test_path(path: &str) -> bool {
 /// Order broad-query hits for the preview: definition lines first, other
 /// non-test hits next, test/docs/example files last (stable within each class).
 fn rank_broad_hits<'a>(index: &RepoIndex, hits: &'a [SearchHit]) -> Vec<&'a SearchHit> {
-    let defs: std::collections::HashSet<(FileId, u32)> = index
-        .graph()
-        .symbols
-        .iter()
-        .filter(|s| {
-            !matches!(
-                s.kind,
-                astrolabe_core::SymbolKind::Variable
-                    | astrolabe_core::SymbolKind::Field
-                    | astrolabe_core::SymbolKind::Const
-            )
-        })
-        .map(|s| (s.file, s.start_line))
-        .collect();
+    // Definition start lines, built only for the files that have hits.
+    let mut defs: std::collections::HashMap<&str, Option<std::collections::HashSet<u32>>> =
+        std::collections::HashMap::new();
+    let mut is_def = |path: &'a str, line: u32| {
+        defs.entry(path)
+            .or_insert_with(|| {
+                index.file_id(path).map(|f| {
+                    index
+                        .file_symbols(f)
+                        .filter(|s| {
+                            !matches!(
+                                s.kind,
+                                astrolabe_core::SymbolKind::Variable
+                                    | astrolabe_core::SymbolKind::Field
+                                    | astrolabe_core::SymbolKind::Const
+                            )
+                        })
+                        .map(|s| s.start_line)
+                        .collect()
+                })
+            })
+            .as_ref()
+            .is_some_and(|set| set.contains(&line))
+    };
     let mut ranked: Vec<(u8, usize, &SearchHit)> = hits
         .iter()
         .enumerate()
         .map(|(i, h)| {
             let class = if is_test_path(&h.path) {
                 2
-            } else if !h.text_only
-                && index
-                    .file_id(&h.path)
-                    .is_some_and(|f| defs.contains(&(f, h.line as u32)))
-            {
+            } else if !h.text_only && is_def(&h.path, h.line as u32) {
                 0
             } else {
                 1
@@ -1606,7 +1610,7 @@ pub(crate) struct ResolveContextParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Coding task.")]
+    #[schemars(description = "Task.")]
     pub task_description: String,
     #[serde(default = "default_budget")]
     #[schemars(description = "Token budget.")]
@@ -1627,13 +1631,11 @@ pub(crate) struct QueryParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(
-        description = "Symbol name, substring, or hierarchical path ('Class/method', 'pkg.Func')."
-    )]
+    #[schemars(description = "Name, substring, 'Class/method', or a file path (outline).")]
     pub query: String,
     /// 对展示列表前 5 个命中符号附带源码体（include_body，对齐 Serena）。
     #[serde(default)]
-    #[schemars(description = "Include source implementation bodies for displayed matches.")]
+    #[schemars(description = "Return full bodies.")]
     pub include_body: bool,
     /// 子串开关。名称查询：省略=子串匹配（精确名优先排序），false=只要精确名，
     /// true=子串；路径查询：最后段子串匹配（省略/false=精确）。
@@ -1704,14 +1706,10 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Default false. Set true to treat query as a regular expression.")]
     pub regex: bool,
     #[serde(default)]
-    #[schemars(
-        description = "Optional repo-relative path substring filter (case-sensitive, not glob)."
-    )]
+    #[schemars(description = "Repo-relative path substring (case-sensitive, not glob).")]
     pub path_filter: Option<String>,
     #[serde(default)]
-    #[schemars(
-        description = "Override case matching (default: literal sensitive iff query has uppercase; regex sensitive)."
-    )]
+    #[schemars(description = "Override case (default: sensitive iff query has uppercase).")]
     pub case_sensitive: Option<bool>,
     #[serde(default = "default_budget")]
     #[schemars(description = "Token budget.")]
@@ -1736,9 +1734,7 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Default true: reference repeated symbol bodies by location.")]
     pub dedup: Option<bool>,
     #[serde(default)]
-    #[schemars(
-        description = "top|dir|file: hits and files per top-level dir / dir / file, plus total; no hit lines."
-    )]
+    #[schemars(description = "top|dir|file: hit/file counts per dir or file + total.")]
     pub aggregate: Option<String>,
     #[serde(default)]
     #[schemars(description = "Skip paths; bare name=segment: [\"vendor\",\"_test.go\"]")]
@@ -1747,9 +1743,7 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Only totals (hits, files).")]
     pub count_only: bool,
     #[serde(default)]
-    #[schemars(
-        description = "Ignore hits inside comments and string literals (go/rs/py/js/ts/dart/java/c-family)."
-    )]
+    #[schemars(description = "Ignore hits in comments and string literals.")]
     pub skip_comments: bool,
 }
 
@@ -2341,6 +2335,31 @@ impl AstrolabeServer {
         }
     }
 
+    /// The coordinate legend of find_references / goto_definition is the
+    /// same sentence every time (seven times in one A/B run); keep the
+    /// first one in the session and drop the rest.
+    fn coord_note_once(&self, mut result: CallToolResult) -> CallToolResult {
+        let notes = [
+            crate::precise_tools::REF_COORD_NOTE,
+            crate::precise_tools::COORD_NOTE,
+        ];
+        let Some(text) = result
+            .content
+            .first()
+            .and_then(|block| block.as_text())
+            .map(|t| t.text.clone())
+        else {
+            return result;
+        };
+        let Some(note) = notes.into_iter().find(|n| text.contains(n)) else {
+            return result;
+        };
+        if !self.once("precise.coord_note") {
+            result.content[0] = ContentBlock::text(text.replacen(note, "", 1));
+        }
+        result
+    }
+
     /// Catalog for `tools/list`: drop `excluded_tools`, optionally sanitize
     /// schemas for OpenAI/Codex, then sort by name.
     fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
@@ -2349,6 +2368,9 @@ impl AstrolabeServer {
         for tool in &mut tools {
             let mut schema = Value::Object((*tool.input_schema).clone());
             slim_schema(&mut schema);
+            if !full_schema_requested() {
+                hide_unadvertised_params(&mut schema, self.dispatch.is_some());
+            }
             if let Value::Object(slim) = schema {
                 tool.input_schema = Arc::new(slim);
             }
@@ -2544,6 +2566,54 @@ impl AstrolabeServer {
 /// type is enough), and the `["x","null"]` union of `Option<T>` fields, which
 /// becomes plain `"x"`: optional is already expressed by absence from
 /// `required`, and deserialization still accepts an explicit `null`.
+/// Parameters still accepted by every tool but left out of `tools/list`.
+/// None was passed once in 66 A/B runs (306 Astrolabe calls), yet together
+/// they were 3.4 KB of the 7.3 KB catalog, resent on every API turn. Tool
+/// descriptions, results and the L2 manual still name the useful ones
+/// (`regex`, `exclude`, `depth`, `kind`, `dry_run_rename`, `offset` from a
+/// result's next_offset). `ASTROLABE_FULL_SCHEMA=1` advertises them all.
+const UNADVERTISED_PARAMS: &[&str] = &[
+    "budget_tokens",
+    "offset",
+    "page",
+    "depth",
+    "kind",
+    "substring",
+    "dedup",
+    "context_lines",
+    "count_only",
+    "exclude",
+    "group",
+    "regex",
+    "dry_run_rename",
+    "character",
+    "severity",
+];
+
+fn full_schema_requested() -> bool {
+    matches!(
+        std::env::var("ASTROLABE_FULL_SCHEMA")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+/// Drop [`UNADVERTISED_PARAMS`] (and `root` outside multi-root sessions)
+/// from a tool's advertised input schema. Deserialization is untouched, so
+/// callers that pass them keep working.
+fn hide_unadvertised_params(schema: &mut Value, multi_root: bool) {
+    let hidden =
+        |name: &str| UNADVERTISED_PARAMS.contains(&name) || (!multi_root && name == "root");
+    if let Some(Value::Object(props)) = schema.get_mut("properties") {
+        props.retain(|name, _| !hidden(name));
+    }
+    if let Some(Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|name| !name.as_str().is_some_and(hidden));
+    }
+}
+
 fn slim_schema(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -2813,7 +2883,7 @@ fn format_find_symbol_unindexed_hint(
 
 #[tool_router]
 impl AstrolabeServer {
-    #[tool(description = "主入口：按任务分页给出相关文件与符号。Task-ranked files/symbols.")]
+    #[tool(description = "任务不明确时用：按任务排序的相关文件与符号。Task-ranked files/symbols.")]
     pub(crate) fn resolve_context(
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
@@ -2960,9 +3030,7 @@ impl AstrolabeServer {
     // `precise_tools`, which reports an actionable install hint (and
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
-    #[tool(
-        description = "精确引用查询（索引优先，语言服务器兜底）。LSP-resolved call sites and usages across repository. Required for reliable renames and caller analysis. Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist."
-    )]
+    #[tool(description = crate::precise_tools::FIND_REFERENCES_DESC)]
     pub(crate) fn find_references(
         &self,
         Parameters(mut params): Parameters<crate::precise_tools::FindReferencesParams>,
@@ -2973,13 +3041,14 @@ impl AstrolabeServer {
         };
         params.path = route.path;
         self.with_precise(&route.hint, true, move |session| {
-            crate::precise_tools::run_find_references(params, session.precise.as_ref())
+            self.coord_note_once(crate::precise_tools::run_find_references(
+                params,
+                session.precise.as_ref(),
+            ))
         })
     }
 
-    #[tool(
-        description = "精确定义跳转（语言服务器绑定解析）。Resolves definition anchor via language server semantics."
-    )]
+    #[tool(description = crate::precise_tools::GOTO_DEFINITION_DESC)]
     pub(crate) fn goto_definition(
         &self,
         Parameters(mut params): Parameters<crate::precise_tools::GotoDefinitionParams>,
@@ -2990,13 +3059,14 @@ impl AstrolabeServer {
         };
         params.path = route.path.unwrap_or_default();
         self.with_precise(&route.hint, true, move |session| {
-            crate::precise_tools::run_goto_definition(params, session.precise.as_ref())
+            self.coord_note_once(crate::precise_tools::run_goto_definition(
+                params,
+                session.precise.as_ref(),
+            ))
         })
     }
 
-    #[tool(
-        description = "获取文件诊断信息（语法与类型错误）。LSP diagnostics to verify file correctness after edits."
-    )]
+    #[tool(description = crate::precise_tools::GET_DIAGNOSTICS_DESC)]
     pub(crate) fn get_diagnostics(
         &self,
         Parameters(mut params): Parameters<crate::precise_tools::GetDiagnosticsParams>,
@@ -3012,7 +3082,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点；query 也可为文件路径输出大纲。Pass include_body=true to retrieve full function/class implementations in indexed languages. Paging via offset=next_offset."
+        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点；query 为文件路径时输出大纲（可加 depth=N、kind=）。include_body=true returns full bodies (indexed languages)."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -3334,7 +3404,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Count hits (统计/计数每个目录有多少处调用): aggregate=top|dir|file gives N matching lines / M files per dir + total (counts lines, not occurrences: a line matching twice counts once); combine with skip_comments, exclude=[\"_test.go\",\"vendor\"], count_only. Also exhaustive code & text search: literal, case-sensitive only if query has uppercase (regex=true for regex), hits come with context; group=true groups per file; other text files tagged [text-only]; page with offset=next_offset."
+        description = "Exhaustive code & text search: literal, case-sensitive only if query has uppercase (regex=true for regex); hits come with context, wide hits grouped per file; other text files tagged [text-only]. 统计/计数: aggregate=top|dir|file gives matching lines / files per dir + total; add skip_comments, exclude=[\"_test.go\",\"vendor\"]."
     )]
     pub(crate) fn search_code(
         &self,
@@ -3406,6 +3476,16 @@ impl AstrolabeServer {
                 ) {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(format!("无效正则表达式：{error}")),
+                };
+                // Whole-buffer candidate lines (a superset of the lines the
+                // per-line matchers accept; see `line_scan`). With smart case
+                // the case-insensitive variant covers both matchers.
+                let line_scanner = if variant_matcher.is_some() {
+                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), true)
+                } else if params.regex {
+                    crate::line_scan::LineScanner::new(&params.query, !sensitive)
+                } else {
+                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), !sensitive)
                 };
                 if let Some(mode) = params.aggregate.as_deref() {
                     if mode != "top" && mode != "dir" && mode != "file" {
@@ -3529,7 +3609,8 @@ impl AstrolabeServer {
                     };
                     // Lazy: the mask is only computed once a line matches.
                     let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
-                    for (line_no, line) in lines.iter().enumerate() {
+                    for line_no in line_scanner.candidates(&lines) {
+                        let line = &lines[line_no];
                         if !matcher.is_match(line) {
                             if variant_matcher.as_ref().is_some_and(|v| v.is_match(line)) {
                                 let text = if out.variants.is_empty() {
@@ -4938,17 +5019,43 @@ fn enclosing_impl_mentions(
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur = vec![i + 1; b.len() + 1];
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != *cb);
-            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
-        }
-        prev = cur;
+    // Called once per symbol name on zero-hit queries: one reused DP row,
+    // on the stack for short names, and bytes instead of chars when both
+    // sides are ASCII. Same Levenshtein distance (over chars) as before.
+    if a.is_ascii() && b.is_ascii() {
+        levenshtein(a.as_bytes(), b.as_bytes())
+    } else {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        levenshtein(&a, &b)
     }
-    prev[b.len()]
+}
+
+fn levenshtein<T: PartialEq>(a: &[T], b: &[T]) -> usize {
+    let mut stack = [0usize; 65];
+    let mut heap = Vec::new();
+    let row: &mut [usize] = if b.len() < stack.len() {
+        &mut stack[..=b.len()]
+    } else {
+        heap.resize(b.len() + 1, 0);
+        &mut heap
+    };
+    for (j, cell) in row.iter_mut().enumerate() {
+        *cell = j;
+    }
+    for (i, ca) in a.iter().enumerate() {
+        // `diag` is the previous row's value at j; `row[j]` becomes the current row's.
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (diag + usize::from(ca != cb))
+                .min(above + 1)
+                .min(row[j] + 1);
+            diag = above;
+        }
+    }
+    row[b.len()]
 }
 
 /// 零命中时给出相近符号名（编辑距离 ≤2 或共享 4 字符前缀），最多 5 个。
@@ -5462,11 +5569,10 @@ mod tests {
                 "{} still has integer: {schema_str}",
                 tool.name
             );
-            let budget = schema
-                .pointer("/properties/budget_tokens")
-                .unwrap_or_else(|| panic!("{} lacks budget_tokens", tool.name));
-            assert_eq!(budget.get("type"), Some(&json!("number")), "{}", tool.name);
-            assert_eq!(budget.get("multipleOf"), Some(&json!(1)), "{}", tool.name);
+            if let Some(line) = schema.pointer("/properties/line") {
+                assert_eq!(line.get("type"), Some(&json!("number")), "{}", tool.name);
+                assert_eq!(line.get("multipleOf"), Some(&json!(1)), "{}", tool.name);
+            }
             if let Some(Value::Object(props)) = schema.get("properties") {
                 for (prop_name, prop) in props {
                     assert!(
@@ -5492,9 +5598,11 @@ mod tests {
             crate::ClientContext::default_builtin(),
         );
         let raw = Value::Object((*default_server.listed_tools()[0].input_schema).clone());
-        let budget = raw.pointer("/properties/budget_tokens").expect("budget");
+        let line = raw
+            .pointer("/properties/line")
+            .expect("find_references line");
         assert_eq!(
-            budget.get("type"),
+            line.get("type"),
             Some(&json!("integer")),
             "non-codex contexts must not sanitize"
         );
@@ -6262,6 +6370,44 @@ mod tests {
     fn name_helpers_split_and_measure() {
         assert_eq!(name_tokens("fooBar_baz"), ["foo", "bar", "baz"]);
         assert_eq!(edit_distance("compute", "computee"), 1);
+        // Reference: the original allocating DP over chars.
+        fn reference(a: &str, b: &str) -> usize {
+            let b: Vec<char> = b.chars().collect();
+            let mut prev: Vec<usize> = (0..=b.len()).collect();
+            for (i, ca) in a.chars().enumerate() {
+                let mut cur = vec![i + 1; b.len() + 1];
+                for (j, cb) in b.iter().enumerate() {
+                    let cost = usize::from(ca != *cb);
+                    cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+                }
+                prev = cur;
+            }
+            prev[b.len()]
+        }
+        let long = "x".repeat(70) + "abc";
+        let words = [
+            "",
+            "a",
+            "ab",
+            "ba",
+            "kitten",
+            "sitting",
+            "flaw",
+            "lawn",
+            "café",
+            "cafe",
+            "日本語",
+            "日本",
+            "zzqqxx_nomatch",
+            "jsonserializer",
+            &long,
+            "xabcx",
+        ];
+        for a in words {
+            for b in words {
+                assert_eq!(edit_distance(a, b), reference(a, b), "{a:?} vs {b:?}");
+            }
+        }
     }
 
     #[test]
@@ -7099,20 +7245,30 @@ mod tests {
         };
         let search_code = desc("search_code");
         assert!(
-            search_code.contains("exhaustive code & text search"),
+            search_code.contains("Exhaustive code & text search"),
             "{search_code}"
         );
-        assert!(search_code.contains("group=true"), "{search_code}");
-        assert!(search_code.contains("offset=next_offset"), "{search_code}");
+        assert!(
+            search_code.contains("aggregate=top|dir|file"),
+            "{search_code}"
+        );
+        // Paging was never used in 66 A/B runs; descriptions no longer teach it.
+        assert!(!search_code.contains("offset=next_offset"), "{search_code}");
         let find_symbol = desc("find_symbol");
         assert!(find_symbol.contains("include_body"), "{find_symbol}");
-        assert!(find_symbol.contains("offset=next_offset"), "{find_symbol}");
+        assert!(!find_symbol.contains("offset=next_offset"), "{find_symbol}");
         let find_references = desc("find_references");
+        // One source of truth: index-first, language server as fallback.
         assert!(
-            find_references.contains("LSP-resolved"),
+            !find_references.contains("LSP-resolved"),
             "{find_references}"
         );
-        assert!(find_references.contains("renames"), "{find_references}");
+        assert!(find_references.contains("索引优先"), "{find_references}");
+        assert!(find_references.contains("改名"), "{find_references}");
+        assert!(
+            find_references.contains("dry_run_rename"),
+            "{find_references}"
+        );
         let goto_definition = desc("goto_definition");
         assert!(goto_definition.contains("definition"), "{goto_definition}");
     }
@@ -8006,27 +8162,22 @@ mod tests {
             .expect("search_code in catalog");
         let schema = Value::Object((*search.input_schema).clone());
         let query = schema.pointer("/properties/query/description").unwrap();
-        let regex = schema.pointer("/properties/regex/description").unwrap();
         let path_filter = schema
             .pointer("/properties/path_filter/description")
             .unwrap();
-        let budget = schema
-            .pointer("/properties/budget_tokens/description")
-            .unwrap();
         let tool_desc = search.description.as_deref().unwrap_or("");
+        // `regex` is accepted but not advertised; query and tool descriptions
+        // still name it.
+        assert!(schema.pointer("/properties/regex").is_none());
         assert!(query.as_str().unwrap().contains("regex=true"), "{query}");
-        assert!(regex.as_str().unwrap().contains("Default false"), "{regex}");
         assert!(
             path_filter.as_str().unwrap().contains("case-sensitive"),
             "{path_filter}"
         );
-        // Paging is taught by the `offset` description and the tool
-        // description; `budget_tokens` stays the shared one-liner.
-        assert_eq!(budget.as_str(), Some("Token budget."), "{budget}");
-        let offset = schema.pointer("/properties/offset/description").unwrap();
-        assert!(offset.as_str().unwrap().contains("next_offset"), "{offset}");
+        assert!(schema.pointer("/properties/budget_tokens").is_none());
+        assert!(schema.pointer("/properties/offset").is_none());
         assert!(tool_desc.contains("regex=true"), "{tool_desc}");
-        assert!(tool_desc.contains("offset=next_offset"), "{tool_desc}");
+        assert!(!tool_desc.contains("offset=next_offset"), "{tool_desc}");
     }
 
     fn server_on_files(files: &[(&str, &str)]) -> (AstrolabeServer, PathBuf) {
@@ -9655,13 +9806,13 @@ mod mcp_routing_tests {
             assert!(!json.contains("\"default\":null"), "{}: {json}", tool.name);
             assert!(!json.contains("\"format\":\"uint"), "{}: {json}", tool.name);
             assert!(!json.contains("\"minimum\":0"), "{}: {json}", tool.name);
-            // Every tool takes an optional `root` for multi-repo workspaces.
+            // `root` only matters in multi-repo workspaces: hidden here.
             assert!(
                 tool.input_schema
                     .get("properties")
                     .and_then(|p| p.get("root"))
-                    .is_some(),
-                "{} lacks `root`",
+                    .is_none(),
+                "{} advertises `root` in a single-repo session",
                 tool.name
             );
             let required = tool
@@ -9672,17 +9823,133 @@ mod mcp_routing_tests {
                 .unwrap_or_default();
             assert!(!required.iter().any(|r| r == "root"), "{}", tool.name);
         }
-        // Compact JSON of the whole `tools` array. v0.13.0 shipped 7,535 B
-        // here without a `root` parameter; schema slimming pays for it.
+        // Compact JSON of the whole `tools` array. v0.13.0 shipped 7,535 B,
+        // v0.15.0 7,3xx B; hiding never-used parameters halves it.
         let bytes = serde_json::to_vec(&tools).unwrap().len();
         assert!(
             bytes <= TOOLS_LIST_MAX_BYTES,
-            "tools/list is {bytes} B, limit {TOOLS_LIST_MAX_BYTES} B (v0.13.0: 7,535 B)"
+            "tools/list is {bytes} B, limit {TOOLS_LIST_MAX_BYTES} B (v0.15.0: ~7,300 B)"
         );
     }
 
     /// Upper bound for the compact `tools` array. Raise only with a reason.
-    const TOOLS_LIST_MAX_BYTES: usize = 7_500;
+    const TOOLS_LIST_MAX_BYTES: usize = 4_500;
+
+    /// Snapshot of the advertised parameters. Everything else is still
+    /// accepted (see `unadvertised_params_are_still_accepted`); add a name
+    /// here only when A/B runs show models need it.
+    #[test]
+    fn advertised_parameters_snapshot() {
+        let server = AstrolabeServer::new(tmp("snapshot"));
+        let props = |tool: &rmcp::model::Tool| -> Vec<String> {
+            let mut names: Vec<String> = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|p| p.keys().cloned().collect())
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        let required = |tool: &rmcp::model::Tool| -> Vec<String> {
+            tool.input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|r| {
+                    r.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let got: Vec<(String, Vec<String>, Vec<String>)> = server
+            .listed_tools()
+            .iter()
+            .map(|t| (t.name.to_string(), props(t), required(t)))
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let want = vec![
+            (
+                "find_references".to_string(),
+                s(&["line", "path", "symbol"]),
+                s(&["symbol"]),
+            ),
+            (
+                "find_symbol".to_string(),
+                s(&["include_body", "path_filter", "query"]),
+                s(&["query"]),
+            ),
+            ("get_diagnostics".to_string(), s(&["path"]), s(&["path"])),
+            ("get_languages".to_string(), s(&[]), s(&[])),
+            (
+                "goto_definition".to_string(),
+                s(&["line", "path", "symbol"]),
+                s(&["path"]),
+            ),
+            (
+                "resolve_context".to_string(),
+                s(&["path_filter", "task_description"]),
+                s(&["task_description"]),
+            ),
+            (
+                "search_code".to_string(),
+                s(&[
+                    "aggregate",
+                    "case_sensitive",
+                    "path_filter",
+                    "query",
+                    "skip_comments",
+                ]),
+                s(&["query"]),
+            ),
+        ];
+        assert_eq!(got, want);
+        // Multi-repo sessions advertise `root` on every tool.
+        let (multi, _parent) = multi_server(&["alpha", "beta"]);
+        for tool in multi.listed_tools() {
+            assert!(props(&tool).iter().any(|p| p == "root"), "{}", tool.name);
+            assert!(
+                !required(&tool).iter().any(|p| p == "root"),
+                "{}",
+                tool.name
+            );
+        }
+        multi.stop_watching();
+    }
+
+    #[test]
+    fn unadvertised_params_are_still_accepted() {
+        let q: QueryParams = serde_json::from_value(json!({
+            "query": "x", "root": "r", "kind": "function", "depth": 1,
+            "substring": true, "budget_tokens": 900, "offset": 3
+        }))
+        .unwrap();
+        assert_eq!((q.depth, q.budget_tokens, q.offset), (1, 900, 3));
+        let sp: SearchParams = serde_json::from_value(json!({
+            "query": "x", "regex": true, "budget_tokens": 900, "offset": 2,
+            "context_lines": 1, "page": true, "group": false, "dedup": false,
+            "exclude": ["vendor"], "count_only": true
+        }))
+        .unwrap();
+        assert!(sp.regex && sp.page && sp.count_only);
+        let r: crate::precise_tools::FindReferencesParams = serde_json::from_value(json!({
+            "symbol": "X", "character": 2, "budget_tokens": 10, "offset": 1,
+            "dry_run_rename": "Y"
+        }))
+        .unwrap();
+        assert!(r.path.is_none(), "path is optional");
+        assert_eq!(r.dry_run_rename.as_deref(), Some("Y"));
+        let d: crate::precise_tools::GetDiagnosticsParams =
+            serde_json::from_value(json!({ "path": "a.go", "severity": "error" })).unwrap();
+        assert_eq!(d.severity.as_deref(), Some("error"));
+        let c: ResolveContextParams = serde_json::from_value(json!({
+            "task_description": "t", "dedup": false, "offset": 4, "budget_tokens": 5
+        }))
+        .unwrap();
+        assert_eq!(c.offset, 4);
+        let _: BudgetOnly =
+            serde_json::from_value(json!({ "root": "r", "budget_tokens": 5 })).unwrap();
+    }
 
     /// Claude Code treats an MCP tool as concurrency-safe only when
     /// `annotations.readOnlyHint` is true; without it, several Astrolabe calls
@@ -9706,8 +9973,8 @@ mod mcp_routing_tests {
         }
         let find_symbol = tools.iter().find(|t| t.name == "find_symbol").unwrap();
         let schema = Value::Object((*find_symbol.input_schema).clone());
-        let root = schema.pointer("/properties/root/type");
-        assert_eq!(root, Some(&json!("string")));
+        let path_filter = schema.pointer("/properties/path_filter/type");
+        assert_eq!(path_filter, Some(&json!("string")));
         // Explicit nulls from clients that still send them deserialize as None.
         let params: QueryParams =
             serde_json::from_value(json!({ "query": "x", "root": null, "kind": null })).unwrap();

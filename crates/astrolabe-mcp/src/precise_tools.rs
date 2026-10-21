@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::refs_graph::{HitInfo, HitKind};
+use crate::refs_render;
 
 const DEFAULT_BUDGET: usize = 2_500;
 
@@ -56,7 +57,7 @@ fn effective_budget(raw: usize) -> usize {
 }
 
 /// Stated once per result that lists positions.
-const COORD_NOTE: &str =
+pub(crate) const COORD_NOTE: &str =
     "坐标：行、列均从 1 起，列按 UTF-16 单位；作为 line/character 入参时用 0 起的值（各减 1）。\n";
 
 /// One page of `items` starting at `offset`, cut by `budget`. Always keeps at
@@ -81,17 +82,15 @@ pub(crate) struct FindReferencesParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Symbol name to find references for.")]
+    #[schemars(description = "Symbol name.")]
     pub symbol: String,
-    // No `serde(default)`: schemars would then drop it from `required`. A
-    // missing `Option` field still deserializes to `None`.
-    #[schemars(
-        required,
-        description = "Repo-relative file (selects the language server)."
-    )]
+    // Optional: a missing or wrong path is fixed from the index
+    // (`refs_graph::fix_path`); requiring it only made models guess.
+    #[serde(default)]
+    #[schemars(description = "File declaring or using it (inferred if omitted).")]
     pub path: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based line.")]
+    #[schemars(description = "0-based line (disambiguates).")]
     pub line: Option<u32>,
     #[serde(default)]
     #[schemars(description = "Optional 0-based UTF-16 column; used with line.")]
@@ -112,13 +111,13 @@ pub(crate) struct GotoDefinitionParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Repo-relative file containing the target symbol reference.")]
+    #[schemars(description = "File containing the use site.")]
     pub path: String,
     #[serde(default)]
-    #[schemars(description = "Symbol name to locate definition for.")]
+    #[schemars(description = "Symbol name.")]
     pub symbol: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Optional 0-based line; used with character.")]
+    #[schemars(description = "0-based line.")]
     pub line: Option<u32>,
     #[serde(default)]
     #[schemars(description = "Optional 0-based UTF-16 column.")]
@@ -136,7 +135,7 @@ pub(crate) struct GetDiagnosticsParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Repo-relative file to diagnose.")]
+    #[schemars(description = "Repo-relative file.")]
     pub path: String,
     #[serde(default)]
     #[schemars(description = "Minimum severity: error, warning, information, or hint.")]
@@ -145,6 +144,13 @@ pub(crate) struct GetDiagnosticsParams {
     #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
 }
+
+/// Tool descriptions shared by `PreciseTools` and `AstrolabeServer`, so the
+/// two catalogs cannot drift apart.
+pub(crate) const FIND_REFERENCES_DESC: &str = "精确引用（索引优先，语言服务器兜底）：调用点与用法，改名和调用方分析用它。Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
+pub(crate) const GOTO_DEFINITION_DESC: &str =
+    "Jump to definition: 按使用处文件 + 符号名返回定义锚点。";
+pub(crate) const GET_DIAGNOSTICS_DESC: &str = "文件诊断（语法与类型错误），编辑后核对用。";
 
 /// Backend for the precise MCP query tools.
 ///
@@ -165,6 +171,11 @@ pub(crate) trait PreciseCapability: std::fmt::Debug + Send + Sync {
     /// then renders as bare coordinates.
     fn annotate(&self, _symbol: &str, _locations: &[Location]) -> Vec<HitInfo> {
         Vec::new()
+    }
+    /// Source lines of a repo-relative file (cached), for inline caller
+    /// context. `None`: no context is shown.
+    fn source_lines(&self, _path: &str) -> Option<Arc<Vec<String>>> {
+        None
     }
     fn definition(
         &self,
@@ -248,7 +259,7 @@ impl PreciseTools {
 #[tool_router]
 impl PreciseTools {
     #[tool(
-        description = "精确引用查询（索引优先，语言服务器兜底）。LSP-resolved call sites and usages across repository. Required for renames and caller analysis. Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.",
+        description = FIND_REFERENCES_DESC,
         annotations(title = "精确引用", read_only_hint = true)
     )]
     pub(crate) fn find_references(
@@ -259,7 +270,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "精确定义跳转（语言服务器绑定解析）。Resolves definition anchor via language server semantics.",
+        description = GOTO_DEFINITION_DESC,
         annotations(title = "精确定义", read_only_hint = true)
     )]
     pub(crate) fn goto_definition(
@@ -270,7 +281,7 @@ impl PreciseTools {
     }
 
     #[tool(
-        description = "文件诊断（语言服务器）。LSP diagnostics (syntax and type errors) to verify file correctness after edits.",
+        description = GET_DIAGNOSTICS_DESC,
         annotations(title = "文件诊断", read_only_hint = true)
     )]
     pub(crate) fn get_diagnostics(
@@ -337,7 +348,7 @@ pub(crate) fn run_find_references(
     if infos.len() != locations.len() {
         infos = vec![HitInfo::default(); locations.len()];
     }
-    let hits = RefHits::new(&locations, &infos);
+    let mut hits = RefHits::new(&locations, &infos);
     let wide = params.offset.is_none()
         && params.dry_run_rename.is_none()
         && locations.len() > WIDE_REFERENCES;
@@ -364,12 +375,49 @@ pub(crate) fn run_find_references(
     }
 
     let offset = params.offset.unwrap_or(0);
-    let items = hits.items();
-    let summary = if locations.is_empty() {
+    let mut summary = if locations.is_empty() {
         String::new()
     } else {
         hits.summary_line()
     };
+    if offset == 0 {
+        if let Some(line) = refs_render::caller_summary(&locations, &infos) {
+            summary.push_str(&line);
+        }
+    }
+    // Complete by construction (language server, or the index answer), so
+    // the model can stop instead of grepping to re-check.
+    let complete = refs_render::complete_source(result.confidence, result.note.as_deref())
+        .filter(|_| !locations.is_empty());
+    let files = locations
+        .iter()
+        .map(|l| l.path.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let completion = complete
+        .map(|src| refs_render::completion_line(locations.len(), files, src))
+        .unwrap_or_default();
+    // Short lists carry the callers' code inline (no Read needed), when it
+    // fits the budget with the whole list.
+    let mut items = hits.items();
+    if params.dry_run_rename.is_none() && offset == 0 {
+        hits.ctx = refs_render::context_blocks(&locations, &infos, &hits.order, &|p| {
+            backend.source_lines(p)
+        });
+        if !hits.ctx.blocks.is_empty() {
+            let with_ctx = hits.items();
+            let fixed = estimate_tokens(&preamble)
+                + estimate_tokens(&summary)
+                + estimate_tokens(REF_COORD_NOTE)
+                + estimate_tokens(&completion);
+            let need: usize = with_ctx.iter().map(|l| estimate_tokens(l) + 1).sum();
+            if fixed + need <= params.budget_tokens {
+                items = with_ctx;
+            } else {
+                hits.ctx = refs_render::Context::default();
+            }
+        }
+    }
     // The header (confidence, note, summary, coordinate line, truncation
     // marker) is part of the output, so it is charged to the budget first.
     let overhead = estimate_tokens(&preamble)
@@ -400,6 +448,8 @@ pub(crate) fn run_find_references(
     let next_offset = offset + kept.len();
     if omitted > 0 {
         body.push_str(&omitted_line(omitted, next_offset));
+    } else if offset == 0 && !kept.is_empty() {
+        body.push_str(&completion);
     }
     let mut preview_files = 0usize;
     if let Some(new_name) = params.dry_run_rename.as_deref() {
@@ -434,6 +484,8 @@ pub(crate) fn run_find_references(
             "next_offset": (omitted > 0).then_some(next_offset),
             "dry_run_rename": params.dry_run_rename.is_some(),
             "rename_files": preview_files,
+            "complete": complete.is_some() && omitted == 0 && offset == 0,
+            "context_blocks": hits.ctx.blocks.len(),
         }),
     )
 }
@@ -443,7 +495,7 @@ pub(crate) fn run_find_references(
 const WIDE_REFERENCES: usize = 150;
 
 /// Coordinate legend for the reference list.
-const REF_COORD_NOTE: &str =
+pub(crate) const REF_COORD_NOTE: &str =
     "坐标 L行:列 均从 1 起（列按 UTF-16）；作 line/character 入参时各减 1。\n";
 
 /// A reference list in display order: non-test hits first (backend order
@@ -452,6 +504,8 @@ struct RefHits<'a> {
     locations: &'a [Location],
     infos: &'a [HitInfo],
     order: Vec<usize>,
+    /// Inline caller context for short lists (empty otherwise).
+    ctx: refs_render::Context,
 }
 
 impl<'a> RefHits<'a> {
@@ -463,6 +517,7 @@ impl<'a> RefHits<'a> {
             locations,
             infos,
             order,
+            ctx: refs_render::Context::default(),
         }
     }
 
@@ -557,7 +612,12 @@ impl<'a> RefHits<'a> {
         if let Some((name, start, end)) = &info.enclosing {
             line.push_str(&format!(" in {name}[{start}-{end}]"));
         }
-        if let Some(text) = info.text.as_deref().filter(|t| !t.is_empty()) {
+        // The line already shows in an inline context block.
+        if let Some(text) = info
+            .text
+            .as_deref()
+            .filter(|t| !t.is_empty() && !self.ctx.covered.contains(&i))
+        {
             line.push_str(": ");
             line.push_str(text);
         }
@@ -580,6 +640,10 @@ impl<'a> RefHits<'a> {
                 item.push_str(&self.file_header(path, test));
             }
             item.push_str(&self.hit_line(i));
+            if let Some(block) = self.ctx.blocks.get(&i) {
+                item.push('\n');
+                item.push_str(block.trim_end_matches('\n'));
+            }
             prev = Some((test, path));
             out.push(item);
         }
@@ -889,6 +953,9 @@ pub(crate) fn run_get_diagnostics(
     };
 
     let result = backend.diagnostics(&params.path);
+    if let Some(fault) = crate::diag_env::detect(&params.path, &result.value) {
+        return env_fault_result(&params, &result.value, &fault);
+    }
     let mut diagnostics = result.value;
     if let Some(min) = min_severity {
         diagnostics.retain(|d| d.severity <= min);
@@ -934,6 +1001,59 @@ pub(crate) fn run_get_diagnostics(
             "confidence": confidence_json(result.confidence),
             "budget_tokens": params.budget_tokens,
             "matches": diagnostics.len(),
+        }),
+    )
+}
+
+/// The toolchain environment is broken (read-only GOCACHE, modules not
+/// downloadable, wrong venv, no node_modules…), so the diagnostics are
+/// cascade noise. Say so in a few lines: the root-cause line, how many were
+/// dropped, and any parser errors (those do not depend on the environment).
+fn env_fault_result(
+    params: &GetDiagnosticsParams,
+    diags: &[Diagnostic],
+    fault: &crate::diag_env::EnvFault,
+) -> CallToolResult {
+    const ROOT_MAX_CHARS: usize = 400;
+    const SYNTAX_MAX: usize = 10;
+    let mut root_line = render_diagnostic(&diags[fault.root]);
+    if root_line.chars().count() > ROOT_MAX_CHARS {
+        root_line = root_line.chars().take(ROOT_MAX_CHARS).collect::<String>() + "…";
+    }
+    let syntax: Vec<&Diagnostic> = diags
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| *i != fault.root && crate::diag_env::is_syntax_error(d))
+        .map(|(_, d)| d)
+        .collect();
+    let suppressed = diags.len() - 1 - syntax.len();
+    let mut body = confidence_header(Confidence::Unknown);
+    body.push_str(&format!(
+        "环境异常，诊断不可信：{}。\n根因：{root_line}\n",
+        fault.kind
+    ));
+    if suppressed > 0 {
+        body.push_str(&format!(
+            "另有 {suppressed} 条诊断多半是它引发的级联错误，已省略。\n"
+        ));
+    }
+    if !syntax.is_empty() {
+        body.push_str("下列语法错误与环境无关，仍可信：\n");
+        for d in syntax.iter().take(SYNTAX_MAX) {
+            body.push_str(&render_diagnostic(d));
+            body.push('\n');
+        }
+    }
+    body.push_str(fault.hint);
+    body.push('\n');
+    text_result(
+        body,
+        json!({
+            "confidence": "unknown",
+            "budget_tokens": params.budget_tokens,
+            "matches": syntax.len(),
+            "environment_fault": fault.kind,
+            "suppressed": suppressed,
         }),
     )
 }
@@ -1328,8 +1448,8 @@ mod tests {
         let required = required_fields(&refs);
         assert!(required.iter().any(|f| f == "symbol"), "{required:?}");
         assert!(
-            required.iter().any(|f| f == "path"),
-            "path is effectively required and must be listed: {required:?}"
+            !required.iter().any(|f| f == "path"),
+            "path is optional (fixed from the index): {required:?}"
         );
 
         let diags = schema_for_tool("get_diagnostics");

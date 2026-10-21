@@ -207,6 +207,13 @@ impl LspTransport {
         }
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
+            // Roslyn's design-time builds would otherwise write obj/ into
+            // the user's project (see `csharp::msbuild_redirect`).
+            if is_roslyn(spec.language) {
+                if let Some((key, props)) = super::csharp::msbuild_redirect(cwd) {
+                    cmd.env(key, props);
+                }
+            }
         }
 
         let mut child = match cmd.spawn() {
@@ -3323,6 +3330,14 @@ while True:
                 resp["result"],
                 json!([false, null, null]),
                 "{lang:?}: {resp}"
+            );
+            // The obj/ redirect lands in the scratch root, not in $HOME.
+            assert!(
+                _tmp.0
+                    .join(".astrolabe-roslyn-test")
+                    .join("astrolabe-obj.props")
+                    .is_file(),
+                "{lang:?}"
             );
             t.shutdown().unwrap();
         }

@@ -6,6 +6,45 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 
 ## [Unreleased]
 
+第 7 批（架构盘点后的 14 路改动）。
+
+### 行为变化（升级时请留意）
+
+- **解析缓存改为紧凑二进制格式，缓存键不再含 crate 版本**：升级到本版后首次启动会冷解析一次，此后发版不再因版本号让缓存整代作废（提取逻辑变化仍由 `EXTRACTOR_VERSION` + 提取结果指纹测试守卫）。旧格式条目在全量扫描时清掉，清理超过四分之一时压缩 redb 文件。
+- **`find_references` 索引优先扩到 TS/TSX 与 Python 顶层符号**：全仓只有一处定义的顶层函数 / 类 / 接口 / 类型（Python 含模块级常量）直接用索引作答，不启动 tsserver / pyright。方法、字段、属性、多处定义的名字与 `dry_run_rename` 仍走语言服务器；JS 仍语言服务器优先。关闭：`ASTROLABE_TS_GRAPH_FIRST=off`、`ASTROLABE_PY_GRAPH_FIRST=off`。
+- **Go `goto_definition` 索引优先**：索引能唯一判定时直接作答（0.25–3.4 ms），无解或有歧义才启动 gopls。关闭：`ASTROLABE_DEFINITION_INDEX_FIRST=off`。
+- **Go `find_references`**：方法引用按接收者类型过滤（如模板的 `t.Execute` 不再算进来），判定不了的标「未核实」；同名多处定义时按调用方给的 `path` 选定，不再退回 gopls；开头不再写「全仓唯一定义」这类不实措辞。
+- **gopls 以 `-remote=auto` 启动**，多个会话共用一个 gopls 守护进程；此时 Astrolabe 设的 gopls 内存上限不再生效。关闭：`ASTROLABE_GOPLS_REMOTE=off`。
+- **`find_references` 输出**：非测试命中不超过 8 处时内联所在函数上下文（`ASTROLABE_REFS_CONTEXT_HITS`，`0` 关闭）；结果确实查全时末行写「已全列」；测试命中占多数时加一行非测试调用方汇总。
+- **`tools/list` 瘦身**：隐藏 16 个从未用过的参数（照常接受；`ASTROLABE_FULL_SCHEMA=1` 全部声明），说明文字去掉互相冲突与「请安装语言服务器」的句子，「末行写已全列时不必复核」放入默认说明。工具定义加说明 8,447 B → 4,740 B（−44%）。
+- **语言服务器缺失时**，`find_references` / `goto_definition` 改由索引作答并附一行安装提示，不再只回 Unknown。
+
+### 修复
+
+- **「改了又改回」后旧符号残留**：watcher 记录被查询屏障修复过的路径，重复事件重新标为疑点。旧符号在约 22–42 ms 内消失（此前 15 s 以上仍在）。
+- **会话锁中毒不再让进程崩溃**：20 处 `unwrap` 改为自动恢复。
+- **增量更新失败不再静默丢弃改动**：记录、重试，仍失败则后台重建，期间结果末尾注明「索引可能过期」。
+- **`get_diagnostics` 识别工具链环境异常**：只报「环境异常，诊断不可信」加根因一行，不再输出级联假错误（E2 场景 10 KB → 约 400 B）；真实语法 / 类型错误照常列出。
+- **TS/JS 索引引用**补转导出链（barrel）、改名绑定（default import、`require` 改名、`{A as B}`）、TS namespace 成员；裸包名不再按目录后缀误配；对象字面量键 / 类型成员 `name:` 不算引用；JS 成员访问与属性赋值式声明分开处理。
+- **Python 索引引用**补字符串类型注解（前向引用）、`__init__` / `__all__` 转导出、`as` 改名、子模块导入；方法 / 属性按接收者类核对。
+- **Roslyn 设计时构建不再往用户工程写 `obj/`**：启动 Roslyn（C#/VB）时设 `CustomAfterDirectoryBuildProps`，指向 Astrolabe 写在 `~/.astrolabe/roslyn/<仓库>-<hash>/astrolabe-obj.props` 的属性文件，把 `IntermediateOutputPath` 改到同目录 `obj/<工程名>-<hash>/` 下；`BaseIntermediateOutputPath` / `MSBuildProjectExtensionsPath` 不动，已有的 `project.assets.json` 照常读取。工程自己设了 `IntermediateOutputPath` 时不覆盖；环境里已有的 `CustomAfterDirectoryBuildProps` 仍会被导入。`ASTROLABE_ROSLYN_OBJ_DIR` 可改目录，设为 `off` 恢复写工程内 `obj/`。实测（.NET 10 SDK 小工程，已还原与未还原两种）：工程目录内不再新增或改动任何 `obj/` 文件，`goto_definition` 仍为 Exact。
+
+### 性能
+
+- **单文件增量**：组图并行化、调用边按文件线性归并、产物缓存改为按代淘汰的 HashMap、旧图在后台线程释放。最大语料上 339 ms → 105 ms。
+- **索引体积**：c-new 库 67.5 MB → 23.7 MB；热重启 0.64 s → 0.44 s。
+- **查询路径**：去掉逐命中全表扫描，`search_code` 整块缓冲区搜索；大仓库上快约 2–6 倍（c-new 字面量 71 → 12 ms，分组 449 → 80 ms），28 个基准查询输出与 0.15.0 逐字节一致。零命中建议的编辑距离不再每字符分配。
+- **内存（Linux glibc）**：建完索引及编辑停下 5 秒后 `malloc_trim`，435 万行仓库连改 10 次后 RSS 2,010 MB → 1,372 MB（−32%）。`ASTROLABE_MALLOC_TRIM=0` 关闭；macOS 上无效。
+- **gopls 共用**：两个会话 gopls 总 RSS 5.7 GB → 3.0 GB（−47%）。
+
+### 依赖
+
+- `ureq` 2 → 3（语言服务器自动安装的下载器）：去掉 `webpki-roots` 0.26 垫片；`rustls-webpki` 0.103.16、`webpki-roots` 1.0.10，修复 RUSTSEC-2026-0381 / 0382（emSign 失信中间证书）。下载体积上限显式放开（clangd 等压缩包超过 ureq 3 默认的 10 MB）；ureq 3 默认读取 `HTTPS_PROXY` 等代理环境变量。
+
+### 文档
+
+- 撤下第 6 批坏基线下的 TS/Python 召回数字，换成第 7 批重测结果（`docs/find-references-graph-first.md`）。
+
 ## [0.15.0] - 2026-10-20
 
 自 v0.14.0 以来的 PR：#84（关闭 Roslyn 自动 NuGet 还原）、#85（第 6 批）。工具目录仍为 7 个，`tools/list` 7,307 B（Linux 实测，上限测试 7,500 B）。完整说明与 A/B 数据见 GitHub Release。
