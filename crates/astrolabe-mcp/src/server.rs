@@ -5019,17 +5019,41 @@ fn enclosing_impl_mentions(
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur = vec![i + 1; b.len() + 1];
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != *cb);
-            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
-        }
-        prev = cur;
+    // Called once per symbol name on zero-hit queries: one reused DP row,
+    // on the stack for short names, and bytes instead of chars when both
+    // sides are ASCII. Same Levenshtein distance (over chars) as before.
+    if a.is_ascii() && b.is_ascii() {
+        levenshtein(a.as_bytes(), b.as_bytes())
+    } else {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        levenshtein(&a, &b)
     }
-    prev[b.len()]
+}
+
+fn levenshtein<T: PartialEq>(a: &[T], b: &[T]) -> usize {
+    let mut stack = [0usize; 65];
+    let mut heap = Vec::new();
+    let row: &mut [usize] = if b.len() < stack.len() {
+        &mut stack[..=b.len()]
+    } else {
+        heap.resize(b.len() + 1, 0);
+        &mut heap
+    };
+    for (j, cell) in row.iter_mut().enumerate() {
+        *cell = j;
+    }
+    for (i, ca) in a.iter().enumerate() {
+        // `diag` is the previous row's value at j; `row[j]` becomes the current row's.
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (diag + usize::from(ca != cb)).min(above + 1).min(row[j] + 1);
+            diag = above;
+        }
+    }
+    row[b.len()]
 }
 
 /// 零命中时给出相近符号名（编辑距离 ≤2 或共享 4 字符前缀），最多 5 个。
@@ -6344,6 +6368,30 @@ mod tests {
     fn name_helpers_split_and_measure() {
         assert_eq!(name_tokens("fooBar_baz"), ["foo", "bar", "baz"]);
         assert_eq!(edit_distance("compute", "computee"), 1);
+        // Reference: the original allocating DP over chars.
+        fn reference(a: &str, b: &str) -> usize {
+            let b: Vec<char> = b.chars().collect();
+            let mut prev: Vec<usize> = (0..=b.len()).collect();
+            for (i, ca) in a.chars().enumerate() {
+                let mut cur = vec![i + 1; b.len() + 1];
+                for (j, cb) in b.iter().enumerate() {
+                    let cost = usize::from(ca != *cb);
+                    cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+                }
+                prev = cur;
+            }
+            prev[b.len()]
+        }
+        let long = "x".repeat(70) + "abc";
+        let words = [
+            "", "a", "ab", "ba", "kitten", "sitting", "flaw", "lawn", "café", "cafe", "日本語", "日本",
+            "zzqqxx_nomatch", "jsonserializer", &long, "xabcx",
+        ];
+        for a in words {
+            for b in words {
+                assert_eq!(edit_distance(a, b), reference(a, b), "{a:?} vs {b:?}");
+            }
+        }
     }
 
     #[test]
