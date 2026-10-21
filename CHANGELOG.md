@@ -18,6 +18,7 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 - **`find_references` 输出**：结果确实查全时末行写「已全列」；测试命中占多数时加一行非测试调用方汇总。内联所在函数上下文默认关闭（第 8 批复盘：第 7 批 33 次 run 里模型照样在这些命中附近 Read 了 26 次，没省下 Read，却每次 run 多约 1 KB 输出），需要时设 `ASTROLABE_REFS_CONTEXT_HITS=on`（非测试命中不超过 8 处时内联）或一个数字作阈值。
 - **`tools/list` 瘦身**：隐藏 16 个从未用过的参数（照常接受；`ASTROLABE_FULL_SCHEMA=1` 全部声明），说明文字去掉互相冲突与「请安装语言服务器」的句子，「末行写已全列时不必复核」放入默认说明。工具定义加说明 8,447 B → 4,740 B（−44%）。
 - **语言服务器缺失时**，`find_references` / `goto_definition` 改由索引作答并附一行安装提示，不再只回 Unknown。
+- **`get_diagnostics` 默认不再启动语言服务器**（第 8 批）：本会话已有该语言的服务器在跑（或已有共用的 gopls 守护进程）时照旧用它；否则 Go 用 `go vet .`（含测试文件的类型检查与分析器，不链接），编译不过时再用 `go test -c -vet=off -gcflags=-e` 列出全部编译错误；Rust 用 `cargo check --message-format=json`；TS/TSX 用最近的 `tsconfig.json` 跑 `tsc --noEmit`；Python 用 `compile()` 只查语法（不写字节码）；其他语言与工具链缺失 / 超时时只报 tree-sitter 的第一处语法错误（标 syntactic）。输出格式与环境异常检测不变，其他文件的错误在说明行里点名。要语言服务器时传 `lsp=true`（不在 `tools/list` 里声明，结果说明会提示），或设 `ASTROLABE_DIAGNOSTICS=lsp` 恢复旧行为；超时统一可用 `ASTROLABE_DIAG_TIMEOUT_SECS` 调（默认 Go 30 s、Rust 90 s、TS 45 s、Python 10 s）。实测 E1/E2/N7 的 6 个文件（暖缓存）：每次 61–93 ms、`go vet` 峰值 27–52 MiB 且随即退出；gopls 路径首次 1.16–1.42 s、常驻 106–241 MiB，结果一致（均无诊断；注入错误的用例两边都报 2 + 1 条）。
 
 ### 修复
 

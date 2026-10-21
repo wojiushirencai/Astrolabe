@@ -14,6 +14,7 @@ mod context;
 mod context_page;
 mod coverage;
 mod diag_env;
+mod diag_toolchain;
 mod ensure_ls;
 mod explain;
 mod knobs;

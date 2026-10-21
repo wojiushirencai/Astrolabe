@@ -1018,7 +1018,7 @@ fn classify_task(task: &str) -> TaskKind {
 /// One-line pointer to the follow-up tool that fits the task wording.
 fn next_step_hint(task: &str) -> &'static str {
     match classify_task(task) {
-        TaskKind::Rename => "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后 get_diagnostics 验证。\n",
+        TaskKind::Rename => "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后跑构建/测试验证（跑不了才用 get_diagnostics）。\n",
         TaskKind::Count => "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 行 / M 个文件计数（按行计，同一行多次出现算 1）；只要总数加 count_only=true。\n",
         TaskKind::Refs => "下一步：find_references(symbol) 取精确调用点；定义用 goto_definition。\n",
         TaskKind::Other => "下一步：已知名字用 find_symbol（include_body=true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n",
@@ -2597,6 +2597,7 @@ const UNADVERTISED_PARAMS: &[&str] = &[
     "dry_run_rename",
     "character",
     "severity",
+    "lsp",
 ];
 
 fn full_schema_requested() -> bool {
@@ -9816,6 +9817,7 @@ mod mcp_routing_tests {
                 path: file.to_string_lossy().into_owned(),
                 severity: None,
                 budget_tokens: 300,
+                lsp: None,
             },
         )));
         assert!(

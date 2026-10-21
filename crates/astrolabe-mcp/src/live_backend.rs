@@ -657,10 +657,25 @@ impl PreciseCapability for LiveBackend {
     }
 
     fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>> {
+        self.diagnostics_with(path, false)
+    }
+
+    /// Language server only when asked (`lsp`), when one is already running
+    /// for the language (in this session, or the shared gopls daemon), or
+    /// with `ASTROLABE_DIAGNOSTICS=lsp`. Otherwise the toolchain / parser
+    /// answers (`diag_toolchain`) and nothing memory-heavy starts.
+    fn diagnostics_with(&self, path: &str, lsp: bool) -> Precise<Vec<Diagnostic>> {
         let rel = RelPath::new(path);
         let Some(language) = server_language(&self.root, path) else {
             return Precise::unknown(Vec::new(), unknown_language("诊断", path));
         };
+        let use_server = lsp
+            || crate::diag_toolchain::lsp_by_default()
+            || self.pool.is_resident(language)
+            || (language == Language::Go && crate::diag_toolchain::gopls_daemon_running());
+        if !use_server {
+            return crate::diag_toolchain::check(&self.root, &rel, language);
+        }
         match self.with_server(language, |server| {
             query_server(server, &rel, FetchOptions::default())
         }) {
@@ -2551,6 +2566,124 @@ mod def_index_harness {
             "SUMMARY\tcases={}\tindex_answered={answered}\tagree={agree}\tdeferred={deferred}\tdeferred_server_found={deferred_in_repo}\tserver_cold_start={cold:?}\tindex_total={t_index:?}\tserver_total={t_server:?}",
             cases.len()
         );
+        backend.pool.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_source_tests {
+    use super::*;
+
+    /// get_diagnostics answers from `go` without starting gopls (on PATH on
+    /// the box, so a start would show as resident); `lsp=true` still asks
+    /// the server.
+    #[test]
+    fn go_diagnostics_use_the_toolchain_not_gopls() {
+        if crate::diag_toolchain::gopls_daemon_running() || crate::diag_toolchain::lsp_by_default()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("astrolabe-lb-diag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("p")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module ex.com/m\n\ngo 1.21\n").unwrap();
+        std::fs::write(
+            dir.join("p/a.go"),
+            "package p\n\nfunc A() int { return missing }\n",
+        )
+        .unwrap();
+        let backend = LiveBackend::new(dir.clone());
+        let r = backend.diagnostics_with("p/a.go", false);
+        assert!(!backend.pool.is_resident(Language::Go));
+        if r.confidence == Confidence::Exact {
+            assert_eq!(r.value.len(), 1, "{r:?}");
+            assert!(r.value[0].message.contains("undefined: missing"), "{r:?}");
+        } else {
+            // No go on PATH: the tree-sitter syntax check.
+            assert_eq!(r.confidence, Confidence::Syntactic, "{r:?}");
+        }
+        // Explicit lsp=true goes to the (absent) server.
+        let mut serverless = LiveBackend::new(dir.clone());
+        serverless.pool = Arc::new(LspPool::from_discovery_and_transport(
+            Discovery::new(""),
+            StdioSpawn::new(&dir),
+            dir.clone(),
+            LspPoolConfig::default(),
+        ));
+        let r = serverless.diagnostics_with("p/a.go", true);
+        assert_eq!(r.confidence, Confidence::Unknown, "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Peak RSS (VmHWM, KiB) of live `name` child processes.
+    fn peak_rss_kib(name: &str) -> u64 {
+        let mut total = 0;
+        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let p = e.path();
+            // Children of this test process only (other sessions' gopls too).
+            let ppid = std::fs::read_to_string(p.join("stat"))
+                .ok()
+                .and_then(|st| {
+                    st.rsplit_once(") ")
+                        .and_then(|(_, rest)| rest.split_whitespace().nth(1).map(str::to_string))
+                })
+                .and_then(|v| v.parse::<u32>().ok());
+            if ppid == Some(std::process::id())
+                && std::fs::read_to_string(p.join("comm")).is_ok_and(|c| c.trim() == name)
+            {
+                if let Ok(st) = std::fs::read_to_string(p.join("status")) {
+                    total += st
+                        .lines()
+                        .find(|l| l.starts_with("VmHWM:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
+
+    /// Toolchain vs language server for get_diagnostics. Ignored: needs
+    /// go + gopls and a corpus. `DIAG_BENCH_REPO=/abs/repo`,
+    /// `DIAG_BENCH_FILES=a.go,b_test.go`. Run with
+    /// `ASTROLABE_GOPLS_REMOTE=off` so gopls is a child we can measure.
+    #[test]
+    #[ignore = "needs a toolchain, a language server and a corpus (DIAG_BENCH_REPO)"]
+    fn toolchain_vs_server_diagnostics() {
+        let Some(root) = std::env::var_os("DIAG_BENCH_REPO").map(PathBuf::from) else {
+            return;
+        };
+        let files: Vec<String> = std::env::var("DIAG_BENCH_FILES")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect();
+        let backend = LiveBackend::new(&root);
+        for f in &files {
+            let t = std::time::Instant::now();
+            let r = backend.diagnostics_with(f, false);
+            println!(
+                "TOOLCHAIN\t{f}\t{:?}\t{:?}\tn={}\t{}",
+                t.elapsed(),
+                r.confidence,
+                r.value.len(),
+                r.note.unwrap_or_default().replace('\n', " ")
+            );
+        }
+        assert!(!backend.pool.is_resident(Language::Go));
+        for f in &files {
+            let t = std::time::Instant::now();
+            let r = backend.diagnostics_with(f, true);
+            println!(
+                "SERVER\t{f}\t{:?}\t{:?}\tn={}\tgopls_peak_rss={} MiB",
+                t.elapsed(),
+                r.confidence,
+                r.value.len(),
+                peak_rss_kib("gopls") / 1024
+            );
+        }
         backend.pool.shutdown();
     }
 }
