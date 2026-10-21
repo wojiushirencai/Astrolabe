@@ -108,10 +108,37 @@ Go 多出的 5 处：
   - 按人工判定，express 去掉 `createApplication` 后，剩下的多报里没有发现真误报。
 - **`createApplication`：** 7b 给出 850 处。多出的是经 `require('..')`、`require('../../')` 再到根 `index.js`（`module.exports = require('./lib/express')`）绑定的本地名 `express`，绝大多数是 `express()` 调用。LanguageService 的 JS 推断不跟这条 CJS 链，所以这一例单列，不计入表里。
 
-**结论（routing 未切换）**
-- **TS/TSX 顶层符号**（Function、Class、Interface、Type，全仓唯一定义）可以切到索引优先。两个语料（单包应用、pnpm monorepo）上召回都 ≥0.999，精度 ≥0.993，与 Go 切换时的水平相当。前提是保留"多处定义就交给语言服务器"这条规则。
-- **TS 的 Method/Field** 继续由语言服务器优先作答。
-- **JS 顶层符号** 召回 1.000；按 LanguageService 口径精度是 0.76–0.88，按人工判定基本没有误报。但 express 是唯一的 JS 语料，而且大量引用依赖 CJS 链和 `this`，基线本身不完整。建议先在第二个 JS 语料（ESM 为主）上测过再切。
+**ESM JavaScript：three.js `src/`（756 个 .js，ESM，有 barrel；commit e8088f9，sparse 浅克隆）**
+
+基线是 LanguageService，配置为 `allowJs` + `module: ESNext` + `moduleResolution: Bundler`，"Cannot find module" 为 0。抽样 200 例（Function/Class/Const）用 7b 加对象字面量键规则（dc9bc19）测量。
+
+在 JS 里，JSDoc（`@param {Foo}`、`{@link Foo}`）就是类型标注，LanguageService 把它们算作引用，而索引排除注释。所以表里分三种口径：
+- "原始"：逐列严格比较。
+- "代码"：去掉落在注释行上的基线引用。
+- "按行"：按 (文件, 行) 比较，吸收 `export { default as X }` 这类列号差异。
+
+| 种类 | 例数 | 召回 原始 / 代码 / 按行 | 精度 原始 / 按行 |
+|---|---|---|---|
+| Class | 40 | 0.631 / 0.938 / 1.000 | 1.000 / 1.000 |
+| Function | 64 | 1.000 / 1.000 / 1.000 | 0.777 / 0.800 |
+| Const | 96 | 0.992 / 0.998 / 1.000 | 0.920 / 0.925 |
+| 合计 | 200 | 0.861 / 0.981 / 1.000 | 0.902 / 0.911 |
+
+- **多报的来源：** 主要是导入方文件里与导入名同名的局部变量和参数。three 的 TSL 节点代码常用 `property`、`userData`、`stack`、`matrix` 这类通用名。索引按整词匹配，不做作用域遮蔽分析，所以 Function 的精度只有 0.80。TS 两个语料的精度在 0.993 以上，因为 TS 代码里很少这样遮蔽。
+- **Class 的原始召回 0.63：** 差额全部来自 JSDoc 类型引用。
+
+**结论**
+- **TS/TSX 顶层唯一定义：已切到索引优先**（3c4b11c，`refs_graph_ts::ts_graph_first`）。
+  - 范围：Function、Class、Interface、Type、Const。
+  - 关闭方法：`ASTROLABE_TS_GRAPH_FIRST=off`。
+  - 多处定义、方法、字段、重命名（exact）仍然走语言服务器。
+  - 转导出链超过跟踪上限（8 层或 5000 个文件）时，note 标"可能不全"，不出"已全列"完成行。
+- **TS 的 Method/Field：** 继续由语言服务器优先作答。
+- **JavaScript 不切换。** 两个 JS 语料按代码口径召回都约等于 1.0，但精度只有 0.76–0.93（express 0.76–0.88，three 0.80–0.93）。还有两项缺口：
+  - 同名局部变量和参数的遮蔽：需要作用域分析。
+  - JSDoc 类型引用：JS 项目做重命名或"所有用到 X 的地方"时，这些也算。
+
+  补上这两项并重测后再切。
 - **Vue** 没测，需要 vue 语言服务作基线。
 
 ## 第 7 批：Python 重测（可信基线）
