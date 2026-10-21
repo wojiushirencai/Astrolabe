@@ -1396,6 +1396,9 @@ pub(crate) fn graph_references_at(
         .filter(|e| e.kind == EdgeKind::Import && targets.contains(&e.to))
         .map(|e| e.from)
         .collect();
+    // TS/JS: also barrel re-exports and renamed bindings (refs_graph_ts).
+    let ts = (!go && crate::refs_graph_ts::is_ts_family(language))
+        .then(|| crate::refs_graph_ts::ts_scope(index, root, decl.file, name));
     let mut files: Vec<&RelPath> = graph
         .files
         .iter()
@@ -1404,7 +1407,9 @@ pub(crate) fn graph_references_at(
             if go {
                 dir_of(f.path.as_str()) == def_dir || (exported && importers.contains(&f.id.0))
             } else {
-                f.id == decl.file || importers.contains(&f.id.0)
+                f.id == decl.file
+                    || importers.contains(&f.id.0)
+                    || ts.as_ref().is_some_and(|t| t.contains(f.id.0))
             }
         })
         .map(|f| &f.path)
@@ -1454,12 +1459,25 @@ pub(crate) fn graph_references_at(
         let Some(lines) = read_lines(root, path.as_str()) else {
             continue;
         };
+        // The name, plus (TS/JS) the local aliases it has in this file.
+        let words: Vec<&str> = match (&ts, index.file_id(path.as_str())) {
+            (Some(t), Some(id)) => t.words(id.0, name),
+            _ => vec![name],
+        };
+        let mut alias_units: HashMap<(usize, usize), u32> = HashMap::new();
         let mut found: Vec<(usize, usize)> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
-            for b in word_offsets(line, name) {
-                found.push((i, b));
+            for w in &words {
+                for b in word_offsets(line, w) {
+                    found.push((i, b));
+                    if *w != name {
+                        alias_units.insert((i, b), w.encode_utf16().count() as u32);
+                    }
+                }
             }
         }
+        found.sort_unstable();
+        found.dedup();
         if found.is_empty() {
             continue;
         }
@@ -1555,7 +1573,11 @@ pub(crate) fn graph_references_at(
             };
             let end = Position {
                 line: line as u32,
-                character: character + name_units,
+                character: character
+                    + alias_units
+                        .get(&(line, byte))
+                        .copied()
+                        .unwrap_or(name_units),
             };
             hits.push(Location {
                 path: path.clone(),
@@ -1576,6 +1598,20 @@ pub(crate) fn graph_references_at(
         } else {
             format!("包 {pkg}/ 内（未导出名）")
         }
+    } else if let Some(t) = ts
+        .as_ref()
+        .filter(|t| t.barrels > 0 || !t.aliases().is_empty())
+    {
+        let mut s = "定义文件、导入它的文件".to_string();
+        if t.barrels > 0 {
+            s += &format!("，以及经 {} 个转导出（barrel）文件到达的文件", t.barrels);
+        }
+        let aliases = t.aliases();
+        if !aliases.is_empty() {
+            let shown: Vec<String> = aliases.iter().take(5).map(|a| format!("`{a}`")).collect();
+            s += &format!("（含改名绑定 {}）", shown.join("、"));
+        }
+        s
     } else {
         "定义文件及导入它的文件".to_string()
     };
