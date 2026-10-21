@@ -494,6 +494,16 @@ impl Store {
         }
     }
 
+    /// Rewrite the file without its free pages (see
+    /// [`Self::prune_parse_cache`]). Needs exclusive use of the handle: no
+    /// transaction may be open.
+    pub fn compact(&mut self) -> Result<bool, StoreError> {
+        match &mut self.db {
+            Db::Rw(db) => db.compact().map_err(backend),
+            Db::Ro(_) => Err(StoreError::Backend("store opened read-only".to_string())),
+        }
+    }
+
     /// Number of parse-cache entries (diagnostics and tests).
     pub fn parse_cache_len(&self) -> Result<u64, StoreError> {
         let read = self.db.begin_read().map_err(backend)?;

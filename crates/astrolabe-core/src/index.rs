@@ -937,7 +937,7 @@ impl CacheWrites {
 
 fn persist_cache_writes(
     root: &Path,
-    store: Option<&Store>,
+    store: Option<&mut Store>,
     cache_writes: CacheWrites,
     cache_hits: AtomicUsize,
     side: ParseSide,
@@ -976,6 +976,25 @@ fn persist_cache_writes(
         match store.prune_parse_cache(&live_keys, &live_paths) {
             Ok(removed) if removed > 0 => {
                 tracing::info!(removed, "parse cache pruned");
+                // redb reuses freed pages but never returns them, so after an
+                // upgrade (every old-format entry dead at once) the file would
+                // keep the previous generation's size on top of the new one.
+                // Compact when a large share went; it is a one-off after a
+                // format or extractor change, not a per-start cost.
+                if removed >= COMPACT_MIN_REMOVED && removed * 4 >= removed + live_keys.len() {
+                    let started = std::time::Instant::now();
+                    match store.compact() {
+                        Ok(_) => tracing::info!(
+                            removed,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "parse cache compacted"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "parse cache compaction failed; index is still valid"
+                        ),
+                    }
+                }
             }
             Ok(_) => {}
             Err(error) => {
@@ -990,6 +1009,10 @@ fn persist_cache_writes(
         "parse cache"
     );
 }
+
+/// Pruned entries that make a compaction worthwhile (and at least a quarter
+/// of the table).
+const COMPACT_MIN_REMOVED: usize = 256;
 
 /// Parse every path that has a known language. Failures are collected, never
 /// swallowed. A disk-store cache hit skips tree-sitter; FileId assignment
@@ -1023,7 +1046,7 @@ fn parse_paths_cancellable(
     cancel: Option<&AtomicBool>,
 ) -> Option<ParseOutcome> {
     let pool = ParserPool::new();
-    let store = open_store(root, opts);
+    let mut store = open_store(root, opts);
     let side = ParseSide::new(store.as_ref(), full_scan);
     let failures = Mutex::new(Vec::new());
     let cache_writes = CacheWrites::new();
@@ -1051,7 +1074,7 @@ fn parse_paths_cancellable(
     }
     persist_cache_writes(
         root,
-        store.as_ref(),
+        store.as_mut(),
         cache_writes,
         cache_hits,
         side,
@@ -3501,6 +3524,36 @@ mod persist_audit_tests {
         }
         IncrementalIndex::build(&root, &opts);
         assert_eq!(stored_entries(&root), 1);
+    }
+
+    #[test]
+    fn upgrade_prune_compacts_the_store_file() {
+        let root = scratch("prune-compact");
+        write_old(&root, "a.py", "def a():\n    pass\n");
+        let opts = IndexOptions::default();
+        IncrementalIndex::build(&root, &opts);
+        {
+            // A previous format's generation: many dead entries at once.
+            let s = Store::open(&store_path(&root)).unwrap();
+            let junk = vec![b'j'; 8 * 1024];
+            let keys: Vec<String> = (0..COMPACT_MIN_REMOVED + 50)
+                .map(|i| format!("x6-v0.15.0:python:{i:016x}"))
+                .collect();
+            s.put_cached_parses(keys.iter().map(|k| (k.as_str(), junk.as_slice())))
+                .unwrap();
+        }
+        let bloated = std::fs::metadata(store_path(&root)).unwrap().len();
+        IncrementalIndex::build(&root, &opts);
+        assert_eq!(stored_entries(&root), 1);
+        let compacted = std::fs::metadata(store_path(&root)).unwrap().len();
+        assert!(
+            compacted * 2 < bloated,
+            "file must shrink after the upgrade prune: {bloated} -> {compacted}"
+        );
+        // Still a working cache.
+        let again = IncrementalIndex::build(&root, &opts);
+        assert!(again.graph.symbols.iter().any(|s| s.name == "a"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
