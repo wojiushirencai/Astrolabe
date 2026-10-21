@@ -496,6 +496,13 @@ fn apply_pending(session: &RootSession, pending: &mut ChangeSet) -> bool {
         ));
         next.prewarm(false);
         *session.state.write().unwrap_or_else(|e| e.into_inner()) = IndexState::Ready(next);
+        // Free the superseded graph (unless a reader still holds it) off this
+        // thread: this may be a query waiting on its inline repair, and
+        // tearing down a large repository's graph and parse products cost it
+        // tens of ms. If the spawn fails the drop runs here.
+        let _ = std::thread::Builder::new()
+            .name("astrolabe-drop".into())
+            .spawn(move || drop(previous));
         if session.rebuild_inflight.load(Ordering::SeqCst) {
             session.rebuild_journal.lock_or_recover().merge(applied);
         }
