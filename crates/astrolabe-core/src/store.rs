@@ -1451,6 +1451,69 @@ mod tests {
         assert_eq!(store.parse_cache_len().unwrap(), 1);
     }
 
+    /// Sources covering the common constructs of every extractor, for
+    /// [`extractor_output_matches_its_version`].
+    const EXTRACTOR_PROBES: &[(Language, &str, &str)] = &[
+        (Language::Python, "m.py", "import os\nfrom a.b import c\n\nclass K(Base):\n    X = 1\n    def m(self):\n        return helper(os.path)\n\ndef helper(p):\n    return K().m()\n"),
+        (Language::Go, "m.go", "package m\n\nimport (\n\t\"fmt\"\n\tx \"example.com/x\"\n)\n\ntype S struct{ A int }\ntype I interface{ M() }\n\nconst C = 1\n\nfunc (s *S) M() { fmt.Println(x.F()) }\nfunc New() *S { return &S{} }\n"),
+        (Language::Java, "M.java", "package p;\nimport java.util.List;\npublic class M extends B implements I {\n  private int f;\n  public M() {}\n  public void run(List<String> xs) { helper(xs); }\n  interface Inner { void x(); }\n  enum E { A, B }\n}\n"),
+        (Language::Rust, "m.rs", "use crate::a::{b, c};\nmod inner;\npub struct S { f: u32 }\npub enum E { A, B }\npub trait T { fn t(&self); }\nimpl T for S { fn t(&self) { helper(self.f); } }\npub const C: u32 = 1;\nfn helper(x: u32) -> u32 { x }\nmacro_rules! m { () => {} }\n"),
+        (Language::TypeScript, "m.ts", "import { a } from './a';\nimport * as b from 'b';\nexport interface I { x: number }\nexport type T = I | null;\nexport enum E { A }\nexport class K implements I { x = 1; m(): void { a(b.c()); } }\nexport function f(): T { return null; }\nexport const g = () => f();\n"),
+        (Language::Tsx, "m.tsx", "import React from 'react';\nexport function App(props: { n: number }) {\n  const v = useThing();\n  return <div onClick={() => go(v)}>{props.n}</div>;\n}\nexport const Button = () => <b>{go(1)}</b>;\nexport default App;\n"),
+        (Language::JavaScript, "m.js", "const fs = require('fs');\nimport x from './x.js';\nclass K { m() { return fs.readFileSync(x); } }\nfunction f() { return new K().m(); }\nmodule.exports = { f };\n"),
+        (Language::C, "m.c", "#include <stdio.h>\n#include \"m.h\"\n#define N 3\nstruct S { int a; };\ntypedef struct S S_t;\nenum E { A, B };\nstatic int helper(int x) { return x; }\nint main(void) { printf(\"%d\", helper(N)); return 0; }\n"),
+        (Language::Cpp, "m.cpp", "#include <vector>\nnamespace n {\nclass K : public B {\n public:\n  K();\n  void m() const { helper(); }\n};\ntemplate <typename T> T id(T t) { return t; }\n}\nusing V = std::vector<int>;\n"),
+        (Language::ObjC, "m.m", "#import \"m.h\"\n@interface K : NSObject\n- (void)run;\n@end\n@implementation K\n- (void)run { [self helper]; }\n@end\n"),
+        (Language::Swift, "m.swift", "import Foundation\nprotocol P { func p() }\nstruct S: P { let a: Int\n  func p() { helper(a) } }\nclass K { var v = 1\n  init() {} }\nenum E { case a, b }\nfunc helper(_ x: Int) {}\n"),
+        (Language::Php, "m.php", "<?php\nnamespace App;\nuse Foo\\Bar;\ninterface I { public function i(); }\nclass K extends Bar implements I {\n  const C = 1;\n  public function i() { return helper($this); }\n}\nfunction helper($x) { return $x; }\n"),
+        (Language::Dart, "m.dart", "import 'package:a/a.dart';\nabstract class I { void i(); }\nclass K extends B implements I {\n  final int v;\n  K(this.v);\n  @override\n  void i() { helper(v); }\n}\nvoid helper(int x) {}\nenum E { a, b }\n"),
+        (Language::CSharp, "M.cs", "using System;\nusing Foo.Bar;\nnamespace App {\n  public interface I { void M(); }\n  public class K : B, I {\n    public int P { get; set; }\n    public void M() { Helper(P); }\n    private static void Helper(int x) {}\n  }\n  public enum E { A, B }\n  public record R(int X);\n}\n"),
+        (Language::VisualBasic, "M.vb", "Imports System\nNamespace App\n  Public Class K\n    Public Property P As Integer\n    Public Sub M()\n      Helper(P)\n    End Sub\n    Private Function Helper(x As Integer) As Integer\n      Return x\n    End Function\n  End Class\nEnd Namespace\n"),
+        (Language::Kotlin, "m.kt", "package p\n\nimport a.b.C\n\ninterface I {\n    fun i()\n}\n\nclass K : I {\n    override fun i() {\n        helper(1)\n    }\n}\n\nfun helper(x: Int): Int {\n    return x\n}\n\nobject O\n"),
+        (Language::Shell, "m.sh", "#!/bin/bash\nsource ./lib.sh\nreadonly N=3\nhelper() { echo \"$1\"; }\nfunction main {\n  helper \"$N\"\n}\nmain \"$@\"\n"),
+        (Language::Ruby, "m.rb", "require 'json'\nrequire_relative 'a'\nmodule M\n  class K < Base\n    C = 1\n    def m\n      helper(C)\n    end\n    def self.s; end\n  end\nend\ndef helper(x) = x\n"),
+        (Language::Lua, "m.lua", "local a = require('a')\nlocal M = {}\nfunction M.f(x) return a.g(x) end\nlocal function helper(y) return y end\nfunction M:m() return helper(self) end\nreturn M\n"),
+    ];
+
+    /// What [`EXTRACTOR_PROBES`] extract under the current [`EXTRACTOR_VERSION`].
+    /// See [`extractor_output_matches_its_version`].
+    const EXTRACTOR_FINGERPRINT: (u32, u64) = (6, 0x1240_3a72_764b_e436);
+
+    /// Guard for the explicit cache versioning. The parse cache is no longer
+    /// invalidated by every release, so an extractor change that forgets to
+    /// bump [`EXTRACTOR_VERSION`] would keep serving the old symbols from
+    /// every user's cache. If this fails: bump `EXTRACTOR_VERSION` (when the
+    /// change is intended) and paste the printed fingerprint.
+    #[test]
+    fn extractor_output_matches_its_version() {
+        let pool = crate::parse::ParserPool::new();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        for (language, path, source) in EXTRACTOR_PROBES {
+            let parsed = pool
+                .parse(*language, &RelPath::new(*path), source)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert!(
+                parsed.symbols.len() >= 2 && !parsed.partial,
+                "{path}: probe must parse cleanly and extract enough to guard anything"
+            );
+            feed(language.name().as_bytes());
+            feed(&encode_parsed(&parsed).unwrap());
+        }
+        let expected = EXTRACTOR_FINGERPRINT;
+        assert_eq!(
+            (EXTRACTOR_VERSION, hash),
+            expected,
+            "extractor output changed: if intended, bump EXTRACTOR_VERSION \
+             and set EXTRACTOR_FINGERPRINT to ({EXTRACTOR_VERSION}, {hash:#018x})"
+        );
+    }
+
     #[test]
     fn parse_cache_key_is_versioned() {
         let key = parse_cache_key(Language::Go, "abc");
