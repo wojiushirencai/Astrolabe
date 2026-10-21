@@ -119,7 +119,9 @@ mod tests {
     use super::*;
 
     fn per_line(re: &regex::Regex, lines: &[String]) -> Vec<usize> {
-        (0..lines.len()).filter(|&i| re.is_match(&lines[i])).collect()
+        (0..lines.len())
+            .filter(|&i| re.is_match(&lines[i]))
+            .collect()
     }
 
     fn check(pattern: &str, ci: bool, text: &str) {
@@ -138,7 +140,10 @@ mod tests {
             .collect();
         assert_eq!(got, want, "pattern {pattern:?} on {text:?}");
         assert!(cands.windows(2).all(|w| w[0] < w[1]), "{cands:?}");
-        assert_eq!(LineScanner::per_line().candidates(&lines).len(), lines.len());
+        assert_eq!(
+            LineScanner::per_line().candidates(&lines).len(),
+            lines.len()
+        );
     }
 
     const TEXT: &str = "fn main() {\n    let x = foo(1);\n\n  // TODO: Foo bar\nfoo\n}\r\nend foo\nFOO\nbaz\n\nquxfoo\n";
@@ -146,10 +151,38 @@ mod tests {
     #[test]
     fn candidates_match_per_line_scan() {
         let patterns = [
-            "foo", "FOO", "^foo", "foo$", "^$", "^", "$", "\\bfoo\\b", "\\Bfoo", "x*",
-            "a[^b]*c", "o\\s+b", "[^z]+", "(?s).", "(?s)foo.*bar", "\\s", "(?i)foo",
-            "\\Afoo", "foo\\z", "(?-m)^foo", "(?i-m)^end", "^\\s*//", "\\}$", "let \\w+ =",
-            "zzz", "", ".*", "o\\n?b", "[\\s\\S]{2}", "(?x)foo # c)", "a|^b", "(?i)x|^foo",
+            "foo",
+            "FOO",
+            "^foo",
+            "foo$",
+            "^$",
+            "^",
+            "$",
+            "\\bfoo\\b",
+            "\\Bfoo",
+            "x*",
+            "a[^b]*c",
+            "o\\s+b",
+            "[^z]+",
+            "(?s).",
+            "(?s)foo.*bar",
+            "\\s",
+            "(?i)foo",
+            "\\Afoo",
+            "foo\\z",
+            "(?-m)^foo",
+            "(?i-m)^end",
+            "^\\s*//",
+            "\\}$",
+            "let \\w+ =",
+            "zzz",
+            "",
+            ".*",
+            "o\\n?b",
+            "[\\s\\S]{2}",
+            "(?x)foo # c)",
+            "a|^b",
+            "(?i)x|^foo",
         ];
         for p in patterns {
             for ci in [false, true] {
@@ -176,8 +209,8 @@ mod tests {
         };
         let alphabet = ['a', 'b', 'A', ' ', '\n', '\n', '_', '(', 'é'];
         let patterns = [
-            "ab", "a b", "^a", "b$", "^$", "\\ba\\b", "a\\s*b", "[^b]+b", "(?s)a.b", "a|^b",
-            "A", "\\(", "b\\s", "_\\w", "\\Ba", "é", "^\\s*\\(",
+            "ab", "a b", "^a", "b$", "^$", "\\ba\\b", "a\\s*b", "[^b]+b", "(?s)a.b", "a|^b", "A",
+            "\\(", "b\\s", "_\\w", "\\Ba", "é", "^\\s*\\(",
         ];
         for _ in 0..400 {
             let len = (next() % 60) as usize;

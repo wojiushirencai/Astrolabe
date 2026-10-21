@@ -24,7 +24,9 @@ fn main() {
     };
     let rounds: usize = args.next().and_then(|r| r.parse().ok()).unwrap_or(10);
     if std::env::var_os("INCR_BENCH_LOG").is_some() {
-        tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init();
     }
     let root = PathBuf::from(repo);
     let file = root.join(&rel);

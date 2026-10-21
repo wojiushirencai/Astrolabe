@@ -106,7 +106,10 @@ impl FileLookup {
         let mut symbols_by_file: std::collections::HashMap<FileId, Vec<u32>> =
             std::collections::HashMap::new();
         for (i, symbol) in graph.symbols.iter().enumerate() {
-            symbols_by_file.entry(symbol.file).or_default().push(i as u32);
+            symbols_by_file
+                .entry(symbol.file)
+                .or_default()
+                .push(i as u32);
         }
         Self {
             exact,
@@ -564,9 +567,32 @@ mod tests {
         ];
         let index = synthetic(&paths, &[]);
         let targets = [
-            "a.rs", "./a.rs", "src/a.rs", "./src/a.rs", "lib/a.rs", "rc/a.rs", "b.rs", "src/b.rs",
-            "rcb.rs", "c.go", "two/c.go", "one/two/c.go", "/c.go", "", "/", "dir", "dir/", "d.rs",
-            "/d.rs", "weird//d.rs", "語.rs", "日本/語.rs", "missing.rs", "a", ".rs", "./",
+            "a.rs",
+            "./a.rs",
+            "src/a.rs",
+            "./src/a.rs",
+            "lib/a.rs",
+            "rc/a.rs",
+            "b.rs",
+            "src/b.rs",
+            "rcb.rs",
+            "c.go",
+            "two/c.go",
+            "one/two/c.go",
+            "/c.go",
+            "",
+            "/",
+            "dir",
+            "dir/",
+            "d.rs",
+            "/d.rs",
+            "weird//d.rs",
+            "語.rs",
+            "日本/語.rs",
+            "missing.rs",
+            "a",
+            ".rs",
+            "./",
             "././a.rs",
         ];
         for t in targets {
@@ -577,9 +603,15 @@ mod tests {
     #[test]
     fn file_symbols_lists_a_files_symbols_in_graph_order() {
         // Symbols of one file need not be contiguous.
-        let index = synthetic(&["a.rs", "b.rs"], &[(0, 1, 9), (1, 1, 3), (0, 2, 4), (1, 5, 5)]);
+        let index = synthetic(
+            &["a.rs", "b.rs"],
+            &[(0, 1, 9), (1, 1, 3), (0, 2, 4), (1, 5, 5)],
+        );
         let names = |f: u32| -> Vec<String> {
-            index.file_symbols(FileId(f)).map(|s| s.name.clone()).collect()
+            index
+                .file_symbols(FileId(f))
+                .map(|s| s.name.clone())
+                .collect()
         };
         assert_eq!(names(0), ["s0", "s2"]);
         assert_eq!(names(1), ["s1", "s3"]);

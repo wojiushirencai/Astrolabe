@@ -5049,7 +5049,9 @@ fn levenshtein<T: PartialEq>(a: &[T], b: &[T]) -> usize {
         row[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let above = row[j + 1];
-            row[j + 1] = (diag + usize::from(ca != cb)).min(above + 1).min(row[j] + 1);
+            row[j + 1] = (diag + usize::from(ca != cb))
+                .min(above + 1)
+                .min(row[j] + 1);
             diag = above;
         }
     }
@@ -6384,8 +6386,22 @@ mod tests {
         }
         let long = "x".repeat(70) + "abc";
         let words = [
-            "", "a", "ab", "ba", "kitten", "sitting", "flaw", "lawn", "café", "cafe", "日本語", "日本",
-            "zzqqxx_nomatch", "jsonserializer", &long, "xabcx",
+            "",
+            "a",
+            "ab",
+            "ba",
+            "kitten",
+            "sitting",
+            "flaw",
+            "lawn",
+            "café",
+            "cafe",
+            "日本語",
+            "日本",
+            "zzqqxx_nomatch",
+            "jsonserializer",
+            &long,
+            "xabcx",
         ];
         for a in words {
             for b in words {
