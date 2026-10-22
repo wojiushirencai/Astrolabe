@@ -3,7 +3,7 @@
 给没有 Rust 工具链的用户用 `npx` 跑 Astrolabe MCP server。主包是零依赖 Node shim，六个平台包通过 `optionalDependencies` 按 `os` / `cpu` / `libc` 各装一个二进制。
 
 ```bash
-npx -y @astrolabe-ai/astrolabe /path/to/repo
+npx -y @zlnap/astrolabe /path/to/repo
 ```
 
 本目录是独立的 npm workspace。**不要**把 `packages/` 打进主包 tarball。
@@ -18,7 +18,7 @@ npm/
   scripts/publish.js            先发六个平台包，再发主包；可重跑
   scripts/verify-install.js     MCP tools/list + 退出码实测
   packages/astrolabe/           发布名 astrolabe（shim）
-  packages/<platform>/          发布名 @astrolabe-ai/<platform>
+  packages/<platform>/          发布名 @zlnap/<platform>
 ```
 
 ## GitHub Releases 契约
@@ -27,12 +27,12 @@ npm/
 
 | 平台包 | rustc target | 归档 |
 |---|---|---|
-| `@astrolabe-ai/darwin-arm64` | `aarch64-apple-darwin` | `astrolabe-aarch64-apple-darwin.tar.gz` |
-| `@astrolabe-ai/darwin-x64` | `x86_64-apple-darwin` | `astrolabe-x86_64-apple-darwin.tar.gz` |
-| `@astrolabe-ai/linux-x64-gnu` | `x86_64-unknown-linux-gnu` | `astrolabe-x86_64-unknown-linux-gnu.tar.gz` |
-| `@astrolabe-ai/linux-x64-musl` | `x86_64-unknown-linux-musl` | `astrolabe-x86_64-unknown-linux-musl.tar.gz` |
-| `@astrolabe-ai/linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | `astrolabe-aarch64-unknown-linux-gnu.tar.gz` |
-| `@astrolabe-ai/win32-x64-msvc` | `x86_64-pc-windows-msvc` | `astrolabe-x86_64-pc-windows-msvc.zip` |
+| `@zlnap/darwin-arm64` | `aarch64-apple-darwin` | `astrolabe-aarch64-apple-darwin.tar.gz` |
+| `@zlnap/darwin-x64` | `x86_64-apple-darwin` | `astrolabe-x86_64-apple-darwin.tar.gz` |
+| `@zlnap/linux-x64-gnu` | `x86_64-unknown-linux-gnu` | `astrolabe-x86_64-unknown-linux-gnu.tar.gz` |
+| `@zlnap/linux-x64-musl` | `x86_64-unknown-linux-musl` | `astrolabe-x86_64-unknown-linux-musl.tar.gz` |
+| `@zlnap/linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | `astrolabe-aarch64-unknown-linux-gnu.tar.gz` |
+| `@zlnap/win32-x64-msvc` | `x86_64-pc-windows-msvc` | `astrolabe-x86_64-pc-windows-msvc.zip` |
 
 另外必须有 `SHA256SUMS`（GNU coreutils：`<hex>  <filename>`）。归档根目录放 `astrolabe` 或 `astrolabe.exe`。
 
@@ -81,4 +81,4 @@ node scripts/publish.js [--dry-run] [--otp …] [--tag latest]
 
 ## 已知的包名占用
 
-npm 上未加 scope 的 [`astrolabe`](https://www.npmjs.com/package/astrolabe)（2014 年 Protractor 辅助包）和 [`astrolabe-ai`](https://www.npmjs.com/package/astrolabe-ai)（与本项目无关的简历工具）都已被他人占用（2026-10-18 核对）。本项目使用 scope 包 `@astrolabe-ai/astrolabe` 与 `@astrolabe-ai/<platform>`，发布前需要先在 npm 上创建 org `astrolabe-ai`，并在 GitHub 仓库 secrets 里配置 `NPM_TOKEN`（见 `docs/distribution/npm-publish.workflow.yml`（需先复制到 `.github/workflows/` 才生效））。二进制名仍是 `astrolabe`。
+npm 上未加 scope 的 [`astrolabe`](https://www.npmjs.com/package/astrolabe)（2014 年 Protractor 辅助包）和 [`astrolabe-ai`](https://www.npmjs.com/package/astrolabe-ai)（与本项目无关的简历工具）都已被他人占用（2026-10-18 核对）。本项目使用 scope 包 `@zlnap/astrolabe` 与 `@zlnap/<platform>`，发布用 npm 账号 `zlnap` 的个人 scope（无需建 org；npm 上的 org `astrolabe-ai` 已被他人占用），CI 发布需在 GitHub 仓库 secrets 里配置 `NPM_TOKEN`（见 `docs/distribution/npm-publish.workflow.yml`（需先复制到 `.github/workflows/` 才生效））。二进制名仍是 `astrolabe`。

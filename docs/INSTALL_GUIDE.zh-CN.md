@@ -49,7 +49,7 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 
 ### 方式 4：npm（尚未发布）
 
-npm 包名为 **`@astrolabe-ai/astrolabe`**（二进制名仍是 `astrolabe`）。**目前未发布到 npm**，发布需要先创建 npm org `astrolabe-ai` 并配置 `NPM_TOKEN`；发布后可用 `npx -y @astrolabe-ai/astrolabe .`。注意：npm 上未加 scope 的 `astrolabe` 和 `astrolabe-ai` 是与本项目无关的他人的包，请不要用它们。
+npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`）。**目前未发布到 npm**，发布使用 npm 账号 `zlnap` 的个人 scope（无需建 org），CI 发布需配置 `NPM_TOKEN`；发布后可用 `npx -y @zlnap/astrolabe .`。注意：npm 上未加 scope 的 `astrolabe` 和 `astrolabe-ai` 是与本项目无关的他人的包，请不要用它们。
 
 ### 方式 5：从源码编译（Rust 1.90+）
 

@@ -16,7 +16,7 @@ const os = require('os');
 const PLATFORMS = [
   {
     key: 'darwin-arm64',
-    npmPackage: '@astrolabe-ai/darwin-arm64',
+    npmPackage: '@zlnap/darwin-arm64',
     rustTarget: 'aarch64-apple-darwin',
     npmOs: 'darwin',
     npmCpu: 'arm64',
@@ -26,7 +26,7 @@ const PLATFORMS = [
   },
   {
     key: 'darwin-x64',
-    npmPackage: '@astrolabe-ai/darwin-x64',
+    npmPackage: '@zlnap/darwin-x64',
     rustTarget: 'x86_64-apple-darwin',
     npmOs: 'darwin',
     npmCpu: 'x64',
@@ -36,7 +36,7 @@ const PLATFORMS = [
   },
   {
     key: 'linux-x64-gnu',
-    npmPackage: '@astrolabe-ai/linux-x64-gnu',
+    npmPackage: '@zlnap/linux-x64-gnu',
     rustTarget: 'x86_64-unknown-linux-gnu',
     npmOs: 'linux',
     npmCpu: 'x64',
@@ -46,7 +46,7 @@ const PLATFORMS = [
   },
   {
     key: 'linux-x64-musl',
-    npmPackage: '@astrolabe-ai/linux-x64-musl',
+    npmPackage: '@zlnap/linux-x64-musl',
     rustTarget: 'x86_64-unknown-linux-musl',
     npmOs: 'linux',
     npmCpu: 'x64',
@@ -56,7 +56,7 @@ const PLATFORMS = [
   },
   {
     key: 'linux-arm64-gnu',
-    npmPackage: '@astrolabe-ai/linux-arm64-gnu',
+    npmPackage: '@zlnap/linux-arm64-gnu',
     rustTarget: 'aarch64-unknown-linux-gnu',
     npmOs: 'linux',
     npmCpu: 'arm64',
@@ -66,7 +66,7 @@ const PLATFORMS = [
   },
   {
     key: 'win32-x64-msvc',
-    npmPackage: '@astrolabe-ai/win32-x64-msvc',
+    npmPackage: '@zlnap/win32-x64-msvc',
     rustTarget: 'x86_64-pc-windows-msvc',
     npmOs: 'win32',
     npmCpu: 'x64',

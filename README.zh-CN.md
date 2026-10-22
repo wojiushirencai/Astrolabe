@@ -30,7 +30,7 @@
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 ```
 
-其它方式（手动下载、Windows、源码编译）见 [安装指南](docs/INSTALL_GUIDE.zh-CN.md)。npm 包 `@astrolabe-ai/astrolabe` 已准备好，但**尚未发布**。
+其它方式（手动下载、Windows、源码编译）见 [安装指南](docs/INSTALL_GUIDE.zh-CN.md)。npm 包 `@zlnap/astrolabe` 已准备好，但**尚未发布**。
 
 **2. 接入客户端。** Claude Code：
 

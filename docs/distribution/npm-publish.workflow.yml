@@ -1,8 +1,8 @@
 # NOT ACTIVE: copy to .github/workflows/npm-publish.yml to enable. (Kept here because the token used to prepare this PR has no `workflow` scope.)
-# Manual npm publish for @astrolabe-ai/astrolabe and @astrolabe-ai/<platform>.
+# Manual npm publish for @zlnap/astrolabe and @zlnap/<platform>.
 #
 # Never runs automatically. Requirements before first use:
-#   1. The npm org/scope `astrolabe-ai` exists and the publishing account is a member.
+#   1. The publishing token belongs to npm account `zlnap` (owner of the `@zlnap` scope).
 #   2. Repository secret NPM_TOKEN (automation token with publish rights on that scope).
 #   3. The GitHub Release for the tag already exists (release.yml builds it).
 # Without NPM_TOKEN the job fails fast with a clear message and publishes nothing.

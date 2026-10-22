@@ -104,7 +104,7 @@ crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当�
 ### 分发与文档（无二进制行为变更）
 
 - **安装修复**：新增 `install.sh`（下载对应平台 Release 归档并校验 sha256，不改 PATH/配置）；README/安装指南删除不存在的 `dist/release-binaries/` 说明，并补 `claude mcp add` 一行命令（已实测语法）。
-- **npm 重命名**：未加 scope 的 `astrolabe`、`astrolabe-ai` 均被他人占用，包名改为 `@astrolabe-ai/astrolabe` 与 `@astrolabe-ai/<platform>`（二进制名仍是 `astrolabe`）；修正 npm 回退下载（原指向错误仓库与 Gitee、归档名缺版本号）；新增手动触发的 npm 发布工作流模板 `docs/distribution/npm-publish.workflow.yml`（未启用：需维护者复制到 `.github/workflows/`；需要 `NPM_TOKEN` 与 npm org `astrolabe-ai`，**尚未发布**）。
+- **npm 重命名**：未加 scope 的 `astrolabe`、`astrolabe-ai` 均被他人占用，包名改为 `@zlnap/astrolabe` 与 `@zlnap/<platform>`（二进制名仍是 `astrolabe`）；修正 npm 回退下载（原指向错误仓库与 Gitee、归档名缺版本号）；新增手动触发的 npm 发布工作流模板 `docs/distribution/npm-publish.workflow.yml`（未启用：需维护者复制到 `.github/workflows/`；需要 `NPM_TOKEN`（npm 账号 `zlnap`，org `astrolabe-ai` 已被他人占用），**尚未发布**）。
 - **README 重写**：英文为主（`README.zh-CN.md` 同步），首屏事实卡、3 步安装、证据与局限、适合/不适合；删除无出处或过期的说法（对 Serena/OpenVisio 的“10 倍/99%”、“不烧一分钱 Token”节、11 MB、190+ 测试等）；防漂移 Hook 不再作为卖点（`docs/HOOKS.md`，注明效果未做基准）；详细内容移到 `docs/`。
 - **评测脚本开源**：`bench/`（配对 A/B 脚本、任务定义、含 N5/N8 两种口径的评分器、复现说明；不含密钥/代理地址/私有仓库任务）。
 - 新增 `llms.txt`、`docs/FAQ.md`、`docs/distribution/`（渠道提交材料）、`glama.json`、Claude Code 插件市场清单（`.claude-plugin/`、`claude-plugin/`）。

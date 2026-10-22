@@ -5,7 +5,7 @@ Prepared 2026-10-18. Needs the maintainer's OK; then run the commands below.
 **Description (≤350 chars):**
 `Local MCP server for code search and navigation (search_code, find_symbol, find_references, goto_definition) for Claude Code, Cursor and Codex. Rust single binary, tree-sitter index, language servers on demand.`
 
-**Homepage:** `https://github.com/wojiushirencai/Astrolabe#readme` (or leave empty until npm exists; once published use `https://www.npmjs.com/package/@astrolabe-ai/astrolabe`).
+**Homepage:** `https://github.com/wojiushirencai/Astrolabe#readme` (or leave empty until npm exists; once published use `https://www.npmjs.com/package/@zlnap/astrolabe`).
 
 **Topics (20):** `mcp` `mcp-server` `model-context-protocol` `code-search` `code-navigation` `code-intelligence` `claude-code` `codex` `cursor` `windsurf` `tree-sitter` `language-server` `lsp` `ai-coding` `coding-agent` `rust` `developer-tools` `static-analysis` `ripgrep-alternative` `token-efficiency`
 
