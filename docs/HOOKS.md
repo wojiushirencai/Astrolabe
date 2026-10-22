@@ -271,6 +271,38 @@ export default AstrolabeGuard;
 ---
 
 
+## DeepSeek Harness（原生插件）
+
+DSH 没有自己的 `hooks.json`：它的"原生 hook"就是一个订阅 `tools/pre-execute` 等生命周期事件的 Cordis 插件，`dsh-hooks-claude-code` 只是把外部 shell hook 协议翻译到同一套 API 的中间层。因此 DSH 有两条接入路径：
+
+### 方式一：原生插件（推荐）
+
+用 `dsh-plugin/`（本仓库自带，包名 `astrolabe-dsh-guard`，声明 `dsh.bundle`）。它直接调用 `astrolabe hooks remind` 并把返回的 `permissionDecision` 映射成 DSH 的 `PreToolDecision`，不需要桥接包、外部 `hooks.json` 或包装脚本。
+
+```yaml
+# ~/.dsh/cordis.patch.yml
+- insert:
+    - id: astrolabe-guard
+      name: 'astrolabe-dsh-guard'
+      config:
+        client: claude-code
+```
+
+### 方式二：经 `dsh-hooks-claude-code` 桥接
+
+若已在用该桥接包，写一个 `PreToolUse` 的 `hooks.json` 指向 `astrolabe hooks remind --client=claude-code`，并在 `cordis.patch.yml` 里 `configPath` 指向它即可。
+
+### DSH 上的两个必须注意点
+
+1. **matcher 必须是 `*`，不能只写 `grep|read`。** 计数只在 hook 看到 Astrolabe 工具调用时才会清零；只把 grep/read 送进 hook 会让计数只增不清，正确使用 Astrolabe 的会话也会被永久拦截（直到空闲超时）。非相关工具由 Astrolabe 自行放行，开销可忽略。
+2. **hook 进程需要可写的 `HOME`。** DSH 在文件 sandbox 里执行 hook 命令，用户家目录可读不可写，`~/.astrolabe/hook_data/` 的计数写入会失败并使 hook 静默 fail-open（表现为"装了但从不拦"）。请把 hook 进程的 `HOME` 指向可写目录（原生插件已默认指向 `<tmpdir>/astrolabe-dsh-guard`），不要把 sandbox 放宽来解决。
+
+### 工具名
+
+DSH 可为每个仓库注册一个 MCP server，工具名形如 `mcp__astrolabe-<repo>__find_symbol`。`is_astrolabe_tool` 按子串匹配（`astrolabe` + 目录里的工具名），因此**无需改写工具名**即可正确识别与清零。
+
+------
+
 ## 输入异常与退出码（fail-open）
 
 宿主语义里 exit 2 通常等于"拦截这次工具调用"，所以 `astrolabe hooks remind` / `cleanup` 遇到空 stdin、非 JSON、缺 `session_id`/`tool_name` 一律 **fail-open**：stderr 打一行提示并返回 0，不会拦住工具调用。`session_id` 含点、冒号、空格等字符时不拒绝，而是哈希成 `s-<fnv1a64>` 目录名（remind 与 cleanup 用同一映射）。只有"拦截"本身通过 stdout 的 deny JSON 表达。
