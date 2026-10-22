@@ -15,7 +15,7 @@ Honesty rule for all copy: use only the measured claims in the README (15 self-d
 
 ## 1. npm (prerequisite for the official registry) — needs the maintainer
 
-1. Create the npm org/scope `astrolabe-ai` (the unscoped names `astrolabe` and `astrolabe-ai` are taken by unrelated packages; checked 2026-10-18).
+1. Publish under the personal npm scope `zlnap` (account `zlnap`; no org needed — the npm org `astrolabe-ai` is owned by someone else, and the unscoped names `astrolabe` and `astrolabe-ai` are taken by unrelated packages; checked 2026-10-18).
 2. Add repository secret `NPM_TOKEN` (automation token with publish rights on the scope).
 3. Copy `docs/distribution/npm-publish.workflow.yml` to `.github/workflows/npm-publish.yml` (not done in the PR: the token used to push it lacks the `workflow` scope), then run workflow **npm-publish** (`workflow_dispatch`) with `tag=v0.13.0`, first with `dry_run=true`, then `false`. The workflow takes binaries from the release tag and package sources from `source_ref` (default `main`, whose `npm/` version is also 0.13.0 after this PR), so v0.13.0 can be published without a new release. The v0.13.0 tag itself still has the old package names.
 

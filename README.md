@@ -30,7 +30,7 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 ```
 
-Other ways (manual download, Windows, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md). An npm package `@astrolabe-ai/astrolabe` is prepared but **not published yet**.
+Other ways (manual download, Windows, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md). An npm package `@zlnap/astrolabe` is prepared but **not published yet**.
 
 **2. Connect your client.** Claude Code:
 

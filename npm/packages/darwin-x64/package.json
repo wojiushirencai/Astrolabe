@@ -1,5 +1,5 @@
 {
-  "name": "@astrolabe-ai/darwin-x64",
+  "name": "@zlnap/darwin-x64",
   "version": "0.16.0",
   "description": "The macOS x86_64 binary for Astrolabe AI (x86_64-apple-darwin)",
   "license": "MIT OR Apache-2.0",

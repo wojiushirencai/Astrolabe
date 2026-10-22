@@ -2,7 +2,7 @@
 
 Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-10-18 for v0.13.0.
 
-> **Name check.** This project is *Astrolabe AI* (GitHub: `wojiushirencai/Astrolabe`, binary: `astrolabe`). It is **not** the npm packages `astrolabe` (a 2014 Protractor page-object library) or `astrolabe-ai` (an unrelated resume tool), nor the other MCP servers that happen to be called "astrolabe". Install only from this repository's GitHub Releases or the `@astrolabe-ai/*` npm scope (once published).
+> **Name check.** This project is *Astrolabe AI* (GitHub: `wojiushirencai/Astrolabe`, binary: `astrolabe`). It is **not** the npm packages `astrolabe` (a 2014 Protractor page-object library) or `astrolabe-ai` (an unrelated resume tool), nor the other MCP servers that happen to be called "astrolabe". Install only from this repository's GitHub Releases or the `@zlnap/*` npm scope (once published).
 
 ## 1. Get the binary
 
@@ -45,7 +45,7 @@ Download `astrolabe-<version>-x86_64-pc-windows-msvc.zip`, compare `Get-FileHash
 
 ### Option 4 — npm (not published yet)
 
-The npm package is **`@astrolabe-ai/astrolabe`** (binary name stays `astrolabe`), with platform packages `@astrolabe-ai/<platform>`. It is **not on npm yet**: publishing needs the npm org `astrolabe-ai` and an `NPM_TOKEN` repository secret (workflow template: `docs/distribution/npm-publish.workflow.yml`, to be copied into `.github/workflows/` by a maintainer). After publishing: `npx -y @astrolabe-ai/astrolabe .`.
+The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with platform packages `@zlnap/<platform>`. It is **not on npm yet**: it is published from the personal npm scope `zlnap` (no org needed; the npm org `astrolabe-ai` belongs to someone else); CI publishing needs an `NPM_TOKEN` repository secret (workflow template: `docs/distribution/npm-publish.workflow.yml`, to be copied into `.github/workflows/` by a maintainer). After publishing: `npx -y @zlnap/astrolabe .`.
 
 ### Option 5 — build from source (Rust 1.90+)
 

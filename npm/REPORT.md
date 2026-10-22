@@ -16,7 +16,7 @@ npm/
   packages/astrolabe/              # 主包 name: astrolabe，零 runtime 依赖
     bin/astrolabe.js               # shebang shim
     lib/{platforms,resolve,download,run}.js
-  packages/darwin-arm64/           # @astrolabe-ai/darwin-arm64
+  packages/darwin-arm64/           # @zlnap/darwin-arm64
   packages/darwin-x64/
   packages/linux-x64-gnu/          # libc: glibc
   packages/linux-x64-musl/         # libc: musl
@@ -26,7 +26,7 @@ npm/
 
 主包 `optionalDependencies` 六个平台包，版本号与主包锁定为同一 `0.1.0`。npm 按 `os` / `cpu` / `libc` 只装匹配当前机器的那一个。
 
-平台包 `bin` 名字是 `astrolabe-<platform>`，避免和主包的 `astrolabe` 抢 `node_modules/.bin`。shim 不走这个 bin 名，而是 `require.resolve('@astrolabe-ai/<platform>/package.json')` 再拼二进制路径。
+平台包 `bin` 名字是 `astrolabe-<platform>`，避免和主包的 `astrolabe` 抢 `node_modules/.bin`。shim 不走这个 bin 名，而是 `require.resolve('@zlnap/<platform>/package.json')` 再拼二进制路径。
 
 ### GitHub Releases 契约（给并行流水线）
 
@@ -34,19 +34,19 @@ tag：`v${version}`。归档根目录放 `astrolabe` 或 `astrolabe.exe`，另�
 
 | 平台包 | rustc target | 归档 |
 |---|---|---|
-| `@astrolabe-ai/darwin-arm64` | `aarch64-apple-darwin` | `astrolabe-aarch64-apple-darwin.tar.gz` |
-| `@astrolabe-ai/darwin-x64` | `x86_64-apple-darwin` | `astrolabe-x86_64-apple-darwin.tar.gz` |
-| `@astrolabe-ai/linux-x64-gnu` | `x86_64-unknown-linux-gnu` | `astrolabe-x86_64-unknown-linux-gnu.tar.gz` |
-| `@astrolabe-ai/linux-x64-musl` | `x86_64-unknown-linux-musl` | `astrolabe-x86_64-unknown-linux-musl.tar.gz` |
-| `@astrolabe-ai/linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | `astrolabe-aarch64-unknown-linux-gnu.tar.gz` |
-| `@astrolabe-ai/win32-x64-msvc` | `x86_64-pc-windows-msvc` | `astrolabe-x86_64-pc-windows-msvc.zip` |
+| `@zlnap/darwin-arm64` | `aarch64-apple-darwin` | `astrolabe-aarch64-apple-darwin.tar.gz` |
+| `@zlnap/darwin-x64` | `x86_64-apple-darwin` | `astrolabe-x86_64-apple-darwin.tar.gz` |
+| `@zlnap/linux-x64-gnu` | `x86_64-unknown-linux-gnu` | `astrolabe-x86_64-unknown-linux-gnu.tar.gz` |
+| `@zlnap/linux-x64-musl` | `x86_64-unknown-linux-musl` | `astrolabe-x86_64-unknown-linux-musl.tar.gz` |
+| `@zlnap/linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | `astrolabe-aarch64-unknown-linux-gnu.tar.gz` |
+| `@zlnap/win32-x64-msvc` | `x86_64-pc-windows-msvc` | `astrolabe-x86_64-pc-windows-msvc.zip` |
 
 ## 2. Shim 定位与回退
 
 顺序：
 
 1. `ASTROLABE_BINARY_PATH`（测试 / 开发覆盖）
-2. `require.resolve('@astrolabe-ai/<当前平台>')` 得到 optionalDependency 里的二进制，必要时 `chmod +x`
+2. `require.resolve('@zlnap/<当前平台>')` 得到 optionalDependency 里的二进制，必要时 `chmod +x`
 3. Yarn PnP 的 `.zip/` 虚路径会先拷到真实缓存再执行
 4. 以上都失败（`--omit=optional`、`--ignore-scripts`、npm < 11 lockfile 丢 optionalDependencies、跨架构拷贝 `node_modules`）→ 从 GitHub Releases 拉 `SHA256SUMS` + 归档，**校验 SHA256 通过才解压**，写入 `~/.astrolabe/bin/<version>/<platform>/`（可用 `ASTROLABE_CACHE_DIR` 改），后续调用命中缓存。下载用目录锁，避免并发打穿。
 
@@ -121,7 +121,7 @@ npm install --omit=optional dist/astrolabe-darwin-arm64-0.1.0.tgz dist/astrolabe
 
 lrwxr-xr-x  node_modules/.bin/astrolabe -> ../astrolabe/bin/astrolabe.js
 -rwxr-xr-x  node_modules/astrolabe/bin/astrolabe.js
--rwxr-xr-x  node_modules/@astrolabe-ai/darwin-arm64/astrolabe   12249184 bytes
+-rwxr-xr-x  node_modules/@zlnap/darwin-arm64/astrolabe   12249184 bytes
 npx which: /private/tmp/astrolabe-npm-install-7UsE/node_modules/.bin/astrolabe
 ```
 
@@ -178,7 +178,7 @@ sha256-mismatch fail-closed: ok
 
 ## 6. 发布注意事项
 
-registry 上已有 2014 年的 Protractor 辅助包占用未加 scope 的 [`astrolabe`](https://www.npmjs.com/package/astrolabe)。（后续更新）未加 scope 的 `astrolabe`、`astrolabe-ai` 均被他人占用，现用 `@astrolabe-ai/astrolabe`，需先建 npm org `astrolabe-ai`。
+registry 上已有 2014 年的 Protractor 辅助包占用未加 scope 的 [`astrolabe`](https://www.npmjs.com/package/astrolabe)。（后续更新）未加 scope 的 `astrolabe`、`astrolabe-ai` 均被他人占用，现用 `@zlnap/astrolabe`，用 npm 个人账号 `zlnap` 的 scope，无需建 org。
 
 许可字段已写 `MIT OR Apache-2.0`，与 Cargo workspace 一致。LICENSE 正文由并行任务放在仓库根；主包 `files` 未内嵌，避免和 LICENSE 任务双写。
 
