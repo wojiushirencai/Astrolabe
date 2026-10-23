@@ -2,7 +2,7 @@
 
 Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-10-18 for v0.13.0.
 
-> **Name check.** This project is *Astrolabe AI* (GitHub: `wojiushirencai/Astrolabe`, binary: `astrolabe`). It is **not** the npm packages `astrolabe` (a 2014 Protractor page-object library) or `astrolabe-ai` (an unrelated resume tool), nor the other MCP servers that happen to be called "astrolabe". Install only from this repository's GitHub Releases or the `@zlnap/*` npm scope (once published).
+> **Name check.** This project is *Astrolabe AI* (GitHub: `wojiushirencai/Astrolabe`, binary: `astrolabe`). It is **not** the npm packages `astrolabe` (a 2014 Protractor page-object library) or `astrolabe-ai` (an unrelated resume tool), nor the other MCP servers that happen to be called "astrolabe". Install only from this repository's GitHub Releases or the `@zlnap/*` npm scope.
 
 ## 1. Get the binary
 
@@ -43,9 +43,9 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 
 Download `astrolabe-<version>-x86_64-pc-windows-msvc.zip`, compare `Get-FileHash -Algorithm SHA256` with `SHA256SUMS`, unzip `astrolabe.exe` to a fixed folder and add it to `PATH`. (The Windows steps were not exercised in this change.)
 
-### Option 4 — npm (not published yet)
+### Option 4 — npm
 
-The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with platform packages `@zlnap/<platform>`. It is **not on npm yet**: it is published from the personal npm scope `zlnap` (no org needed; the npm org `astrolabe-ai` belongs to someone else); CI publishing needs an `NPM_TOKEN` repository secret (workflow template: `docs/distribution/npm-publish.workflow.yml`, to be copied into `.github/workflows/` by a maintainer). After publishing: `npx -y @zlnap/astrolabe .`.
+The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with platform packages `@zlnap/<platform>`. Published under the personal npm scope `zlnap` (no org needed; the npm org `astrolabe-ai` belongs to someone else); Install: `npx -y @zlnap/astrolabe .` then `npx -y @zlnap/astrolabe setup` to wire MCP clients. (Optional CI publish workflow template: `docs/distribution/npm-publish.workflow.yml`.)
 
 ### Option 5 — build from source (Rust 1.90+)
 
@@ -57,6 +57,19 @@ cargo build --release --bin astrolabe      # target/release/astrolabe
 Verify with `astrolabe --version`, then restart your client so it picks up the new MCP server.
 
 ## 2. Client configuration
+
+### One-shot setup (recommended)
+
+After installing the npm package (or with `npx`), run:
+
+```bash
+npx -y @zlnap/astrolabe setup
+```
+
+The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, and Continue on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's MCP config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag. Useful flags: `--yes` (all detected), `--clients=cursor,claude-code`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--no-cursor-permissions`.
+
+Cargo-only installs: `astrolabe setup` re-execs the same flow via `npx` when Node is available.
+
 
 Astrolabe is a stdio MCP server: `astrolabe . --context=<client>`. `.` means "index the repo containing the working directory". Use an absolute path for `command` if `astrolabe` is not on your PATH.
 

@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
             let subcommand = args.get(1).is_some_and(|a| {
                 matches!(
                     a.to_string_lossy().as_ref(),
-                    "hooks" | "print-cc-system-prompt-override"
+                    "hooks" | "print-cc-system-prompt-override" | "setup"
                 )
             });
             if subcommand {
@@ -89,6 +89,26 @@ async fn main() -> anyhow::Result<()> {
         Launch::Version => {
             println!("astrolabe {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        Launch::Setup { args } => {
+            // Interactive MCP client setup ships with the npm package (Node).
+            // Prefer re-exec via npx so cargo-only installs still work when
+            // network/npm is available; otherwise print the install hint.
+            let status = std::process::Command::new("npx")
+                .arg("-y")
+                .arg("@zlnap/astrolabe")
+                .arg("setup")
+                .args(&args)
+                .status();
+            match status {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(err) => {
+                    eprintln!(
+                        "astrolabe setup is provided by the npm package (@zlnap/astrolabe).\nCould not run `npx` ({err}).\nInstall Node.js, then: npx -y @zlnap/astrolabe setup\nOr: npm i -g @zlnap/astrolabe && astrolabe setup"
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         Launch::HooksRemind {
             client,
