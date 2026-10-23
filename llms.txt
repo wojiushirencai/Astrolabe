@@ -2,7 +2,7 @@
 
 > Astrolabe AI is a local MCP server that gives Claude Code, Cursor and Codex fast code search, symbol lookup and reference navigation, with directory-level counts for questions like "how many call sites per module". Single Rust binary named `astrolabe`; indexes with tree-sitter and starts language servers on demand. Not related to the npm packages `astrolabe` or `astrolabe-ai`.
 
-Facts (as of 2026-10-21, version 0.16.0):
+Facts (as of 2026-10-23, version 0.17.0):
 - Repository: https://github.com/wojiushirencai/Astrolabe
 - License: MIT OR Apache-2.0
 - Tools (7): resolve_context, search_code, find_symbol, find_references, goto_definition, get_diagnostics, get_languages

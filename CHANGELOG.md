@@ -2,9 +2,27 @@
 
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-crates.io / npm 尚未发布；tag 与 release 记录见 GitHub Releases。当前 workspace 版本见 `[workspace.package]`。
+npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release 记录见 GitHub Releases。当前 workspace 版本见 `[workspace.package]`。
 
 ## [Unreleased]
+
+## [0.17.0] - 2026-10-23
+
+自 v0.16.0 以来的 PR：#90（npm 改发个人 scope `@zlnap`）、#91（DeepSeek Harness 原生 hook 插件）、#92（`astrolabe setup` 一键探测并合并 MCP）、#93（setup 支持 OpenCode / DSH）、#94（setup 支持 Codebuddy / Grok Build / Kimi Code / ZCode）。本版以 **npm/CLI 安装体验** 为主；Rust 索引与工具行为相对 0.16.0 无功能变更。完整说明见 GitHub Release。
+
+### 新增
+
+- **`astrolabe setup` / `npx -y @zlnap/astrolabe setup`**：探测本机已装客户端，交互多选后**合并**写入 MCP 配置（不清空其它 server）。支持 Claude Code、Cursor、Codex、Windsurf、Cline、Roo、Continue、OpenCode、DeepSeek Harness、Codebuddy、Grok Build、Kimi Code、ZCode。常用参数：`--yes`、`--clients=…`、`--dry-run`、`--native`、`--list`、`--with-hooks`、`--no-cursor-permissions`。
+- **`--with-hooks`（可选，效果未做基准）**：OpenCode 写入守卫插件；Codebuddy / Grok / Kimi / ZCode 写入各自 hooks 配方。ZCode：**不写 `SessionEnd`**，也不在 `Stop` 上挂 cleanup。
+- **DeepSeek Harness**：vendored `astrolabe-dsh-guard` + `~/.dsh/cordis.patch.yml` 托管块合并（不碰 `orca-managed-dsh-hooks`）；DSH 的 MCP 仍按仓库在 UI 配置。
+
+### 分发
+
+- npm 包发布在个人 scope **`@zlnap/astrolabe`** 与 `@zlnap/<platform>`（npm org `astrolabe-ai` 已被占用，见 #90）。
+
+### 文档
+
+- 安装指南（中/英）与 README 对齐完整 setup 客户端列表与配置路径。
 
 ## [0.16.0] - 2026-10-21
 
