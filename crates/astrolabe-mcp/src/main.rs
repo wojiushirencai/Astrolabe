@@ -104,12 +104,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(status) => std::process::exit(status.code().unwrap_or(1)),
                 Err(err) => {
                     eprintln!(
-                        concat!(
-                            "astrolabe setup is provided by the npm package (@zlnap/astrolabe).\n",
-                            "Could not run `npx` ({err}).\n",
-                            "Install Node.js, then: npx -y @zlnap/astrolabe setup\n",
-                            "Or: npm i -g @zlnap/astrolabe && astrolabe setup"
-                        )
+                        "astrolabe setup is provided by the npm package (@zlnap/astrolabe).\nCould not run `npx` ({err}).\nInstall Node.js, then: npx -y @zlnap/astrolabe setup\nOr: npm i -g @zlnap/astrolabe && astrolabe setup"
                     );
                     std::process::exit(1);
                 }

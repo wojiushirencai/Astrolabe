@@ -62,7 +62,9 @@ pub enum Launch {
     HooksGc,
     PrintCcSystemPromptOverride,
     /// npm-shipped interactive MCP client setup (cargo binary prints a hint).
-    Setup { args: Vec<OsString> },
+    Setup {
+        args: Vec<OsString>,
+    },
     Run {
         requested_root: PathBuf,
         context: ClientContext,
