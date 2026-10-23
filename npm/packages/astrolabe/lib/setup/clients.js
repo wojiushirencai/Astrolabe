@@ -5,6 +5,10 @@ const os = require('os');
 const path = require('path');
 const opencodeMod = require('./opencode');
 const dshMod = require('./dsh');
+const codebuddyMod = require('./codebuddy');
+const grokMod = require('./grok');
+const kimicodeMod = require('./kimicode');
+const zcodeMod = require('./zcode');
 const PACKAGE_NAME = '@zlnap/astrolabe';
 const SERVER_NAME = 'astrolabe';
 
@@ -623,11 +627,243 @@ const CLIENTS = [
       };
     },
   },
+  {
+    id: 'codebuddy',
+    label: 'Codebuddy',
+    aliases: [],
+    context: null,
+    detect(home, env = process.env) {
+      return codebuddyMod.detectCodebuddy(home, env, { whichFn: which, existsFn: exists });
+    },
+    plan({ home, launch, withHooks = false }) {
+      const mcpPath = codebuddyMod.resolveCodebuddyMcpPath(home, exists);
+      const settingsPath = path.join(home, '.codebuddy', 'settings.json');
+      const entry = jsonServerEntry(launch, { typed: true });
+      const steps = [];
+      steps.push({
+        kind: 'json-mcp',
+        filePath: mcpPath,
+        summary: `merge mcpServers.astrolabe into ${mcpPath}`,
+        apply() {
+          const create =
+            exists(path.join(home, '.codebuddy')) ||
+            exists(mcpPath) ||
+            exists(path.join(home, '.codebuddy.json'));
+          const result = mergeJsonMcpFile(mcpPath, entry, { create });
+          if (result.skipped) return result;
+          return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
+        },
+      });
+      if (withHooks) {
+        steps.push({
+          kind: 'codebuddy-hooks',
+          filePath: settingsPath,
+          summary: `merge PreToolUse/SessionEnd into ${settingsPath}`,
+          apply() {
+            const create = exists(path.join(home, '.codebuddy')) || exists(settingsPath);
+            const result = codebuddyMod.mergeCodebuddyHooksSettings(settingsPath, {
+              create,
+              existsFn: exists,
+            });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
+          },
+        });
+      }
+      return {
+        kind: 'codebuddy',
+        filePath: mcpPath,
+        summary:
+          steps[0].summary + (withHooks ? `; hooks → ${settingsPath}` : ''),
+        steps,
+        apply() {
+          const results = [];
+          for (const step of steps) {
+            const applied = step.apply();
+            if (!applied.skipped && !applied.write && applied.doc) {
+              const fp = applied.filePath;
+              applied.write = () => writeJsonAtomic(fp, applied.doc);
+            }
+            results.push(applied);
+          }
+          const primary = results.find((r) => !r.skipped) || results[0];
+          return {
+            ...primary,
+            results,
+            write: () => {
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
+            },
+          };
+        },
+      };
+    },
+  },
+  {
+    id: 'grok',
+    label: 'Grok Build',
+    aliases: ['grokbuild', 'grok-build'],
+    context: null,
+    detect(home, env = process.env) {
+      return grokMod.detectGrok(home, env, { whichFn: which, existsFn: exists });
+    },
+    plan({ home, launch, withHooks = false }) {
+      const tomlPath = grokMod.resolveGrokConfigToml(home);
+      const hooksPath = grokMod.resolveGrokHooksPath(home);
+      const steps = [];
+      steps.push({
+        kind: 'grok-toml',
+        filePath: tomlPath,
+        summary: `merge [mcp_servers.astrolabe] into ${tomlPath}`,
+        apply() {
+          const create = exists(path.join(home, '.grok')) || exists(tomlPath);
+          if (!create) {
+            return { skipped: true, reason: `missing ${tomlPath} (will not create)` };
+          }
+          const result = mergeCodexToml(tomlPath, launch);
+          return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
+        },
+      });
+      if (withHooks) {
+        steps.push({
+          kind: 'grok-hooks',
+          filePath: hooksPath,
+          summary: `write ${hooksPath}`,
+          apply() {
+            const create = exists(path.join(home, '.grok')) || exists(hooksPath);
+            const result = grokMod.mergeGrokHooksFile(hooksPath, { create, existsFn: exists });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
+          },
+        });
+      }
+      return {
+        kind: 'grok',
+        filePath: tomlPath,
+        summary: steps[0].summary + (withHooks ? `; hooks → ${hooksPath}` : ''),
+        steps,
+        apply() {
+          const results = [];
+          for (const step of steps) {
+            const applied = step.apply();
+            results.push(applied);
+          }
+          const primary = results.find((r) => !r.skipped) || results[0];
+          return {
+            ...primary,
+            results,
+            write: () => {
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
+            },
+          };
+        },
+      };
+    },
+  },
+  {
+    id: 'kimicode',
+    label: 'Kimi Code',
+    aliases: ['kimi-code', 'kimi_code', 'kimi'],
+    context: null,
+    detect(home, env = process.env) {
+      return kimicodeMod.detectKimiCode(home, env, { whichFn: which, existsFn: exists });
+    },
+    plan({ home, launch, withHooks = false }) {
+      const mcpPath = kimicodeMod.resolveKimiMcpPath(home);
+      const tomlPath = kimicodeMod.resolveKimiConfigToml(home);
+      const entry = jsonServerEntry(launch);
+      const steps = [];
+      steps.push({
+        kind: 'json-mcp',
+        filePath: mcpPath,
+        summary: `merge mcpServers.astrolabe into ${mcpPath}`,
+        apply() {
+          const create = exists(path.join(home, '.kimi-code')) || exists(mcpPath);
+          const result = mergeJsonMcpFile(mcpPath, entry, { create });
+          if (result.skipped) return result;
+          return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
+        },
+      });
+      if (withHooks) {
+        steps.push({
+          kind: 'kimi-hooks',
+          filePath: tomlPath,
+          summary: `merge [[hooks]] into ${tomlPath}`,
+          apply() {
+            const create = exists(path.join(home, '.kimi-code')) || exists(tomlPath);
+            const result = kimicodeMod.mergeKimiHooksToml(tomlPath, { create, existsFn: exists });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
+          },
+        });
+      }
+      return {
+        kind: 'kimicode',
+        filePath: mcpPath,
+        summary: steps[0].summary + (withHooks ? `; hooks → ${tomlPath}` : ''),
+        steps,
+        apply() {
+          const results = [];
+          for (const step of steps) {
+            results.push(step.apply());
+          }
+          const primary = results.find((r) => !r.skipped) || results[0];
+          return {
+            ...primary,
+            results,
+            write: () => {
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
+            },
+          };
+        },
+      };
+    },
+  },
+  {
+    id: 'zcode',
+    label: 'ZCode',
+    aliases: ['z-code', 'zai'],
+    context: null,
+    detect(home, env = process.env) {
+      return zcodeMod.detectZCode(home, env, { whichFn: which, existsFn: exists });
+    },
+    plan({ home, launch, withHooks = false }) {
+      const filePath = zcodeMod.resolveZcodeConfigPath(home, exists);
+      return {
+        kind: 'zcode',
+        filePath,
+        summary:
+          `merge mcp.servers.astrolabe into ${filePath}` +
+          (withHooks ? ' (+ hooks.events.PreToolUse, no SessionEnd)' : ''),
+        apply() {
+          const create =
+            exists(path.join(home, '.zcode')) ||
+            exists(path.join(home, '.zcode', 'cli')) ||
+            exists(filePath);
+          const result = zcodeMod.mergeZcodeConfigFile(filePath, launch, {
+            create,
+            withHooks,
+            existsFn: exists,
+          });
+          if (result.skipped) return result;
+          return { ...result, write: () => writeJsonAtomic(filePath, result.doc) };
+        },
+      };
+    },
+  },
+
 ];
 
 function getClient(id) {
   return (
-    CLIENTS.find((c) => c.id === id || (Array.isArray(c.aliases) && c.aliases.includes(id))) || null
+    CLIENTS.find(
+      (c) => c && (c.id === id || (Array.isArray(c.aliases) && c.aliases.includes(id))),
+    ) || null
   );
 }
 
@@ -662,4 +898,15 @@ module.exports = {
   resolveDshPluginInstallDirs: dshMod.resolveDshPluginInstallDirs,
   OPENCODE_GUARD_TS: opencodeMod.OPENCODE_GUARD_TS,
   parseJsonc: require('./jsonc').parseJsonc,
+  // Codebuddy / Grok / Kimi / ZCode helpers (tests)
+  resolveCodebuddyMcpPath: codebuddyMod.resolveCodebuddyMcpPath,
+  mergeCodebuddyHooksSettings: codebuddyMod.mergeCodebuddyHooksSettings,
+  resolveGrokConfigToml: grokMod.resolveGrokConfigToml,
+  resolveGrokHooksPath: grokMod.resolveGrokHooksPath,
+  mergeGrokHooksFile: grokMod.mergeGrokHooksFile,
+  resolveKimiMcpPath: kimicodeMod.resolveKimiMcpPath,
+  resolveKimiConfigToml: kimicodeMod.resolveKimiConfigToml,
+  mergeKimiHooksToml: kimicodeMod.mergeKimiHooksToml,
+  resolveZcodeConfigPath: zcodeMod.resolveZcodeConfigPath,
+  mergeZcodeConfigFile: zcodeMod.mergeZcodeConfigFile,
 };

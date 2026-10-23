@@ -72,10 +72,14 @@ cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 npx -y @zlnap/astrolabe setup
 ```
 
-会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件）、`--no-cursor-permissions`。
+会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件，以及 Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`。
 
 - **OpenCode：** 合并进 `~/.config/opencode/opencode.jsonc`（或已有的 `.json` / 旧版 `config.json`，或 `~/.opencode/…`）。自动识别 V1（`mcp.<name>` + `enabled`）、V2（`mcp.servers`）或类 Claude 的 `mcpServers`；在父对象已存在时尽量保留 JSONC 注释。可选 `--with-hooks` 写入 `~/.config/opencode/plugins/astrolabe-guard.ts`。
 - **DeepSeek Harness：** 把自带的 `astrolabe-dsh-guard` 装进 `~/.dsh/profiles/**/node_modules`，并合并写入 `~/.dsh/cordis.patch.yml` 的托管块（不碰 `orca-managed-dsh-hooks`）。DSH 的 MCP 是按仓库在 UI 里配的，setup 不会代写。
+- **Codebuddy：** MCP 写入 `~/.codebuddy/.mcp.json`（若已有 `mcp.json` / `~/.codebuddy.json` 则合并进优先已存在的那个）；可选 `--with-hooks` 合并进 `~/.codebuddy/settings.json` 的 CC 兼容 `hooks`（PreToolUse + SessionEnd）。
+- **Grok Build：** MCP 合并进 `~/.grok/config.toml` 的 `[mcp_servers.astrolabe]`（与 Codex 同形）；可选 `--with-hooks` 写入 `~/.grok/hooks/astrolabe.json`。
+- **Kimi Code：** MCP 合并进 `~/.kimi-code/mcp.json`；可选 `--with-hooks` 在 `~/.kimi-code/config.toml` 追加托管 `[[hooks]]` 块（不覆盖其它 hooks）。
+- **ZCode：** 合并进 `~/.zcode/cli/config.json` 的 `mcp.servers.astrolabe`；可选 `--with-hooks` 设置 `hooks.enabled: true` 并写入 `hooks.events.PreToolUse`（**绝不**写 `SessionEnd`，也不在 `Stop` 上挂 cleanup）。
 
 若只用 cargo 安装：`astrolabe setup` 在本机有 Node 时会通过 `npx` 跑同一套流程。
 
@@ -241,9 +245,18 @@ command = "astrolabe"
 args = [".", "--context=codex"]
 ```
 
-### 4. Codebuddy / Grok 等 CLI 配置与 Hook
+### 4. Codebuddy / Grok / Kimi Code / ZCode 等 CLI 配置与 Hook
 
-- **MCP 服务接入**：作为标准 stdio MCP 启动，无需指定特殊 context 参数（默认回退 `default` 温和级）：
+一键配置见上文 `astrolabe setup`（含 `--with-hooks`）。手动路径摘要：
+
+| 客户端 | MCP 配置 | Hooks（可选） |
+|---|---|---|
+| Codebuddy | `~/.codebuddy/.mcp.json`（`mcpServers`） | `~/.codebuddy/settings.json` → `hooks` |
+| Grok Build | `~/.grok/config.toml` → `[mcp_servers.astrolabe]` | `~/.grok/hooks/astrolabe.json` |
+| Kimi Code | `~/.kimi-code/mcp.json`（`mcpServers`） | `~/.kimi-code/config.toml` → `[[hooks]]` |
+| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` | 同文件 `hooks.enabled` + `hooks.events`（无 SessionEnd） |
+
+- **MCP 服务接入**：作为标准 stdio MCP 启动，无需指定特殊 context 参数（默认回退 `default` 温和级）。JSON `mcpServers` 示例：
   ```json
   {
     "mcpServers": {
@@ -254,7 +267,7 @@ args = [".", "--context=codex"]
     }
   }
   ```
-- **防漂移 Hook 接入（可选，效果未做基准，见 [HOOKS.md](HOOKS.md)）**：若宿主支持 Claude Code 兼容的 hooks，将 PreToolUse 命令指定为 `astrolabe hooks remind --client=codebuddy` 或 `astrolabe hooks remind --client=grok`（Grok 别名 `grokbuild`、`grok-build` 均已内置支持）。
+- **防漂移 Hook 接入（可选，效果未做基准，见 [HOOKS.md](HOOKS.md)）**：`--client=codebuddy` / `grok`（别名 `grokbuild`、`grok-build`）/ `kimicode`（别名 `kimi` 等）/ `zcode`（别名 `zai` 等）。
 
 ---
 
