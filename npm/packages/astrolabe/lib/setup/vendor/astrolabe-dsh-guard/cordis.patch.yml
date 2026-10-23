@@ -1,0 +1,11 @@
+# Bundle patch for DeepSeek Harness: inserts the Astrolabe drift guard plugin.
+#
+# Installed through the harness plugin manager (it declares `dsh.bundle`), or
+# copied into a profile and referenced from the profile's own cordis.patch.yml.
+# `astrolabe` must be on PATH for the plugin's `shell` calls; override the
+# binary path with `config.binary` when it is not.
+- insert:
+    - id: astrolabe-guard
+      name: 'astrolabe-dsh-guard'
+      config:
+        client: claude-code

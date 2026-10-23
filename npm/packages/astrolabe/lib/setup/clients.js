@@ -3,6 +3,8 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const opencodeMod = require('./opencode');
+const dshMod = require('./dsh');
 const PACKAGE_NAME = '@zlnap/astrolabe';
 const SERVER_NAME = 'astrolabe';
 
@@ -507,10 +509,131 @@ const CLIENTS = [
       };
     },
   },
+  {
+    id: 'opencode',
+    label: 'OpenCode',
+    aliases: [],
+    context: null,
+    detect(home, env = process.env) {
+      return opencodeMod.detectOpenCode(home, env, { whichFn: which, existsFn: exists });
+    },
+    plan({ home, launch, withHooks = false }) {
+      const filePath = opencodeMod.resolveOpenCodeConfigPath(home, exists);
+      const steps = [];
+      const mcpPlan = {
+        kind: 'opencode-mcp',
+        filePath,
+        summary: `merge mcp.astrolabe into ${filePath} (OpenCode V1/V2/mcpServers auto-detect)`,
+        apply() {
+          const result = opencodeMod.mergeOpenCodeMcpFile(filePath, launch, { create: true, existsFn: exists });
+          if (result.skipped) return result;
+          return {
+            ...result,
+            write: () => writeTextAtomic(filePath, result.text),
+          };
+        },
+      };
+      steps.push(mcpPlan);
+      if (withHooks) {
+        steps.push(opencodeMod.planOpenCodeGuardPlugin(home, exists));
+      }
+      // Primary plan surface remains the MCP file; hooks are optional extras applied by run.js
+      return {
+        kind: 'opencode',
+        filePath,
+        summary: mcpPlan.summary + (withHooks ? '; optional guard plugin' : ''),
+        steps,
+        apply() {
+          const results = [];
+          for (const step of steps) {
+            const applied = step.apply();
+            if (applied.skipped) {
+              results.push(applied);
+              continue;
+            }
+            if (!applied.write) {
+              const fp = applied.filePath;
+              const contents = applied.text;
+              applied.write = () => writeTextAtomic(fp, contents);
+            }
+            results.push(applied);
+          }
+          const primary = results.find((r) => !r.skipped) || results[0];
+          return {
+            ...primary,
+            results,
+            write: () => {
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
+            },
+          };
+        },
+      };
+    },
+  },
+  {
+    id: 'deepseek-harness',
+    label: 'DeepSeek Harness (DSH)',
+    aliases: ['dsh'],
+    context: null,
+    detect(home, env = process.env) {
+      return dshMod.detectDsh(home, env, { whichFn: which, existsFn: exists });
+    },
+    plan({ home }) {
+      const patchPath = path.join(home, '.dsh', 'cordis.patch.yml');
+      const source = dshMod.resolveDshPluginSource(exists);
+      const installDirs = dshMod.resolveDshPluginInstallDirs(home, exists);
+      return {
+        kind: 'dsh-guard',
+        filePath: patchPath,
+        summary:
+          `install astrolabe-dsh-guard into DSH profile node_modules and merge ${patchPath}` +
+          ' (MCP servers are per-repo in the DSH UI — setup does not write them)',
+        apply() {
+          if (!source) {
+            return {
+              skipped: true,
+              reason:
+                'dsh-plugin sources not found (expected vendor/astrolabe-dsh-guard next to setup or repo dsh-plugin/)',
+            };
+          }
+          const patch = dshMod.mergeDshCordisPatch(patchPath, {
+            create: exists(path.join(home, '.dsh')) || exists(patchPath),
+            existsFn: exists,
+          });
+          if (patch.skipped) return patch;
+          return {
+            filePath: patchPath,
+            created: patch.created,
+            replaced: patch.replaced,
+            text: patch.text,
+            source,
+            installDirs,
+            entryPreview: dshMod.MANAGED_BLOCK.trim(),
+            write: () => {
+              for (const dest of installDirs) {
+                fs.rmSync(dest, { recursive: true, force: true });
+                dshMod.copyDirRecursive(source, dest);
+              }
+              writeTextAtomic(patchPath, patch.text);
+            },
+          };
+        },
+      };
+    },
+  },
 ];
 
 function getClient(id) {
-  return CLIENTS.find((c) => c.id === id) || null;
+  return (
+    CLIENTS.find((c) => c.id === id || (Array.isArray(c.aliases) && c.aliases.includes(id))) || null
+  );
+}
+
+function canonicalClientId(id) {
+  const c = getClient(id);
+  return c ? c.id : id;
 }
 
 module.exports = {
@@ -528,5 +651,15 @@ module.exports = {
   writeJsonAtomic,
   writeTextAtomic,
   getClient,
+  canonicalClientId,
   appSupport,
+  // OpenCode / DSH helpers (tests)
+  mergeOpenCodeMcpFile: opencodeMod.mergeOpenCodeMcpFile,
+  detectOpenCodeMcpFormat: opencodeMod.detectOpenCodeMcpFormat,
+  resolveOpenCodeConfigPath: opencodeMod.resolveOpenCodeConfigPath,
+  mergeDshCordisPatch: dshMod.mergeDshCordisPatch,
+  resolveDshPluginSource: dshMod.resolveDshPluginSource,
+  resolveDshPluginInstallDirs: dshMod.resolveDshPluginInstallDirs,
+  OPENCODE_GUARD_TS: opencodeMod.OPENCODE_GUARD_TS,
+  parseJsonc: require('./jsonc').parseJsonc,
 };

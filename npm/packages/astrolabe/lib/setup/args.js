@@ -12,6 +12,8 @@ Options:
   --dry-run              Preview writes; do not modify files
   --native               Use command "astrolabe" on PATH instead of npx
   --command=<bin>        Override MCP command (default: npx, or astrolabe with --native)
+  --with-hooks           Also install drift-guard hooks/plugins where supported
+                         (OpenCode: plugins/astrolabe-guard.ts; DSH always installs its native guard)
   --no-cursor-permissions
                          Skip merging Cursor mcpAllowlist
   --cursor-permissions   Force Cursor allowlist merge when Cursor is selected (default on)
@@ -19,7 +21,8 @@ Options:
   -h, --help             Show this help
 
 Client ids:
-  claude-code, cursor, codex, windsurf, cline, roo, continue
+  claude-code, cursor, codex, windsurf, cline, roo, continue, opencode,
+  deepseek-harness (alias: dsh)
 `;
 
 function parseArgs(argv) {
@@ -33,6 +36,7 @@ function parseArgs(argv) {
     clients: null,
     command: null,
     cursorPermissions: true,
+    withHooks: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -41,6 +45,7 @@ function parseArgs(argv) {
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--native') opts.native = true;
     else if (arg === '--help' || arg === '-h') opts.help = true;
+    else if (arg === '--with-hooks') opts.withHooks = true;
     else if (arg === '--no-cursor-permissions') opts.cursorPermissions = false;
     else if (arg === '--cursor-permissions') opts.cursorPermissions = true;
     else if (arg === '--home') {

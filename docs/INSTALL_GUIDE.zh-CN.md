@@ -72,7 +72,10 @@ cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 npx -y @zlnap/astrolabe setup
 ```
 
-会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue，交互多选要写入的客户端，并把 Astrolabe **合并**进各自的 MCP 配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，并带上对应的 `--context=`。常用参数：`--yes`（全部已探测到的）、`--clients=cursor,claude-code`、`--dry-run`、`--native`（改用 PATH 上的 `astrolabe`）、`--list`、`--no-cursor-permissions`。
+会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件）、`--no-cursor-permissions`。
+
+- **OpenCode：** 合并进 `~/.config/opencode/opencode.jsonc`（或已有的 `.json` / 旧版 `config.json`，或 `~/.opencode/…`）。自动识别 V1（`mcp.<name>` + `enabled`）、V2（`mcp.servers`）或类 Claude 的 `mcpServers`；在父对象已存在时尽量保留 JSONC 注释。可选 `--with-hooks` 写入 `~/.config/opencode/plugins/astrolabe-guard.ts`。
+- **DeepSeek Harness：** 把自带的 `astrolabe-dsh-guard` 装进 `~/.dsh/profiles/**/node_modules`，并合并写入 `~/.dsh/cordis.patch.yml` 的托管块（不碰 `orca-managed-dsh-hooks`）。DSH 的 MCP 是按仓库在 UI 里配的，setup 不会代写。
 
 若只用 cargo 安装：`astrolabe setup` 在本机有 Node 时会通过 `npx` 跑同一套流程。
 

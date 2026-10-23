@@ -5,6 +5,7 @@ const os = require('os');
 const {
   CLIENTS,
   getClient,
+  canonicalClientId,
   resolveLaunch,
   mergeCursorPermissions,
   backupFile,
@@ -37,7 +38,7 @@ function printList(rows) {
   for (const row of rows) {
     const status = row.detected ? 'detected' : 'missing';
     const ev = row.evidence.length ? ` (${row.evidence.join('; ')})` : '';
-    process.stdout.write(`${row.id.padEnd(12)} ${status}${ev}\n`);
+    process.stdout.write(`${row.id.padEnd(18)} ${status}${ev}\n`);
   }
 }
 
@@ -47,7 +48,8 @@ function chooseIds(rows, opts) {
     if (unknown.length) {
       throw new Error(`unknown client id(s): ${unknown.join(', ')}`);
     }
-    return opts.clients;
+    // Deduplicate aliases onto canonical ids (e.g. dsh → deepseek-harness).
+    return [...new Set(opts.clients.map((id) => canonicalClientId(id)))];
   }
   if (opts.yes) {
     const detected = rows.filter((r) => r.detected).map((r) => r.id);
@@ -65,7 +67,11 @@ function chooseIds(rows, opts) {
 }
 
 function formatEntryPreview(planResult) {
-  if (planResult.doc) {
+  if (planResult.entryPreview) return String(planResult.entryPreview).trimEnd();
+  if (planResult.entry) {
+    return JSON.stringify({ astrolabe: planResult.entry }, null, 2);
+  }
+  if (planResult.doc && planResult.doc.mcpServers) {
     return JSON.stringify(
       { mcpServers: { astrolabe: planResult.doc.mcpServers.astrolabe } },
       null,
@@ -74,7 +80,18 @@ function formatEntryPreview(planResult) {
   }
   if (planResult.text) {
     const match = planResult.text.match(/\[mcp_servers\.astrolabe\][\s\S]*?(?=\n\[|$)/);
-    return (match ? match[0] : planResult.text).trimEnd();
+    if (match) return match[0].trimEnd();
+    const managed = planResult.text.match(
+      /# >>> astrolabe-managed-dsh-guard >>>[\s\S]*?# <<< astrolabe-managed-dsh-guard <<</,
+    );
+    if (managed) return managed[0].trimEnd();
+    // OpenCode: show a short snippet around "astrolabe"
+    const idx = planResult.text.indexOf('"astrolabe"');
+    if (idx >= 0) {
+      const start = Math.max(0, planResult.text.lastIndexOf('\n', idx) - 80);
+      return planResult.text.slice(start, Math.min(planResult.text.length, idx + 220)).trimEnd();
+    }
+    return planResult.text.trimEnd();
   }
   return '';
 }
@@ -114,7 +131,7 @@ function run(argv = process.argv.slice(2)) {
       native: opts.native,
       commandOverride: opts.command,
     });
-    const plan = client.plan({ home, launch });
+    const plan = client.plan({ home, launch, withHooks: opts.withHooks });
     const applied = plan.apply();
     actions.push({
       id,
@@ -141,7 +158,23 @@ function run(argv = process.argv.slice(2)) {
     }
     const op = action.applied.created ? 'create' : action.applied.replaced ? 'update' : 'write';
     process.stdout.write(`  - ${action.label}: ${op} ${action.applied.filePath}\n`);
-    process.stdout.write(`      command: ${action.launch.command} ${action.launch.args.join(' ')}\n`);
+    if (action.applied.installDirs) {
+      for (const dir of action.applied.installDirs) {
+        process.stdout.write(`      plugin → ${dir}\n`);
+      }
+    }
+    if (Array.isArray(action.applied.results)) {
+      for (const step of action.applied.results) {
+        if (!step || step.skipped) continue;
+        if (step.filePath && step.filePath !== action.applied.filePath) {
+          const sop = step.created ? 'create' : step.replaced ? 'update' : 'write';
+          process.stdout.write(`      ${sop} ${step.filePath}\n`);
+        }
+      }
+    }
+    if (action.id !== 'deepseek-harness') {
+      process.stdout.write(`      command: ${action.launch.command} ${action.launch.args.join(' ')}\n`);
+    }
     const preview = formatEntryPreview(action.applied);
     if (preview) {
       for (const line of preview.split('\n')) {
@@ -229,7 +262,22 @@ function run(argv = process.argv.slice(2)) {
       '  3. Cursor: open Settings → MCP and confirm astrolabe is listed; enable Run Mode for allowlist.\n',
     );
   }
-  return summary.some((s) => s.status === 'written') || summary.every((s) => s.status === 'skipped')
+  if (selectedIds.includes('opencode')) {
+    process.stdout.write(
+      '  3. OpenCode: restart opencode; MCP is under mcp / mcp.servers in ~/.config/opencode/.\n',
+    );
+    if (!opts.withHooks) {
+      process.stdout.write(
+        '     Tip: re-run with --with-hooks to install plugins/astrolabe-guard.ts\n',
+      );
+    }
+  }
+  if (selectedIds.includes('deepseek-harness')) {
+    process.stdout.write(
+      '  3. DSH: native guard is in cordis.patch.yml; add the Astrolabe MCP server per repo in the DSH UI.\n',
+    );
+  }
+  return summary.some((row) => row.status === 'written') || summary.every((row) => row.status === 'skipped')
     ? 0
     : 0;
 }
