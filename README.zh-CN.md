@@ -30,12 +30,14 @@
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 ```
 
-其它方式（手动下载、Windows、源码编译）见 [安装指南](docs/INSTALL_GUIDE.zh-CN.md)。npm 包 `@zlnap/astrolabe` 已准备好，但**尚未发布**。
+其它方式（手动下载、Windows、源码编译）见 [安装指南](docs/INSTALL_GUIDE.zh-CN.md)。npm 包：`npx -y @zlnap/astrolabe`（已发布）；配置客户端：`npx -y @zlnap/astrolabe setup`。
 
 **2. 接入客户端。** Claude Code：
 
 ```bash
-claude mcp add --scope user astrolabe -- astrolabe . --context=claude-code
+npx -y @zlnap/astrolabe setup   # 探测本机 agent 并合并写入 MCP 配置
+# 或手动：
+claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=claude-code
 ```
 
 Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`。Codex、Windsurf 等见[安装指南](docs/INSTALL_GUIDE.zh-CN.md)。

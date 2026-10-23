@@ -42,6 +42,8 @@ ROOT 优先级：位置参数 → ASTROLABE_ROOT → .（从 cwd 探测）
                                （适用于 ZCode 等无 SessionEnd 事件的宿主）
   print-cc-system-prompt-override
                                输出 Claude Code --system-prompt 整体替换文本
+  setup                        探测本机 AI 客户端并写入 MCP 配置（实现在 npm 包；
+                               cargo 安装请运行: npx -y @zlnap/astrolabe setup）
 ";
 
 #[derive(Debug)]
@@ -59,6 +61,10 @@ pub enum Launch {
     /// `hooks gc`：清理过期会话状态目录
     HooksGc,
     PrintCcSystemPromptOverride,
+    /// npm-shipped interactive MCP client setup (cargo binary prints a hint).
+    Setup {
+        args: Vec<OsString>,
+    },
     Run {
         requested_root: PathBuf,
         context: ClientContext,
@@ -104,6 +110,11 @@ where
                     );
                 }
                 return Ok(Launch::PrintCcSystemPromptOverride);
+            }
+            "setup" => {
+                return Ok(Launch::Setup {
+                    args: rest[1..].to_vec(),
+                });
             }
             _ => {}
         }
@@ -360,6 +371,26 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    #[test]
+    fn setup_subcommand_forwards_args() {
+        match parse(&["astrolabe", "setup", "--list", "--yes"]) {
+            Launch::Setup { args } => {
+                assert_eq!(
+                    args,
+                    vec![
+                        std::ffi::OsString::from("--list"),
+                        std::ffi::OsString::from("--yes")
+                    ]
+                );
+            }
+            _ => panic!("expected setup"),
+        }
+        assert!(matches!(
+            parse(&["astrolabe", "setup"]),
+            Launch::Setup { args } if args.is_empty()
+        ));
     }
 
     #[test]

@@ -47,7 +47,7 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 
 下载 `astrolabe-<版本>-x86_64-pc-windows-msvc.zip`，用 `Get-FileHash -Algorithm SHA256` 对照 `SHA256SUMS`，解压出 `astrolabe.exe` 放到固定目录并加入 `PATH`。（Windows 路径未在本次改动中实机验证。）
 
-### 方式 4：npm（尚未发布）
+### 方式 4：npm
 
 npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`）。**目前未发布到 npm**，发布使用 npm 账号 `zlnap` 的个人 scope（无需建 org），CI 发布需配置 `NPM_TOKEN`；发布后可用 `npx -y @zlnap/astrolabe .`。注意：npm 上未加 scope 的 `astrolabe` 和 `astrolabe-ai` 是与本项目无关的他人的包，请不要用它们。
 
@@ -63,6 +63,19 @@ cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 ---
 
 ## 三、各 AI 编程工具 MCP 配置配方
+
+### 一键配置（推荐）
+
+安装 npm 包后（或直接用 `npx`）运行：
+
+```bash
+npx -y @zlnap/astrolabe setup
+```
+
+会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue，交互多选要写入的客户端，并把 Astrolabe **合并**进各自的 MCP 配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，并带上对应的 `--context=`。常用参数：`--yes`（全部已探测到的）、`--clients=cursor,claude-code`、`--dry-run`、`--native`（改用 PATH 上的 `astrolabe`）、`--list`、`--no-cursor-permissions`。
+
+若只用 cargo 安装：`astrolabe setup` 在本机有 Node 时会通过 `npx` 跑同一套流程。
+
 
 MCP 客户端通过标准输入输出（stdio）启动 Astrolabe。Astrolabe 暴露 7 个工具（见 [参考手册](REFERENCE.zh-CN.md)）。
 
