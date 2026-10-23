@@ -66,7 +66,10 @@ After installing the npm package (or with `npx`), run:
 npx -y @zlnap/astrolabe setup
 ```
 
-The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, and Continue on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's MCP config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag. Useful flags: `--yes` (all detected), `--clients=cursor,claude-code`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--no-cursor-permissions`.
+The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, and **DeepSeek Harness (DSH)** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one. Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin), `--no-cursor-permissions`.
+
+- **OpenCode:** merges into `~/.config/opencode/opencode.jsonc` (or `.json` / older `config.json`, or `~/.opencode/…` if that is what exists). Auto-detects V1 (`mcp.<name>` + `enabled`), V2 (`mcp.servers`), or Claude-like `mcpServers`. JSONC comments are preserved when the parent object already exists. Optional `--with-hooks` writes `~/.config/opencode/plugins/astrolabe-guard.ts`.
+- **DeepSeek Harness:** installs vendored `astrolabe-dsh-guard` into `~/.dsh/profiles/**/node_modules` and merges a managed block into `~/.dsh/cordis.patch.yml` without touching the `orca-managed-dsh-hooks` block. DSH MCP servers are per-repo in the UI — setup does not write them.
 
 Cargo-only installs: `astrolabe setup` re-execs the same flow via `npx` when Node is available.
 

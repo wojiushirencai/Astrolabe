@@ -98,6 +98,8 @@ test('CLIENTS catalog covers documented agents', () => {
     'codex',
     'continue',
     'cursor',
+    'deepseek-harness',
+    'opencode',
     'roo',
     'windsurf',
   ]);
@@ -175,6 +177,143 @@ test('detect uses PATH and home markers', () => {
     assert.equal(codex.detected, true);
     const windsurf = CLIENTS.find((c) => c.id === 'windsurf').detect(home, env);
     assert.equal(windsurf.detected, false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('parseArgs accepts --with-hooks', () => {
+  const opts = argsMod.parseArgs(['--with-hooks', '--clients=dsh,opencode']);
+  assert.equal(opts.withHooks, true);
+  assert.deepEqual(opts.clients, ['dsh', 'opencode']);
+  assert.equal(clientsMod.getClient('dsh').id, 'deepseek-harness');
+  assert.equal(clientsMod.canonicalClientId('dsh'), 'deepseek-harness');
+});
+
+test('OpenCode V1 merge preserves JSONC comments and siblings', () => {
+  const home = tmpHome();
+  try {
+    const dir = path.join(home, '.config', 'opencode');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'opencode.jsonc'),
+      `{
+  // keep-comment
+  "mcp": {
+    "serena": { "type": "local", "command": ["echo"], "enabled": true }
+  }
+}
+`,
+    );
+    const r = clientsMod.mergeOpenCodeMcpFile(path.join(dir, 'opencode.jsonc'), {
+      command: 'npx',
+      args: ['-y', '@zlnap/astrolabe', '.'],
+    });
+    assert.equal(r.format, 'v1');
+    assert.match(r.text, /keep-comment/);
+    assert.match(r.text, /"serena"/);
+    assert.match(r.text, /"astrolabe"/);
+    assert.match(r.text, /"enabled"\s*:\s*true/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('OpenCode V2 merge writes mcp.servers without enabled', () => {
+  const home = tmpHome();
+  try {
+    const file = path.join(home, 'opencode.jsonc');
+    fs.writeFileSync(
+      file,
+      `{
+  "mcp": {
+    "servers": {
+      "other": { "type": "local", "command": ["x"] }
+    }
+  }
+}
+`,
+    );
+    const r = clientsMod.mergeOpenCodeMcpFile(file, {
+      command: 'npx',
+      args: ['-y', '@zlnap/astrolabe', '.'],
+    });
+    assert.equal(r.format, 'v2');
+    const doc = clientsMod.parseJsonc(r.text);
+    assert.ok(doc.mcp.servers.astrolabe);
+    assert.equal(doc.mcp.servers.astrolabe.enabled, undefined);
+    assert.ok(doc.mcp.servers.other);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('OpenCode resolve prefers existing ~/.opencode/config.json', () => {
+  const home = tmpHome();
+  try {
+    const old = path.join(home, '.opencode', 'config.json');
+    fs.mkdirSync(path.dirname(old), { recursive: true });
+    fs.writeFileSync(old, '{}\n');
+    assert.equal(clientsMod.resolveOpenCodeConfigPath(home, fs.existsSync), old);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('OpenCode detect uses config dir markers', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.config', 'opencode'), { recursive: true });
+    const d = clientsMod.getClient('opencode').detect(home, { PATH: '/nonexistent' });
+    assert.equal(d.detected, true);
+    assert.ok(d.evidence.some((e) => e.includes('.config/opencode')));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('DSH cordis patch keeps orca-managed block', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.dsh'), { recursive: true });
+    const patch = path.join(home, '.dsh', 'cordis.patch.yml');
+    fs.writeFileSync(
+      patch,
+      `# >>> orca-managed-dsh-hooks (managed by Orca; do not edit) >>>
+- insert:
+    - id: orca-agent-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+# <<< orca-managed-dsh-hooks <<<
+`,
+    );
+    const r = clientsMod.mergeDshCordisPatch(patch);
+    assert.match(r.text, /orca-managed-dsh-hooks/);
+    assert.match(r.text, /astrolabe-managed-dsh-guard/);
+    assert.match(r.text, /astrolabe-dsh-guard/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('DSH plan copies vendor plugin and writes patch', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.dsh', 'profiles', 'node_modules'), { recursive: true });
+    const client = clientsMod.getClient('deepseek-harness');
+    const plan = client.plan({
+      home,
+      launch: { command: 'npx', args: ['-y', '@zlnap/astrolabe', '.'] },
+    });
+    const applied = plan.apply();
+    assert.equal(applied.skipped, undefined);
+    applied.write();
+    assert.ok(
+      fs.existsSync(
+        path.join(home, '.dsh', 'profiles', 'node_modules', 'astrolabe-dsh-guard', 'package.json'),
+      ),
+    );
+    const text = fs.readFileSync(path.join(home, '.dsh', 'cordis.patch.yml'), 'utf8');
+    assert.match(text, /astrolabe-managed-dsh-guard/);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
