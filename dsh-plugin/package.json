@@ -1,0 +1,38 @@
+{
+  "name": "astrolabe-dsh-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Astrolabe drift guard for DeepSeek Harness: deny repeated grep/read calls and steer the model to Astrolabe's MCP code-navigation tools.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "astrolabe",
+    "hook",
+    "mcp"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wojiushirencai/Astrolabe.git",
+    "directory": "dsh-plugin"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
