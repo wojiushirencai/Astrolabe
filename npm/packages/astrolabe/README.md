@@ -6,14 +6,20 @@ Astrolabe AI：面向 AI 编码助手的本地代码检索与导航 MCP server�
 npx -y @zlnap/astrolabe /path/to/repo
 ```
 
-MCP 客户端：
+MCP 客户端（推荐一键配置）：
+
+```bash
+npx -y @zlnap/astrolabe setup
+```
+
+探测本机 Claude Code / Cursor / Codex 等，交互勾选后合并写入 MCP 配置（`--yes`、`--dry-run`、`--list` 可用）。手动配置示例：
 
 ```json
 {
   "mcpServers": {
     "astrolabe": {
       "command": "npx",
-      "args": ["-y", "@zlnap/astrolabe", "."]
+      "args": ["-y", "@zlnap/astrolabe", ".", "--context=cursor"]
     }
   }
 }

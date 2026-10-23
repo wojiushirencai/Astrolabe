@@ -35,7 +35,9 @@ Other ways (manual download, Windows, build from source): [docs/INSTALL_GUIDE.md
 **2. Connect your client.** Claude Code:
 
 ```bash
-claude mcp add --scope user astrolabe -- astrolabe . --context=claude-code
+npx -y @zlnap/astrolabe setup   # detect agents and merge MCP configs
+# or manually:
+claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=claude-code
 ```
 
 Cursor (`.cursor/mcp.json`): `{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`.
