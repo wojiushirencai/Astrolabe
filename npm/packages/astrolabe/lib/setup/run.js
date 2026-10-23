@@ -277,6 +277,26 @@ function run(argv = process.argv.slice(2)) {
       '  3. DSH: native guard is in cordis.patch.yml; add the Astrolabe MCP server per repo in the DSH UI.\n',
     );
   }
+  if (selectedIds.includes('codebuddy')) {
+    process.stdout.write(
+      '  3. Codebuddy: MCP in ~/.codebuddy/.mcp.json; restart codebuddy. Tip: --with-hooks merges ~/.codebuddy/settings.json.\n',
+    );
+  }
+  if (selectedIds.includes('grok')) {
+    process.stdout.write(
+      '  3. Grok Build: MCP in ~/.grok/config.toml ([mcp_servers.astrolabe]); tip: --with-hooks writes ~/.grok/hooks/astrolabe.json.\n',
+    );
+  }
+  if (selectedIds.includes('kimicode')) {
+    process.stdout.write(
+      '  3. Kimi Code: MCP in ~/.kimi-code/mcp.json; tip: --with-hooks merges [[hooks]] into config.toml.\n',
+    );
+  }
+  if (selectedIds.includes('zcode')) {
+    process.stdout.write(
+      '  3. ZCode: MCP under mcp.servers in ~/.zcode/cli/config.json; tip: --with-hooks adds hooks.events.PreToolUse (no SessionEnd).\n',
+    );
+  }
   return summary.some((row) => row.status === 'written') || summary.every((row) => row.status === 'skipped')
     ? 0
     : 0;

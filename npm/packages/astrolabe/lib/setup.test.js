@@ -95,15 +95,22 @@ test('CLIENTS catalog covers documented agents', () => {
   assert.deepEqual(ids, [
     'claude-code',
     'cline',
+    'codebuddy',
     'codex',
     'continue',
     'cursor',
     'deepseek-harness',
+    'grok',
+    'kimicode',
     'opencode',
     'roo',
     'windsurf',
+    'zcode',
   ]);
   assert.equal(CATALOG_TOOL_NAMES.length, 7);
+  assert.equal(clientsMod.canonicalClientId('kimi'), 'kimicode');
+  assert.equal(clientsMod.canonicalClientId('zai'), 'zcode');
+  assert.equal(clientsMod.canonicalClientId('grokbuild'), 'grok');
 });
 
 test('setup --list and --dry-run via bin shim', () => {
@@ -314,6 +321,218 @@ test('DSH plan copies vendor plugin and writes patch', () => {
     );
     const text = fs.readFileSync(path.join(home, '.dsh', 'cordis.patch.yml'), 'utf8');
     assert.match(text, /astrolabe-managed-dsh-guard/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+test('Codebuddy detect + MCP + withHooks settings merge', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.codebuddy'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.codebuddy', 'settings.json'),
+      JSON.stringify(
+        {
+          hooks: {
+            PreToolUse: [{ hooks: [{ type: 'command', command: 'echo keep' }] }],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const client = clientsMod.getClient('codebuddy');
+    const det = client.detect(home, { PATH: '/nonexistent' });
+    assert.equal(det.detected, true);
+    const launch = { command: 'npx', args: ['-y', '@zlnap/astrolabe', '.'] };
+    const plan = client.plan({ home, launch, withHooks: true });
+    const applied = plan.apply();
+    assert.equal(applied.skipped, undefined);
+    applied.write();
+    const mcp = JSON.parse(
+      fs.readFileSync(path.join(home, '.codebuddy', '.mcp.json'), 'utf8'),
+    );
+    assert.equal(mcp.mcpServers.astrolabe.command, 'npx');
+    assert.equal(mcp.mcpServers.astrolabe.type, 'stdio');
+    const settings = JSON.parse(
+      fs.readFileSync(path.join(home, '.codebuddy', 'settings.json'), 'utf8'),
+    );
+    assert.equal(settings.hooks.PreToolUse[0].hooks[0].command, 'echo keep');
+    assert.ok(
+      settings.hooks.PreToolUse.some((e) =>
+        (e.hooks || []).some((h) => String(h.command).includes('--client=codebuddy')),
+      ),
+    );
+    assert.ok(
+      settings.hooks.SessionEnd.some((e) =>
+        (e.hooks || []).some((h) => String(h.command).includes('hooks cleanup')),
+      ),
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Grok MCP toml + withHooks astrolabe.json', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.grok'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.grok', 'config.toml'), 'model = "x"\n');
+    const client = clientsMod.getClient('grok');
+    assert.equal(client.detect(home, { PATH: '/nonexistent' }).detected, true);
+    const launch = { command: 'npx', args: ['-y', '@zlnap/astrolabe', '.'] };
+    const plan = client.plan({ home, launch, withHooks: true });
+    const applied = plan.apply();
+    applied.write();
+    const toml = fs.readFileSync(path.join(home, '.grok', 'config.toml'), 'utf8');
+    assert.match(toml, /model = "x"/);
+    assert.match(toml, /\[mcp_servers\.astrolabe\]/);
+    assert.match(toml, /command = "npx"/);
+    const hooks = JSON.parse(
+      fs.readFileSync(path.join(home, '.grok', 'hooks', 'astrolabe.json'), 'utf8'),
+    );
+    assert.ok(hooks.hooks.PreToolUse);
+    assert.ok(hooks.hooks.SessionEnd);
+    assert.match(
+      hooks.hooks.PreToolUse[0].hooks[0].command,
+      /--client=grok/,
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Kimi Code mcp.json + managed [[hooks]] toml', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.kimi-code'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.kimi-code', 'mcp.json'),
+      JSON.stringify({ mcpServers: { keep: { command: 'x', args: [] } } }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(home, '.kimi-code', 'config.toml'),
+      'default_model = "kimi"\n\n[[hooks]]\nevent = "Notification"\ncommand = "echo keep"\n',
+    );
+    const client = clientsMod.getClient('kimi');
+    assert.equal(client.id, 'kimicode');
+    const launch = { command: 'npx', args: ['-y', '@zlnap/astrolabe', '.'] };
+    const plan = client.plan({ home, launch, withHooks: true });
+    plan.apply().write();
+    const mcp = JSON.parse(fs.readFileSync(path.join(home, '.kimi-code', 'mcp.json'), 'utf8'));
+    assert.equal(mcp.mcpServers.keep.command, 'x');
+    assert.equal(mcp.mcpServers.astrolabe.command, 'npx');
+    const toml = fs.readFileSync(path.join(home, '.kimi-code', 'config.toml'), 'utf8');
+    assert.match(toml, /default_model = "kimi"/);
+    assert.match(toml, /echo keep/);
+    assert.match(toml, /astrolabe-managed-kimi-hooks/);
+    assert.match(toml, /--client=kimicode/);
+    assert.match(toml, /event = "SessionEnd"/);
+    // idempotent
+    const again = clientsMod.mergeKimiHooksToml(path.join(home, '.kimi-code', 'config.toml'));
+    assert.equal(again.replaced, true);
+    assert.equal((again.text.match(/astrolabe-managed-kimi-hooks/g) || []).length, 2);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('ZCode mcp.servers + hooks.events without SessionEnd', () => {
+  const home = tmpHome();
+  try {
+    const cli = path.join(home, '.zcode', 'cli');
+    fs.mkdirSync(cli, { recursive: true });
+    fs.writeFileSync(
+      path.join(cli, 'config.json'),
+      JSON.stringify(
+        {
+          mcp: { servers: { keep: { type: 'stdio', command: 'x', args: [] } } },
+          hooks: {
+            enabled: false,
+            events: {
+              SessionEnd: [{ hooks: [{ type: 'command', command: 'bad' }] }],
+              PreToolUse: [{ hooks: [{ type: 'command', command: 'echo keep' }] }],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const client = clientsMod.getClient('zai');
+    assert.equal(client.id, 'zcode');
+    const launch = { command: 'npx', args: ['-y', '@zlnap/astrolabe', '.'] };
+    const plan = client.plan({ home, launch, withHooks: true });
+    plan.apply().write();
+    const doc = JSON.parse(fs.readFileSync(path.join(cli, 'config.json'), 'utf8'));
+    assert.equal(doc.mcp.servers.keep.command, 'x');
+    assert.equal(doc.mcp.servers.astrolabe.type, 'stdio');
+    assert.equal(doc.mcp.servers.astrolabe.command, 'npx');
+    assert.equal(doc.hooks.enabled, true);
+    assert.equal(doc.hooks.events.SessionEnd, undefined);
+    assert.ok(
+      !JSON.stringify(doc.hooks).includes('SessionEnd'),
+      'SessionEnd must not appear in ZCode hooks',
+    );
+    assert.ok(
+      doc.hooks.events.PreToolUse.some((e) =>
+        (e.hooks || []).some((h) => String(h.command).includes('--client=zcode')),
+      ),
+    );
+    assert.ok(
+      doc.hooks.events.PreToolUse.some((e) =>
+        (e.hooks || []).some((h) => h.command === 'echo keep'),
+      ),
+    );
+    // MCP-only path does not force hooks.enabled
+    const home2 = tmpHome();
+    try {
+      fs.mkdirSync(path.join(home2, '.zcode', 'cli'), { recursive: true });
+      const p2 = clientsMod.getClient('zcode').plan({
+        home: home2,
+        launch,
+        withHooks: false,
+      });
+      p2.apply().write();
+      const d2 = JSON.parse(
+        fs.readFileSync(path.join(home2, '.zcode', 'cli', 'config.json'), 'utf8'),
+      );
+      assert.ok(d2.mcp.servers.astrolabe);
+      assert.equal(d2.hooks, undefined);
+    } finally {
+      fs.rmSync(home2, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('setup --clients aliases resolve for new clients', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.grok'), { recursive: true });
+    const dry = spawnSync(
+      process.execPath,
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=grokbuild,kimi,zai,codebuddy',
+        '--dry-run',
+        '--home',
+        home,
+        '--no-cursor-permissions',
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(dry.status, 0, dry.stderr + dry.stdout);
+    assert.match(dry.stdout, /Grok Build/);
+    assert.match(dry.stdout, /Kimi Code/);
+    assert.match(dry.stdout, /ZCode/);
+    // codebuddy skipped (no ~/.codebuddy)
+    assert.match(dry.stdout, /Codebuddy: SKIP|Codebuddy/);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

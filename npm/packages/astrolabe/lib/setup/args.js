@@ -13,7 +13,8 @@ Options:
   --native               Use command "astrolabe" on PATH instead of npx
   --command=<bin>        Override MCP command (default: npx, or astrolabe with --native)
   --with-hooks           Also install drift-guard hooks/plugins where supported
-                         (OpenCode: plugins/astrolabe-guard.ts; DSH always installs its native guard)
+                         (OpenCode guard plugin; Codebuddy/Grok/Kimi/ZCode hook recipes;
+                          DSH always installs its native guard)
   --no-cursor-permissions
                          Skip merging Cursor mcpAllowlist
   --cursor-permissions   Force Cursor allowlist merge when Cursor is selected (default on)
@@ -22,7 +23,8 @@ Options:
 
 Client ids:
   claude-code, cursor, codex, windsurf, cline, roo, continue, opencode,
-  deepseek-harness (alias: dsh)
+  deepseek-harness (alias: dsh), codebuddy, grok (aliases: grokbuild, grok-build),
+  kimicode (aliases: kimi-code, kimi_code, kimi), zcode (aliases: z-code, zai)
 `;
 
 function parseArgs(argv) {
