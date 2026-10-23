@@ -12,7 +12,7 @@ MCP 客户端（推荐一键配置）：
 npx -y @zlnap/astrolabe setup
 ```
 
-Detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo, Continue, OpenCode, DeepSeek Harness, Codebuddy, Grok Build, Kimi Code, and ZCode. Merges MCP config (OpenCode V1/V2/jsonc; Grok `[mcp_servers.*]` TOML; ZCode `mcp.servers`; DSH installs the native guard plugin + `cordis.patch.yml` merge). Flags: `--yes`, `--clients=…`, `--dry-run`, `--with-hooks`, `--list`.
+Detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo, Continue, OpenCode, DeepSeek Harness, Codebuddy, Grok Build, Kimi Code, and ZCode. Merges MCP config (OpenCode V1/V2/jsonc; Grok `[mcp_servers.*]` TOML; ZCode `mcp.servers`; DSH installs the native guard plugin + `cordis.patch.yml` merge). Optional `--with-hooks` installs OpenCode's guard plugin and hook recipes for Codebuddy / Grok / Kimi / ZCode (ZCode: no `SessionEnd`, do not hang cleanup on `Stop`). Flags: `--yes`, `--clients=…`, `--dry-run`, `--with-hooks`, `--list`.
 
 探测本机 Claude Code / Cursor / Codex 等，交互勾选后合并写入 MCP 配置（`--yes`、`--dry-run`、`--list` 可用）。手动配置示例：
 

@@ -66,10 +66,14 @@ After installing the npm package (or with `npx`), run:
 npx -y @zlnap/astrolabe setup
 ```
 
-The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, and **DeepSeek Harness (DSH)** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one. Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin), `--no-cursor-permissions`.
+The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin plus Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`.
 
 - **OpenCode:** merges into `~/.config/opencode/opencode.jsonc` (or `.json` / older `config.json`, or `~/.opencode/…` if that is what exists). Auto-detects V1 (`mcp.<name>` + `enabled`), V2 (`mcp.servers`), or Claude-like `mcpServers`. JSONC comments are preserved when the parent object already exists. Optional `--with-hooks` writes `~/.config/opencode/plugins/astrolabe-guard.ts`.
 - **DeepSeek Harness:** installs vendored `astrolabe-dsh-guard` into `~/.dsh/profiles/**/node_modules` and merges a managed block into `~/.dsh/cordis.patch.yml` without touching the `orca-managed-dsh-hooks` block. DSH MCP servers are per-repo in the UI — setup does not write them.
+- **Codebuddy:** MCP into `~/.codebuddy/.mcp.json` (or existing `mcp.json` / `~/.codebuddy.json`); optional `--with-hooks` merges CC-compatible hooks into `~/.codebuddy/settings.json` (PreToolUse + SessionEnd).
+- **Grok Build:** MCP into `~/.grok/config.toml` as `[mcp_servers.astrolabe]` (Codex-shaped); optional `--with-hooks` writes `~/.grok/hooks/astrolabe.json`.
+- **Kimi Code:** MCP into `~/.kimi-code/mcp.json`; optional `--with-hooks` appends managed `[[hooks]]` blocks in `~/.kimi-code/config.toml` (does not overwrite other hooks).
+- **ZCode:** MCP into `~/.zcode/cli/config.json` → `mcp.servers.astrolabe`; optional `--with-hooks` sets `hooks.enabled: true` and writes `hooks.events.PreToolUse` (**never** writes `SessionEnd`, and does not hang cleanup on `Stop`).
 
 Cargo-only installs: `astrolabe setup` re-execs the same flow via `npx` when Node is available.
 
@@ -121,9 +125,19 @@ args = [".", "--context=codex"]
 { "mcpServers": { "astrolabe": { "command": "astrolabe", "args": ["."] } } }
 ```
 
-### Codebuddy, Grok Build, Kimi Code, ZCode, OpenCode
+### Codebuddy / Grok Build / Kimi Code / ZCode / OpenCode
 
-Register the same stdio server (`"args": ["."]`, default context). The optional PreToolUse hook for these clients is documented in [HOOKS.md](HOOKS.md); it has **not** been benchmarked for effect.
+One-shot setup above covers these. Manual path summary:
+
+| Client | MCP config | Hooks (optional; effect not benchmarked — see [HOOKS.md](HOOKS.md)) |
+|---|---|---|
+| Codebuddy | `~/.codebuddy/.mcp.json` (`mcpServers`) | `~/.codebuddy/settings.json` → `hooks` |
+| Grok Build | `~/.grok/config.toml` → `[mcp_servers.astrolabe]` | `~/.grok/hooks/astrolabe.json` |
+| Kimi Code | `~/.kimi-code/mcp.json` (`mcpServers`) | `~/.kimi-code/config.toml` → `[[hooks]]` |
+| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` | same file: `hooks.enabled` + `hooks.events` (no `SessionEnd`) |
+| OpenCode | `~/.config/opencode/opencode.jsonc` (V1/V2) | `--with-hooks` → `plugins/astrolabe-guard.ts` |
+
+Stdio server args are `["."]` with the mild `default` context (no `--context` unless the client needs one).
 
 ## 3. Environment variables and language servers
 

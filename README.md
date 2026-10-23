@@ -7,18 +7,18 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 
 > **Not to be confused with** the npm packages `astrolabe` (a 2014 Protractor page-object library) and `astrolabe-ai` (an unrelated resume tool), or other MCP servers named "astrolabe". This project lives at `github.com/wojiushirencai/Astrolabe`; the binary is `astrolabe`.
 
-## Fact card (as of 2026-10-21)
+## Fact card (as of 2026-10-23)
 
 | | |
 |---|---|
-| Latest release | [v0.16.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.16.0), published 2026-10-21 |
+| Latest release | [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0), published 2026-10-23 |
 | What it exposes | 7 MCP tools: `resolve_context`, `search_code`, `find_symbol`, `find_references`, `goto_definition`, `get_diagnostics`, `get_languages` |
 | `tools/list` size | about 3.6 KB compact JSON (3,607 B measured on Linux for v0.16.0; not re-measured on macOS) |
 | Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |
 | Platforms | macOS arm64/x64, Linux x64 (glibc/musl), Linux arm64, Windows x64 |
 | Languages | 17 matrix rows incl. Python, Go, Rust, Java, TypeScript/JavaScript, C/C++, Swift, Objective-C, PHP, Vue, Dart, C#, VB.NET, Kotlin, Shell, Ruby, Lua ([details](docs/REFERENCE.zh-CN.md)) |
 | Needs an API key / network? | No. Indexing and search do not call an LLM. (The model that reads the results still spends tokens.) |
-| Clients documented | Claude Code, Cursor, Codex, Windsurf/Cline/Roo Code/Continue, Codebuddy, Grok Build, Kimi Code, ZCode, OpenCode |
+| Clients documented | Claude Code, Cursor, Codex, Windsurf/Cline/Roo Code/Continue, OpenCode, DeepSeek Harness, Codebuddy, Grok Build, Kimi Code, ZCode |
 | License | MIT OR Apache-2.0 |
 | Tests | `cargo test --workspace -- --list` lists 1,117 test cases (2026-10-18) |
 
@@ -30,7 +30,7 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 ```
 
-Other ways (manual download, Windows, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md). An npm package `@zlnap/astrolabe` is prepared but **not published yet**.
+Other ways (manual download, Windows, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md). npm: `npx -y @zlnap/astrolabe` (published); wire clients: `npx -y @zlnap/astrolabe setup`.
 
 **2. Connect your client.** Claude Code:
 
@@ -41,7 +41,7 @@ claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=cla
 ```
 
 Cursor (`.cursor/mcp.json`): `{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`.
-Codex, Windsurf and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-client-configuration).
+Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-client-configuration).
 
 **3. Verify.** `astrolabe --version` prints the version; in your client, ask it to call `get_languages` or `search_code`. Restart the client session after adding the server.
 

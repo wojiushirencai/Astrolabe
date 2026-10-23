@@ -7,18 +7,18 @@
 
 > **同名消歧**：不是 npm 上的 `astrolabe`（2014 年的 Protractor 页面对象库）或 `astrolabe-ai`（无关的简历工具），也不是其它叫 “astrolabe” 的 MCP 服务。本项目在 `github.com/wojiushirencai/Astrolabe`，二进制名是 `astrolabe`。
 
-## 事实卡（截至 2026-10-21）
+## 事实卡（截至 2026-10-23）
 
 | | |
 |---|---|
-| 最新版本 | [v0.16.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.16.0)，2026-10-21 发布 |
+| 最新版本 | [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0)，2026-10-23 发布 |
 | 暴露的工具 | 7 个 MCP 工具：`resolve_context`、`search_code`、`find_symbol`、`find_references`、`goto_definition`、`get_diagnostics`、`get_languages` |
 | `tools/list` 体积 | 紧凑 JSON 约 3.6 KB（v0.16.0 Linux 实测 3,607 B；macOS 未重测） |
 | 二进制 | 单文件、无运行时；Release 压缩包 7.4–9.1 MB，Linux x64 解压后约 50 MB |
 | 平台 | macOS arm64/x64、Linux x64（glibc/musl）、Linux arm64、Windows x64 |
 | 语言 | 17 行语言矩阵，含 Python、Go、Rust、Java、TS/JS、C/C++、Swift、Objective-C、PHP、Vue、Dart、C#、VB.NET、Kotlin、Shell、Ruby、Lua（[详情](docs/REFERENCE.zh-CN.md)） |
 | 需要 API Key / 联网吗 | 不需要。索引与检索本身不调用 LLM（读取结果的模型仍会消耗 token） |
-| 已写明配置的客户端 | Claude Code、Cursor、Codex、Windsurf/Cline/Roo Code/Continue、Codebuddy、Grok Build、Kimi Code、ZCode、OpenCode |
+| 已写明配置的客户端 | Claude Code、Cursor、Codex、Windsurf/Cline/Roo Code/Continue、OpenCode、DeepSeek Harness、Codebuddy、Grok Build、Kimi Code、ZCode |
 | 许可证 | MIT OR Apache-2.0 |
 | 测试 | `cargo test --workspace -- --list` 列出 1,117 个测试用例（2026-10-18） |
 
@@ -40,7 +40,7 @@ npx -y @zlnap/astrolabe setup   # 探测本机 agent 并合并写入 MCP 配置
 claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=claude-code
 ```
 
-Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`。Codex、Windsurf 等见[安装指南](docs/INSTALL_GUIDE.zh-CN.md)。
+Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`。Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安装指南](docs/INSTALL_GUIDE.zh-CN.md)。
 
 **3. 验证。** `astrolabe --version` 输出版本；在客户端里让它调用 `get_languages` 或 `search_code`。添加后请重启客户端会话。
 
