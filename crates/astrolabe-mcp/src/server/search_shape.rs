@@ -462,7 +462,9 @@ mod behaviour {
     #[test]
     fn outline_and_resolve_context_show_go_implementors() {
         let (server, dir) = server_on(&provider_repo());
-        let out = text(&server.find_symbol(Parameters(find("oauth/provider.go"))));
+        let mut outline = find("*");
+        outline.path_filter = Some("oauth/provider.go".into());
+        let out = text(&server.find_symbol(Parameters(outline)));
         assert!(out.contains("outline:"), "{out}");
         assert!(
             out.contains("Go 隐式实现方") && out.contains("GitHubProvider"),

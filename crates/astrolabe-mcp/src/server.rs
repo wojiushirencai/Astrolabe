@@ -3176,7 +3176,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或层级路径定位符号，返回签名、path:line 锚点与定义体（include_body 默认 true）。query 放符号名（或 Class/method）；文件范围用 path_filter。列大纲：query='*' + path_filter。不要把文件路径放进 query。"
+        description = "按名称或层级路径定位符号，返回签名、path:line 锚点与定义体（include_body 默认 true，indexed languages）。query 放符号名（或 Class/method）；文件范围用 path_filter。列大纲：query='*' + path_filter。不要把文件路径放进 query。"
     )]
     pub(crate) fn find_symbol(
         &self,
