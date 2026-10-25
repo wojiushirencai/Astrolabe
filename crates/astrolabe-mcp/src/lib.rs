@@ -10,6 +10,7 @@
 mod alloc;
 mod cli;
 mod code_mask;
+mod compat;
 mod context;
 mod context_page;
 mod coverage;

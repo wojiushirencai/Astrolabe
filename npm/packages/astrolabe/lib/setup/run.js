@@ -261,6 +261,15 @@ function run(argv = process.argv.slice(2)) {
     process.stdout.write(
       '  3. Cursor: open Settings → MCP and confirm astrolabe is listed; enable Run Mode for allowlist.\n',
     );
+    if (opts.withHooks) {
+      process.stdout.write(
+        '     Hooks: ~/.cursor/hooks.json uses --client=cursor (matcher includes mcp__astrolabe__.*).\n',
+      );
+    } else {
+      process.stdout.write(
+        '     Tip: re-run with --with-hooks to write ~/.cursor/hooks.json (--client=cursor).\n',
+      );
+    }
   }
   if (selectedIds.includes('opencode')) {
     process.stdout.write(
@@ -294,7 +303,7 @@ function run(argv = process.argv.slice(2)) {
   }
   if (selectedIds.includes('zcode')) {
     process.stdout.write(
-      '  3. ZCode: MCP under mcp.servers in ~/.zcode/cli/config.json; tip: --with-hooks adds hooks.events.PreToolUse (no SessionEnd).\n',
+      '  3. ZCode: MCP under mcp.servers in ~/.zcode/cli/config.json; tip: --with-hooks adds hooks.events.PreToolUse (--client=zcode; no SessionEnd; scrub Stop cleanup).\n',
     );
   }
   return summary.some((row) => row.status === 'written') || summary.every((row) => row.status === 'skipped')

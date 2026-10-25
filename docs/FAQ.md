@@ -1,6 +1,6 @@
 # Astrolabe AI — FAQ
 
-Last updated 2026-10-18 (v0.13.0). Numbers are from our own runs; see [bench/README.md](../bench/README.md) for method and limits.
+Last updated 2026-10-25 (v0.17.0). Bench numbers below are still from the v0.13.0 A/B runs (index/tool behavior unchanged through 0.17 for search). Numbers are from our own runs; see [bench/README.md](../bench/README.md) for method and limits.
 
 ## What is Astrolabe AI?
 A local MCP server (single Rust binary `astrolabe`) that gives AI coding agents such as Claude Code, Cursor and Codex code search, symbol lookup and reference navigation over your repository. It exposes 7 tools; `search_code` can also count hits per directory.
@@ -18,13 +18,16 @@ On 15 tasks of our own design, 95 simultaneous A/B pairs with v0.13.0 (5 pairs f
 All of them target the same problem (fewer blind greps for coding agents). We have **not** benchmarked Astrolabe against them, so we make no claim of being better. Factual differences we can state: Astrolabe is a single Rust binary with tree-sitter indexing, runs without an embedding model or API key, exposes only 7 tools, and has `search_code` aggregate counting (`aggregate=top|dir|file`, `skip_comments`, `exclude`). Claude Code's LSP plugins provide go-to-definition and find-references natively ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)), which overlaps with our `goto_definition` / `find_references`.
 
 ## Is it the same as the npm package `astrolabe` or `astrolabe-ai`?
-No. Those are unrelated third-party packages (a 2014 Protractor library; a resume tool). This project's npm packages are planned under the `@zlnap/` scope and are not published yet. Install from [GitHub Releases](https://github.com/wojiushirencai/Astrolabe/releases) or with `install.sh`.
+No. Those are unrelated third-party packages (a 2014 Protractor library; a resume tool). This project publishes **`@zlnap/astrolabe`** (and platform packages `@zlnap/<platform>`) under the personal npm scope `zlnap` — live as of [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0). Install with `npx -y @zlnap/astrolabe`, wire clients with `npx -y @zlnap/astrolabe setup`, or use [GitHub Releases](https://github.com/wojiushirencai/Astrolabe/releases) / `install.sh`. Do not install the unscoped `astrolabe` or `astrolabe-ai` packages.
 
 ## Does it send my code anywhere?
 By reading the code: the server does not call an LLM and has no telemetry upload (the "root telemetry" function only writes one local log line). The only network code is the optional language-server installer, which is off by default (`ASTROLABE_AUTO_INSTALL=on` enables it, checksums are mandatory, `ASTROLABE_OFFLINE=1` blocks it). This is a code-reading statement, not an independent network audit. The model your client uses still receives whatever tool results it asks for.
 
 ## How do I install it?
 ```bash
+# npm (recommended): run MCP + wire detected clients
+npx -y @zlnap/astrolabe setup
+# or pin a release binary:
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 claude mcp add --scope user astrolabe -- astrolabe . --context=claude-code
 ```

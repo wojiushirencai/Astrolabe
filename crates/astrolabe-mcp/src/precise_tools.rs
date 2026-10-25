@@ -1151,8 +1151,15 @@ fn server_missing(note: Option<&str>) -> bool {
     let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) else {
         return true;
     };
+    // A timeout means the server is present; installing again does not help.
+    // Match before the "not installed" substring checks so a carefully worded
+    // timeout note cannot trip an install hint.
+    if note.contains("timed out") || note.contains("超时") {
+        return false;
+    }
     [
         "not installed",
+        "not configured",
         "no language server available",
         "failed to start",
         "尚未接通",
@@ -2275,5 +2282,23 @@ mod tests {
             text.contains("安装提示") && text.contains("go install"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn diagnostics_timeout_note_does_not_trigger_install_hint() {
+        let note = "language server timed out after 2.5s waiting for textDocument/publishDiagnostics on src/a.ts;                     the server never published — this is a timeout (server present), not a missing install";
+        let text = unknown_preamble(Some(note), Some("src/a.ts"), false);
+        assert!(text.contains("timed out"), "{text}");
+        assert!(
+            !text.contains("安装提示"),
+            "timeout must not append an install block: {text}"
+        );
+        assert!(
+            !server_missing(Some(note)),
+            "server_missing must treat timed-out notes as present"
+        );
+        assert!(server_missing(Some(
+            "language server not installed or not configured for TypeScript"
+        )));
     }
 }

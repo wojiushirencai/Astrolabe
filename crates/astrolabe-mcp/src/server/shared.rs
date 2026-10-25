@@ -80,6 +80,8 @@ impl AstrolabeServer {
             "find_references" => self.find_references(params(args)?),
             "goto_definition" => self.goto_definition(params(args)?),
             "get_diagnostics" => self.get_diagnostics(params(args)?),
+            // Call-time alias: not in tools/list (catalog stays at 7).
+            crate::compat::EXPLAIN_SYMBOL => self.explain_symbol_compat(args),
             other => {
                 return Err(ErrorData::invalid_params(
                     format!("tool not found: {other}"),
