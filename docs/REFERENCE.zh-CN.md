@@ -125,6 +125,7 @@ Astrolabe 适配以下语言的构建系统与语言服务器；索引与检索�
 | **Shell / Bash** | `.sh`, `.bash`，以及 `#!` 为 sh/bash/dash/ksh 的无后缀脚本 | `bash-language-server` | `ASTROLABE_LSP_SHELL` | `npm i -g bash-language-server`（可选 `shellcheck` 提供诊断）。函数定义（含 `a::b` 风格名字）与 `source` / `.` 相对路径；`.bats` 暂按纯文本；zsh 专有语法不在 bash 语法覆盖范围内 |
 | **Ruby** | `.rb`, `.rake`, `.gemspec`，`Rakefile` / `Gemfile` 等，以及 ruby shebang 脚本 | `ruby-lsp`（回退 `solargraph`） | `ASTROLABE_LSP_RUBY` | `gem install ruby-lsp`（回退 `gem install solargraph`）。class / module / def / `def self.x` / 常量；`define_method`、`alias_method`、`attr_*` 与 `A::B` 嵌套命名；`require_relative` / `require`（经 `lib/`）解析 |
 | **Lua** | `.lua`，以及 lua/luajit shebang 脚本 | `lua-language-server` | `ASTROLABE_LSP_LUA` | `brew install lua-language-server`（或从 [Releases](https://github.com/LuaLS/lua-language-server/releases) 下载）。`function a.b:c()`、`local function`、表字段函数与模块表；`require("a.b")` → `a/b.lua` / `a/b/init.lua` |
+| **Protobuf** | `.proto` | —（图索引，无专用 LSP） | — | message / enum / service / rpc 进入符号图；`import "a/b.proto"` 按仓库相对路径解析（常见根：`proto/`、`protos/`、`api/`、`idl/`、`third_party/`）。字段级符号与 `rpc` 调用边留待后续。
 
 ---
 

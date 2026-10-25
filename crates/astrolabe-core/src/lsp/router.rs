@@ -272,6 +272,7 @@ pub fn install_hint_for(language: Language) -> &'static str {
         Language::Shell => "bash-language-server (`npm i -g bash-language-server`)",
         Language::Ruby => "ruby-lsp (`gem install ruby-lsp`) or solargraph",
         Language::Lua => "lua-language-server (`brew install lua-language-server`)",
+        Language::Proto => "no protobuf language server (use find_symbol / search_code on .proto)",
     }
 }
 
@@ -294,6 +295,7 @@ pub fn primary_server_name(language: Language) -> &'static str {
         Language::Shell => "bash-language-server",
         Language::Ruby => "ruby-lsp",
         Language::Lua => "lua-language-server",
+        Language::Proto => "protobuf (graph-only)",
     }
 }
 

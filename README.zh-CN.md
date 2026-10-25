@@ -16,7 +16,7 @@
 | `tools/list` 体积 | 紧凑 JSON 约 3.6 KB（v0.16.0 Linux 实测 3,607 B；macOS 未重测） |
 | 二进制 | 单文件、无运行时；Release 压缩包 7.4–9.1 MB，Linux x64 解压后约 50 MB |
 | 平台 | macOS arm64/x64、Linux x64（glibc/musl）、Linux arm64、Windows x64 |
-| 语言 | 17 行语言矩阵，含 Python、Go、Rust、Java、TS/JS、C/C++、Swift、Objective-C、PHP、Vue、Dart、C#、VB.NET、Kotlin、Shell、Ruby、Lua（[详情](docs/REFERENCE.zh-CN.md)） |
+| 语言 | 18 行语言矩阵，含 Python、Go、Rust、Java、TS/JS、C/C++、Swift、Objective-C、PHP、Vue、Dart、C#、VB.NET、Kotlin、Shell、Ruby、Lua、Protobuf（[详情](docs/REFERENCE.zh-CN.md)） |
 | 需要 API Key / 联网吗 | 不需要。索引与检索本身不调用 LLM（读取结果的模型仍会消耗 token） |
 | 已写明配置的客户端 | Claude Code、Cursor、Codex、Windsurf/Cline/Roo Code/Continue、OpenCode、DeepSeek Harness、Codebuddy、Grok Build、Kimi Code、ZCode |
 | 许可证 | MIT OR Apache-2.0 |
