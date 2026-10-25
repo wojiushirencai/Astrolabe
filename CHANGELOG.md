@@ -6,6 +6,10 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+### 修复
+
+- **`explain_symbol` 调用期兼容别名**：目录仍固定 7 个工具、`tools/list` 不暴露该名；旧客户端（如 Cursor 残留提示）调用时转发到 `find_symbol(include_body=true, substring=false)`，并在结果中注明改用 `find_symbol` / `find_references`。Hook 将 `mcp__astrolabe__explain_symbol` 视为符号工具以清零计数。
+
 ## [0.17.0] - 2026-10-23
 
 自 v0.16.0 以来的 PR：#90（npm 改发个人 scope `@zlnap`）、#91（DeepSeek Harness 原生 hook 插件）、#92（`astrolabe setup` 一键探测并合并 MCP）、#93（setup 支持 OpenCode / DSH）、#94（setup 支持 Codebuddy / Grok Build / Kimi Code / ZCode）。本版以 **npm/CLI 安装体验** 为主；Rust 索引与工具行为相对 0.16.0 无功能变更。完整说明见 GitHub Release。

@@ -17,6 +17,7 @@ mod diag_env;
 mod diag_toolchain;
 mod ensure_ls;
 mod explain;
+mod compat;
 mod knobs;
 mod line_scan;
 mod session;

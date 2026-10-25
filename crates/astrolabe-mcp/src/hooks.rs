@@ -656,11 +656,16 @@ const ASTROLABE_CATALOG_TOOLS: &[&str] = &[
     "get_languages",
 ];
 
-/// 工具名是否属于 Astrolabe：含 "astrolabe" 且含固定目录里的某个工具名。
+/// 工具名是否属于 Astrolabe：含 "astrolabe" 且含固定目录或兼容别名里的某个工具名。
 /// 第三方 `mcp__astrolabe_docs__fetch` 之类仅名字撞上的工具不算。
 pub(crate) fn is_astrolabe_tool(tool_name: &str) -> bool {
-    tool_name.contains("astrolabe")
-        && ASTROLABE_CATALOG_TOOLS
+    if !tool_name.contains("astrolabe") {
+        return false;
+    }
+    ASTROLABE_CATALOG_TOOLS
+        .iter()
+        .any(|t| tool_name.contains(t))
+        || crate::compat::COMPAT_TOOL_NAMES
             .iter()
             .any(|t| tool_name.contains(t))
 }
@@ -5932,6 +5937,13 @@ mod tests {
         ));
         assert!(is_astrolabe_tool("mcp__astrolabe__search_code"));
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__search_code"));
+    }
+
+    #[test]
+    fn explain_symbol_compat_counts_as_astrolabe_symbolic() {
+        assert!(is_astrolabe_tool("mcp__astrolabe__explain_symbol"));
+        assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__explain_symbol"));
+        assert!(!crate::CATALOG_TOOL_NAMES.contains(&"explain_symbol"));
     }
 
     #[test]
