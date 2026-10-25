@@ -212,7 +212,8 @@ pub(crate) fn config() -> &'static HooksConfig {
     CONFIG.get_or_init(HooksConfig::from_env)
 }
 
-/// 非符号工具子串：Astrolabe 工具名包含这些子串时不重置 burst 计数
+/// 非符号工具子串：仍用于分类（AstrolabeNonSymbolic vs Symbolic），
+/// 但两类工具在 decide 中都会 `reset_burst`（含 grep/read/non_symbolic/slice）。
 pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] =
     &["search_code", "diagnostics", "languages"];
 
@@ -378,8 +379,9 @@ impl CounterState {
 pub(crate) enum ToolKind {
     /// Astrolabe 符号工具（find_symbol, find_references 等，重置计数）
     AstrolabeSymbolic,
-    /// Astrolabe 非符号工具（search_code / diagnostics / instructions 等）：
-    /// 只清零切片读额度，不清零 grep/read/non_symbolic 计数
+    /// Astrolabe 非符号工具（search_code / diagnostics / languages 等）：
+    /// 与符号工具一样清零全部 burst 计数（grep/read/non_symbolic/slice），
+    /// 并结束静默窗（清 last_deny_ts），避免跟 deny 文案走仍 sticky deny。
     AstrolabeNonSymbolic,
     /// grep 类工具（含 shell 文本搜索）
     Grep,
@@ -415,7 +417,7 @@ pub(crate) enum Decision {
     Silenced,
     /// 符号工具，计数清零并保存，无输出
     ResetSymbolic,
-    /// 非符号 astrolabe 工具，切片读额度清零并保存，无输出
+    /// 任意 astrolabe 工具（含非符号）全量清零 burst + 结束静默窗，无输出
     ResetSlice,
     /// 中立工具，直接放行不写盘
     NeutralAllow,
@@ -665,10 +667,10 @@ pub(crate) fn is_astrolabe_tool(tool_name: &str) -> bool {
             .any(|t| tool_name.contains(t))
 }
 
-/// 判定工具名是否为 Astrolabe 符号工具
+/// 判定工具名是否为 Astrolabe 符号（导航）工具。
 ///
-/// tool_name 含 "astrolabe" 且不含子串
-/// {pattern, search_code, diagnostics, languages, instructions}
+/// 分类用：含 "astrolabe" 且不含 NON_SYMBOLIC 子串。decide 中符号与非符号
+/// 都会全量 reset_burst；此函数仅用于分类与观测。
 pub(crate) fn is_astrolabe_symbolic_tool(tool_name: &str) -> bool {
     is_astrolabe_tool(tool_name)
         && !NON_SYMBOLIC_ASTROLABE_SUBSTRINGS
@@ -1337,8 +1339,8 @@ pub(crate) fn classify_tool_ex(
         return ToolKind::AstrolabeSymbolic;
     }
 
-    // 1.5 非符号 astrolabe 工具（search_code / diagnostics / instructions 等）：
-    // 只清零切片读额度（decide 中处理），不清零 grep/read/non_symbolic 计数
+    // 1.5 非符号 astrolabe 工具（search_code / diagnostics / languages 等）：
+    // decide 中与符号工具一样 reset_burst（含 grep/read）；分类保留便于观测。
     if is_astrolabe_tool(tool_name) {
         return ToolKind::AstrolabeNonSymbolic;
     }
@@ -1507,23 +1509,25 @@ pub(crate) fn decide_with(
         }
     }
 
-    // 1. 静默窗内 → no-op（allow，无输出更新）
+    // 1. 任意 Astrolabe MCP 工具（符号 + 非符号）→ 全量清零 burst，并结束静默窗。
+    //    必须排在静默窗判定之前：否则 deny 后跟文案调用 search_code/find_symbol
+    //    会落在 Silenced 分支，计数/sticky deny 状态得不到恢复。
+    //    PreToolUse 时尚未知工具成败；与既有符号路径一致，以「即将调用」为准。
+    if matches!(
+        tool_kind,
+        ToolKind::AstrolabeSymbolic | ToolKind::AstrolabeNonSymbolic
+    ) {
+        counter.reset_burst();
+        counter.last_deny_ts = None;
+        return match tool_kind {
+            ToolKind::AstrolabeSymbolic => Decision::ResetSymbolic,
+            _ => Decision::ResetSlice,
+        };
+    }
+
+    // 2. 静默窗内 → no-op（allow，无输出更新）；Astrolabe 已在上面处理
     if !counter.is_hook_active(now) {
         return Decision::Silenced;
-    }
-
-    // 2. astrolabe 符号工具 → 重置 burst 计数（含切片额度），保留 last_deny_ts
-    if tool_kind == ToolKind::AstrolabeSymbolic {
-        counter.reset_burst();
-        return Decision::ResetSymbolic;
-    }
-
-    // 2.5 非符号 astrolabe 工具 → 只清零切片读额度；
-    // 不清零 n_grep/n_read/n_non_symbolic（维持既有符号重置语义不变）
-    if tool_kind == ToolKind::AstrolabeNonSymbolic {
-        counter.n_slice = 0;
-        counter.last_slice_ts = None;
-        return Decision::ResetSlice;
     }
 
     // 2.7 切片读（Read 带 limit<=max）→ 连续额度制：
@@ -2134,7 +2138,7 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
             0
         }
         Decision::ResetSlice => {
-            // 非符号 astrolabe 工具：已清零切片读额度并保存，无输出
+            // 非符号 astrolabe 工具：已全量清零 burst（含 grep/read）并结束静默窗
             0
         }
         Decision::Allow => {
@@ -2348,15 +2352,14 @@ mod tests {
     }
 
     #[test]
-    fn test_3_search_code_does_not_reset_counter() {
-        // search_code / diagnostics 等非导航类工具不应重置符号计数
+    fn test_3_search_code_resets_burst_counters() {
+        // 分类仍区分非符号 vs 符号（观测/文案用），但 decide 一律 reset_burst
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__search_code"));
         assert!(!is_astrolabe_symbolic_tool(
             "mcp__astrolabe__get_diagnostics"
         ));
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_languages"));
 
-        // 导航类工具正常重置
         assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__find_symbol"));
         assert!(is_astrolabe_symbolic_tool(
             "mcp__astrolabe__find_references"
@@ -2381,19 +2384,66 @@ mod tests {
 
         let mut counter = CounterState {
             n_grep: 2,
+            n_read: 1,
+            n_non_symbolic: 3,
             n_slice: 5,
             last_grep_ts: Some(100.0),
+            last_read_ts: Some(100.2),
+            last_non_symbolic_ts: Some(100.3),
             last_slice_ts: Some(100.5),
-            ..CounterState::default()
+            last_deny_ts: Some(90.0),
         };
 
-        // 调用 search_code：grep 计数不重置（维持既有符号重置语义），
-        // 但切片读额度清零（任何 astrolabe 工具调用都清零切片额度）
+        // search_code：全量清零 burst（含 grep/read/non_symbolic/slice）并结束静默窗
         let d = decide(&mut counter, kind, 101.0);
         assert_eq!(d, Decision::ResetSlice);
-        assert_eq!(counter.n_grep, 2);
+        assert_eq!(counter.n_grep, 0);
+        assert_eq!(counter.n_read, 0);
+        assert_eq!(counter.n_non_symbolic, 0);
         assert_eq!(counter.n_slice, 0);
+        assert_eq!(counter.last_grep_ts, None);
         assert_eq!(counter.last_slice_ts, None);
+        assert_eq!(counter.last_deny_ts, None);
+    }
+
+    #[test]
+    fn test_3b_astrolabe_resets_even_inside_silence_window() {
+        // 回归：静默窗内调用 Astrolabe 必须恢复，不能落 Silenced 留下 sticky 计数
+        let mut counter = CounterState {
+            n_grep: 2,
+            n_read: 2,
+            n_non_symbolic: 3,
+            n_slice: 4,
+            last_grep_ts: Some(1000.0),
+            last_deny_ts: Some(1000.0), // 静默至 1015
+            ..CounterState::default()
+        };
+        let d = decide(
+            &mut counter,
+            ToolKind::AstrolabeNonSymbolic,
+            1005.0, // 仍在 15s 静默窗内
+        );
+        assert_eq!(d, Decision::ResetSlice);
+        assert_eq!(counter.n_grep, 0);
+        assert_eq!(counter.n_read, 0);
+        assert_eq!(counter.n_non_symbolic, 0);
+        assert_eq!(counter.n_slice, 0);
+        assert_eq!(counter.last_deny_ts, None);
+
+        // 恢复后立刻 grep 应从 0 累加，不再 sticky deny
+        let d2 = decide(&mut counter, ToolKind::Grep, 1005.5);
+        assert_eq!(d2, Decision::Allow);
+        assert_eq!(counter.n_grep, 1);
+
+        let mut counter2 = CounterState {
+            n_grep: 2,
+            last_deny_ts: Some(2000.0),
+            ..CounterState::default()
+        };
+        let d3 = decide(&mut counter2, ToolKind::AstrolabeSymbolic, 2005.0);
+        assert_eq!(d3, Decision::ResetSymbolic);
+        assert_eq!(counter2.n_grep, 0);
+        assert_eq!(counter2.last_deny_ts, None);
     }
 
     #[test]

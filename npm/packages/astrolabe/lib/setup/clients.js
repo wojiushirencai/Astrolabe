@@ -9,6 +9,7 @@ const codebuddyMod = require('./codebuddy');
 const grokMod = require('./grok');
 const kimicodeMod = require('./kimicode');
 const zcodeMod = require('./zcode');
+const cursorMod = require('./cursor');
 const PACKAGE_NAME = '@zlnap/astrolabe';
 const SERVER_NAME = 'astrolabe';
 
@@ -360,17 +361,60 @@ const CLIENTS = [
       }
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch }) {
+    plan({ home, launch, withHooks = false }) {
       const filePath = path.join(home, '.cursor', 'mcp.json');
+      const hooksPath = cursorMod.resolveCursorHooksPath(home);
       const entry = jsonServerEntry(launch);
-      return {
+      const steps = [];
+      steps.push({
         kind: 'json-mcp',
         filePath,
-        entry,
         summary: `merge mcpServers.astrolabe into ${filePath}`,
         apply() {
           const result = mergeJsonMcpFile(filePath, entry, { create: true });
-          return { ...result, write: () => writeJsonAtomic(filePath, result.doc) };
+          return { ...result, entry, write: () => writeJsonAtomic(filePath, result.doc) };
+        },
+      });
+      if (withHooks) {
+        steps.push({
+          kind: 'cursor-hooks',
+          filePath: hooksPath,
+          summary: `merge preToolUse/sessionEnd into ${hooksPath} (--client=cursor)`,
+          apply() {
+            const create = exists(path.join(home, '.cursor')) || exists(hooksPath);
+            const result = cursorMod.mergeCursorHooksFile(hooksPath, {
+              create,
+              existsFn: exists,
+            });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
+          },
+        });
+      }
+      return {
+        kind: 'cursor',
+        filePath,
+        entry,
+        summary:
+          steps[0].summary +
+          (withHooks ? `; hooks → ${hooksPath} (--client=cursor, matcher incl. mcp__astrolabe__.*)` : ''),
+        steps,
+        apply() {
+          const results = [];
+          for (const step of steps) {
+            results.push(step.apply());
+          }
+          const primary = results.find((r) => !r.skipped) || results[0];
+          return {
+            ...primary,
+            entry,
+            results,
+            write: () => {
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
+            },
+          };
         },
       };
     },
@@ -839,7 +883,7 @@ const CLIENTS = [
         filePath,
         summary:
           `merge mcp.servers.astrolabe into ${filePath}` +
-          (withHooks ? ' (+ hooks.events.PreToolUse, no SessionEnd)' : ''),
+          (withHooks ? ' (+ hooks.events.PreToolUse; no SessionEnd; scrub Stop cleanup)' : ''),
         apply() {
           const create =
             exists(path.join(home, '.zcode')) ||
@@ -898,7 +942,7 @@ module.exports = {
   resolveDshPluginInstallDirs: dshMod.resolveDshPluginInstallDirs,
   OPENCODE_GUARD_TS: opencodeMod.OPENCODE_GUARD_TS,
   parseJsonc: require('./jsonc').parseJsonc,
-  // Codebuddy / Grok / Kimi / ZCode helpers (tests)
+  // Codebuddy / Grok / Kimi / ZCode / Cursor helpers (tests)
   resolveCodebuddyMcpPath: codebuddyMod.resolveCodebuddyMcpPath,
   mergeCodebuddyHooksSettings: codebuddyMod.mergeCodebuddyHooksSettings,
   resolveGrokConfigToml: grokMod.resolveGrokConfigToml,
@@ -909,4 +953,7 @@ module.exports = {
   mergeKimiHooksToml: kimicodeMod.mergeKimiHooksToml,
   resolveZcodeConfigPath: zcodeMod.resolveZcodeConfigPath,
   mergeZcodeConfigFile: zcodeMod.mergeZcodeConfigFile,
+  resolveCursorHooksPath: cursorMod.resolveCursorHooksPath,
+  mergeCursorHooksFile: cursorMod.mergeCursorHooksFile,
+  CURSOR_REMIND_MATCHER: cursorMod.REMIND_MATCHER,
 };
