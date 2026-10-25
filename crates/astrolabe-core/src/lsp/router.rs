@@ -423,8 +423,7 @@ impl<'a> Router<'a> {
                 sort_locations(&mut locs);
                 if external > 0 {
                     let note = format!(
-                        "{external} 条结果在仓库外（标准库或依赖），已省略；{} result(s) sit outside the repository",
-                        external
+                        "{external} result(s) sit outside the repository (stdlib or dependencies) and were omitted"
                     );
                     return finish(
                         kind,

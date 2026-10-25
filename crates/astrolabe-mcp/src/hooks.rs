@@ -730,9 +730,9 @@ fn is_sed_in_place(args_str: &str) -> bool {
     })
 }
 
-/// 从 JSON 值提取非空 id 字符串（String trim 非空或 Number→字符串）。
-/// 用于 session/conversation/agent 标识的跨键 fallback 解析：按"第一个合法值"而非
-/// "第一个存在的键"取值，null/空白占位键会被跳过继续找后续键。
+/// 从 JSON 值提取非空 id 字符串(String trim 非空或 Number→字符串).
+/// 用于 session/conversation/agent 标识的跨键 fallback 解析:按"第一个合法值"而非
+/// "第一个存在的键"取值，null/空白占位键会被跳过继续找后续键.
 fn json_nonempty_id(v: Option<&serde_json::Value>) -> Option<String> {
     match v? {
         serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
@@ -741,7 +741,7 @@ fn json_nonempty_id(v: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
-/// 从 tool_input JSON 字段提取 u64（接受 Number 或可解析为数字的 String）
+/// 从 tool_input JSON 字段提取 u64(接受 Number 或可解析为数字的 String)
 fn json_value_as_u64(v: &serde_json::Value) -> Option<u64> {
     match v {
         serde_json::Value::Number(n) => n.as_u64(),
@@ -750,8 +750,8 @@ fn json_value_as_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// 解析纯数字字符串为 u64（拒绝 `+N`/`-N`/混入其它字符的形式：
-/// 如 tail -n +5 表示从第 5 行打印到 EOF，不是有界切片）
+/// 解析纯数字字符串为 u64(拒绝 `+N`/`-N`/混入其它字符的形式:
+/// 如 tail -n +5 表示从第 5 行打印到 EOF，不是有界切片)
 fn parse_digits(s: &str) -> Option<u64> {
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
         s.parse::<u64>().ok()
@@ -760,8 +760,8 @@ fn parse_digits(s: &str) -> Option<u64> {
     }
 }
 
-/// 解析 head/tail 参数中的行数：-n N、-nN、--lines=N（只接受有界行数，
-/// 不接受 tail 的 `+N` 起始行形式——那会打印到 EOF，不是有界切片）
+/// 解析 head/tail 参数中的行数:-n N, -nN, --lines=N(只接受有界行数，
+/// 不接受 tail 的 `+N` 起始行形式——那会打印到 EOF，不是有界切片)
 fn parse_head_tail_line_count(args_str: &str) -> Option<u64> {
     let tokens: Vec<&str> = args_str.split_whitespace().collect();
     for (i, raw) in tokens.iter().enumerate() {
@@ -786,11 +786,11 @@ fn parse_head_tail_line_count(args_str: &str) -> Option<u64> {
     None
 }
 
-/// 判定单个 sed 脚本 token 是否为"纯数字地址 + p 打印"命令（如 300,340p / 50p / 50p;80p）
+/// 判定单个 sed 脚本 token 是否为"纯数字地址 + p 打印"命令(如 300,340p / 50p / 50p;80p)
 ///
-/// 检查 sed 脚本是否为受限的切片打印 token（如 `'300,340p'`、`'50p'` 或 `'50p;80p'`）。
-/// 仅放行纯数字单行或跨度 <= slice_read_max_limit（默认 200）的明确行号区间；
-/// 拒绝 `$p`、`/re/p`、`1,$p` 以及超限大范围倾倒。
+/// 检查 sed 脚本是否为受限的切片打印 token(如 `'300,340p'`, `'50p'` 或 `'50p;80p'`).
+/// 仅放行纯数字单行或跨度 <= slice_read_max_limit(默认 200)的明确行号区间；
+/// 拒绝 `$p`, `/re/p`, `1,$p` 以及超限大范围倾倒.
 fn is_sed_print_script_token(cleaned: &str) -> bool {
     let mut total: u64 = 0;
     for part in cleaned.split(';') {
@@ -803,17 +803,17 @@ fn is_sed_print_script_token(cleaned: &str) -> bool {
     total <= config().slice_read_max_limit
 }
 
-/// 单段 `Np` / `A,Bp` 的行数；非纯数字打印返回 None；区间超上限返回 None。
+/// 单段 `Np` / `A,Bp` 的行数；非纯数字打印返回 None；区间超上限返回 None.
 fn sed_print_part_lines(s_raw: &str) -> Option<u64> {
     let s = s_raw.strip_suffix('p')?;
     if s.is_empty() {
         return None;
     }
-    // 单行形式：如 "50p"
+    // 单行形式:如 "50p"
     if parse_digits(s).is_some() {
         return Some(1);
     }
-    // 区间形式：如 "300,340p"
+    // 区间形式:如 "300,340p"
     if let Some((start_str, end_str)) = s.split_once(',') {
         if let (Some(start), Some(end)) = (parse_digits(start_str), parse_digits(end_str)) {
             if end >= start && (end - start + 1) <= config().slice_read_max_limit {
@@ -824,7 +824,7 @@ fn sed_print_part_lines(s_raw: &str) -> Option<u64> {
     None
 }
 
-/// 是否为 sed 的静默 flag：`-n`、`--quiet`、`--silent`，或合并短 flag（如 `-ne`、`-nE`）。
+/// 是否为 sed 的静默 flag:`-n`, `--quiet`, `--silent`，或合并短 flag(如 `-ne`, `-nE`).
 fn is_sed_quiet_flag(cleaned: &str) -> bool {
     if cleaned == "--quiet" || cleaned == "--silent" {
         return true;
@@ -837,8 +837,8 @@ fn is_sed_quiet_flag(cleaned: &str) -> bool {
         && !cleaned[1..].contains('i')
 }
 
-/// 判定 sed 参数是否为切片打印：带 -n（--quiet/--silent）静默且脚本含 p 打印命令，
-/// 且不含 -i 原地写（如 `sed -n '300,340p' src/a.rs`）
+/// 判定 sed 参数是否为切片打印:带 -n(--quiet/--silent)静默且脚本含 p 打印命令，
+/// 且不含 -i 原地写(如 `sed -n '300,340p' src/a.rs`)
 fn is_sed_slice_print(args_str: &str) -> bool {
     if args_str.trim().is_empty() || is_sed_in_place(args_str) {
         return false;
@@ -1831,7 +1831,7 @@ pub(crate) fn gc_stale_sessions(
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => removed += 1,
                 Err(err) => {
-                    tracing::debug!(path = %path.display(), error = %err, "hook GC 删除失败")
+                    tracing::debug!(path = %path.display(), error = %err, "hook GC delete failed")
                 }
             }
         }
@@ -1863,7 +1863,7 @@ fn maybe_gc_opportunistic(home: &Path, now: std::time::SystemTime, keep: &str, m
     let _ = std::fs::write(&stamp, b"");
     let max_age = std::time::Duration::from_secs(max_age_hours.saturating_mul(3600));
     match gc_stale_sessions(home, now, max_age, Some(keep)) {
-        Ok(n) if n > 0 => tracing::debug!(removed = n, "hook GC 清理过期会话"),
+        Ok(n) if n > 0 => tracing::debug!(removed = n, "hook GC cleaned expired sessions"),
         _ => {}
     }
 }
@@ -2085,7 +2085,7 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
         ?agent_id,
         tool_name = %tool_name,
         ?tool_kind,
-        "处理 PreToolUse hook 调用"
+        "handling PreToolUse hook call"
     );
 
     let now_ts = now.unwrap_or_else(current_timestamp);
@@ -2154,7 +2154,7 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
         Decision::Deny(deny_kind) => {
             // 超阈值触发 deny：已清零并保存，输出 JSON
             let output_str = build_output(client, deny_kind);
-            tracing::info!(?deny_kind, client = %client_name, "触发防漂移 deny 提示");
+            tracing::info!(?deny_kind, client = %client_name, "emitting anti-drift deny hint");
             let _ = writeln!(stdout, "{output_str}");
             0
         }
@@ -2221,7 +2221,7 @@ pub(crate) fn run_cleanup_impl<R: Read, E: Write>(
     if let Some(h) = home {
         match cleanup_session(&h, &session_id) {
             Ok(()) => {
-                tracing::debug!(session_id = %session_id, "SessionEnd cleanup 成功");
+                tracing::debug!(session_id = %session_id, "SessionEnd cleanup succeeded");
                 0
             }
             Err(err) => {
@@ -3010,7 +3010,11 @@ mod tests {
                 Some(&temp_home),
             );
             assert_eq!(code, 0);
-            assert!(out.is_empty(), "第 {} 次调用不应产生 deny 输出", i + 1);
+            assert!(
+                out.is_empty(),
+                "call #{} should not produce deny output",
+                i + 1
+            );
         }
 
         let _ = std::fs::remove_dir_all(&temp_home);
@@ -3087,7 +3091,10 @@ mod tests {
                 Some(&temp_home),
             );
             assert_eq!(code, 0);
-            assert!(out.is_empty(), "README.md 读取不应触发 read deny");
+            assert!(
+                out.is_empty(),
+                "README.md read should not trigger read deny"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&temp_home);
@@ -3262,7 +3269,7 @@ mod tests {
             assert_eq!(code, 0);
             assert!(
                 out.is_empty(),
-                "第 {} 次 heredoc 写操作不应产生 deny 输出",
+                "heredoc write #{} should not produce deny output",
                 i + 1
             );
         }
@@ -3305,7 +3312,7 @@ mod tests {
             assert_eq!(code, 0);
             assert!(
                 out.is_empty(),
-                "第 {} 次 echo 追加操作不应产生 deny 输出",
+                "echo append #{} should not produce deny output",
                 i + 1
             );
         }
@@ -3398,7 +3405,7 @@ mod tests {
                 Some(&temp_home),
             );
             assert_eq!(code, 0);
-            assert!(out.is_empty(), "sed -i 不应计为 read");
+            assert!(out.is_empty(), "sed -i should not count as read");
         }
 
         // sed 变体：-i''、-i.bak、--in-place 均不触发 deny
@@ -3427,7 +3434,10 @@ mod tests {
                 Some(&temp_home),
             );
             assert_eq!(code, 0);
-            assert!(out.is_empty(), "sed 原地变体不应计为 read: {cmd}");
+            assert!(
+                out.is_empty(),
+                "sed in-place variant should not count as read: {cmd}"
+            );
         }
 
         // Case 2: sed 's/a/b/' src/a.rs（无 -i，stdout 读）连续 3 次 -> 触发 read deny
@@ -3558,7 +3568,7 @@ mod tests {
                     Some(300)
                 ),
                 ToolKind::Neutral,
-                "非代码文件切片应保持中立: {non_code}"
+                "non-code file slice should stay Neutral: {non_code}"
             );
         }
 
@@ -3590,7 +3600,7 @@ mod tests {
             assert_eq!(code, 0);
             assert!(
                 out.is_empty(),
-                "第 {} 次切片 Read 不应产生 deny 输出",
+                "slice Read #{} should not produce deny output",
                 i + 1
             );
         }
@@ -3659,8 +3669,12 @@ mod tests {
                 Some(now),
                 Some(&temp_home),
             );
-            assert_eq!(code, 0, "第 {} 次切片读应正常放行", i + 1);
-            assert!(out.is_empty(), "第 {} 次切片读不应有输出", i + 1);
+            assert_eq!(code, 0, "slice read #{} should be allowed", i + 1);
+            assert!(
+                out.is_empty(),
+                "slice read #{} should have no output",
+                i + 1
+            );
             now += 1.0;
         }
 
@@ -3678,7 +3692,7 @@ mod tests {
         let denied = String::from_utf8_lossy(&out);
         assert!(
             denied.contains("\"permissionDecision\":\"deny\""),
-            "第 10 次切片读应触发 deny，got: {denied}"
+            "10th slice read should trigger deny, got: {denied}"
         );
         assert!(denied.contains("file-slice reads"));
         now += 1.0;
@@ -3698,7 +3712,11 @@ mod tests {
                 Some(&temp_home),
             );
             assert_eq!(code, 0);
-            assert!(out.is_empty(), "静默窗后第 {} 次切片读不应有输出", i + 1);
+            assert!(
+                out.is_empty(),
+                "slice read #{} after silence window should have no output",
+                i + 1
+            );
             now += 1.0;
         }
 
@@ -3713,12 +3731,18 @@ mod tests {
             Some(&temp_home),
         );
         assert_eq!(code_search, 0);
-        assert!(out.is_empty(), "astrolabe 非符号工具调用本身不应有输出");
+        assert!(
+            out.is_empty(),
+            "astrolabe non-symbol tool call itself should have no output"
+        );
         let counter_path = get_hook_data_dir(&temp_home, sess_id, None)
             .unwrap()
             .join("counter.json");
         let counter = load_counter(&counter_path);
-        assert_eq!(counter.n_slice, 0, "search_code 调用后切片额度应清零");
+        assert_eq!(
+            counter.n_slice, 0,
+            "slice counter should reset after search_code call"
+        );
         assert_eq!(counter.last_slice_ts, None);
         now += 1.0;
 
@@ -3736,7 +3760,7 @@ mod tests {
             assert_eq!(code, 0);
             assert!(
                 out.is_empty(),
-                "清零后第 {} 次切片读不应有输出（额度应已被 search_code 清零）",
+                "slice read #{} after reset should have no output (counter should have been cleared by search_code)",
                 i + 1
             );
             now += 1.0;
@@ -3787,7 +3811,11 @@ mod tests {
                 Some(&temp_home),
             );
             assert_eq!(code, 0);
-            assert!(out.is_empty(), "第 {} 次 .scala 切片读不应有输出", i + 1);
+            assert!(
+                out.is_empty(),
+                ".scala slice read #{} should have no output",
+                i + 1
+            );
         }
 
         let _ = std::fs::remove_dir_all(&temp_home);
@@ -3797,7 +3825,8 @@ mod tests {
     fn test_old_counter_json_without_slice_fields_deserializes() {
         // 旧版 counter.json（无 n_slice/last_slice_ts 字段）反序列化落到默认值，不 panic
         let old = r#"{"n_grep":2,"n_read":1,"n_non_symbolic":3,"last_grep_ts":1.0,"last_read_ts":1.0,"last_non_symbolic_ts":1.0,"last_deny_ts":null}"#;
-        let c: CounterState = serde_json::from_str(old).expect("旧 counter.json 应可反序列化");
+        let c: CounterState =
+            serde_json::from_str(old).expect("legacy counter.json should deserialize");
         assert_eq!(c.n_slice, 0);
         assert_eq!(c.last_slice_ts, None);
         assert_eq!(c.n_grep, 2);
@@ -3816,7 +3845,10 @@ mod tests {
         };
         let d = decide(&mut counter, ToolKind::SliceRead, 105.0);
         assert_eq!(d, Decision::Silenced);
-        assert_eq!(counter.n_slice, 9, "静默窗内不应累加切片计数");
+        assert_eq!(
+            counter.n_slice, 9,
+            "should not increment slice counter inside silence window"
+        );
 
         // 2. 间隔 > SLICE_RESET_PERIOD_SECONDS(2000s) → 重置为 1
         let mut counter = CounterState {
@@ -3826,7 +3858,7 @@ mod tests {
         };
         let d = decide(&mut counter, ToolKind::SliceRead, 2101.5);
         assert_eq!(d, Decision::Allow);
-        assert_eq!(counter.n_slice, 1, "超 2000s 间隔应重置为 1");
+        assert_eq!(counter.n_slice, 1, "gap > 2000s should reset counter to 1");
 
         // 3. 符号工具 reset_burst 清零 n_slice
         let mut counter = CounterState {
@@ -3836,7 +3868,7 @@ mod tests {
         };
         let d = decide(&mut counter, ToolKind::AstrolabeSymbolic, 101.0);
         assert_eq!(d, Decision::ResetSymbolic);
-        assert_eq!(counter.n_slice, 0, "符号工具应清零切片额度");
+        assert_eq!(counter.n_slice, 0, "symbol tool should clear slice counter");
         assert_eq!(counter.last_slice_ts, None);
     }
 
@@ -3870,31 +3902,31 @@ mod tests {
             let out = build_output(Client::ClaudeCode, kind);
             assert!(
                 out.contains("find_symbol"),
-                "{kind:?} deny 输出应优先含 find_symbol: {out}"
+                "{kind:?} deny output should prefer find_symbol: {out}"
             );
             assert!(
                 out.contains("resolve_context"),
-                "{kind:?} deny 输出应优先含 resolve_context: {out}"
+                "{kind:?} deny output should prefer resolve_context: {out}"
             );
             assert!(
                 out.contains("search_code"),
-                "{kind:?} deny 输出应仍提及 search_code: {out}"
+                "{kind:?} deny output should still mention search_code: {out}"
             );
             assert!(
                 out.contains("slice-read counter") || out.contains("slice counter"),
-                "{kind:?} deny 应诚实说明 search_code 只清切片额度: {out}"
+                "{kind:?} deny should honestly say search_code only clears the slice counter: {out}"
             );
             assert!(
                 out.contains("Stop using"),
-                "{kind:?} deny 输出应含明确停止+切换指令: {out}"
+                "{kind:?} deny output should include a clear stop+switch instruction: {out}"
             );
             assert!(
                 !out.contains("You can continue using"),
-                "{kind:?} deny 输出不应残留软口径: {out}"
+                "{kind:?} deny output should not retain soft wording: {out}"
             );
             assert!(
                 !out.contains("the counter was reset"),
-                "{kind:?} deny 输出不应残留计数重置软话术: {out}"
+                "{kind:?} deny output should not retain soft counter-reset wording: {out}"
             );
         }
     }
@@ -4481,13 +4513,13 @@ mod tests {
             );
             assert_eq!(code, 0);
             if i < 2 {
-                assert!(out.is_empty(), "agent-a 第 {} 次 grep 不应 deny", i + 1);
+                assert!(out.is_empty(), "agent-a grep #{} should not deny", i + 1);
             }
         }
         let out_str = String::from_utf8_lossy(&out);
         assert!(
             out_str.contains("\"permissionDecision\":\"deny\""),
-            "agent-a 第 3 次 grep 应触发 deny，got: {out_str}"
+            "agent-a 3rd grep should trigger deny, got: {out_str}"
         );
 
         // agent-b：同会话第 1 次 grep（now=103）不受 agent-a 计数影响，无 deny 输出
@@ -4503,7 +4535,7 @@ mod tests {
         assert_eq!(code_b1, 0);
         assert!(
             out.is_empty(),
-            "agent-b 首次 grep 不应被 agent-a 的 deny 计数/静默窗波及"
+            "agent-b first grep should not be affected by agent-a's deny count/silence window"
         );
 
         // 补强：agent-b 继续累计到自己的第 3 次（105）必须触发 deny。
@@ -4524,7 +4556,7 @@ mod tests {
         let out_b_str = String::from_utf8_lossy(&out);
         assert!(
             out_b_str.contains("\"permissionDecision\":\"deny\""),
-            "agent-b 第 3 次 grep 应触发独立 deny，got: {out_b_str}"
+            "agent-b 3rd grep should trigger its own deny, got: {out_b_str}"
         );
 
         // 落盘路径按 agent 分片
@@ -4584,7 +4616,7 @@ mod tests {
         assert_eq!(
             entries.len(),
             1,
-            "无 agent_id 时会话目录应只有 counter.json 一个条目"
+            "without agent_id, session dir should contain only counter.json"
         );
         assert!(entries[0].as_ref().unwrap().path().is_file());
 
@@ -4654,11 +4686,11 @@ mod tests {
             assert_eq!(
                 got.len(),
                 3 + 16,
-                "应收敛为 ag-<16hex> 哈希分量: {bad} -> {got}"
+                "should collapse to ag-<16hex> hash component: {bad} -> {got}"
             );
             assert!(
                 got.starts_with("ag-"),
-                "应收敛为 ag-<16hex> 哈希分量: {bad} -> {got}"
+                "should collapse to ag-<16hex> hash component: {bad} -> {got}"
             );
         }
         assert_eq!(
@@ -4772,7 +4804,7 @@ mod tests {
         assert_eq!(
             hook_data_entries.len(),
             1,
-            "hook_data 下应只有会话目录一个条目"
+            "hook_data should contain only the session directory entry"
         );
 
         let _ = std::fs::remove_dir_all(&temp_home);
@@ -4816,11 +4848,11 @@ mod tests {
                 Some(100.0),
                 Some(&temp_home),
             );
-            assert_eq!(code, 0, "{sess} 应正常处理");
+            assert_eq!(code, 0, "{sess} should process normally");
             let sess_dir = get_hook_data_dir(&temp_home, sess, None).unwrap();
             assert!(
                 sess_dir.join("counter.json").exists(),
-                "{sess} 应落会话级平面 counter"
+                "{sess} should land a session-level flat counter"
             );
             let entries: Vec<_> = std::fs::read_dir(&sess_dir)
                 .unwrap()
@@ -4834,7 +4866,7 @@ mod tests {
             assert_eq!(
                 entries.len(),
                 1,
-                "{sess} 会话目录应只有 counter.json 一个条目"
+                "{sess} session dir should contain only counter.json"
             );
         }
 
@@ -4872,7 +4904,7 @@ mod tests {
         let both_dir = get_hook_data_dir(&temp_home, "edge_both", None).unwrap();
         assert!(
             both_dir.join("snake-x").join("counter.json").exists(),
-            "agent_id 应优先于 agentId"
+            "agent_id should take precedence over agentId"
         );
         assert!(!both_dir.join("camel-y").exists());
 
@@ -4909,7 +4941,10 @@ mod tests {
             Some(100.0),
             Some(&temp_home),
         );
-        assert_eq!(code, 0, "应跳过占位键用 conversation_id，而非 exit 2");
+        assert_eq!(
+            code, 0,
+            "should skip placeholder keys and use conversation_id, not exit 2"
+        );
         // 计数落盘：会话目录 conv-abc、分片 camel-1（agent_id 空串被跳过）
         let sess_dir = get_hook_data_dir(&temp_home, "conv-abc", None).unwrap();
         assert!(sess_dir.join("camel-1").join("counter.json").exists());
@@ -4961,7 +4996,7 @@ mod tests {
             assert_eq!(code, 0);
             assert!(
                 out.is_empty(),
-                "README 非代码文件，第 {} 次不应 deny（path 未提取时会误走保守分支）",
+                "README is non-code; call #{} should not deny (conservative branch when path is missing)",
                 i + 1
             );
         }
@@ -5202,7 +5237,7 @@ mod tests {
         let user_msg = cursor_val["user_message"].as_str().unwrap();
         assert!(
             agent_msg.len() > user_msg.len(),
-            "agent_message 应承载长引导文案: agent={agent_msg} user={user_msg}"
+            "agent_message should carry the long guidance text: agent={agent_msg} user={user_msg}"
         );
         assert!(agent_msg.contains("read-only"));
 
@@ -5542,7 +5577,10 @@ mod tests {
             SystemTime::now() - Duration::from_secs(48 * 3600),
         );
         maybe_gc_opportunistic(home, SystemTime::now(), "cur", 24);
-        assert!(root.join("b").exists(), "节流窗口内不应扫描");
+        assert!(
+            root.join("b").exists(),
+            "should not scan inside throttle window"
+        );
     }
 
     #[test]

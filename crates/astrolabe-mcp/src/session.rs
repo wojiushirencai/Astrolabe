@@ -270,7 +270,9 @@ pub(crate) fn build_session_index(session: &RootSession, persist: bool) -> Optio
         )
     }));
     let state = match outcome {
-        Err(_) => IndexState::Failed("底层索引能力尚未实现或发生 panic".to_string()),
+        Err(_) => IndexState::Failed(
+            "Underlying index capability is not implemented or panicked".to_string(),
+        ),
         Ok(None) => {
             tracing::info!(
                 root = %session.root.display(),
@@ -291,7 +293,7 @@ pub(crate) fn build_index(root: &Path, persist: bool, parse_cache_bytes: u64) ->
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         index::build_with_options(root, persist, parse_cache_bytes)
     }))
-    .map_err(|_| "底层索引能力尚未实现或发生 panic".to_string())
+    .map_err(|_| "Underlying index capability is not implemented or panicked".to_string())
     .and_then(|result| result.map_err(|error| error.to_string()))
     .map(Arc::new)
     .map(IndexState::Ready)
@@ -621,10 +623,10 @@ fn settle_unapplied(session: &Arc<RootSession>) -> Option<String> {
 }
 
 pub(crate) fn incremental_failure_note(count: usize, sample: &[String]) -> String {
-    let more = if count > sample.len() { " 等" } else { "" };
+    let more = if count > sample.len() { " etc." } else { "" };
     format!(
-        "索引可能过期：{count} 个文件的增量更新失败（{}{more}），已重试并触发后台重建；涉及这些文件的结果可能是旧的。confidence: unknown",
-        sample.join("、")
+        "Index may be stale: incremental update failed for {count} files ({}{more}); retried and triggered a background rebuild; results involving these files may be outdated. confidence: unknown",
+        sample.join(", ")
     )
 }
 
@@ -745,7 +747,7 @@ pub(crate) fn fresh_window_for(
 const BARRIER_VERIFY_WAIT: Duration = Duration::from_secs(2);
 
 pub(crate) fn verification_timeout_note() -> String {
-    "索引可能过期：变更校验未在 2 秒内完成，本结果基于未确认的索引。confidence: unknown".to_string()
+    "Index may be stale: change verification did not finish within 2s; this result is based on an unverified index. confidence: unknown".to_string()
 }
 
 /// Returns `true` when the watermark advanced before `timeout`.
@@ -885,7 +887,7 @@ pub(crate) fn append_stale_note(result: CallToolResult, note: &str) -> CallToolR
 
 pub(crate) fn unroutable_message(children: &[PathBuf]) -> String {
     let mut out = String::from(
-        "多项目工作区：无法路由到唯一子仓。请加 root 参数（子仓名或绝对路径），或让 path 以子仓名/绝对路径开头。候选：\n",
+        "Multi-project workspace: cannot route to a unique sub-repo. Pass root (sub-repo name or absolute path), or make path start with the sub-repo name/absolute path. Candidates:\n",
     );
     for child in children {
         out.push_str(&format!("  {}\n", child.display()));
@@ -895,7 +897,7 @@ pub(crate) fn unroutable_message(children: &[PathBuf]) -> String {
         .and_then(|c| c.file_name())
         .and_then(|n| n.to_str())
     {
-        out.push_str(&format!("例如 root=\"{name}\"\n"));
+        out.push_str(&format!("e.g. root=\"{name}\"\n"));
     }
     out.push_str("confidence: unknown");
     out
@@ -1123,7 +1125,7 @@ mod tests {
             before,
             Duration::from_millis(50)
         ));
-        assert!(verification_timeout_note().contains("索引可能过期"));
+        assert!(verification_timeout_note().contains("Index may be stale"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1437,7 +1439,7 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(600));
         let note = barrier_note(&session).expect("stale note while unapplied");
         assert!(
-            note.contains("增量更新失败") && note.contains("b.py"),
+            note.contains("incremental update failed") && note.contains("b.py"),
             "{note}"
         );
         // Once the retry is due, the query retries inline and succeeds.
@@ -1483,7 +1485,7 @@ mod tests {
         session.fail_applies.store(1, Ordering::SeqCst);
         session.apply_health.lock().unwrap().next_inline_retry = None;
         let note = barrier_note(&session).expect("note while still failing");
-        assert!(note.contains("增量更新失败"), "{note}");
+        assert!(note.contains("incremental update failed"), "{note}");
         let deadline = Instant::now() + Duration::from_secs(30);
         while !has_symbol(&session, "beta") || session.rebuild_inflight.load(Ordering::SeqCst) {
             assert!(Instant::now() < deadline, "rebuild never absorbed b.py");

@@ -20,7 +20,7 @@ pub const COMPAT_TOOL_NAMES: &[&str] = &[EXPLAIN_SYMBOL];
 
 const COMPAT_NOTE: &str = "\
 [compat] explain_symbol → find_symbol(include_body=true, substring=false). \
-调用点请用 find_references；请改用这两个工具，勿再调用 explain_symbol。";
+Use find_references for call sites; switch to these two tools and stop calling explain_symbol.";
 
 #[derive(Debug, Deserialize)]
 struct ExplainCompatParams {
@@ -46,16 +46,16 @@ impl AstrolabeServer {
             Ok(p) => p,
             Err(err) => {
                 return crate::server::text_error(format!(
-                    "explain_symbol 已从目录移除；参数无效（{err}）。\
-                     请改用 find_symbol（include_body=true）取定义，find_references 取调用点。"
+                    "explain_symbol was removed from the catalog; invalid params ({err}).\
+                     Use find_symbol (include_body=true) for definitions and find_references for call sites."
                 ));
             }
         };
         let query = first_nonempty([&params.name, &params.query]);
         if query.is_empty() {
             return crate::server::text_error(
-                "explain_symbol 已从目录移除（兼容层仍可用）。\
-                 请传 name（或 query）；推荐改用 find_symbol(include_body=true) 与 find_references。",
+                "explain_symbol was removed from the catalog (compat shim still works).\
+                 Pass name (or query); prefer find_symbol(include_body=true) and find_references.",
             );
         }
         let result = self.find_symbol(Parameters(QueryParams {

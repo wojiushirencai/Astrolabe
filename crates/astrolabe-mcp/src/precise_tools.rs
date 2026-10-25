@@ -29,15 +29,13 @@ use crate::refs_render;
 const DEFAULT_BUDGET: usize = 2_500;
 
 const SEARCH_CODE_FALLBACK: &str =
-    "可改用 search_code 做字面搜索，但那是句法匹配：同名标识符、字符串和注释都会算作命中，\
-     既会误报也会漏掉经别名或重导出的引用。它不能代替精确引用。";
+    "You can use search_code for a literal search, but that is syntactic: same-name identifiers, strings, and comments all count as hits — both false positives and misses via aliases/re-exports. It cannot replace precise references.";
 
 const DEFINITION_FALLBACK: &str =
-    "可改用 find_symbol（句法/图谱名字匹配）或 search_code（字面搜索），\
-     但二者都不能代替语言服务器的绑定解析。";
+    "You can use find_symbol (syntactic/graph name match) or search_code (literal search), but neither replaces language-server binding resolution.";
 
 const NOT_WIRED: &str =
-    "该能力尚未接通：语言服务器查询层与改写引擎仍在接入中，当前不能给出精确结果。";
+    "This capability is not wired yet: the language-server query layer and rewrite engine are still being connected; no precise result is available.";
 
 fn default_budget() -> usize {
     DEFAULT_BUDGET
@@ -58,7 +56,7 @@ fn effective_budget(raw: usize) -> usize {
 
 /// Stated once per result that lists positions.
 pub(crate) const COORD_NOTE: &str =
-    "坐标：行、列均从 1 起，列按 UTF-16 单位；作为 line/character 入参时用 0 起的值（各减 1）。\n";
+    "Coordinates: line and column are 1-based; columns are UTF-16 units. For line/character parameters use 0-based values (subtract 1 each).\n";
 
 /// One page of `items` starting at `offset`, cut by `budget`. Always keeps at
 /// least one item when any remain, so `next_offset` advances. Returns the kept
@@ -74,7 +72,7 @@ fn page(items: &[String], offset: usize, budget: usize) -> (Vec<&String>, usize)
 }
 
 fn omitted_line(omitted: usize, next_offset: usize) -> String {
-    format!("{omitted} 个结果因 budget_tokens 被省略；用 offset={next_offset} 取后续。\n")
+    format!("{omitted} omitted due to budget_tokens; offset={next_offset} for more.\n")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -156,11 +154,11 @@ pub(crate) struct GetDiagnosticsParams {
 
 /// Tool descriptions shared by `PreciseTools` and `AstrolabeServer`, so the
 /// two catalogs cannot drift apart.
-pub(crate) const FIND_REFERENCES_DESC: &str = "精确引用（索引优先，语言服务器兜底）：调用点与用法，改名和调用方分析用它。传 path（定义或使用处）消歧；省略时沿用本会话最近 find_symbol/goto_definition 命中，否则唯一索引定义或候选列表。Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
+pub(crate) const FIND_REFERENCES_DESC: &str = "Precise references (index first, language-server fallback): call sites and usages — use for rename and caller analysis. Pass path (definition or use site) to disambiguate; when omitted, reuse this session's latest find_symbol/goto_definition hit, else the unique index definition or a candidate list. Hits show source line, enclosing func, [declaration]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
 pub(crate) const GOTO_DEFINITION_DESC: &str =
-    "Jump to definition: 按使用处文件 + 符号名返回定义锚点。";
+    "Jump to definition: return the definition anchor from the use-site file + symbol name.";
 pub(crate) const GET_DIAGNOSTICS_DESC: &str =
-    "文件诊断（语法与类型错误），编辑后核对用；已跑通构建/测试则不必再调。";
+    "File diagnostics (syntax and type errors) for checking after edits; skip if build/tests already pass.";
 
 /// Backend for the precise MCP query tools.
 ///
@@ -226,8 +224,9 @@ impl PreciseCapability for Unwired {
         Precise::unknown(
             Vec::new(),
             format!(
-                "{NOT_WIRED} 目标符号 `{symbol}`{}。",
-                path.map(|p| format!("（限定 {p}）")).unwrap_or_default()
+                "{NOT_WIRED} target symbol `{symbol}`{}.",
+                path.map(|p| format!(" (scoped to {p})"))
+                    .unwrap_or_default()
             ),
         )
     }
@@ -241,14 +240,14 @@ impl PreciseCapability for Unwired {
     ) -> Precise<Vec<Location>> {
         let target = match (symbol, line, character) {
             (_, Some(l), Some(c)) => format!("@{path}:{l}:{c}"),
-            (Some(s), _, _) => format!("`{s}`（限定 {path}）"),
-            _ => format!("（限定 {path}）"),
+            (Some(s), _, _) => format!("`{s}` (scoped to {path})"),
+            _ => format!(" (scoped to {path})"),
         };
-        Precise::unknown(Vec::new(), format!("{NOT_WIRED} 目标 {target}。"))
+        Precise::unknown(Vec::new(), format!("{NOT_WIRED} target {target}."))
     }
 
     fn diagnostics(&self, path: &str) -> Precise<Vec<Diagnostic>> {
-        Precise::unknown(Vec::new(), format!("{NOT_WIRED} 目标文件 `{path}`。"))
+        Precise::unknown(Vec::new(), format!("{NOT_WIRED} target file `{path}`."))
     }
 }
 
@@ -276,7 +275,7 @@ impl PreciseTools {
 impl PreciseTools {
     #[tool(
         description = FIND_REFERENCES_DESC,
-        annotations(title = "精确引用", read_only_hint = true)
+        annotations(title = "Precise references", read_only_hint = true)
     )]
     pub(crate) fn find_references(
         &self,
@@ -287,7 +286,7 @@ impl PreciseTools {
 
     #[tool(
         description = GOTO_DEFINITION_DESC,
-        annotations(title = "精确定义", read_only_hint = true)
+        annotations(title = "Precise definition", read_only_hint = true)
     )]
     pub(crate) fn goto_definition(
         &self,
@@ -298,7 +297,7 @@ impl PreciseTools {
 
     #[tool(
         description = GET_DIAGNOSTICS_DESC,
-        annotations(title = "文件诊断", read_only_hint = true)
+        annotations(title = "File diagnostics", read_only_hint = true)
     )]
     pub(crate) fn get_diagnostics(
         &self,
@@ -315,7 +314,11 @@ pub(crate) fn run_find_references(
     params.budget_tokens = effective_budget(params.budget_tokens);
     if params.symbol.trim().is_empty() {
         return text_result(
-            unknown_preamble(Some("symbol 不能为空。"), params.path.as_deref(), true),
+            unknown_preamble(
+                Some("symbol cannot be empty."),
+                params.path.as_deref(),
+                true,
+            ),
             json!({
                 "confidence": "unknown",
                 "budget_tokens": params.budget_tokens,
@@ -351,7 +354,7 @@ pub(crate) fn run_find_references(
             }
         }
         if locations.is_empty() {
-            header.push_str(&format!("未找到对 `{}` 的引用。\n", params.symbol));
+            header.push_str(&format!("References not found for `{}`.\n", params.symbol));
         }
         header
     };
@@ -453,7 +456,10 @@ pub(crate) fn run_find_references(
         body.push_str(REF_COORD_NOTE);
     }
     if offset > 0 && offset >= items.len() && !items.is_empty() {
-        body.push_str(&format!("offset={offset} 超出结果总数 {}。\n", items.len()));
+        body.push_str(&format!(
+            "offset={offset} beyond total result count {}.\n",
+            items.len()
+        ));
     }
     if !kept.is_empty() {
         body.push_str(&hits.continuation_headers(offset));
@@ -513,7 +519,7 @@ const WIDE_REFERENCES: usize = 150;
 
 /// Coordinate legend for the reference list.
 pub(crate) const REF_COORD_NOTE: &str =
-    "坐标 L行:列 均从 1 起（列按 UTF-16）；作 line/character 入参时各减 1。\n";
+    "Coords Lline:col 1-based (UTF-16); -1 for line/character params.\n";
 
 /// A reference list in display order: non-test hits first (backend order
 /// kept within each group), then test hits.
@@ -571,25 +577,40 @@ impl<'a> RefHits<'a> {
             .iter()
             .filter(|h| h.kind != HitKind::Code)
             .count();
-        let mut out = format!("共 {} 处 / {} 个文件", self.locations.len(), files.len());
+        let hit_word = |n: usize| if n == 1 { "hit" } else { "hits" };
+        let file_word = |n: usize| if n == 1 { "file" } else { "files" };
+        let mut out = format!(
+            "{} {} / {} {} total",
+            self.locations.len(),
+            hit_word(self.locations.len()),
+            files.len(),
+            file_word(files.len())
+        );
         let mut parts: Vec<String> = Vec::new();
         if prod > 0 && test > 0 {
             parts.push(format!(
-                "非测试 {prod} 处 / {prod_files} 个文件，测试 {test} 处 / {test_files} 个文件"
+                "non-test {prod} {} / {prod_files} {}, test {test} {} / {test_files} {}",
+                hit_word(prod),
+                file_word(prod_files),
+                hit_word(test),
+                file_word(test_files)
             ));
         } else if test > 0 {
-            parts.push("全部在测试代码".to_string());
+            parts.push("all in test code".to_string());
         }
         if decl > 0 {
-            parts.push(format!("[声明] {decl} 处"));
+            parts.push(format!("[declaration] {decl} {}", hit_word(decl)));
         }
         if noncode > 0 {
-            parts.push(format!("注释/字符串 {noncode} 处，已标注"));
+            parts.push(format!(
+                "comment/string {noncode} {}, tagged",
+                hit_word(noncode)
+            ));
         }
         if !parts.is_empty() {
-            out.push_str(&format!("（{}）", parts.join("；")));
+            out.push_str(&format!(" ({})", parts.join("; ")));
         }
-        out.push_str("。\n");
+        out.push_str(".\n");
         out
     }
 
@@ -602,8 +623,10 @@ impl<'a> RefHits<'a> {
             return String::new();
         }
         let (n, files) = self.group_counts(test);
-        let title = if test { "测试" } else { "非测试" };
-        format!("## {title}（{n} 处 / {files} 个文件）\n")
+        let title = if test { "test" } else { "non-test" };
+        let hw = if n == 1 { "hit" } else { "hits" };
+        let fw = if files == 1 { "file" } else { "files" };
+        format!("## {title} ({n} {hw} / {files} {fw})\n")
     }
 
     fn file_header(&self, path: &str, test: bool) -> String {
@@ -619,11 +642,11 @@ impl<'a> RefHits<'a> {
             loc.range.start.character.saturating_add(1)
         );
         if info.declaration {
-            line.push_str(" [声明]");
+            line.push_str(" [declaration]");
         }
         match info.kind {
-            HitKind::Comment => line.push_str(" [注释]"),
-            HitKind::Str => line.push_str(" [字符串]"),
+            HitKind::Comment => line.push_str(" [comment]"),
+            HitKind::Str => line.push_str(" [string]"),
             HitKind::Code => {}
         }
         if let Some((name, start, end)) = &info.enclosing {
@@ -688,7 +711,7 @@ impl<'a> RefHits<'a> {
     /// Wide result: declarations, then per-file counts (non-test first).
     fn wide_summary(&self) -> String {
         let mut out = format!(
-            "超过 {WIDE_REFERENCES} 处，先给按文件计数（不是逐条列表）；逐条列出请传 offset=0（按 budget_tokens 分页，非测试在前）。\n"
+            "Over {WIDE_REFERENCES} hits; per-file counts first. Pass offset=0 for row listing (paged by budget_tokens, non-test first).\n"
         );
         let decls: Vec<usize> = self
             .order
@@ -698,7 +721,7 @@ impl<'a> RefHits<'a> {
             .take(5)
             .collect();
         if !decls.is_empty() {
-            out.push_str("[声明]：\n");
+            out.push_str("[declaration]:\n");
             for i in decls {
                 out.push_str(&format!(
                     "  {} {}\n",
@@ -724,14 +747,19 @@ impl<'a> RefHits<'a> {
             }
             files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
             let (n, nf) = self.group_counts(test);
-            let title = if test { "测试" } else { "非测试" };
-            out.push_str(&format!("## {title}（{n} 处 / {nf} 个文件），按文件：\n"));
+            let title = if test { "test" } else { "non-test" };
+            let hw = if n == 1 { "hit" } else { "hits" };
+            let fw = if nf == 1 { "file" } else { "files" };
+            out.push_str(&format!("## {title} ({n} {hw} / {nf} {fw}), by file:\n"));
             for (f, n) in files.iter().take(cap) {
                 out.push_str(&format!("  {n:>5}  {f}\n"));
             }
             if files.len() > cap {
                 let rest: usize = files[cap..].iter().map(|(_, n)| n).sum();
-                out.push_str(&format!("  …其余 {} 个文件 {rest} 处\n", files.len() - cap));
+                out.push_str(&format!(
+                    "  …{} more files, {rest} hits\n",
+                    files.len() - cap
+                ));
             }
         }
         out
@@ -758,17 +786,20 @@ fn render_rename_preview(
             .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
     if !valid {
         return (
-            format!("改名预览未生成：dry_run_rename=`{new_name}` 不是合法标识符。\n"),
+            format!("Rename preview not generated:dry_run_rename=`{new_name}` is not a valid identifier.\n"),
             0,
         );
     }
     if new_name == symbol {
-        return ("改名预览未生成：新名与旧名相同。\n".to_string(), 0);
+        return (
+            "Rename preview not generated: new name is the same as the old name; no changes needed.\n".to_string(),
+            0,
+        );
     }
     if confidence == Confidence::Unknown {
         return (
             format!(
-                "改名预览未生成：`{symbol}` 的引用查询没有得出可信结果（confidence: Unknown），不能据此判断是否需要改动。\n"
+                "Rename preview not generated: reference query for `{symbol}` has no trusted result (confidence: Unknown); cannot decide whether edits are needed.\n"
             ),
             0,
         );
@@ -776,14 +807,14 @@ fn render_rename_preview(
     if ambiguous {
         return (
             format!(
-                "改名预览未生成：`{symbol}` 在该文件有多个同名定义，引用已被合并，不是单个符号的改名清单。请用 line/character 指定其中一个再预览。\n"
+                "Rename preview not generated: `{symbol}` has multiple same-name definitions in this file; references were merged and are not a single-symbol rename list. Pass line/character to pick one, then preview again.\n"
             ),
             0,
         );
     }
     if locations.is_empty() {
         return (
-            format!("改名预览：语言服务器未返回 `{symbol}` 的任何引用，无需改动。\n"),
+            format!("Rename preview: language server returned no references for `{symbol}`; nothing to change.\n"),
             0,
         );
     }
@@ -800,7 +831,7 @@ fn render_rename_preview(
         }
     }
     let mut out = format!(
-        "改名预览（只读，未写盘）：`{symbol}` → `{new_name}`，共 {} 处 / {} 个文件。逐文件把下列位置的 `{symbol}` 替换为 `{new_name}`：\n",
+        "Rename preview (read-only, not written): `{symbol}` → `{new_name}`, {} hits / {} files total. Per file, replace `{symbol}` with `{new_name}` at:\n",
         locations.len(),
         by_file.len()
     );
@@ -815,13 +846,13 @@ fn render_rename_preview(
     }
     if omitted > 0 {
         out.push_str(&format!(
-            "（不完整）另有 {omitted} 个文件因 budget_tokens 未列出；加大 budget_tokens 取全清单。\n"
+            "(incomplete) {omitted} more files omitted due to budget_tokens; raise budget_tokens for the full list.\n"
         ));
     }
     if confidence == Confidence::Exact {
-        out.push_str("清单来自语言服务器（精确）；替换完成后跑构建/测试验证（跑不了才用 get_diagnostics 逐文件查）。\n");
+        out.push_str("Checklist from the language server (precise); after replacements run build/tests to verify (use get_diagnostics per file only if you cannot).\n");
     } else {
-        out.push_str("注意：引用置信度低于 exact，清单可能漏报或误报，替换前请核对。\n");
+        out.push_str("Note: reference confidence is below exact; the checklist may miss or false-positive — verify before replacing.\n");
     }
     (out, by_file.len())
 }
@@ -833,7 +864,7 @@ pub(crate) fn run_goto_definition(
     params.budget_tokens = effective_budget(params.budget_tokens);
     if params.path.trim().is_empty() {
         return text_result(
-            unknown_preamble_definition(Some("path 不能为空。"), None),
+            unknown_preamble_definition(Some("path cannot be empty."), None),
             json!({
                 "confidence": "unknown",
                 "budget_tokens": params.budget_tokens,
@@ -850,9 +881,9 @@ pub(crate) fn run_goto_definition(
         .filter(|s| !s.is_empty());
     if !has_position && symbol.is_none() {
         let hint = if params.line.is_some() ^ params.character.is_some() {
-            "需要同时提供 line 与 character，或提供非空 symbol。"
+            "Provide both line and character, or a non-empty symbol."
         } else {
-            "需要提供 symbol，或同时提供 line 与 character。"
+            "Provide symbol, or both line and character."
         };
         return text_result(
             unknown_preamble_definition(Some(hint), Some(params.path.as_str())),
@@ -883,8 +914,8 @@ pub(crate) fn run_goto_definition(
             }
         }
         if locations.is_empty() {
-            let label = symbol.unwrap_or("该位置");
-            header.push_str(&format!("未找到 `{label}` 的定义。\n"));
+            let label = symbol.unwrap_or("this location");
+            header.push_str(&format!("Definition not found for `{label}`.\n"));
         }
         header
     };
@@ -905,7 +936,10 @@ pub(crate) fn run_goto_definition(
         body.push_str(COORD_NOTE);
     }
     if offset > 0 && offset >= items.len() && !items.is_empty() {
-        body.push_str(&format!("offset={offset} 超出结果总数 {}。\n", items.len()));
+        body.push_str(&format!(
+            "offset={offset} beyond total result count {}.\n",
+            items.len()
+        ));
     }
     for line in &kept {
         body.push_str(line);
@@ -937,7 +971,7 @@ pub(crate) fn run_get_diagnostics(
 ) -> CallToolResult {
     if params.path.trim().is_empty() {
         return text_result(
-            unknown_preamble(Some("path 不能为空。"), None, false),
+            unknown_preamble(Some("path cannot be empty."), None, false),
             json!({
                 "confidence": "unknown",
                 "budget_tokens": params.budget_tokens,
@@ -954,7 +988,7 @@ pub(crate) fn run_get_diagnostics(
                 return text_result(
                     unknown_preamble(
                         Some(&format!(
-                            "无法识别的 severity：{raw}。允许值：error, warning, information, hint。"
+                            "Unrecognized severity: {raw}. Allowed: error, warning, information, hint."
                         )),
                         Some(params.path.as_str()),
                         false,
@@ -996,7 +1030,7 @@ pub(crate) fn run_get_diagnostics(
             }
         }
         if diagnostics.is_empty() {
-            header.push_str(&format!("`{}` 没有匹配的诊断。\n", params.path));
+            header.push_str(&format!("No matching diagnostics for `{}`.\n", params.path));
         }
         header
     };
@@ -1009,7 +1043,7 @@ pub(crate) fn run_get_diagnostics(
         body.push('\n');
     }
     if omitted > 0 {
-        body.push_str(&format!("{omitted} 个结果因 budget_tokens 被省略。\n"));
+        body.push_str(&format!("{omitted} omitted due to budget_tokens.\n"));
     }
 
     text_result(
@@ -1046,16 +1080,18 @@ fn env_fault_result(
     let suppressed = diags.len() - 1 - syntax.len();
     let mut body = confidence_header(Confidence::Unknown);
     body.push_str(&format!(
-        "环境异常，诊断不可信：{}。\n根因：{root_line}\n",
+        "Environment issue; diagnostics are not trustworthy:{}.\nRoot cause: {root_line}\n",
         fault.kind
     ));
     if suppressed > 0 {
         body.push_str(&format!(
-            "另有 {suppressed} 条诊断多半是它引发的级联错误，已省略。\n"
+            "{suppressed} more diagnostics are mostly cascade errors from it and were omitted.\n"
         ));
     }
     if !syntax.is_empty() {
-        body.push_str("下列语法错误与环境无关，仍可信：\n");
+        body.push_str(
+            "The following syntax errors are unrelated to the environment and still trustworthy:\n",
+        );
         for d in syntax.iter().take(SYNTAX_MAX) {
             body.push_str(&render_diagnostic(d));
             body.push('\n');
@@ -1077,7 +1113,7 @@ fn env_fault_result(
 
 fn text_result(body: String, structured: Value) -> CallToolResult {
     let body = if body.trim().is_empty() {
-        "没有匹配结果。confidence: unknown".to_string()
+        "No matches. confidence: unknown".to_string()
     } else {
         body
     };
@@ -1109,7 +1145,7 @@ fn unknown_preamble(note: Option<&str>, path: Option<&str>, suggest_search: bool
         // Discovery's own message (e.g. a rustup proxy without a toolchain)
         // already says what to run; a generic hint would contradict it.
         if !note_has_install_command(note) {
-            body.push_str("安装提示：\n");
+            body.push_str("Install hints:\n");
             body.push_str(&install_hint(language_of(path)));
         }
     }
@@ -1134,7 +1170,7 @@ fn unknown_preamble_definition(note: Option<&str>, path: Option<&str>) -> String
         // Discovery's own message (e.g. a rustup proxy without a toolchain)
         // already says what to run; a generic hint would contradict it.
         if !note_has_install_command(note) {
-            body.push_str("安装提示：\n");
+            body.push_str("Install hints:\n");
             body.push_str(&install_hint(language_of(path)));
         }
     }
@@ -1154,7 +1190,7 @@ fn server_missing(note: Option<&str>) -> bool {
     // A timeout means the server is present; installing again does not help.
     // Match before the "not installed" substring checks so a carefully worded
     // timeout note cannot trip an install hint.
-    if note.contains("timed out") || note.contains("超时") {
+    if note.contains("timed out") || note.contains("timed out") {
         return false;
     }
     [
@@ -1162,8 +1198,8 @@ fn server_missing(note: Option<&str>) -> bool {
         "not configured",
         "no language server available",
         "failed to start",
-        "尚未接通",
-        "语言服务器不可用",
+        "not wired yet",
+        "Language server unavailable",
     ]
     .iter()
     .any(|m| note.contains(m))
@@ -1197,7 +1233,7 @@ fn unavailable_ensure_gate(language: Option<Language>) -> String {
         None => ("the language server", "<language>"),
     };
     format!(
-        "语言服务器不可用（{server}）。请在本机安装后重试，或用 get_languages 查看 Ready / needs_install / AST-only。\n"
+        "Language server unavailable ({server}). Install it on this machine and retry, or use get_languages for Ready / needs_install / AST-only.\n"
     )
 }
 
@@ -1235,56 +1271,56 @@ pub(crate) fn install_hint(language: Option<Language>) -> String {
 fn install_hint_one(language: Language) -> String {
     match language {
         Language::Python => {
-            "Python（pyright）：`npm i -g pyright`，stdio 启动 `pyright-langserver --stdio`。也可用 `pip install pyright`。".into()
+            "Python (pyright): `npm i -g pyright`, stdio `pyright-langserver --stdio`. Or `pip install pyright`.".into()
         }
         Language::Go => {
-            "Go（gopls）：`go install golang.org/x/tools/gopls@latest`。".into()
+            "Go(gopls):`go install golang.org/x/tools/gopls@latest`.".into()
         }
         Language::Rust => {
-            "Rust（rust-analyzer）：`rustup component add rust-analyzer`。".into()
+            "Rust(rust-analyzer):`rustup component add rust-analyzer`.".into()
         }
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
-            "TypeScript/JavaScript（typescript-language-server）：`npm i -g typescript-language-server typescript`，stdio 启动 `typescript-language-server --stdio`。".into()
+            "TypeScript/JavaScript (typescript-language-server): `npm i -g typescript-language-server typescript`, stdio `typescript-language-server --stdio`.".into()
         }
         Language::Java => {
-            "Java（Eclipse JDT LS / jdtls）：启动参数依赖发行版，Homebrew 可用 `brew install jdtls`。当前默认不自动拉起。".into()
+            "Java (Eclipse JDT LS / jdtls): launch args depend on the distribution; Homebrew: `brew install jdtls`. Not auto-started by default.".into()
         }
         Language::Swift => {
-            "Swift（sourcekit-lsp）：`xcode-select --install` 或完整 Xcode；可用 ASTROLABE_LSP_SWIFT 覆盖。".into()
+            "Swift (sourcekit-lsp): `xcode-select --install` or full Xcode; override with ASTROLABE_LSP_SWIFT.".into()
         }
         Language::ObjC | Language::ObjCpp => {
-            "ObjC/ObjC++：优先 clangd（`brew install llvm` / `apt-get install clangd`），回退 sourcekit-lsp（`xcode-select --install`）。".into()
+            "ObjC/ObjC++: prefer clangd (`brew install llvm` / `apt-get install clangd`), fall back to sourcekit-lsp (`xcode-select --install`).".into()
         }
         Language::C | Language::Cpp => {
-            "C/C++（clangd）：`brew install llvm`，或设置 ASTROLABE_LSP_C。".into()
+            "C/C++ (clangd): `brew install llvm`, or set ASTROLABE_LSP_C.".into()
         }
         Language::Kotlin => {
-            "Kotlin：优先 kotlin-lsp（JetBrains，`brew install JetBrains/utils/kotlin-lsp`），回退 kotlin-language-server；可用 ASTROLABE_LSP_KOTLIN 覆盖。".into()
+            "Kotlin: prefer kotlin-lsp (JetBrains, `brew install JetBrains/utils/kotlin-lsp`), fall back to kotlin-language-server; override with ASTROLABE_LSP_KOTLIN.".into()
         }
         Language::Shell => {
-            "Shell/Bash（bash-language-server）：`npm i -g bash-language-server`，可选装 shellcheck。".into()
+            "Shell/Bash (bash-language-server): `npm i -g bash-language-server`; optional shellcheck.".into()
         }
         Language::Ruby => {
-            "Ruby（ruby-lsp）：`gem install ruby-lsp`，回退 solargraph。".into()
+            "Ruby (ruby-lsp): `gem install ruby-lsp`, fall back to solargraph.".into()
         }
         Language::Lua => {
-            "Lua（lua-language-server）：`brew install lua-language-server`。".into()
+            "Lua(lua-language-server):`brew install lua-language-server`.".into()
         }
         Language::Proto => {
-            "Protobuf：无专用语言服务器；message / enum / service / rpc 由 tree-sitter 索引，用 find_symbol / search_code。".into()
+            "Protobuf: no dedicated language server; message / enum / service / rpc are tree-sitter indexed — use find_symbol / search_code.".into()
         }
         Language::Php => {
-            "PHP（intelephense）：`npm i -g intelephense`。".into()
+            "PHP(intelephense):`npm i -g intelephense`.".into()
         }
         Language::Vue => {
-            "Vue（Volar / vue-language-server）：`npm i -g @vue/language-server typescript-language-server typescript`，stdio 启动 `vue-language-server --stdio`。可设 ASTROLABE_LSP_VUE。2.x 单进程（hybridMode=false）；3.x 自动桥接 typescript-language-server + @vue/typescript-plugin。".into()
+            "Vue (Volar / vue-language-server): `npm i -g @vue/language-server typescript-language-server typescript`, stdio `vue-language-server --stdio`. Optional ASTROLABE_LSP_VUE. 2.x single process (hybridMode=false); 3.x auto-bridges typescript-language-server + @vue/typescript-plugin.".into()
         }
-        Language::Dart => "Dart（dart language-server）：内置于 Dart / Flutter SDK。".into(),
+        Language::Dart => "Dart (dart language-server): bundled with the Dart / Flutter SDK.".into(),
         Language::CSharp => {
-            "C#（Microsoft.CodeAnalysis.LanguageServer）：`dotnet <dll> --stdio`；需要 .NET 10 runtime（分析目标框架可更旧）；设置 ASTROLABE_LSP_CSHARP。非 OmniSharp / csharp-ls。".into()
+            "C# (Microsoft.CodeAnalysis.LanguageServer): `dotnet <dll> --stdio`; needs .NET 10 runtime (analyzed target frameworks may be older); set ASTROLABE_LSP_CSHARP. Not OmniSharp / csharp-ls.".into()
         }
         Language::VisualBasic => {
-            "Visual Basic .NET（同一 Microsoft.CodeAnalysis.LanguageServer）：`dotnet <dll> --stdio`；与 C# 共用 ASTROLABE_LSP_CSHARP；.vb / .vbproj / .sln。非 OmniSharp。".into()
+            "Visual Basic .NET (same Microsoft.CodeAnalysis.LanguageServer): `dotnet <dll> --stdio`; shares ASTROLABE_LSP_CSHARP with C#; .vb / .vbproj / .sln. Not OmniSharp.".into()
         }
     }
 }
@@ -1579,9 +1615,9 @@ mod tests {
         assert!(text.contains("go install"), "{text}");
         assert!(text.contains("get_languages"), "{text}");
         assert!(text.contains("search_code"), "{text}");
-        assert!(text.contains("误报"), "{text}");
+        assert!(text.contains("false positive"), "{text}");
         assert!(
-            text.contains("尚未接通") || text.contains("not installed"),
+            text.contains("not wired yet") || text.contains("not installed"),
             "{text}"
         );
 
@@ -1611,7 +1647,7 @@ mod tests {
         assert!(text.contains("confidence: Unknown"), "{text}");
         assert!(text.contains("go install"), "{text}");
         assert!(
-            text.contains("find_symbol") || text.contains("绑定解析"),
+            text.contains("find_symbol") || text.contains("binding resolution"),
             "{text}"
         );
     }
@@ -1640,7 +1676,7 @@ mod tests {
             dry_run_rename: None,
         })));
         let text = first_text(&refs);
-        assert!(text.contains("因 budget_tokens 被省略"), "{text}");
+        assert!(text.contains("omitted due to budget_tokens"), "{text}");
         let structured = refs.structured_content.unwrap();
         assert_eq!(structured["budget_tokens"], json!(0));
         assert_eq!(structured["truncated"], json!(true));
@@ -1658,7 +1694,7 @@ mod tests {
             lsp: None,
         })));
         let text = first_text(&diags);
-        assert!(text.contains("因 budget_tokens 被省略"), "{text}");
+        assert!(text.contains("omitted due to budget_tokens"), "{text}");
     }
 
     #[test]
@@ -1718,7 +1754,7 @@ mod tests {
             lsp: None,
         })));
         let text = first_text(&invalid);
-        assert!(text.contains("无法识别的 severity"), "{text}");
+        assert!(text.contains("Unrecognized severity"), "{text}");
         assert!(text.contains("confidence: Unknown"), "{text}");
     }
 
@@ -1744,9 +1780,12 @@ mod tests {
             dry_run_rename: Some("new_name".into()),
         })));
         let text = first_text(&result);
-        assert!(text.contains("改名预览（只读，未写盘）"), "{text}");
         assert!(
-            text.contains("`old_name` → `new_name`，共 3 处 / 2 个文件"),
+            text.contains("Rename preview (read-only, not written)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`old_name` → `new_name`, 3 hits / 2 files total"),
             "{text}"
         );
         assert!(text.contains("  src/a.rs ×2: L4:5 L10:9"), "{text}");
@@ -1763,7 +1802,7 @@ mod tests {
             offset: None,
             dry_run_rename: None,
         })));
-        assert!(!first_text(&plain).contains("改名预览"));
+        assert!(!first_text(&plain).contains("Rename preview"));
     }
 
     #[test]
@@ -1776,7 +1815,7 @@ mod tests {
             false,
             800,
         );
-        assert!(bad.contains("不是合法标识符"), "{bad}");
+        assert!(bad.contains("is not a valid identifier"), "{bad}");
         let (same, _) = render_rename_preview(
             "a",
             "a",
@@ -1785,9 +1824,9 @@ mod tests {
             false,
             800,
         );
-        assert!(same.contains("相同"), "{same}");
+        assert!(same.contains("same"), "{same}");
         let (none, n) = render_rename_preview("a", "b", &[], Confidence::Exact, false, 800);
-        assert!(none.contains("无需改动") && n == 0, "{none}");
+        assert!(none.contains("nothing to change") && n == 0, "{none}");
         let (low, _) = render_rename_preview(
             "a",
             "b",
@@ -1796,7 +1835,7 @@ mod tests {
             false,
             800,
         );
-        assert!(low.contains("低于 exact"), "{low}");
+        assert!(low.contains("below exact"), "{low}");
     }
 
     #[test]
@@ -1818,9 +1857,9 @@ mod tests {
         })));
         let text = first_text(&result);
         assert!(text.contains("confidence: Exact"), "{text}");
-        assert!(text.contains("未找到"), "{text}");
+        assert!(text.contains("not found"), "{text}");
         assert!(!text.contains("search_code"), "{text}");
-        assert!(!text.contains("尚未接通"), "{text}");
+        assert!(!text.contains("not wired yet"), "{text}");
     }
 
     #[test]
@@ -1867,8 +1906,8 @@ mod tests {
         })));
         let text = first_text(&result);
         assert!(text.contains("confidence: Exact"), "{text}");
-        assert!(text.contains("未找到"), "{text}");
-        assert!(!text.contains("尚未接通"), "{text}");
+        assert!(text.contains("not found"), "{text}");
+        assert!(!text.contains("not wired yet"), "{text}");
         assert!(!text.contains("search_code"), "{text}");
     }
 
@@ -1927,7 +1966,7 @@ mod tests {
         })));
         let text = first_text(&result);
         assert!(
-            text.contains("因 budget_tokens 被省略") || text.contains("confidence:"),
+            text.contains("omitted due to budget_tokens") || text.contains("confidence:"),
             "{text}"
         );
     }
@@ -1969,8 +2008,8 @@ mod tests {
         let tools = fake_refs(Precise::unknown(Vec::new(), "gopls is not installed"));
         let r = tools.find_references(Parameters(refs_params(800, None, Some("Go"))));
         let text = first_text(&r);
-        assert!(text.contains("改名预览未生成"), "{text}");
-        assert!(!text.contains("无需改动"), "{text}");
+        assert!(text.contains("Rename preview not generated"), "{text}");
+        assert!(!text.contains("no changes needed"), "{text}");
     }
 
     #[test]
@@ -1983,9 +2022,12 @@ mod tests {
         });
         let r = tools.find_references(Parameters(refs_params(800, None, Some("Go"))));
         let text = first_text(&r);
-        assert!(text.contains("多个同名定义"), "{text}");
-        assert!(!text.contains("清单来自语言服务器（精确）"), "{text}");
-        assert!(!text.contains("改名预览（只读"), "{text}");
+        assert!(text.contains("multiple same-name definitions"), "{text}");
+        assert!(
+            !text.contains("Checklist from language server (precise)"),
+            "{text}"
+        );
+        assert!(!text.contains("Rename preview (read-only"), "{text}");
         assert!(text.contains("confidence: Scoped"), "{text}");
     }
 
@@ -2113,7 +2155,7 @@ mod tests {
         let text = first_text(&r);
         assert!(text.contains("not found in a.go"), "{text}");
         assert!(!text.contains("go install"), "{text}");
-        assert!(!text.contains("语言服务器不可用"), "{text}");
+        assert!(!text.contains("Language server unavailable"), "{text}");
     }
 
     #[derive(Debug)]
@@ -2201,10 +2243,10 @@ mod tests {
         }));
         let r = tools.find_references(Parameters(refs_params(2_000, None, None)));
         let text = first_text(&r);
-        assert!(text.contains("共 4 处 / 2 个文件（非测试 3 处 / 1 个文件，测试 1 处 / 1 个文件；[声明] 1 处；注释/字符串 1 处，已标注）"), "{text}");
+        assert!(text.contains("4 hits / 2 files total (non-test 3 hits / 1 file, test 1 hit / 1 file; [declaration] 1 hit; comment/string 1 hit, tagged)"), "{text}");
         assert!(
             text.contains(
-                "  L1070:18 [声明] in Execute[1070-1074]: func (c *Command) Execute() error {"
+                "  L1070:18 [declaration] in Execute[1070-1074]: func (c *Command) Execute() error {"
             ),
             "{text}"
         );
@@ -2213,11 +2255,11 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("  L201:4 [注释]: // Execute runs it"),
+            text.contains("  L201:4 [comment]: // Execute runs it"),
             "{text}"
         );
-        let prod = text.find("## 非测试（3 处 / 1 个文件）").expect(text);
-        let test = text.find("## 测试（1 处 / 1 个文件）").expect(text);
+        let prod = text.find("## non-test (3 hits / 1 file)").expect(text);
+        let test = text.find("## test (1 hit / 1 file)").expect(text);
         assert!(
             prod < test && text.find("command_test.go (1)").unwrap() > test,
             "{text}"
@@ -2247,17 +2289,17 @@ mod tests {
         let tools = PreciseTools::with_backend(Arc::new(Annotated { refs, infos }));
         let r = tools.find_references(Parameters(refs_params(2_500, None, None)));
         let text = first_text(&r);
-        assert!(text.contains("共 181 处 / 3 个文件"), "{text}");
-        assert!(text.contains("逐条列出请传 offset=0"), "{text}");
+        assert!(text.contains("181 hits / 3 files total"), "{text}");
+        assert!(text.contains("Pass offset=0 for row listing"), "{text}");
         assert!(
-            text.contains("  a.go L3:6 [声明] in Run[3-9]: func Run() {"),
+            text.contains("  a.go L3:6 [declaration] in Run[3-9]: func Run() {"),
             "{text}"
         );
         let prod = text
-            .find("## 非测试（61 处 / 2 个文件），按文件：\n     60  b.go\n      1  a.go")
+            .find("## non-test (61 hits / 2 files), by file:\n     60  b.go\n      1  a.go")
             .expect(text);
         let test = text
-            .find("## 测试（120 处 / 1 个文件），按文件：\n    120  x_test.go")
+            .find("## test (120 hits / 1 file), by file:\n    120  x_test.go")
             .expect(text);
         assert!(prod < test, "{text}");
         assert!(text.len() < 1_200, "{}", text.len());
@@ -2279,10 +2321,10 @@ mod tests {
         let note = "no language server available for rust: rust-analyzer at ~/.cargo/bin is a rustup proxy with no toolchain; run `rustup default stable`";
         let text = unknown_preamble(Some(note), Some("src/lib.rs"), false);
         assert!(text.contains("rustup default stable"), "{text}");
-        assert!(!text.contains("安装提示"), "{text}");
+        assert!(!text.contains("Install hints"), "{text}");
         let text = unknown_preamble(Some("gopls is not installed"), Some("a.go"), false);
         assert!(
-            text.contains("安装提示") && text.contains("go install"),
+            text.contains("Install hints") && text.contains("go install"),
             "{text}"
         );
     }
@@ -2293,7 +2335,7 @@ mod tests {
         let text = unknown_preamble(Some(note), Some("src/a.ts"), false);
         assert!(text.contains("timed out"), "{text}");
         assert!(
-            !text.contains("安装提示"),
+            !text.contains("Install hints"),
             "timeout must not append an install block: {text}"
         );
         assert!(

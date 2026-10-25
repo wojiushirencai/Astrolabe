@@ -336,15 +336,15 @@ impl SessionView for View {
             Ok(Err(_panic)) => {
                 tracing::error!(tool = %name, "tool body panicked (shared session)");
                 to_json(Ok(self.0.finish(text_error(format!(
-                    "{name} 内部错误（已记录日志）。confidence: unknown"
+                    "{name} internal error (logged). confidence: unknown"
                 )))))
             }
             Err(limit) => {
                 flag.store(true, Ordering::Relaxed);
                 let secs = limit.map(|d| d.as_secs()).unwrap_or_default();
                 to_json(Ok(self.0.finish(text_error(format!(
-                    "{name} 超过 {secs} 秒未完成，已放弃等待。请缩小范围（path_filter / aggregate / count_only）后重试；\
-                     可用 ASTROLABE_TOOL_TIMEOUT_SECS 调整。confidence: unknown"
+                    "{name} did not finish within {secs}s; gave up waiting. Narrow the scope (path_filter / aggregate / count_only) and retry;\
+                     tune via ASTROLABE_TOOL_TIMEOUT_SECS. confidence: unknown"
                 )))))
             }
         }
