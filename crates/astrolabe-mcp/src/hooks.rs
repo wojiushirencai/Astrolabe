@@ -1269,10 +1269,20 @@ pub(crate) fn effective_shell_command(cmd: &str) -> Option<(String, Option<Strin
 
 /// 硬模式文本搜索检测：只看各"命令位置"的命令名（含 `bash -c`、`sudo`、`.exe`、`git grep`），
 /// 不对整串做子串匹配，因此 `echo grep is great` / `git commit -m "fix grep bug"` 不误伤，
-/// 路径 `src/grep_utils.rs` 也不会命中。
+/// 路径 `src/grep_utils.rs` 也不会命中。含管道后的 grep（`go test | grep FAIL`）。
 pub(crate) fn command_contains_text_search(cmd: &str) -> bool {
     shell_invocations(cmd)
         .iter()
+        .any(|i| is_text_search_command(&i.command) || is_git_grep(i))
+}
+
+/// Soft-mode / primary code-search detection：与 [`command_contains_text_search`] 同口径，
+/// 但**忽略管道后段**。`rg foo src` / `cd x && grep -rn pat .` / `git grep foo` → true；
+/// `go test | grep FAIL` / `cargo test 2>&1 | rg error` → false（管道过滤合法，不拦）。
+pub(crate) fn command_contains_primary_text_search(cmd: &str) -> bool {
+    shell_invocations(cmd)
+        .iter()
+        .filter(|i| !i.after_pipe)
         .any(|i| is_text_search_command(&i.command) || is_git_grep(i))
 }
 
@@ -1348,6 +1358,18 @@ pub(crate) fn classify_tool_ex(
                 None => cmd.to_string(),
             };
             if command_contains_text_search(&reconstructed) {
+                return ToolKind::Grep;
+            }
+        }
+    }
+
+    // 1.8 Soft primary code-search: non-piped `rg`/`grep -rn`/`git grep` (and wrappers
+    // like `cd x && rg …`) count as Grep so Bash cannot bypass the host Grep deny.
+    // Pipe-only greps stay Neutral here (`go test | grep FAIL`); hard mode still
+    // catches them via 1.7 when ASTROLABE_DENY_TEXT_SEARCH is on.
+    if !deny_text_search {
+        if let Some(cmd) = full_command {
+            if command_contains_primary_text_search(cmd) {
                 return ToolKind::Grep;
             }
         }
@@ -1625,40 +1647,42 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let slice_threshold = config().slice_read_threshold;
     let readonly_note = format!(" Note: all Astrolabe tools are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
     let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_languages tool), grep is the correct tool for them — ignore this reminder.";
+    // Prefer symbolic tools: they reset n_grep/n_read/n_non_symbolic. search_code only
+    // clears n_slice — following a search_code-only hint can still hit Read/Grep deny.
     let switch_instruction =
-        "Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).";
+        "Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (they reset grep/read burst counters); mcp__astrolabe__search_code is for literal/regex text search but only clears the slice-read counter, not n_grep/n_read. Call a symbolic Astrolabe tool now (read-only, safe).";
     let (reason, ctx) = match deny_kind {
         DenyKind::Grep => (
-            "Too many consecutive grep calls without using symbolic tools. Stop using grep for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).",
+            "Too many consecutive grep/rg calls without using symbolic tools. Stop using Grep/grep/rg (including Bash rg/grep -rn) for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were using many grep calls recently. Use Astrolabe's symbolic mcp tools instead for more code-centric search (search_code / find_references are read-only and return path:line anchors). {switch_instruction}{unindexed_lang_note}"
+                "You were using many Grep/grep/rg calls recently (host Grep or Bash text-search). Prefer Astrolabe symbolic tools: find_symbol / resolve_context reset the grep/read burst counters; find_references returns path:line anchors. search_code is fine for literal/regex but only clears the slice-read counter — it will not clear n_grep/n_read, so you may still hit Read deny afterward. {switch_instruction}{unindexed_lang_note}"
             ),
         ),
         DenyKind::TextSearch => (
-            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, goto_definition. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
+            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code for literal/regex (slice counter only); also find_references / goto_definition. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
             format!(
-                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Call mcp__astrolabe__search_code (literal/regex, enclosing bodies), mcp__astrolabe__find_symbol, mcp__astrolabe__find_references, or mcp__astrolabe__goto_definition now (read-only, safe).{unindexed_lang_note}"
+                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (they reset burst counters); use mcp__astrolabe__search_code for literal/regex enclosing bodies (clears slice-read counter only); also find_references / goto_definition (read-only, safe).{unindexed_lang_note}"
             ),
         ),
         DenyKind::Glob => (
-            "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Use Astrolabe MCP tools instead: search_code, find_symbol, find_references, goto_definition.",
-            "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__search_code or mcp__astrolabe__find_symbol to locate symbols and paths (read-only, safe).".to_string(),
+            "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first; also search_code / find_references / goto_definition.",
+            "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context to locate symbols and paths (full burst reset); mcp__astrolabe__search_code is an alternative for text/path discovery (slice counter only).".to_string(),
         ),
         DenyKind::Read => (
-            "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).",
+            "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were using many read calls on files recently. Use Astrolabe's symbolic mcp tools instead for more targeted reads (read-only exploration included: find_symbol / search_code return exact bodies and path:line anchors without whole-file reads). {switch_instruction}"
+                "You were using many read calls on files recently. Prefer Astrolabe symbolic tools for targeted reads: find_symbol / resolve_context return exact bodies and path:line anchors and reset grep/read burst counters; search_code helps locate text but only clears the slice-read counter. {switch_instruction}"
             ),
         ),
         DenyKind::Mixed => (
-            "Too many consecutive non-symbolic tool calls (mixed grep and read). Stop using grep/read for code discovery. Call mcp__astrolabe__search_code or mcp__astrolabe__find_symbol now (read-only, safe).",
+            "Too many consecutive non-symbolic tool calls (mixed grep and read). Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were alternating between grep and read file calls recently without using Astrolabe's symbolic mcp tools. Use symbolic search and targeted symbol reads instead for more code-centric exploration. {switch_instruction}{unindexed_lang_note}"
+                "You were alternating between grep/rg and read file calls recently without using Astrolabe's symbolic mcp tools. Prefer find_symbol / resolve_context (reset burst counters); search_code is for literal/regex and only clears the slice-read counter. {switch_instruction}{unindexed_lang_note}"
             ),
         ),
         DenyKind::Slice => (
-            "Too many consecutive file-slice reads without using any Astrolabe tool. Call search_code or find_symbol now — they are read-only and return exact bodies with path:line anchors.",
-            "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: mcp__astrolabe__search_code or mcp__astrolabe__find_symbol are read-only and return exact bodies with path:line anchors, usually cheaper than repeated slice reads. Call them now (read-only, safe).".to_string(),
+            "Too many consecutive file-slice reads without using any Astrolabe tool. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first; mcp__astrolabe__search_code also clears the slice-read counter — they are read-only and return exact bodies with path:line anchors.",
+            "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context; mcp__astrolabe__search_code also clears this slice-read counter (unlike grep/read counters). Call an Astrolabe tool now (read-only, safe).".to_string(),
         ),
     };
     let ctx = format!("{ctx}{readonly_note}");
@@ -2828,7 +2852,7 @@ mod tests {
         assert_eq!(c3, 0);
         let out_str = String::from_utf8_lossy(&out);
         assert!(out_str.contains("\"permissionDecision\":\"deny\""));
-        assert!(out_str.contains("Too many consecutive grep calls"));
+        assert!(out_str.contains("Too many consecutive grep/rg calls"));
 
         let _ = std::fs::remove_dir_all(&temp_home);
     }
@@ -2892,7 +2916,7 @@ mod tests {
         assert_eq!(c3, 0);
         let out_str = String::from_utf8_lossy(&out);
         assert!(out_str.contains("\"permissionDecision\":\"deny\""));
-        assert!(out_str.contains("Too many consecutive grep calls"));
+        assert!(out_str.contains("Too many consecutive grep/rg calls"));
 
         let _ = std::fs::remove_dir_all(&temp_home);
     }
@@ -3439,7 +3463,7 @@ mod tests {
         assert_eq!(code3, 0);
         let out_str = String::from_utf8_lossy(&out);
         assert!(out_str.contains("\"permissionDecision\":\"deny\""));
-        assert!(out_str.contains("Too many consecutive grep calls"));
+        assert!(out_str.contains("Too many consecutive grep/rg calls"));
 
         let _ = std::fs::remove_dir_all(&temp_home);
     }
@@ -3784,16 +3808,28 @@ mod tests {
 
     #[test]
     fn test_deny_texts_direct_switch_instruction() {
-        // Grep/Read/Mixed 三种 DenyKind：输出必须给出直接切换指令，
-        // 不得残留 "You can continue using ... the counter was reset" 软口径
+        // Grep/Read/Mixed：优先推 find_symbol / resolve_context（清零 burst），
+        // 诚实说明 search_code 只清 n_slice；不得残留软口径
         for kind in [DenyKind::Grep, DenyKind::Read, DenyKind::Mixed] {
             let out = build_output(Client::ClaudeCode, kind);
             assert!(
-                out.contains("search_code"),
-                "{kind:?} deny 输出应含 search_code 切换指令: {out}"
+                out.contains("find_symbol"),
+                "{kind:?} deny 输出应优先含 find_symbol: {out}"
             );
             assert!(
-                out.contains("Stop using grep/read for code discovery"),
+                out.contains("resolve_context"),
+                "{kind:?} deny 输出应优先含 resolve_context: {out}"
+            );
+            assert!(
+                out.contains("search_code"),
+                "{kind:?} deny 输出应仍提及 search_code: {out}"
+            );
+            assert!(
+                out.contains("slice-read counter") || out.contains("slice counter"),
+                "{kind:?} deny 应诚实说明 search_code 只清切片额度: {out}"
+            );
+            assert!(
+                out.contains("Stop using"),
                 "{kind:?} deny 输出应含明确停止+切换指令: {out}"
             );
             assert!(
@@ -3805,6 +3841,87 @@ mod tests {
                 "{kind:?} deny 输出不应残留计数重置软话术: {out}"
             );
         }
+    }
+
+    #[test]
+    fn command_contains_primary_text_search_skips_pipe_only() {
+        assert!(command_contains_primary_text_search("rg foo src"));
+        assert!(command_contains_primary_text_search("grep -rn pat ."));
+        assert!(command_contains_primary_text_search("cd src && rg foo"));
+        assert!(command_contains_primary_text_search("git grep foo"));
+        assert!(command_contains_primary_text_search("bash -c \"rg foo .\""));
+        // Pipe-only filter greps must NOT count as primary code search
+        assert!(!command_contains_primary_text_search("go test | grep FAIL"));
+        assert!(!command_contains_primary_text_search(
+            "cargo test 2>&1 | rg error"
+        ));
+        assert!(!command_contains_primary_text_search("ls"));
+        // Hard mode still sees pipe greps; soft primary does not
+        assert!(command_contains_text_search("go test | grep FAIL"));
+        assert!(!command_contains_primary_text_search("go test | grep FAIL"));
+    }
+
+    #[test]
+    fn soft_mode_classifies_primary_bash_rg_and_git_grep_not_pipe_filter() {
+        let soft_rg = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("rg"),
+            Some("foo src"),
+            Some("rg foo src"),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(soft_rg, ToolKind::Grep);
+
+        let soft_grep_rn = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("cd"),
+            Some("src && grep -rn pool ."),
+            Some("cd src && grep -rn pool ."),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(soft_grep_rn, ToolKind::Grep);
+
+        let soft_git = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("git"),
+            Some("grep foo"),
+            Some("git grep foo"),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            soft_git,
+            ToolKind::Grep,
+            "soft mode should count primary git grep as Grep"
+        );
+
+        let pipe_filter = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("go"),
+            Some("test | grep FAIL"),
+            Some("go test | grep FAIL"),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            pipe_filter,
+            ToolKind::Neutral,
+            "soft mode must not deny go test | grep FAIL"
+        );
     }
 
     #[test]
@@ -5464,7 +5581,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_git_grep_and_pipeline_only_when_hard() {
+    fn classify_git_grep_primary_in_soft_pipe_filter_only_when_hard() {
+        // Soft mode now counts primary `git grep` (and `cd && rg`) as Grep so Bash
+        // cannot bypass host Grep deny; pipe-only filters stay Neutral until hard mode.
         let soft = classify_tool_ex(
             "bash",
             Client::ClaudeCode,
@@ -5476,7 +5595,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(soft, ToolKind::Neutral);
+        assert_eq!(soft, ToolKind::Grep);
         let hard = classify_tool_ex(
             "bash",
             Client::ClaudeCode,
@@ -5501,6 +5620,30 @@ mod tests {
             true,
         );
         assert_eq!(pipe, ToolKind::Grep);
+        let soft_pipe_filter = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("go"),
+            Some("test | grep FAIL"),
+            Some("go test | grep FAIL"),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(soft_pipe_filter, ToolKind::Neutral);
+        let hard_pipe_filter = classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some("go"),
+            Some("test | grep FAIL"),
+            Some("go test | grep FAIL"),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(hard_pipe_filter, ToolKind::Grep);
     }
 
     #[test]
@@ -5564,10 +5707,13 @@ mod tests {
     fn build_output_hard_text_search_and_glob() {
         let out = build_output(Client::ClaudeCode, DenyKind::TextSearch);
         assert!(out.contains("ASTROLABE_DENY_TEXT_SEARCH"), "{out}");
+        assert!(out.contains("find_symbol"), "{out}");
+        assert!(out.contains("resolve_context"), "{out}");
         assert!(out.contains("search_code"), "{out}");
         assert!(out.contains("\"permissionDecision\":\"deny\""));
         let glob = build_output(Client::ClaudeCode, DenyKind::Glob);
         assert!(glob.contains("Glob"), "{glob}");
+        assert!(glob.contains("find_symbol"), "{glob}");
         assert!(glob.contains("search_code"), "{glob}");
     }
 
