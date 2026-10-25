@@ -93,6 +93,48 @@ fn looks_like_regex_query(query: &str) -> bool {
         || (query.ends_with('$') && query.len() > 1 && !query.ends_with("\\$"))
 }
 
+/// Heuristic: query looks like a function signature / call / code snippet.
+/// Models often pass these with `regex=true` (parens read as "exact"), which
+/// either fails to compile (unclosed groups) or matches the wrong thing
+/// (`foo(bar)` as a capture group ≠ the literal `foo(bar)`).
+fn looks_like_code_fragment(query: &str) -> bool {
+    // Leave intentional regex alone.
+    if looks_like_regex_query(query) {
+        return false;
+    }
+    // Escaped parens mean the caller wanted a literal `(` under regex mode.
+    if query.contains(r"\(") || query.contains(r"\)") {
+        return false;
+    }
+    let Some(paren) = query.find('(') else {
+        return false;
+    };
+    // Leading `(…)` is usually a regex group; only treat as code when the
+    // rest of the line is clearly a snippet (arrow / block).
+    if paren == 0 {
+        return query.contains("=>") || query.contains(") {") || query.contains("){");
+    }
+    let before = query[..paren].trim_end();
+    if before.is_empty() {
+        return false;
+    }
+    // Require an identifier-ish token immediately before `(` (`foo(`, `Type::new(`,
+    // `obj.method(`, `fn process(`).
+    let last = before.chars().last().unwrap_or('\0');
+    last.is_alphanumeric() || last == '_'
+}
+
+/// When `regex=true` but the query looks like a code snippet, force literal.
+/// Returns whether the flag was downgraded.
+fn apply_code_fragment_literal(params: &mut SearchParams) -> bool {
+    if params.regex && looks_like_code_fragment(&params.query) {
+        params.regex = false;
+        true
+    } else {
+        false
+    }
+}
+
 fn quote_query_for_note(query: &str) -> String {
     const MAX: usize = 80;
     let count = query.chars().count();
@@ -103,16 +145,27 @@ fn quote_query_for_note(query: &str) -> String {
     format!("{clipped}…")
 }
 
-fn render_search_mode_header(regex: bool, query: &str) -> String {
+fn render_search_mode_header(regex: bool, query: &str, downgraded_from_regex: bool) -> String {
     let mode = if regex { "regex" } else { "literal" };
     let mut header = format!("mode: {mode}\n");
-    if !regex && looks_like_regex_query(query) {
+    if downgraded_from_regex {
+        header.push_str(&format!(
+            "注意：query 像函数签名/代码片段，已忽略 regex=true，按字面搜索「{}」。确需正则请写明确模式（如 a|b、foo\\(.*\\)），不要把源码片段直接当正则。\n",
+            quote_query_for_note(query)
+        ));
+    } else if !regex && looks_like_regex_query(query) {
         header.push_str(&format!(
             "注意：query 含正则元字符，但 regex=false，已按字面搜索「{}」。要按正则请传 regex=true；多符号请拆成多次字面搜索。\n",
             quote_query_for_note(query)
         ));
     }
     header
+}
+
+fn invalid_regex_message(error: impl std::fmt::Display) -> String {
+    format!(
+        "无效正则表达式：{error}。若本意是字面搜索该字符串，请传 regex=false（默认即为字面量）；不要把函数签名或源码片段当作正则。"
+    )
 }
 
 /// search_code 的分页状态行：保留 `shown= omitted= truncated=` 机器可读格式，
@@ -2194,6 +2247,8 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         const MAX_SHOWN: usize = 60;
         const MAX_SECONDS: u64 = 20;
+        let mut params = params.clone();
+        let regex_downgraded = apply_code_fragment_literal(&mut params);
         let sensitive = search_shape::literal_case_sensitive(
             &params.query,
             params.regex,
@@ -2201,7 +2256,7 @@ impl AstrolabeServer {
         );
         let matcher = match build_search_matcher(&params.query, params.regex, Some(sensitive)) {
             Ok(matcher) => matcher,
-            Err(error) => return text_error(format!("无效正则表达式：{error}")),
+            Err(error) => return text_error(invalid_regex_message(error)),
         };
         let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
             Ok(set) => set,
@@ -2255,7 +2310,11 @@ impl AstrolabeServer {
         let mut body = String::from(
             "confidence: exact (磁盘源码字面扫描；索引仍在后台构建，本结果无符号/角色标注，[text-only])\n",
         );
-        body.push_str(&render_search_mode_header(params.regex, &params.query));
+        body.push_str(&render_search_mode_header(
+            params.regex,
+            &params.query,
+            regex_downgraded,
+        ));
         if params.aggregate.is_some() {
             body.push_str("aggregate 需索引就绪后才分组，此处只给总数。\n");
         }
@@ -3539,7 +3598,8 @@ impl AstrolabeServer {
         Self::with_route_note(result, &route.note)
     }
 
-    fn search_code_inner(&self, params: SearchParams) -> CallToolResult {
+    fn search_code_inner(&self, mut params: SearchParams) -> CallToolResult {
+        let regex_downgraded = apply_code_fragment_literal(&mut params);
         self.with_fresh_index(
             params.root.as_deref().unwrap_or(""),
             |session, index| {
@@ -3585,7 +3645,7 @@ impl AstrolabeServer {
                     Some(sensitive),
                 ) {
                     Ok(matcher) => matcher,
-                    Err(error) => return text_error(format!("无效正则表达式：{error}")),
+                    Err(error) => return text_error(invalid_regex_message(error)),
                 };
                 // Whole-buffer candidate lines (a superset of the lines the
                 // per-line matchers accept; see `line_scan`). With smart case
@@ -3670,7 +3730,7 @@ impl AstrolabeServer {
                             .unwrap_or_default();
                         let body = format!(
                             "{conf}{}同一查询已在本会话第 {c} 次工具调用返回（文件未改动），不再重发全文。\n{digest}若你没看到那份结果（如子任务或上下文已压缩后丢失），传 dedup=false 重新取全文。\n",
-                            render_search_mode_header(params.regex, &params.query)
+                            render_search_mode_header(params.regex, &params.query, regex_downgraded)
                         );
                         return self.result_on(
                             &session.root,
@@ -3927,7 +3987,7 @@ impl AstrolabeServer {
                     }
                     let body = format!(
                         "{conf}{}{}",
-                        render_search_mode_header(params.regex, &params.query),
+                        render_search_mode_header(params.regex, &params.query, regex_downgraded),
                         render_search_counts(&matches, params.aggregate.as_deref(), params.offset),
                     ) + &variant_note
                         + &skip_note;
@@ -3971,7 +4031,7 @@ impl AstrolabeServer {
                     );
                     let mut body = format!(
                         "{conf}{}",
-                        render_search_mode_header(params.regex, &params.query)
+                        render_search_mode_header(params.regex, &params.query, regex_downgraded)
                     );
                     body.push_str(&format!(
                         "grouped=true total={total} shown={shown}\n"
@@ -4003,7 +4063,7 @@ impl AstrolabeServer {
                 if broad {
                     let mut body = format!(
                         "{conf}{}",
-                        render_search_mode_header(params.regex, &params.query)
+                        render_search_mode_header(params.regex, &params.query, regex_downgraded)
                     );
                     let ranked = rank_broad_hits(index, &matches);
                     let preview_budget = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS) / 2;
@@ -4115,7 +4175,7 @@ impl AstrolabeServer {
                 let mode = if params.regex { "regex" } else { "literal" };
                 let mut body = format!(
                     "{conf}{}",
-                    render_search_mode_header(params.regex, &params.query)
+                    render_search_mode_header(params.regex, &params.query, regex_downgraded)
                 );
                 body.push_str(&render_search_page_status(
                     total,
@@ -6427,6 +6487,80 @@ mod tests {
         let empty = server.search_code(Parameters(search("")));
         assert_eq!(empty.is_error, Some(true));
         assert!(text_of(&empty).contains("不能为空"), "{}", text_of(&empty));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn looks_like_code_fragment_detects_signatures_not_regex() {
+        assert!(looks_like_code_fragment("fn process(data: &str)"));
+        assert!(looks_like_code_fragment("compute(a, b)"));
+        assert!(looks_like_code_fragment("Type::new(cfg)"));
+        assert!(looks_like_code_fragment("obj.method(")); // unclosed call
+        assert!(looks_like_code_fragment("(x) => x + 1"));
+        assert!(!looks_like_code_fragment("foo|bar"));
+        assert!(!looks_like_code_fragment(r"foo\(.*\)"));
+        assert!(!looks_like_code_fragment(r"^\s*fn\s+"));
+        assert!(!looks_like_code_fragment("[a-z]+"));
+        assert!(!looks_like_code_fragment("(foo|bar)"));
+        assert!(!looks_like_code_fragment("plain_name"));
+    }
+
+    #[test]
+    fn search_code_downgrades_signature_query_from_regex_to_literal() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        // As regex, `compute(a, b)` is a capture group and would match `computea, b`
+        // (no parens). As literal it matches the call site in CALC_PY.
+        let mut p = search("compute(a, b)");
+        p.regex = true;
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("mode: literal"), "{text}");
+        assert!(text.contains("已忽略 regex=true"), "{text}");
+        assert!(text.contains("compute(a, b)"), "{text}");
+        assert!(text.contains("calc.py"), "{text}");
+        assert!(!text.contains("(未找到匹配的代码行)"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_downgrades_unclosed_call_instead_of_invalid_regex() {
+        let (server, dir) =
+            smart_server(&[("calc.py", "def helper(x):\n    return helper(x\n".into())]);
+        let mut p = search("helper(x");
+        p.regex = true;
+        let r = server.search_code(Parameters(p));
+        assert_ne!(r.is_error, Some(true), "{}", text_of(&r));
+        let text = text_of(&r);
+        assert!(text.contains("mode: literal"), "{text}");
+        assert!(text.contains("已忽略 regex=true"), "{text}");
+        assert!(text.contains("helper(x"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_invalid_regex_suggests_literal() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        // Character class left open — not a code-fragment shape, so still an error.
+        let mut p = search("[unclosed");
+        p.regex = true;
+        let r = server.search_code(Parameters(p));
+        assert_eq!(r.is_error, Some(true));
+        let text = text_of(&r);
+        assert!(text.contains("无效正则表达式"), "{text}");
+        assert!(text.contains("regex=false"), "{text}");
+        assert!(text.contains("字面"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_keeps_intentional_regex_with_groups() {
+        let (server, dir) = smart_server(&[("calc.py", "alpha_hit\nbeta_hit\n".into())]);
+        let mut p = search("alpha_hit|beta_hit");
+        p.regex = true;
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("mode: regex"), "{text}");
+        assert!(!text.contains("已忽略 regex=true"), "{text}");
+        assert!(text.contains("alpha_hit"), "{text}");
+        assert!(text.contains("beta_hit"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
