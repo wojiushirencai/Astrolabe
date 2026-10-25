@@ -453,6 +453,15 @@ test('ZCode mcp.servers + hooks.events without SessionEnd', () => {
             enabled: false,
             events: {
               SessionEnd: [{ hooks: [{ type: 'command', command: 'bad' }] }],
+              // Misconfigured: cleanup on Stop would wipe counters every turn
+              Stop: [
+                {
+                  hooks: [
+                    { type: 'command', command: 'astrolabe hooks cleanup' },
+                    { type: 'command', command: 'echo keep-stop' },
+                  ],
+                },
+              ],
               PreToolUse: [{ hooks: [{ type: 'command', command: 'echo keep' }] }],
             },
           },
@@ -475,6 +484,15 @@ test('ZCode mcp.servers + hooks.events without SessionEnd', () => {
     assert.ok(
       !JSON.stringify(doc.hooks).includes('SessionEnd'),
       'SessionEnd must not appear in ZCode hooks',
+    );
+    // Stop keeps non-cleanup hooks; cleanup command is stripped
+    assert.ok(Array.isArray(doc.hooks.events.Stop));
+    assert.equal(doc.hooks.events.Stop.length, 1);
+    assert.equal(doc.hooks.events.Stop[0].hooks.length, 1);
+    assert.equal(doc.hooks.events.Stop[0].hooks[0].command, 'echo keep-stop');
+    assert.ok(
+      !JSON.stringify(doc.hooks).includes('hooks cleanup'),
+      'Stop must not hang astrolabe hooks cleanup',
     );
     assert.ok(
       doc.hooks.events.PreToolUse.some((e) =>
@@ -509,6 +527,53 @@ test('ZCode mcp.servers + hooks.events without SessionEnd', () => {
   }
 });
 
+test('ZCode withHooks strips Stop cleanup but keeps non-cleanup Stop', () => {
+  const home = tmpHome();
+  try {
+    const cli = path.join(home, '.zcode', 'cli');
+    fs.mkdirSync(cli, { recursive: true });
+    fs.writeFileSync(
+      path.join(cli, 'config.json'),
+      JSON.stringify(
+        {
+          hooks: {
+            enabled: true,
+            events: {
+              Stop: [
+                {
+                  matcher: 'cleanup-only',
+                  hooks: [{ type: 'command', command: 'astrolabe hooks cleanup' }],
+                },
+                {
+                  matcher: 'other',
+                  hooks: [{ type: 'command', command: 'echo turn-end' }],
+                },
+              ],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const launch = { command: 'npx', args: ['-y', '@zlnap/astrolabe', '.'] };
+    clientsMod
+      .getClient('zcode')
+      .plan({ home, launch, withHooks: true })
+      .apply()
+      .write();
+    const doc = JSON.parse(fs.readFileSync(path.join(cli, 'config.json'), 'utf8'));
+    assert.equal(doc.hooks.events.SessionEnd, undefined);
+    assert.ok(Array.isArray(doc.hooks.events.Stop));
+    assert.equal(doc.hooks.events.Stop.length, 1);
+    assert.equal(doc.hooks.events.Stop[0].matcher, 'other');
+    assert.equal(doc.hooks.events.Stop[0].hooks[0].command, 'echo turn-end');
+    assert.ok(!JSON.stringify(doc.hooks).includes('hooks cleanup'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('setup --clients aliases resolve for new clients', () => {
   const home = tmpHome();
   try {
@@ -533,6 +598,219 @@ test('setup --clients aliases resolve for new clients', () => {
     assert.match(dry.stdout, /ZCode/);
     // codebuddy skipped (no ~/.codebuddy)
     assert.match(dry.stdout, /Codebuddy: SKIP|Codebuddy/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Cursor client context is always cursor (never claude-code)', () => {
+  const client = clientsMod.getClient('cursor');
+  assert.equal(client.context, 'cursor');
+  const launch = clientsMod.resolveLaunch({ context: client.context });
+  assert.ok(launch.args.includes('--context=cursor'));
+  assert.ok(!launch.args.some((a) => String(a).includes('claude-code')));
+});
+
+test('Cursor --with-hooks writes hooks.json with --client=cursor and mcp matcher', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    // Bad prior config: wrong client + matcher missing mcp__astrolabe__.*
+    fs.writeFileSync(
+      path.join(home, '.cursor', 'hooks.json'),
+      JSON.stringify(
+        {
+          version: 1,
+          hooks: {
+            preToolUse: [
+              {
+                command: 'astrolabe hooks remind --client=claude-code',
+                matcher: 'Shell|Read|Grep',
+              },
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(
+      path.join(home, '.cursor', 'mcp.json'),
+      JSON.stringify(
+        {
+          mcpServers: {
+            astrolabe: {
+              command: 'npx',
+              args: ['-y', '@zlnap/astrolabe', '.', '--context=claude-code'],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--with-hooks',
+        '--home',
+        home,
+        '--no-cursor-permissions',
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+
+    const mcp = JSON.parse(fs.readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8'));
+    assert.deepEqual(mcp.mcpServers.astrolabe.args, [
+      '-y',
+      '@zlnap/astrolabe',
+      '.',
+      '--context=cursor',
+    ]);
+    assert.ok(!JSON.stringify(mcp).includes('claude-code'));
+
+    const hooks = JSON.parse(fs.readFileSync(path.join(home, '.cursor', 'hooks.json'), 'utf8'));
+    assert.equal(hooks.version, 1);
+    const remind = hooks.hooks.preToolUse.find((e) =>
+      String(e.command || '').includes('astrolabe hooks remind'),
+    );
+    assert.ok(remind, 'preToolUse remind missing');
+    assert.equal(remind.command, 'astrolabe hooks remind --client=cursor');
+    assert.equal(remind.matcher, clientsMod.CURSOR_REMIND_MATCHER);
+    assert.match(remind.matcher, /mcp__astrolabe__\.\*/);
+    assert.ok(!remind.command.includes('claude-code'));
+    const cleanup = hooks.hooks.sessionEnd.find((e) =>
+      String(e.command || '').includes('hooks cleanup'),
+    );
+    assert.ok(cleanup, 'sessionEnd cleanup missing');
+    // Idempotent: no duplicate reminds
+    const remindCount = hooks.hooks.preToolUse.filter((e) =>
+      String(e.command || '').includes('astrolabe hooks remind'),
+    ).length;
+    assert.equal(remindCount, 1);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('ZCode --with-hooks replaces wrong remind client and scrubs Stop cleanup', () => {
+  const home = tmpHome();
+  try {
+    const cli = path.join(home, '.zcode', 'cli');
+    fs.mkdirSync(cli, { recursive: true });
+    fs.writeFileSync(
+      path.join(cli, 'config.json'),
+      JSON.stringify(
+        {
+          mcp: { servers: {} },
+          hooks: {
+            enabled: true,
+            events: {
+              PreToolUse: [
+                {
+                  matcher: '*',
+                  hooks: [
+                    {
+                      type: 'command',
+                      command: 'astrolabe hooks remind --client=claude-code',
+                      timeout: 10,
+                    },
+                  ],
+                },
+              ],
+              Stop: [
+                {
+                  matcher: '*',
+                  hooks: [
+                    {
+                      type: 'command',
+                      command: 'astrolabe hooks cleanup',
+                      timeout: 10,
+                    },
+                    {
+                      type: 'command',
+                      command: 'echo keep-stop',
+                    },
+                  ],
+                },
+              ],
+              SessionEnd: [
+                {
+                  hooks: [{ type: 'command', command: 'astrolabe hooks cleanup' }],
+                },
+              ],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const client = clientsMod.getClient('zcode');
+    assert.equal(client.context, null);
+    const launch = clientsMod.resolveLaunch({ context: client.context });
+    assert.ok(!launch.args.some((a) => String(a).includes('--context=')));
+    const plan = client.plan({ home, launch, withHooks: true });
+    plan.apply().write();
+    const doc = JSON.parse(fs.readFileSync(path.join(cli, 'config.json'), 'utf8'));
+    assert.equal(doc.hooks.events.SessionEnd, undefined);
+    assert.ok(!JSON.stringify(doc.hooks).includes('SessionEnd'));
+    // Stop cleanup removed; non-cleanup Stop hook preserved
+    assert.ok(doc.hooks.events.Stop, 'Stop should remain when non-cleanup hooks survive');
+    const stopCmds = (doc.hooks.events.Stop || []).flatMap((e) =>
+      (e.hooks || []).map((h) => h.command),
+    );
+    assert.ok(stopCmds.includes('echo keep-stop'));
+    assert.ok(!stopCmds.some((c) => String(c).includes('hooks cleanup')));
+    // Wrong client replaced
+    const remindCmds = (doc.hooks.events.PreToolUse || []).flatMap((e) =>
+      (e.hooks || []).map((h) => h.command),
+    );
+    assert.ok(remindCmds.includes('astrolabe hooks remind --client=zcode'));
+    assert.ok(!remindCmds.some((c) => String(c).includes('--client=claude-code')));
+    // Pure Stop-cleanup-only configs drop Stop entirely
+    const home2 = tmpHome();
+    try {
+      const cli2 = path.join(home2, '.zcode', 'cli');
+      fs.mkdirSync(cli2, { recursive: true });
+      fs.writeFileSync(
+        path.join(cli2, 'config.json'),
+        JSON.stringify(
+          {
+            hooks: {
+              events: {
+                Stop: [
+                  {
+                    hooks: [{ type: 'command', command: 'astrolabe hooks cleanup' }],
+                  },
+                ],
+              },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      clientsMod
+        .getClient('zcode')
+        .plan({ home: home2, launch, withHooks: true })
+        .apply()
+        .write();
+      const d2 = JSON.parse(fs.readFileSync(path.join(cli2, 'config.json'), 'utf8'));
+      assert.equal(d2.hooks.events.Stop, undefined);
+      assert.ok(
+        d2.hooks.events.PreToolUse.some((e) =>
+          (e.hooks || []).some((h) => h.command === 'astrolabe hooks remind --client=zcode'),
+        ),
+      );
+    } finally {
+      fs.rmSync(home2, { recursive: true, force: true });
+    }
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

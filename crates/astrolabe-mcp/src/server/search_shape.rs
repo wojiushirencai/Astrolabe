@@ -93,7 +93,7 @@ pub(super) fn symbol_hits_outside_filter(
     filter: &str,
 ) -> String {
     let symbols = &index.graph().symbols;
-    let mut outside: Vec<(u8, String)> = Vec::new();
+    let mut outside: Vec<(u8, String, String)> = Vec::new();
     for (idx, lower) in index.names().lower().iter().enumerate() {
         let Some(tier) = name_match_tier(lower, needle) else {
             continue;
@@ -103,19 +103,28 @@ pub(super) fn symbol_hits_outside_filter(
             continue;
         }
         if let Some(file) = index.file(s.file) {
-            outside.push((tier, format!("{}:{}", file.path.as_str(), s.start_line)));
+            outside.push((
+                tier,
+                format!("{}:{}", file.path.as_str(), s.start_line),
+                file.path.as_str().to_string(),
+            ));
         }
     }
     let mut note = if outside.is_empty() {
-        format!("path_filter=\"{filter}\" 之外也没有：全仓库都没有这个名字。\n")
+        format!(
+            "path_filter=\"{filter}\" 之外也没有：全仓库都没有这个名字。\n{}",
+            filter_zero_next_step(filter, &[])
+        )
     } else {
         outside.sort();
-        let sample: Vec<&str> = outside.iter().take(3).map(|(_, l)| l.as_str()).collect();
+        let sample: Vec<&str> = outside.iter().take(3).map(|(_, l, _)| l.as_str()).collect();
+        let paths: Vec<&str> = outside.iter().map(|(_, _, p)| p.as_str()).collect();
         format!(
-            "path_filter=\"{filter}\" 内没有；过滤范围外有 {} 处：{}{}\n",
+            "path_filter=\"{filter}\" 内没有；过滤范围外有 {} 处：{}{}\n{}",
             outside.len(),
             sample.join("、"),
-            if outside.len() > 3 { " …" } else { "" }
+            if outside.len() > 3 { " …" } else { "" },
+            filter_zero_next_step(filter, &paths)
         )
     };
     if index.file_id(filter).is_some() {
@@ -130,7 +139,10 @@ pub(super) fn symbol_hits_outside_filter(
 /// and first locations, `file:line,line`), or that the repo has none.
 pub(super) fn search_hits_outside_filter(filter: &str, outside: &[SearchHit]) -> String {
     if outside.is_empty() {
-        return format!("path_filter=\"{filter}\" 之外也没有：全仓库都没有这个字面量。\n");
+        return format!(
+            "path_filter=\"{filter}\" 之外也没有：全仓库都没有这个字面量。\n{}",
+            filter_zero_next_step(filter, &[])
+        );
     }
     let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     let mut order: Vec<&str> = Vec::new();
@@ -150,12 +162,34 @@ pub(super) fn search_hits_outside_filter(filter: &str, outside: &[SearchHit]) ->
         })
         .collect();
     format!(
-        "path_filter=\"{filter}\" 内没有；过滤范围外有 {} 处 / {} 个文件：{}{}\n",
+        "path_filter=\"{filter}\" 内没有；过滤范围外有 {} 处 / {} 个文件：{}{}\n{}",
         outside.len(),
         by_file.len(),
         shown.join("；"),
-        if order.len() > 3 { " …" } else { "" }
+        if order.len() > 3 { " …" } else { "" },
+        filter_zero_next_step(
+            filter,
+            &outside.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+        )
     )
+}
+
+/// Explicit next action when `path_filter` yielded zero hits. Models often
+/// report the outside-hit count and then keep the same filter; this line
+/// tells them to drop or widen it (or stop narrowing when the repo has none).
+fn filter_zero_next_step(filter: &str, outside_paths: &[&str]) -> String {
+    if outside_paths.is_empty() {
+        return "下一步：去掉 path_filter 也搜不到；改 query（更短字面量 / find_symbol），不要反复收窄 path_filter。\n"
+            .to_string();
+    }
+    if let Some(suggest) = suggest_path_filter(outside_paths.iter().copied()) {
+        if suggest != filter {
+            return format!(
+                "下一步：去掉 path_filter 重试；或改 path_filter=\"{suggest}\" 只看含命中的范围。\n"
+            );
+        }
+    }
+    "下一步：去掉 path_filter 重试（当前过滤把已有命中挡在外面）。\n".to_string()
 }
 
 /// Smart case for literal search: case-sensitive when the query has an
@@ -275,9 +309,15 @@ mod tests {
         let note = search_hits_outside_filter("_test.go", &out);
         assert!(note.contains("过滤范围外有 3 处 / 2 个文件"), "{note}");
         assert!(note.contains("command.go:789,862"), "{note}");
+        assert!(note.contains("下一步：去掉 path_filter 重试"), "{note}");
+        assert!(
+            note.contains("path_filter=\"command.go\"") || note.contains("改 path_filter="),
+            "suggests a wider/alt filter: {note}"
+        );
         assert!(!note.contains("过窄"), "{note}");
         let none = search_hits_outside_filter("_test.go", &[]);
         assert!(none.contains("全仓库都没有"), "{none}");
+        assert!(none.contains("去掉 path_filter 也搜不到"), "{none}");
     }
 }
 
@@ -490,10 +530,12 @@ mod behaviour {
         let out = text(&server.find_symbol(Parameters(p)));
         assert!(out.contains("过滤范围外有"), "{out}");
         assert!(out.contains("oauth/github.go:3"), "{out}");
+        assert!(out.contains("下一步：去掉 path_filter 重试"), "{out}");
         let mut p = find("controller");
         p.path_filter = Some("oauth/github.go".into());
         let out = text(&server.find_symbol(Parameters(p)));
         assert!(out.contains("全仓库都没有这个名字"), "{out}");
+        assert!(out.contains("去掉 path_filter 也搜不到"), "{out}");
         assert!(out.contains("query=\"oauth/github.go\""), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -510,6 +552,7 @@ mod behaviour {
             "{out}"
         );
         assert!(out.contains("oauth/discord.go:5"), "{out}");
+        assert!(out.contains("下一步：去掉 path_filter 重试"), "{out}");
         assert!(!out.contains("过窄"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
