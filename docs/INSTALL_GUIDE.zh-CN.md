@@ -1,6 +1,6 @@
 # Astrolabe AI 安装与客户端配置指南（中文）
 
-英文版见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)。
+英文版见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)。最后更新 2026-10-25（v0.17.0）。
 
 本指南覆盖安装与各客户端的 MCP 配置。
 
@@ -10,16 +10,16 @@
 
 唯一的官方二进制来源是 [GitHub Releases](https://github.com/wojiushirencai/Astrolabe/releases)。归档命名：`astrolabe-<版本>-<target>.tar.gz`（Windows 为 `.zip`），每个版本附 `SHA256SUMS`。
 
-| 平台 | target | 示例（v0.13.0，压缩包大小） |
+| 平台 | target | 示例（v0.17.0，压缩包大小） |
 |---|---|---|
-| macOS Apple Silicon | `aarch64-apple-darwin` | 8,570,892 B |
-| macOS Intel | `x86_64-apple-darwin` | 8,791,798 B |
-| Linux x64（glibc） | `x86_64-unknown-linux-gnu` | 8,956,755 B |
-| Linux x64（静态，musl） | `x86_64-unknown-linux-musl` | 9,113,635 B |
-| Linux arm64 | `aarch64-unknown-linux-gnu` | 7,351,404 B |
-| Windows x64 | `x86_64-pc-windows-msvc`（`.zip`） | 8,478,933 B |
+| macOS Apple Silicon | `aarch64-apple-darwin` | 9,728,734 B |
+| macOS Intel | `x86_64-apple-darwin` | 10,078,526 B |
+| Linux x64（glibc） | `x86_64-unknown-linux-gnu` | 10,238,301 B |
+| Linux x64（静态，musl） | `x86_64-unknown-linux-musl` | 10,406,095 B |
+| Linux arm64 | `aarch64-unknown-linux-gnu` | 8,507,630 B |
+| Windows x64 | `x86_64-pc-windows-msvc`（`.zip`） | 9,666,430 B |
 
-解压后的 Linux x64 二进制约 50 MB（2026-10-18 实测 49,718,560 B）。
+压缩包大小取自 [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0) Release 资源。
 
 ## 二、安装
 
@@ -28,7 +28,7 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 # 指定版本 / 目录：
-ASTROLABE_VERSION=0.13.0 ASTROLABE_INSTALL_DIR="$HOME/.local/bin" sh install.sh
+ASTROLABE_VERSION=0.17.0 ASTROLABE_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 ```
 
 脚本只做：下载对应平台归档和 `SHA256SUMS` → 校验 → 把 `astrolabe` 放到安装目录。不修改 PATH 或任何配置文件。
@@ -36,7 +36,7 @@ ASTROLABE_VERSION=0.13.0 ASTROLABE_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 ### 方式 2：手动下载
 
 ```bash
-V=0.13.0; T=aarch64-apple-darwin   # 按上表选择 target
+V=0.17.0; T=aarch64-apple-darwin   # 按上表选择 target
 curl -fsSLO https://github.com/wojiushirencai/Astrolabe/releases/download/v$V/astrolabe-$V-$T.tar.gz
 curl -fsSLO https://github.com/wojiushirencai/Astrolabe/releases/download/v$V/SHA256SUMS
 grep "astrolabe-$V-$T.tar.gz" SHA256SUMS | sha256sum -c -     # macOS 用 shasum -a 256 -c -
@@ -49,7 +49,7 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 
 ### 方式 4：npm
 
-npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`），平台包为 `@zlnap/<platform>`，发布在 npm 个人 scope `zlnap`（无需建 org；npm org `astrolabe-ai` 已被他人占用）。安装：`npx -y @zlnap/astrolabe .`，再 `npx -y @zlnap/astrolabe setup` 接入客户端。注意：npm 上未加 scope 的 `astrolabe` 和 `astrolabe-ai` 是与本项目无关的他人的包，请不要用它们。
+npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`），平台包为 `@zlnap/<platform>`，已在 npm 个人 scope `zlnap` **发布**（[v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0)；无需建 org；npm org `astrolabe-ai` 已被他人占用）。安装：`npx -y @zlnap/astrolabe .`，再 `npx -y @zlnap/astrolabe setup` 接入客户端。注意：npm 上未加 scope 的 `astrolabe` 和 `astrolabe-ai` 是与本项目无关的他人的包，请不要用它们。
 
 ### 方式 5：从源码编译（Rust 1.90+）
 
@@ -72,14 +72,15 @@ cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 npx -y @zlnap/astrolabe setup
 ```
 
-会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件，以及 Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`。
+会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件，以及 Cursor / Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`。
 
+- **Cursor：** MCP 写入 `~/.cursor/mcp.json`（`--context=cursor`）；可选 `--with-hooks` 写入 `~/.cursor/hooks.json`（`preToolUse` → `astrolabe hooks remind --client=cursor`，matcher 含 `mcp__astrolabe__.*`；`sessionEnd` cleanup）。
 - **OpenCode：** 合并进 `~/.config/opencode/opencode.jsonc`（或已有的 `.json` / 旧版 `config.json`，或 `~/.opencode/…`）。自动识别 V1（`mcp.<name>` + `enabled`）、V2（`mcp.servers`）或类 Claude 的 `mcpServers`；在父对象已存在时尽量保留 JSONC 注释。可选 `--with-hooks` 写入 `~/.config/opencode/plugins/astrolabe-guard.ts`。
 - **DeepSeek Harness：** 把自带的 `astrolabe-dsh-guard` 装进 `~/.dsh/profiles/**/node_modules`，并合并写入 `~/.dsh/cordis.patch.yml` 的托管块（不碰 `orca-managed-dsh-hooks`）。DSH 的 MCP 是按仓库在 UI 里配的，setup 不会代写。
 - **Codebuddy：** MCP 写入 `~/.codebuddy/.mcp.json`（若已有 `mcp.json` / `~/.codebuddy.json` 则合并进优先已存在的那个）；可选 `--with-hooks` 合并进 `~/.codebuddy/settings.json` 的 CC 兼容 `hooks`（PreToolUse + SessionEnd）。
 - **Grok Build：** MCP 合并进 `~/.grok/config.toml` 的 `[mcp_servers.astrolabe]`（与 Codex 同形）；可选 `--with-hooks` 写入 `~/.grok/hooks/astrolabe.json`。
 - **Kimi Code：** MCP 合并进 `~/.kimi-code/mcp.json`；可选 `--with-hooks` 在 `~/.kimi-code/config.toml` 追加托管 `[[hooks]]` 块（不覆盖其它 hooks）。
-- **ZCode：** 合并进 `~/.zcode/cli/config.json` 的 `mcp.servers.astrolabe`；可选 `--with-hooks` 设置 `hooks.enabled: true` 并写入 `hooks.events.PreToolUse`（**绝不**写 `SessionEnd`，也不在 `Stop` 上挂 cleanup）。
+- **ZCode：** 合并进 `~/.zcode/cli/config.json` 的 `mcp.servers.astrolabe`；可选 `--with-hooks` 设置 `hooks.enabled: true` 并写入 `hooks.events.PreToolUse`（**绝不**写 `SessionEnd`；并**清掉**已有的 `Stop` → cleanup，避免每轮清零计数）。
 
 若只用 cargo 安装：`astrolabe setup` 在本机有 Node 时会通过 `npx` 跑同一套流程。
 

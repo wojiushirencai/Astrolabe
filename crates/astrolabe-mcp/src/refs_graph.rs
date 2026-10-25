@@ -346,7 +346,18 @@ pub(crate) fn fix_path(
             }
         }
         n if !exists => {
-            let list: Vec<String> = decls
+            // Rank candidates so the model picks a useful path: non-test and
+            // exported first, then path/line (stable).
+            let mut ranked: Vec<&CodeSymbol> = decls;
+            ranked.sort_by_key(|s| {
+                let path = index.file(s.file).map(|f| f.path.as_str()).unwrap_or("");
+                let test = path.contains("/test")
+                    || path.contains("_test.")
+                    || path.contains("/tests/")
+                    || path.starts_with("tests/");
+                (!s.exported, test, path, s.start_line)
+            });
+            let list: Vec<String> = ranked
                 .iter()
                 .take(8)
                 .filter_map(|s| {
@@ -355,14 +366,14 @@ pub(crate) fn fix_path(
                         .map(|f| format!("{}:{}", f.path.as_str(), s.start_line))
                 })
                 .collect();
-            let more = if decls.len() > 8 {
-                format!(" …共 {} 处", decls.len())
+            let more = if ranked.len() > 8 {
+                format!(" …共 {} 处", ranked.len())
             } else {
                 String::new()
             };
             PathFix::Ambiguous {
                 note: format!(
-                    "{why}，而索引里 `{symbol}` 定义在 {n} 个文件：{}{more}。请把其中一个作为 path 再查。",
+                    "{why}，而索引里 `{symbol}` 定义在 {n} 个文件（已按导出/非测试优先排列）：{}{more}。请把其中一个作为 path 再查（或先 find_symbol 收窄后再 find_references）。",
                     list.join("、")
                 ),
             }
@@ -2643,10 +2654,16 @@ mod tests {
         ));
         // Ambiguous without a path: candidates listed.
         match fix_path(&ix, &dir, "Dup", None) {
-            PathFix::Ambiguous { note } => assert!(
-                note.contains("a/x.go:3") && note.contains("b/y.go:3"),
-                "{note}"
-            ),
+            PathFix::Ambiguous { note } => {
+                assert!(
+                    note.contains("a/x.go:3") && note.contains("b/y.go:3"),
+                    "{note}"
+                );
+                assert!(
+                    note.contains("请把其中一个作为 path") || note.contains("find_symbol"),
+                    "{note}"
+                );
+            }
             other => panic!("{other:?}"),
         }
         // Unknown names: keep (the server path reports it).

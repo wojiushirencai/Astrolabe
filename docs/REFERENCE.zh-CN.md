@@ -4,7 +4,7 @@
 
 ## 一、工具速查（7 个）
 
-Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、依赖图、热点、重命名、记忆等 15 个入口已移除，无兼容层）：
+Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、依赖图、热点、重命名、记忆等 15 个入口已移除）。例外：已删除的 `explain_symbol` 仍可在 `tools/call` 调用（不进 `tools/list`），会转发到 `find_symbol(include_body=true)` 并提示改用 `find_symbol` / `find_references`：
 
 | 工具名称 | 核心参数 | 它能帮 AI 解决什么？（大白话解读） |
 |---|---|---|
