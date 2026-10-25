@@ -3165,12 +3165,7 @@ impl AstrolabeServer {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                self.remember_symbol_anchor(
-                    &session.root,
-                    sym,
-                    &params.path,
-                    params.line,
-                );
+                self.remember_symbol_anchor(&session.root, sym, &params.path, params.line);
             }
             self.coord_note_once(crate::precise_tools::run_goto_definition(
                 params,
