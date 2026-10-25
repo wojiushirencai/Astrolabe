@@ -298,6 +298,7 @@ pub(crate) const SUPPORTED_CODE_EXTENSIONS: &[&str] = &[
     "rake",
     "gemspec",
     "lua",
+    "proto",
 ];
 
 /// 触发 hook 的客户端类型

@@ -6,6 +6,10 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+### 新增
+
+- **Protobuf（`.proto`）图索引**：tree-sitter-proto 提取 `package` / `message` / `enum` / `service` / `rpc`；`import` 按仓库相对路径解析。无专用 LSP（`get_diagnostics` 等精确工具为图/语法路径）。缓解会话里反复撞「未索引 .proto」的问题。
+
 ### Fixed
 
 - **`explain_symbol` 调用期兼容别名**：目录仍固定 7 个工具、`tools/list` 不暴露该名；旧客户端（如 Cursor 残留提示）调用时转发到 `find_symbol(include_body=true, substring=false)`，并在结果中注明改用 `find_symbol` / `find_references`。Hook 将 `mcp__astrolabe__explain_symbol` 视为符号工具以清零计数。

@@ -1270,6 +1270,9 @@ fn install_hint_one(language: Language) -> String {
         Language::Lua => {
             "Lua（lua-language-server）：`brew install lua-language-server`。".into()
         }
+        Language::Proto => {
+            "Protobuf：无专用语言服务器；message / enum / service / rpc 由 tree-sitter 索引，用 find_symbol / search_code。".into()
+        }
         Language::Php => {
             "PHP（intelephense）：`npm i -g intelephense`。".into()
         }
