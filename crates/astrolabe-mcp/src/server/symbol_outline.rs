@@ -694,7 +694,13 @@ def make_client():
     #[test]
     fn file_path_query_is_rejected_with_path_filter_guidance() {
         let (server, dir) = server_on(&[("pkg/cloud.py", MODULE)]);
-        for q in ["pkg/cloud.py", "./cloud.py", "cloud.py", "/abs/pkg/cloud.py", "pkg/"] {
+        for q in [
+            "pkg/cloud.py",
+            "./cloud.py",
+            "cloud.py",
+            "/abs/pkg/cloud.py",
+            "pkg/",
+        ] {
             let result = server.find_symbol(Parameters(query(q)));
             assert_eq!(result.is_error, Some(true), "query={q}");
             let text = result.content[0].as_text().unwrap().text.clone();

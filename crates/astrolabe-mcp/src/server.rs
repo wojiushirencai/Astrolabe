@@ -8375,7 +8375,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn looks_like_filesystem_path_detects_code_paths_not_type_methods() {
         assert!(looks_like_filesystem_path("pkg/cloud.py"));
