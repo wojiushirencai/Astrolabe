@@ -1,10 +1,11 @@
 //! `find_symbol` file outlines, member expansion for name queries, and the
 //! sub-word relevance fallback for zero-hit queries.
 //!
-//! - `query=<file path>` (or `query="*"` with a `path_filter`) lists the
-//!   file's symbols as an indented outline with line ranges, so an agent can
-//!   see a file's shape without reading it whole. `depth` controls how many
-//!   member levels are shown; fields/variables below the top level are
+//! - `query="*"` with a `path_filter` lists the file's (or directory's)
+//!   symbols as an indented outline with line ranges, so an agent can see a
+//!   file's shape without reading it whole. File paths in `query` are
+//!   rejected by the caller — put them in `path_filter`. `depth` controls how
+//!   many member levels are shown; fields/variables below the top level are
 //!   counted rather than listed. Over budget it degrades to depth 0, then
 //!   pages (with per-kind counts).
 //! - A plain name query with `depth>0` lists each shown match's members
@@ -41,10 +42,10 @@ pub(super) enum OutlineTarget {
     Files(Vec<FileId>),
 }
 
-/// Recognise an outline request: `query="*"` (needs `path_filter`), or a
-/// query that is an indexed file's repo-relative path (or a path suffix of
-/// one, or a directory holding indexed files). `None` = an ordinary symbol
-/// query; `Some(Err)` = an outline request that cannot be served.
+/// Recognise an outline request: `query="*"` with a `path_filter`.
+/// File paths in `query` are rejected upstream (`looks_like_filesystem_path`);
+/// this only serves the explicit `*` form. `None` = an ordinary symbol query;
+/// `Some(Err)` = an outline request that cannot be served.
 pub(super) fn outline_target(
     index: &RepoIndex,
     query: &str,
@@ -52,76 +53,32 @@ pub(super) fn outline_target(
 ) -> Option<Result<OutlineTarget, String>> {
     let files = &index.graph().files;
     let q = query.trim();
-    if q == "*" {
-        let Some(filter) = path_filter.filter(|f| !f.is_empty()) else {
-            return Some(Err(
-                "query=\"*\" 需配合 path_filter（文件或目录）才列出符号大纲；不支持列出全库符号。"
-                    .to_string(),
-            ));
-        };
-        let mut matched: Vec<(&str, FileId)> = files
-            .iter()
-            .filter(|f| f.path.as_str().contains(filter))
-            .map(|f| (f.path.as_str(), f.id))
-            .collect();
-        matched.sort();
-        matched.dedup_by_key(|(p, _)| *p);
-        return Some(match matched.as_slice() {
-            [] => Err(format!(
-                "path_filter `{filter}` 只匹配到未入符号索引的文件，无符号大纲可列；请用 Read 或 search_code。"
-            )),
-            [(_, id)] => Ok(OutlineTarget::File {
-                id: *id,
-                others: Vec::new(),
-            }),
-            many => Ok(OutlineTarget::Files(many.iter().map(|(_, id)| *id).collect())),
-        });
-    }
-    let q = q.trim_start_matches("./");
-    if q.is_empty()
-        || q.contains(char::is_whitespace)
-        || !(q.contains('/') || q.contains('.'))
-        // A symbol literally named like the query wins (`a.b` in Ruby …).
-        || index.names().has_exact(&index.graph().symbols, q)
-    {
+    if q != "*" {
         return None;
     }
-    if let Some(file) = files.iter().find(|f| f.path.as_str() == q) {
-        return Some(Ok(OutlineTarget::File {
-            id: file.id,
-            others: Vec::new(),
-        }));
-    }
-    let dir = q.trim_end_matches('/');
-    let suffix = format!("/{dir}");
-    let mut by_suffix: Vec<(&str, FileId)> = files
+    let Some(filter) = path_filter.filter(|f| !f.is_empty()) else {
+        return Some(Err(
+            "query=\"*\" 需配合 path_filter（文件或目录）才列出符号大纲；不支持列出全库符号。"
+                .to_string(),
+        ));
+    };
+    let mut matched: Vec<(&str, FileId)> = files
         .iter()
-        .filter(|f| f.path.as_str().ends_with(&suffix))
+        .filter(|f| f.path.as_str().contains(filter))
         .map(|f| (f.path.as_str(), f.id))
         .collect();
-    if !by_suffix.is_empty() && !q.ends_with('/') {
-        by_suffix.sort_by_key(|(p, _)| (p.len(), *p));
-        let (_, id) = by_suffix[0];
-        let others = by_suffix[1..].iter().map(|(p, _)| p.to_string()).collect();
-        return Some(Ok(OutlineTarget::File { id, others }));
-    }
-    // A directory: only when written with a `/` (so `Type/method` path
-    // queries are not taken for directories unless such a directory exists).
-    if q.contains('/') {
-        let prefix = format!("{dir}/");
-        let mut under: Vec<(&str, FileId)> = files
-            .iter()
-            .filter(|f| f.path.as_str().starts_with(&prefix))
-            .map(|f| (f.path.as_str(), f.id))
-            .collect();
-        under.sort();
-        if !under.is_empty() {
-            return Some(Ok(OutlineTarget::Files(
-                under.into_iter().map(|(_, id)| id).collect(),
-            )));
-        }
-    }
-    None
+    matched.sort();
+    matched.dedup_by_key(|(p, _)| *p);
+    Some(match matched.as_slice() {
+        [] => Err(format!(
+            "path_filter `{filter}` 只匹配到未入符号索引的文件，无符号大纲可列；请用 Read 或 search_code。"
+        )),
+        [(_, id)] => Ok(OutlineTarget::File {
+            id: *id,
+            others: Vec::new(),
+        }),
+        many => Ok(OutlineTarget::Files(many.iter().map(|(_, id)| *id).collect())),
+    })
 }
 
 /// Fields and variables: listed at the top level, only counted below it.
@@ -735,20 +692,29 @@ def make_client():
     }
 
     #[test]
-    fn file_path_query_is_an_outline_with_ranges_and_auto_expanded_members() {
+    fn file_path_query_is_rejected_with_path_filter_guidance() {
         let (server, dir) = server_on(&[("pkg/cloud.py", MODULE)]);
-        let text = run(&server, query("pkg/cloud.py"));
-        assert!(text.contains("outline: pkg/cloud.py"), "{text}");
-        assert!(text.contains("已自动展开一层"), "{text}");
-        assert!(text.contains("\nclass CloudClient:  L1-"), "{text}");
-        assert!(text.contains("\n  def update(self, item):  L4-7"), "{text}");
-        assert!(text.contains("\ndef make_client():  L13-14"), "{text}");
-        // Fields are counted on the type's line; closures are not members.
-        assert!(text.contains("(+1 fields)"), "{text}");
-        assert!(!text.contains("helper"), "{text}");
-        // `./` prefix and a bare suffix resolve to the same file.
-        let suffix = run(&server, query("./cloud.py"));
-        assert!(suffix.contains("outline: pkg/cloud.py"), "{suffix}");
+        for q in [
+            "pkg/cloud.py",
+            "./cloud.py",
+            "cloud.py",
+            "/abs/pkg/cloud.py",
+            "pkg/",
+        ] {
+            let result = server.find_symbol(Parameters(query(q)));
+            assert_eq!(result.is_error, Some(true), "query={q}");
+            let text = result.content[0].as_text().unwrap().text.clone();
+            assert!(text.contains("文件路径"), "{q}: {text}");
+            assert!(text.contains("path_filter"), "{q}: {text}");
+            assert!(!text.contains("outline:"), "{q}: {text}");
+        }
+        // Hierarchical Type/method is not a filesystem path.
+        let path = run(&server, query("CloudClient/update"));
+        assert!(
+            path.contains("def update(self, item):  @pkg/cloud.py:4"),
+            "{path}"
+        );
+        assert!(!path.contains("outline:"), "{path}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -764,6 +730,14 @@ def make_client():
         let one = run(&server, params);
         assert!(one.contains("outline: pkg/local.py"), "{one}");
         assert!(one.contains("def save():  L1-2"), "{one}");
+        // Single-file outlines with few top-level symbols auto-expand one level.
+        let mut params = query("*");
+        params.path_filter = Some("pkg/cloud.py".into());
+        let cloud = run(&server, params);
+        assert!(cloud.contains("outline: pkg/cloud.py"), "{cloud}");
+        assert!(cloud.contains("已自动展开一层"), "{cloud}");
+        assert!(cloud.contains("\nclass CloudClient:  L1-"), "{cloud}");
+        assert!(cloud.contains("(+1 fields)"), "{cloud}");
 
         let mut params = query("*");
         params.path_filter = Some("pkg/".into());
@@ -786,17 +760,18 @@ def make_client():
     }
 
     #[test]
-    fn ambiguous_suffix_names_the_other_files_and_hierarchical_queries_still_work() {
+    fn star_path_filter_outline_and_hierarchical_queries_still_work() {
         let (server, dir) = server_on(&[
             ("a/cloud.py", MODULE),
             ("b/c/cloud.py", "def other():\n    pass\n"),
         ]);
-        let text = run(&server, query("cloud.py"));
+        // Bare filename as query is rejected; outline goes through path_filter.
+        let rejected = server.find_symbol(Parameters(query("cloud.py")));
+        assert_eq!(rejected.is_error, Some(true));
+        let mut params = query("*");
+        params.path_filter = Some("a/cloud.py".into());
+        let text = run(&server, params);
         assert!(text.contains("outline: a/cloud.py"), "{text}");
-        assert!(
-            text.contains("另有 1 个文件路径以此结尾（b/c/cloud.py）"),
-            "{text}"
-        );
         // `Type/method` is not a file or directory: hierarchical lookup.
         let path = run(&server, query("CloudClient/update"));
         assert!(
@@ -816,7 +791,8 @@ def make_client():
             ));
         }
         let (server, dir) = server_on(&[("w.py", &source)]);
-        let mut params = query("w.py");
+        let mut params = query("*");
+        params.path_filter = Some("w.py".into());
         params.depth = 1;
         params.budget_tokens = 400;
         let text = run(&server, params);
@@ -824,7 +800,8 @@ def make_client():
         assert!(text.contains("next_offset="), "{text}");
         assert!(text.contains("按类型计数：class 40, method 40"), "{text}");
         assert!(!text.contains("method_with_a_long_name"), "{text}");
-        let mut params = query("w.py");
+        let mut params = query("*");
+        params.path_filter = Some("w.py".into());
         params.depth = 1;
         let full = run(&server, params);
         assert!(full.contains("  def method_with_a_long_name_39"), "{full}");

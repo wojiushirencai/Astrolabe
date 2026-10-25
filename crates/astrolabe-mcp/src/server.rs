@@ -78,6 +78,86 @@ pub(crate) fn default_budget() -> usize {
     DEFAULT_BUDGET
 }
 
+fn default_include_body() -> bool {
+    true
+}
+
+/// Query looks like a filesystem path (absolute, known code extension, or a
+/// trailing-slash directory), not a symbol name / `Type/method` path.
+/// Those belong in `path_filter` (or `query="*"` + `path_filter` for outlines).
+pub(crate) fn looks_like_filesystem_path(query: &str) -> bool {
+    let q = query.trim().trim_start_matches("./");
+    if q.is_empty() || q == "*" {
+        return false;
+    }
+    // Absolute / home paths: require a second separator, a trailing slash, or a
+    // known code extension. A lone `/Name` (e.g. `/pager`) is a symbol-path
+    // probe — normalize_symbol_query strips the slash — not a filesystem path.
+    if q.starts_with('/') || q.starts_with('\\') {
+        let rest = &q[1..];
+        if rest.is_empty() {
+            return false;
+        }
+        if rest.contains('/') || rest.contains('\\') || q.ends_with('/') {
+            return true;
+        }
+        if segment_has_known_code_ext(rest) {
+            return true;
+        }
+        return false;
+    }
+    if q.starts_with("~/") || q.starts_with("~\\") {
+        return true;
+    }
+    // Windows drive: `C:\...` or `C:/...`
+    let bytes = q.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+    {
+        return true;
+    }
+    if q.contains('\\') {
+        return true;
+    }
+    // Directory written with a trailing slash.
+    if q.ends_with('/') && q.contains('/') {
+        return true;
+    }
+    // Last path segment has a known code extension (`pkg/foo.rs`, `cloud.py`).
+    let last = q.rsplit('/').next().unwrap_or(q);
+    segment_has_known_code_ext(last)
+}
+
+fn segment_has_known_code_ext(segment: &str) -> bool {
+    let Some((_, ext)) = segment.rsplit_once('.') else {
+        return false;
+    };
+    !ext.is_empty()
+        && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        && astrolabe_core::index::KNOWN_CODE_EXTENSIONS
+            .iter()
+            .any(|e| ext.eq_ignore_ascii_case(e))
+}
+
+pub(crate) fn filesystem_path_as_query_error(query: &str) -> String {
+    let shown = {
+        let t = query.trim();
+        const MAX: usize = 120;
+        if t.chars().count() <= MAX {
+            t.to_string()
+        } else {
+            format!("{}…", t.chars().take(MAX - 1).collect::<String>())
+        }
+    };
+    format!(
+        "find_symbol 的 query 看起来是文件路径（`{shown}`），不是符号名。\n\
+请把符号名放在 query，用 path_filter 限定文件/目录；\n\
+列文件大纲请用 query=\"*\" + path_filter=<路径>。"
+    )
+}
+
 /// Heuristic: query looks like a regex but `regex` was left false.
 /// `|` / `.*` / `\b` 是上一会话假阴性的主因；单独的 `.` 不警告（`foo.bar` 常为字面搜索）。
 fn looks_like_regex_query(query: &str) -> bool {
@@ -1074,7 +1154,7 @@ fn next_step_hint(task: &str) -> &'static str {
         TaskKind::Rename => "下一步：find_references(symbol, dry_run_rename=新名) 取逐文件改名清单；改后跑构建/测试验证（跑不了才用 get_diagnostics）。\n",
         TaskKind::Count => "下一步：search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) 直接取各目录/文件的 N 行 / M 个文件计数（按行计，同一行多次出现算 1）；只要总数加 count_only=true。\n",
         TaskKind::Refs => "下一步：find_references(symbol) 取精确调用点；定义用 goto_definition。\n",
-        TaskKind::Other => "下一步：已知名字用 find_symbol（include_body=true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n",
+        TaskKind::Other => "下一步：已知名字用 find_symbol（include_body 默认 true 取源码）；找字面量/文案用 search_code；调用方用 find_references。\n",
     }
 }
 
@@ -1681,15 +1761,19 @@ pub(crate) struct ResolveContextParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct QueryParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
-    #[schemars(description = "Name, substring, 'Class/method', or a file path (outline).")]
+    #[schemars(
+        description = "Symbol name, substring, or 'Class/method' / Type.method. Not a file path — use path_filter (outline: query='*' + path_filter)."
+    )]
     pub query: String,
     /// 对展示列表前 5 个命中符号附带源码体（include_body，对齐 Serena）。
-    #[serde(default)]
-    #[schemars(description = "Return full bodies.")]
+    /// 默认 true：减少拿到 path:line 后整文件 Read。
+    #[serde(default = "default_include_body")]
+    #[schemars(description = "Return full bodies (default true; set false for anchors only).")]
     pub include_body: bool,
     /// 子串开关。名称查询：省略=子串匹配（精确名优先排序），false=只要精确名，
     /// true=子串；路径查询：最后段子串匹配（省略/false=精确）。
@@ -1706,12 +1790,12 @@ pub(crate) struct QueryParams {
     pub kind: Option<String>,
     /// 仓库相对路径子串过滤（与 search_code 相同语义）。
     #[serde(default)]
-    #[schemars(description = "Repo-relative path substring.")]
+    #[schemars(description = "Repo-relative path substring (not a substitute for query).")]
     pub path_filter: Option<String>,
-    /// 展开成员的层数（0=不展开）；query 为文件路径或 `*`+path_filter 时输出文件大纲。
+    /// 展开成员的层数（0=不展开）；`query="*"` + path_filter 时输出文件大纲。
     #[serde(default)]
     #[schemars(
-        description = "Member levels to show (0 = none). query=<file path> or '*'+path_filter: file outline."
+        description = "Member levels to show (0 = none). query='*' + path_filter: file outline."
     )]
     pub depth: u8,
     #[serde(default = "default_budget")]
@@ -3249,7 +3333,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "按名称或层级路径定位符号，返回签名与 path:line 锚点；query 为文件路径时输出大纲（可加 depth=N、kind=）。include_body=true returns full bodies (indexed languages)."
+        description = "按名称或层级路径定位符号，返回签名、path:line 锚点与定义体（include_body 默认 true，indexed languages）。query 放符号名（或 Class/method）；文件范围用 path_filter。列大纲：query='*' + path_filter。不要把文件路径放进 query。"
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -3324,6 +3408,9 @@ impl AstrolabeServer {
                 "find_symbol 需要非空 query（符号名、子串或 'Class/method' 路径）；空白查询不返回全部符号。".to_string(),
             );
         }
+        if looks_like_filesystem_path(&params.query) {
+            return text_error(filesystem_path_as_query_error(&params.query));
+        }
         self.with_fresh_index(params.root.as_deref().unwrap_or(""), |session, index| {
             if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
                 return self.finish_at(&session.root, text_error(message));
@@ -3335,7 +3422,7 @@ impl AstrolabeServer {
                     Err(message) => return self.finish_at(&session.root, text_error(message)),
                 },
             };
-            // A file path (or `*` + path_filter) as the query: file outline.
+            // `*` + path_filter: file outline (file paths in query are rejected above).
             if let Some(target) =
                 symbol_outline::outline_target(index, &params.query, params.path_filter.as_deref())
             {
@@ -8694,6 +8781,82 @@ mod tests {
         params.kind = Some("variable".into());
         let text = fs_text(&server.find_symbol(Parameters(params)));
         assert!(!text.contains("未知 kind"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn looks_like_filesystem_path_detects_code_paths_not_type_methods() {
+        assert!(looks_like_filesystem_path("pkg/cloud.py"));
+        assert!(looks_like_filesystem_path("./src/lib.rs"));
+        assert!(looks_like_filesystem_path("cloud.py"));
+        assert!(looks_like_filesystem_path("/Users/x/proj/a.go"));
+        assert!(looks_like_filesystem_path("/abs/pkg/cloud.py"));
+        assert!(looks_like_filesystem_path("/cloud.py"));
+        assert!(looks_like_filesystem_path("C:/work/a.ts"));
+        assert!(looks_like_filesystem_path("pkg/"));
+        assert!(looks_like_filesystem_path(r"src\main.rs"));
+        assert!(looks_like_filesystem_path("~/proj/a.rs"));
+        assert!(!looks_like_filesystem_path("/pager"));
+        assert!(!looks_like_filesystem_path("/CloudClient"));
+        assert!(!looks_like_filesystem_path("CloudClient"));
+        assert!(!looks_like_filesystem_path("CloudClient/update"));
+        assert!(!looks_like_filesystem_path("pkg.Func"));
+        assert!(!looks_like_filesystem_path("a::b"));
+        assert!(!looks_like_filesystem_path("*"));
+        assert!(!looks_like_filesystem_path(""));
+    }
+
+    #[test]
+    fn query_params_reject_unknown_fields_and_default_include_body() {
+        let ok: QueryParams = serde_json::from_value(serde_json::json!({
+            "query": "Foo"
+        }))
+        .expect("query alone");
+        assert!(ok.include_body, "include_body should default to true");
+        assert_eq!(ok.query, "Foo");
+
+        let err = serde_json::from_value::<QueryParams>(serde_json::json!({
+            "name": "Foo"
+        }))
+        .expect_err("name is not a valid field");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("name") && (msg.contains("query") || msg.contains("expected")),
+            "{msg}"
+        );
+
+        let err = serde_json::from_value::<QueryParams>(serde_json::json!({
+            "query": "Foo",
+            "symbol": "Foo"
+        }))
+        .expect_err("symbol is not a valid field");
+        let msg = err.to_string();
+        assert!(msg.contains("symbol"), "{msg}");
+
+        let off: QueryParams = serde_json::from_value(serde_json::json!({
+            "query": "Foo",
+            "include_body": false
+        }))
+        .unwrap();
+        assert!(!off.include_body);
+    }
+
+    #[test]
+    fn find_symbol_defaults_to_include_body_so_models_need_less_read() {
+        let (server, dir) = server_on_files(&[(
+            "pkg/cloud.py",
+            "class CloudClient:\n    def update(self, item):\n        return item\n",
+        )]);
+        // Mimic an MCP call that omits include_body (serde default = true).
+        let params: QueryParams = serde_json::from_value(serde_json::json!({
+            "query": "CloudClient"
+        }))
+        .unwrap();
+        assert!(params.include_body);
+        let text = fs_text(&server.find_symbol(Parameters(params)));
+        assert!(text.contains("----- body @"), "{text}");
+        assert!(text.contains("class CloudClient"), "{text}");
+        assert!(text.contains("def update"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
