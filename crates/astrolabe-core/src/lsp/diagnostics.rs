@@ -306,7 +306,7 @@ fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
 /// Human-readable wait bound for agent-facing notes ("2.5s", "40ms").
 fn format_timeout(timeout: Duration) -> String {
     let ms = timeout.as_millis();
-    if ms >= 1000 && ms % 1000 == 0 {
+    if ms >= 1000 && ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
     } else if ms >= 1000 {
         format!("{:.1}s", timeout.as_secs_f64())
