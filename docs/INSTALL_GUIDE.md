@@ -1,6 +1,6 @@
 # Astrolabe AI — install and client setup
 
-Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-10-18 for v0.13.0.
+Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-10-25 for v0.17.0.
 
 > **Name check.** This project is *Astrolabe AI* (GitHub: `wojiushirencai/Astrolabe`, binary: `astrolabe`). It is **not** the npm packages `astrolabe` (a 2014 Protractor page-object library) or `astrolabe-ai` (an unrelated resume tool), nor the other MCP servers that happen to be called "astrolabe". Install only from this repository's GitHub Releases or the `@zlnap/*` npm scope.
 
@@ -8,23 +8,23 @@ Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 
 
 Official binaries: [GitHub Releases](https://github.com/wojiushirencai/Astrolabe/releases). Archives are named `astrolabe-<version>-<target>.tar.gz` (`.zip` on Windows); every release ships `SHA256SUMS`.
 
-| Platform | Rust target | v0.13.0 archive size |
+| Platform | Rust target | v0.17.0 archive size |
 |---|---|---|
-| macOS Apple Silicon | `aarch64-apple-darwin` | 8,570,892 B |
-| macOS Intel | `x86_64-apple-darwin` | 8,791,798 B |
-| Linux x64 (glibc) | `x86_64-unknown-linux-gnu` | 8,956,755 B |
-| Linux x64 (static, musl) | `x86_64-unknown-linux-musl` | 9,113,635 B |
-| Linux arm64 (glibc) | `aarch64-unknown-linux-gnu` | 7,351,404 B |
-| Windows x64 | `x86_64-pc-windows-msvc` (`.zip`) | 8,478,933 B |
+| macOS Apple Silicon | `aarch64-apple-darwin` | 9,728,734 B |
+| macOS Intel | `x86_64-apple-darwin` | 10,078,526 B |
+| Linux x64 (glibc) | `x86_64-unknown-linux-gnu` | 10,238,301 B |
+| Linux x64 (static, musl) | `x86_64-unknown-linux-musl` | 10,406,095 B |
+| Linux arm64 (glibc) | `aarch64-unknown-linux-gnu` | 8,507,630 B |
+| Windows x64 | `x86_64-pc-windows-msvc` (`.zip`) | 9,666,430 B |
 
-The unpacked Linux x64 binary is about 50 MB (49,718,560 B, measured 2026-10-18).
+Archive sizes from the [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0) GitHub Release assets.
 
 ### Option 1 — `install.sh` (macOS / Linux, verifies sha256)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
 # pin a version / directory:
-ASTROLABE_VERSION=0.13.0 ASTROLABE_INSTALL_DIR="$HOME/.local/bin" sh install.sh
+ASTROLABE_VERSION=0.17.0 ASTROLABE_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 ```
 
 The script downloads the archive for your platform and `SHA256SUMS`, checks the hash, and copies `astrolabe` into the install directory (default `~/.local/bin`). It does not edit your PATH or any config. Read it first if you prefer: [install.sh](../install.sh).
@@ -32,7 +32,7 @@ The script downloads the archive for your platform and `SHA256SUMS`, checks the 
 ### Option 2 — manual download
 
 ```bash
-V=0.13.0; T=aarch64-apple-darwin          # pick the target from the table
+V=0.17.0; T=aarch64-apple-darwin          # pick the target from the table
 curl -fsSLO https://github.com/wojiushirencai/Astrolabe/releases/download/v$V/astrolabe-$V-$T.tar.gz
 curl -fsSLO https://github.com/wojiushirencai/Astrolabe/releases/download/v$V/SHA256SUMS
 grep "astrolabe-$V-$T.tar.gz" SHA256SUMS | sha256sum -c -      # macOS: shasum -a 256 -c -
@@ -45,7 +45,7 @@ Download `astrolabe-<version>-x86_64-pc-windows-msvc.zip`, compare `Get-FileHash
 
 ### Option 4 — npm
 
-The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with platform packages `@zlnap/<platform>`. Published under the personal npm scope `zlnap` (no org needed; the npm org `astrolabe-ai` belongs to someone else); Install: `npx -y @zlnap/astrolabe .` then `npx -y @zlnap/astrolabe setup` to wire MCP clients. (Optional CI publish workflow template: `docs/distribution/npm-publish.workflow.yml`.)
+The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with platform packages `@zlnap/<platform>`. **Published** under the personal npm scope `zlnap` as of [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0) (no org needed; the npm org `astrolabe-ai` belongs to someone else). Install: `npx -y @zlnap/astrolabe .` then `npx -y @zlnap/astrolabe setup` to wire MCP clients. Unscoped `astrolabe` / `astrolabe-ai` on npm are unrelated — do not use them.
 
 ### Option 5 — build from source (Rust 1.90+)
 
@@ -66,14 +66,15 @@ After installing the npm package (or with `npx`), run:
 npx -y @zlnap/astrolabe setup
 ```
 
-The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin plus Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`.
+The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin plus Cursor / Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`.
 
+- **Cursor:** MCP into `~/.cursor/mcp.json` with `--context=cursor`; optional `--with-hooks` writes `~/.cursor/hooks.json` (`preToolUse` → `astrolabe hooks remind --client=cursor` with matcher `Shell|Read|Grep|mcp__astrolabe__.*`, plus `sessionEnd` cleanup).
 - **OpenCode:** merges into `~/.config/opencode/opencode.jsonc` (or `.json` / older `config.json`, or `~/.opencode/…` if that is what exists). Auto-detects V1 (`mcp.<name>` + `enabled`), V2 (`mcp.servers`), or Claude-like `mcpServers`. JSONC comments are preserved when the parent object already exists. Optional `--with-hooks` writes `~/.config/opencode/plugins/astrolabe-guard.ts`.
 - **DeepSeek Harness:** installs vendored `astrolabe-dsh-guard` into `~/.dsh/profiles/**/node_modules` and merges a managed block into `~/.dsh/cordis.patch.yml` without touching the `orca-managed-dsh-hooks` block. DSH MCP servers are per-repo in the UI — setup does not write them.
 - **Codebuddy:** MCP into `~/.codebuddy/.mcp.json` (or existing `mcp.json` / `~/.codebuddy.json`); optional `--with-hooks` merges CC-compatible hooks into `~/.codebuddy/settings.json` (PreToolUse + SessionEnd).
 - **Grok Build:** MCP into `~/.grok/config.toml` as `[mcp_servers.astrolabe]` (Codex-shaped); optional `--with-hooks` writes `~/.grok/hooks/astrolabe.json`.
 - **Kimi Code:** MCP into `~/.kimi-code/mcp.json`; optional `--with-hooks` appends managed `[[hooks]]` blocks in `~/.kimi-code/config.toml` (does not overwrite other hooks).
-- **ZCode:** MCP into `~/.zcode/cli/config.json` → `mcp.servers.astrolabe`; optional `--with-hooks` sets `hooks.enabled: true` and writes `hooks.events.PreToolUse` (**never** writes `SessionEnd`, and does not hang cleanup on `Stop`).
+- **ZCode:** MCP into `~/.zcode/cli/config.json` → `mcp.servers.astrolabe`; optional `--with-hooks` sets `hooks.enabled: true` and writes `hooks.events.PreToolUse` (**never** writes `SessionEnd`; **scrubs** any existing `Stop` → cleanup so counters are not zeroed each turn).
 
 Cargo-only installs: `astrolabe setup` re-execs the same flow via `npx` when Node is available.
 

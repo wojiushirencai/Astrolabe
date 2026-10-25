@@ -5198,7 +5198,13 @@ fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> 
         "path_filter '{filter}' 不匹配任何已索引路径（区分大小写的仓库相对路径子串，不是 glob，不要带绝对路径或 ./ 前缀）。"
     );
     if !closest.is_empty() {
-        message.push_str(&format!("最接近的已索引路径：{}", closest.join(", ")));
+        message.push_str(&format!("最接近的已索引路径：{}。", closest.join(", ")));
+        message.push_str(&format!(
+            "下一步：改用上述路径之一作 path_filter（例如 \"{}\"），或去掉 path_filter 后重试。",
+            closest[0]
+        ));
+    } else {
+        message.push_str("下一步：去掉 path_filter 后重试。");
     }
     Some(message)
 }
@@ -6463,6 +6469,7 @@ mod tests {
         assert!(text.contains("最接近的符号名"), "{text}");
         assert!(text.contains("def compute(a, b):"), "{text}");
         assert!(text.contains("全仓库都没有这个字面量"), "{text}");
+        assert!(text.contains("去掉 path_filter 也搜不到"), "{text}");
         assert!(!text.contains("过窄"), "{text}");
         // Nothing close: no suggestion block, still the generic hint.
         let none = text_of(&server.search_code(Parameters(search("zzzqqq"))));
@@ -8513,6 +8520,11 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = fs_text(&result);
         assert!(text.contains("relay/channel"), "{text}");
+        assert!(text.contains("下一步："), "{text}");
+        assert!(
+            text.contains("去掉 path_filter") || text.contains("改用上述路径"),
+            "{text}"
+        );
 
         let result = server.search_code(Parameters(SearchParams {
             root: None,
