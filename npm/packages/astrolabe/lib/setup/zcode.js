@@ -47,15 +47,31 @@ function preToolUseEntry() {
   };
 }
 
-function entryHasRemind(entry) {
-  if (!entry || typeof entry !== 'object') return false;
+function hookCommands(entry) {
+  if (!entry || typeof entry !== 'object') return [];
   const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
-  return hooks.some(
-    (h) =>
-      h &&
-      typeof h.command === 'string' &&
-      h.command.includes('astrolabe hooks remind --client=zcode'),
+  return hooks
+    .filter((h) => h && typeof h.command === 'string')
+    .map((h) => h.command);
+}
+
+function entryHasAstrolabeRemind(entry) {
+  return hookCommands(entry).some((cmd) => cmd.includes('astrolabe hooks remind'));
+}
+
+/**
+ * Strip cleanup hooks from a Stop entry; drop the entry if nothing remains.
+ * Returns { entry | null, stripped }.
+ */
+function scrubStopEntry(entry) {
+  if (!entry || typeof entry !== 'object') return { entry: null, stripped: false };
+  if (!entryHasCleanup(entry)) return { entry, stripped: false };
+  const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
+  const kept = hooks.filter(
+    (h) => !(h && typeof h.command === 'string' && h.command.includes('astrolabe hooks cleanup')),
   );
+  if (!kept.length) return { entry: null, stripped: true };
+  return { entry: { ...entry, hooks: kept }, stripped: true };
 }
 
 /**
@@ -73,46 +89,12 @@ function entryHasCleanup(entry) {
   );
 }
 
-/**
- * Strip SessionEnd entirely. On Stop, remove only `astrolabe hooks cleanup`
- * commands (and drop empty entries). Never invents a Stop event.
- */
-function sanitizeZcodeHookEvents(events) {
-  if (!events || typeof events !== 'object' || Array.isArray(events)) return;
-  if (Object.prototype.hasOwnProperty.call(events, 'SessionEnd')) {
-    delete events.SessionEnd;
-  }
-  if (Array.isArray(events.Stop)) {
-    const next = [];
-    for (const entry of events.Stop) {
-      if (!entry || typeof entry !== 'object') continue;
-      if (!Array.isArray(entry.hooks)) {
-        next.push(entry);
-        continue;
-      }
-      const hooks = entry.hooks.filter(
-        (h) =>
-          !(
-            h &&
-            typeof h.command === 'string' &&
-            h.command.includes('astrolabe hooks cleanup')
-          ),
-      );
-      if (hooks.length === 0) continue;
-      next.push({ ...entry, hooks });
-    }
-    if (next.length === 0) {
-      delete events.Stop;
-    } else {
-      events.Stop = next;
-    }
-  }
-}
 
 /**
  * Merge mcp.servers.astrolabe and (optional) hooks.events.PreToolUse into
  * ~/.zcode/cli/config.json. Never writes SessionEnd; never hangs cleanup on Stop
- * (Stop is turn-end, not session-end — use `astrolabe hooks gc` instead).
+ * (Stop is turn-end — use `astrolabe hooks gc`). Replaces any prior Astrolabe
+ * remind (including wrong --client=claude-code).
  */
 function mergeZcodeConfigFile(
   filePath,
@@ -151,13 +133,30 @@ function mergeZcodeConfigFile(
     if (!doc.hooks.events || typeof doc.hooks.events !== 'object' || Array.isArray(doc.hooks.events)) {
       doc.hooks.events = {};
     }
-    // Hard rules for hosts without SessionEnd (ZCode): never SessionEnd;
-    // never hang cleanup on Stop (turn-end would wipe drift counters every turn).
-    sanitizeZcodeHookEvents(doc.hooks.events);
+    // Hard rule: never SessionEnd (ZCode rejects unknown events).
+    if (Object.prototype.hasOwnProperty.call(doc.hooks.events, 'SessionEnd')) {
+      delete doc.hooks.events.SessionEnd;
+      hooksReplaced = true;
+    }
+    // Hard rule: never hang cleanup on Stop (fires every turn; would zero counters).
+    if (Array.isArray(doc.hooks.events.Stop)) {
+      const scrubbed = [];
+      for (const entry of doc.hooks.events.Stop) {
+        const { entry: next, stripped } = scrubStopEntry(entry);
+        if (stripped) hooksReplaced = true;
+        if (next) scrubbed.push(next);
+      }
+      if (scrubbed.length) {
+        doc.hooks.events.Stop = scrubbed;
+      } else {
+        delete doc.hooks.events.Stop;
+      }
+    }
     if (!Array.isArray(doc.hooks.events.PreToolUse)) {
       doc.hooks.events.PreToolUse = [];
     }
-    const idx = doc.hooks.events.PreToolUse.findIndex(entryHasRemind);
+    // Match any prior remind (wrong --client=claude-code included) and replace.
+    const idx = doc.hooks.events.PreToolUse.findIndex(entryHasAstrolabeRemind);
     const next = preToolUseEntry();
     if (idx >= 0) {
       doc.hooks.events.PreToolUse[idx] = next;
@@ -183,6 +182,4 @@ module.exports = {
   resolveZcodeConfigPath,
   zcodeServerEntry,
   mergeZcodeConfigFile,
-  entryHasCleanup,
-  sanitizeZcodeHookEvents,
 };
