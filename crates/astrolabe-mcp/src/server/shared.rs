@@ -50,6 +50,7 @@ impl AstrolabeServer {
         view.call_seq = Arc::new(AtomicU64::new(0));
         view.shown_once = Arc::new(Mutex::new(Default::default()));
         view.coverage_note_override = Some(Arc::new(Mutex::new(None)));
+        view.recent_symbols = Arc::new(crate::recent_symbol::RecentSymbols::new());
         // A view never forwards: it *is* the leader.
         view.shared = None;
         view

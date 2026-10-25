@@ -33,6 +33,7 @@ mod precise_tools;
 mod py_refs;
 mod refs_graph;
 mod refs_graph_ts;
+mod recent_symbol;
 mod refs_render;
 mod reindex;
 mod root;
