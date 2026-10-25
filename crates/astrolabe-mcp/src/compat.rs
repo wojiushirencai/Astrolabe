@@ -76,12 +76,10 @@ impl AstrolabeServer {
 }
 
 fn first_nonempty(opts: [&Option<String>; 2]) -> String {
-    for opt in opts {
-        if let Some(s) = opt {
-            let t = s.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
+    for s in opts.into_iter().flatten() {
+        let t = s.trim();
+        if !t.is_empty() {
+            return t.to_string();
         }
     }
     String::new()
