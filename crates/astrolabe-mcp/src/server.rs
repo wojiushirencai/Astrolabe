@@ -2264,7 +2264,11 @@ impl AstrolabeServer {
         let mut body = String::from(
             "confidence: exact (磁盘源码字面扫描；索引仍在后台构建，本结果无符号/角色标注，[text-only])\n",
         );
-        body.push_str(&render_search_mode_header(params.regex, &params.query, regex_downgraded));
+        body.push_str(&render_search_mode_header(
+            params.regex,
+            &params.query,
+            regex_downgraded,
+        ));
         if params.aggregate.is_some() {
             body.push_str("aggregate 需索引就绪后才分组，此处只给总数。\n");
         }
