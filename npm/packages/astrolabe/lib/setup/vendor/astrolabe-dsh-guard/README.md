@@ -84,9 +84,11 @@ and reset when the OS clears the temp directory.
 
 - Astrolabe identifies its own tools by substring, so DSH's per-repository server
   names (`mcp__astrolabe-<repo>__find_symbol`) need no rewriting.
-- `search_code` is a *non-symbolic* Astrolabe tool: it does not reset the
-  grep/read counter (by Astrolabe's own design). Use `find_symbol` /
-  `resolve_context` / `find_references` / `goto_definition` to reset it.
+- Any Astrolabe catalog tool (including `search_code`) resets the
+  grep/read/non_symbolic/slice counters on PreToolUse and clears the
+  post-deny silence window. Prefer `find_symbol` /
+  `resolve_context` / `find_references` / `goto_definition` for navigation;
+  `search_code` is fine for recovery after a deny.
 
 ## Licence
 

@@ -453,6 +453,15 @@ test('ZCode mcp.servers + hooks.events without SessionEnd', () => {
             enabled: false,
             events: {
               SessionEnd: [{ hooks: [{ type: 'command', command: 'bad' }] }],
+              // Misconfigured: cleanup on Stop would wipe counters every turn
+              Stop: [
+                {
+                  hooks: [
+                    { type: 'command', command: 'astrolabe hooks cleanup' },
+                    { type: 'command', command: 'echo keep-stop' },
+                  ],
+                },
+              ],
               PreToolUse: [{ hooks: [{ type: 'command', command: 'echo keep' }] }],
             },
           },
@@ -475,6 +484,15 @@ test('ZCode mcp.servers + hooks.events without SessionEnd', () => {
     assert.ok(
       !JSON.stringify(doc.hooks).includes('SessionEnd'),
       'SessionEnd must not appear in ZCode hooks',
+    );
+    // Stop keeps non-cleanup hooks; cleanup command is stripped
+    assert.ok(Array.isArray(doc.hooks.events.Stop));
+    assert.equal(doc.hooks.events.Stop.length, 1);
+    assert.equal(doc.hooks.events.Stop[0].hooks.length, 1);
+    assert.equal(doc.hooks.events.Stop[0].hooks[0].command, 'echo keep-stop');
+    assert.ok(
+      !JSON.stringify(doc.hooks).includes('hooks cleanup'),
+      'Stop must not hang astrolabe hooks cleanup',
     );
     assert.ok(
       doc.hooks.events.PreToolUse.some((e) =>
@@ -504,6 +522,53 @@ test('ZCode mcp.servers + hooks.events without SessionEnd', () => {
     } finally {
       fs.rmSync(home2, { recursive: true, force: true });
     }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('ZCode withHooks strips Stop cleanup but keeps non-cleanup Stop', () => {
+  const home = tmpHome();
+  try {
+    const cli = path.join(home, '.zcode', 'cli');
+    fs.mkdirSync(cli, { recursive: true });
+    fs.writeFileSync(
+      path.join(cli, 'config.json'),
+      JSON.stringify(
+        {
+          hooks: {
+            enabled: true,
+            events: {
+              Stop: [
+                {
+                  matcher: 'cleanup-only',
+                  hooks: [{ type: 'command', command: 'astrolabe hooks cleanup' }],
+                },
+                {
+                  matcher: 'other',
+                  hooks: [{ type: 'command', command: 'echo turn-end' }],
+                },
+              ],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const launch = { command: 'npx', args: ['-y', '@zlnap/astrolabe', '.'] };
+    clientsMod
+      .getClient('zcode')
+      .plan({ home, launch, withHooks: true })
+      .apply()
+      .write();
+    const doc = JSON.parse(fs.readFileSync(path.join(cli, 'config.json'), 'utf8'));
+    assert.equal(doc.hooks.events.SessionEnd, undefined);
+    assert.ok(Array.isArray(doc.hooks.events.Stop));
+    assert.equal(doc.hooks.events.Stop.length, 1);
+    assert.equal(doc.hooks.events.Stop[0].matcher, 'other');
+    assert.equal(doc.hooks.events.Stop[0].hooks[0].command, 'echo turn-end');
+    assert.ok(!JSON.stringify(doc.hooks).includes('hooks cleanup'));
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -6,6 +6,11 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+### 修复
+
+- **hooks**：任意 Astrolabe MCP 工具（含 `search_code` 等非符号）在 PreToolUse 时全量清零 `n_grep` / `n_read` / `n_non_symbolic` / `n_slice`，并清除 `last_deny_ts` 结束静默窗；重置排在静默窗判定之前，避免 deny 后跟文案调用仍 sticky deny。
+- **setup / ZCode**：`--with-hooks` 合并时剥离误挂在 `Stop` 上的 `astrolabe hooks cleanup`（Stop 为回合结束非会话结束）；仍不写 `SessionEnd`，状态靠 `hooks gc`。
+
 ## [0.17.0] - 2026-10-23
 
 自 v0.16.0 以来的 PR：#90（npm 改发个人 scope `@zlnap`）、#91（DeepSeek Harness 原生 hook 插件）、#92（`astrolabe setup` 一键探测并合并 MCP）、#93（setup 支持 OpenCode / DSH）、#94（setup 支持 Codebuddy / Grok Build / Kimi Code / ZCode）。本版以 **npm/CLI 安装体验** 为主；Rust 索引与工具行为相对 0.16.0 无功能变更。完整说明见 GitHub Release。

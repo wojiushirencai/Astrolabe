@@ -59,8 +59,60 @@ function entryHasRemind(entry) {
 }
 
 /**
+ * True when a Stop (or similar) event entry hangs `astrolabe hooks cleanup`.
+ * ZCode fires Stop at every turn end — cleanup there would wipe counters each turn.
+ */
+function entryHasCleanup(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
+  return hooks.some(
+    (h) =>
+      h &&
+      typeof h.command === 'string' &&
+      h.command.includes('astrolabe hooks cleanup'),
+  );
+}
+
+/**
+ * Strip SessionEnd entirely. On Stop, remove only `astrolabe hooks cleanup`
+ * commands (and drop empty entries). Never invents a Stop event.
+ */
+function sanitizeZcodeHookEvents(events) {
+  if (!events || typeof events !== 'object' || Array.isArray(events)) return;
+  if (Object.prototype.hasOwnProperty.call(events, 'SessionEnd')) {
+    delete events.SessionEnd;
+  }
+  if (Array.isArray(events.Stop)) {
+    const next = [];
+    for (const entry of events.Stop) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (!Array.isArray(entry.hooks)) {
+        next.push(entry);
+        continue;
+      }
+      const hooks = entry.hooks.filter(
+        (h) =>
+          !(
+            h &&
+            typeof h.command === 'string' &&
+            h.command.includes('astrolabe hooks cleanup')
+          ),
+      );
+      if (hooks.length === 0) continue;
+      next.push({ ...entry, hooks });
+    }
+    if (next.length === 0) {
+      delete events.Stop;
+    } else {
+      events.Stop = next;
+    }
+  }
+}
+
+/**
  * Merge mcp.servers.astrolabe and (optional) hooks.events.PreToolUse into
- * ~/.zcode/cli/config.json. Never writes SessionEnd; never hangs cleanup on Stop.
+ * ~/.zcode/cli/config.json. Never writes SessionEnd; never hangs cleanup on Stop
+ * (Stop is turn-end, not session-end — use `astrolabe hooks gc` instead).
  */
 function mergeZcodeConfigFile(
   filePath,
@@ -99,10 +151,9 @@ function mergeZcodeConfigFile(
     if (!doc.hooks.events || typeof doc.hooks.events !== 'object' || Array.isArray(doc.hooks.events)) {
       doc.hooks.events = {};
     }
-    // Hard rule: never SessionEnd (ZCode rejects unknown events).
-    if (Object.prototype.hasOwnProperty.call(doc.hooks.events, 'SessionEnd')) {
-      delete doc.hooks.events.SessionEnd;
-    }
+    // Hard rules for hosts without SessionEnd (ZCode): never SessionEnd;
+    // never hang cleanup on Stop (turn-end would wipe drift counters every turn).
+    sanitizeZcodeHookEvents(doc.hooks.events);
     if (!Array.isArray(doc.hooks.events.PreToolUse)) {
       doc.hooks.events.PreToolUse = [];
     }
@@ -132,4 +183,6 @@ module.exports = {
   resolveZcodeConfigPath,
   zcodeServerEntry,
   mergeZcodeConfigFile,
+  entryHasCleanup,
+  sanitizeZcodeHookEvents,
 };
