@@ -53,31 +53,13 @@ message GetUserRequest {
             names.iter().any(|n| *n == "demo.v1" || n.contains("demo")),
             "package symbol missing: {names:?}"
         );
-        assert!(
-            names.iter().any(|n| *n == "User"),
-            "message User: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| *n == "Status"),
-            "enum Status: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| *n == "UserService"),
-            "service: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| *n == "GetUser"),
-            "rpc GetUser: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| *n == "ListUsers"),
-            "rpc ListUsers: {names:?}"
-        );
+        assert!(names.contains(&"User"), "message User: {names:?}");
+        assert!(names.contains(&"Status"), "enum Status: {names:?}");
+        assert!(names.contains(&"UserService"), "service: {names:?}");
+        assert!(names.contains(&"GetUser"), "rpc GetUser: {names:?}");
+        assert!(names.contains(&"ListUsers"), "rpc ListUsers: {names:?}");
         // Nested enum Role should appear
-        assert!(
-            names.iter().any(|n| *n == "Role"),
-            "nested enum Role: {names:?}"
-        );
+        assert!(names.contains(&"Role"), "nested enum Role: {names:?}");
 
         let kinds: Vec<SymbolKind> = file.symbols.iter().map(|s| s.kind).collect();
         assert!(
