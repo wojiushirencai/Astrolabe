@@ -37,9 +37,9 @@ pub(super) fn folded_note(symbols: &[CodeSymbol], folded: &[usize], typed: &str)
         .take(3)
         .collect();
     format!(
-        "另有 {} 个名字含 \"{typed}\" 的符号未列出（如 {}）；要看全部传 substring=true。\n",
+        "{} more symbols whose names contain \"{typed}\" not listed (e.g. {}); pass substring=true to see all.\n",
         folded.len(),
-        sample.join("、")
+        sample.join(", ")
     )
 }
 
@@ -112,7 +112,7 @@ pub(super) fn symbol_hits_outside_filter(
     }
     let mut note = if outside.is_empty() {
         format!(
-            "path_filter=\"{filter}\" 之外也没有：全仓库都没有这个名字。\n{}",
+            "Also nothing outside path_filter=\"{filter}\": this name is absent repo-wide.\n{}",
             filter_zero_next_step(filter, &[])
         )
     } else {
@@ -120,16 +120,16 @@ pub(super) fn symbol_hits_outside_filter(
         let sample: Vec<&str> = outside.iter().take(3).map(|(_, l, _)| l.as_str()).collect();
         let paths: Vec<&str> = outside.iter().map(|(_, _, p)| p.as_str()).collect();
         format!(
-            "path_filter=\"{filter}\" 内没有；过滤范围外有 {} 处：{}{}\n{}",
+            "Nothing inside path_filter=\"{filter}\"; {} hits outside the filter: {}{}\n{}",
             outside.len(),
-            sample.join("、"),
+            sample.join(", "),
             if outside.len() > 3 { " …" } else { "" },
             filter_zero_next_step(filter, &paths)
         )
     };
     if index.file_id(filter).is_some() {
         note.push_str(&format!(
-            "要这个文件的大纲：query=\"{filter}\"（文件路径作为 query）。\n"
+            "For this file's outline: query=\"{filter}\" (file path as query).\n"
         ));
     }
     note
@@ -140,7 +140,7 @@ pub(super) fn symbol_hits_outside_filter(
 pub(super) fn search_hits_outside_filter(filter: &str, outside: &[SearchHit]) -> String {
     if outside.is_empty() {
         return format!(
-            "path_filter=\"{filter}\" 之外也没有：全仓库都没有这个字面量。\n{}",
+            "Also nothing outside path_filter=\"{filter}\": this literal is absent repo-wide.\n{}",
             filter_zero_next_step(filter, &[])
         );
     }
@@ -162,10 +162,10 @@ pub(super) fn search_hits_outside_filter(filter: &str, outside: &[SearchHit]) ->
         })
         .collect();
     format!(
-        "path_filter=\"{filter}\" 内没有；过滤范围外有 {} 处 / {} 个文件：{}{}\n{}",
+        "Nothing inside path_filter=\"{filter}\"; {} hits / {} files outside the filter: {}{}\n{}",
         outside.len(),
         by_file.len(),
-        shown.join("；"),
+        shown.join("; "),
         if order.len() > 3 { " …" } else { "" },
         filter_zero_next_step(
             filter,
@@ -179,17 +179,18 @@ pub(super) fn search_hits_outside_filter(filter: &str, outside: &[SearchHit]) ->
 /// tells them to drop or widen it (or stop narrowing when the repo has none).
 fn filter_zero_next_step(filter: &str, outside_paths: &[&str]) -> String {
     if outside_paths.is_empty() {
-        return "下一步：去掉 path_filter 也搜不到；改 query（更短字面量 / find_symbol），不要反复收窄 path_filter。\n"
+        return "Next: still nothing without path_filter; change query (shorter literal / find_symbol) — do not keep narrowing path_filter.\n"
             .to_string();
     }
     if let Some(suggest) = suggest_path_filter(outside_paths.iter().copied()) {
         if suggest != filter {
             return format!(
-                "下一步：去掉 path_filter 重试；或改 path_filter=\"{suggest}\" 只看含命中的范围。\n"
+                "Next: drop path_filter and retry; or set path_filter=\"{suggest}\" to only the range that has hits.\n"
             );
         }
     }
-    "下一步：去掉 path_filter 重试（当前过滤把已有命中挡在外面）。\n".to_string()
+    "Next: drop path_filter and retry (the current filter is excluding existing hits).\n"
+        .to_string()
 }
 
 /// Smart case for literal search: case-sensitive when the query has an
@@ -211,9 +212,14 @@ pub(super) fn case_variant_note(variants: &[SearchHit]) -> String {
     }
     let sample = &variants[0];
     let text: String = sample.text.trim().chars().take(60).collect();
+    let n = variants.len();
+    let (noun, verb) = if n == 1 {
+        ("line", "differs")
+    } else {
+        ("lines", "differ")
+    };
     format!(
-        "另有 {} 行仅大小写不同（如 {}:{} {text}）；含大写的字面量默认区分大小写，传 case_sensitive=false 一并列出。\n",
-        variants.len(),
+        "{n} more {noun} {verb} only by case (e.g. {}:{} {text}); literals with uppercase are case-sensitive by default — pass case_sensitive=false to include them.\n",
         sample.path,
         sample.line
     )
@@ -307,17 +313,20 @@ mod tests {
             hit("args.go", 3),
         ];
         let note = search_hits_outside_filter("_test.go", &out);
-        assert!(note.contains("过滤范围外有 3 处 / 2 个文件"), "{note}");
-        assert!(note.contains("command.go:789,862"), "{note}");
-        assert!(note.contains("下一步：去掉 path_filter 重试"), "{note}");
         assert!(
-            note.contains("path_filter=\"command.go\"") || note.contains("改 path_filter="),
+            note.contains("3 hits / 2 files outside the filter"),
+            "{note}"
+        );
+        assert!(note.contains("command.go:789,862"), "{note}");
+        assert!(note.contains("Next: drop path_filter and retry"), "{note}");
+        assert!(
+            note.contains("path_filter=\"command.go\"") || note.contains("change path_filter="),
             "suggests a wider/alt filter: {note}"
         );
-        assert!(!note.contains("过窄"), "{note}");
+        assert!(!note.contains("too narrow"), "{note}");
         let none = search_hits_outside_filter("_test.go", &[]);
-        assert!(none.contains("全仓库都没有"), "{none}");
-        assert!(none.contains("去掉 path_filter 也搜不到"), "{none}");
+        assert!(none.contains("absent repo-wide"), "{none}");
+        assert!(none.contains("still nothing without path_filter"), "{none}");
     }
 }
 
@@ -440,19 +449,19 @@ mod behaviour {
             !out.contains("func ProviderName"),
             "substring folded: {out}"
         );
-        assert!(out.contains("另有 "), "{out}");
+        assert!(out.contains("and "), "{out}");
         assert!(
             out.contains("ProviderName"),
             "fold note names a sample: {out}"
         );
         assert!(out.contains("substring=true"), "{out}");
-        assert!(!out.contains("请用锚点核验"), "{out}");
+        assert!(!out.contains("verify against the anchors"), "{out}");
         // Implementors: rule + count, production first, test double tagged.
-        assert!(out.contains("方法 2/2 全匹配"), "{out}");
-        assert!(!out.contains("误报"), "{out}");
+        assert!(out.contains("methods 2/2 all matched"), "{out}");
+        assert!(!out.contains("false positive"), "{out}");
         let gh = out.find("GitHubProvider @oauth/github.go:3").expect(&out);
         let fake = out
-            .find("fakeFlowProvider @oauth/flow_test.go:3 [测试]")
+            .find("fakeFlowProvider @oauth/flow_test.go:3 [test]")
             .expect(&out);
         assert!(gh < fake, "{out}");
         // substring=true lists everything.
@@ -461,7 +470,7 @@ mod behaviour {
         let out = text(&server.find_symbol(Parameters(all)));
         assert!(out.contains("func ProviderName"), "{out}");
         // The confidence parenthetical is sent once per session.
-        assert!(!out.contains("(符号名称匹配)"), "{out}");
+        assert!(!out.contains("(symbol-name match)"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -479,8 +488,8 @@ mod behaviour {
         p.budget_tokens = 300;
         let out = text(&server.find_symbol(Parameters(p)));
         assert!(out.contains("truncated=true"), "{out}");
-        assert!(out.contains("Go 隐式实现方"), "{out}");
-        assert!(out.contains("收窄：path_filter="), "{out}");
+        assert!(out.contains("Go implicit implementors"), "{out}");
+        assert!(out.contains("Narrow: path_filter="), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -495,7 +504,7 @@ mod behaviour {
         let upper = out.find("Execute() error").expect(&out);
         let lower = out.find("execute() error").expect(&out);
         assert!(upper < lower, "{out}");
-        assert!(!out.contains("请核验"), "{out}");
+        assert!(!out.contains("please verify"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -507,7 +516,7 @@ mod behaviour {
         let out = text(&server.find_symbol(Parameters(outline)));
         assert!(out.contains("outline:"), "{out}");
         assert!(
-            out.contains("Go 隐式实现方") && out.contains("GitHubProvider"),
+            out.contains("Go implicit implementors") && out.contains("GitHubProvider"),
             "{out}"
         );
         let rc = ResolveContextParams {
@@ -519,7 +528,7 @@ mod behaviour {
             path_filter: None,
         };
         let out = text(&server.resolve_context(Parameters(rc)));
-        assert!(out.contains("Go 隐式实现方"), "{out}");
+        assert!(out.contains("Go implicit implementors"), "{out}");
         assert!(out.contains("DiscordProvider @oauth/discord.go:3"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -530,14 +539,17 @@ mod behaviour {
         let mut p = find("GitHubProvider");
         p.path_filter = Some("_test.go".into());
         let out = text(&server.find_symbol(Parameters(p)));
-        assert!(out.contains("过滤范围外有"), "{out}");
+        assert!(out.contains("outside the filter"), "{out}");
         assert!(out.contains("oauth/github.go:3"), "{out}");
-        assert!(out.contains("下一步：去掉 path_filter 重试"), "{out}");
+        assert!(out.contains("Next: drop path_filter and retry"), "{out}");
         let mut p = find("controller");
         p.path_filter = Some("oauth/github.go".into());
         let out = text(&server.find_symbol(Parameters(p)));
-        assert!(out.contains("全仓库都没有这个名字"), "{out}");
-        assert!(out.contains("去掉 path_filter 也搜不到"), "{out}");
+        assert!(
+            out.contains("absent repo-wide") || out.contains("name not found anywhere"),
+            "{out}"
+        );
+        assert!(out.contains("still nothing without path_filter"), "{out}");
         assert!(out.contains("query=\"oauth/github.go\""), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -548,14 +560,15 @@ mod behaviour {
         let mut p = search("GetName");
         p.path_filter = Some("model/".into());
         let out = text(&server.search_code(Parameters(p)));
-        assert!(out.contains("(未找到匹配的代码行)"), "{out}");
+        assert!(out.contains("(no matching code lines)"), "{out}");
         assert!(
-            out.contains("path_filter=\"model/\" 内没有；过滤范围外有"),
+            out.contains("Nothing inside path_filter=\"model/\"")
+                && out.contains("outside the filter"),
             "{out}"
         );
         assert!(out.contains("oauth/discord.go:5"), "{out}");
-        assert!(out.contains("下一步：去掉 path_filter 重试"), "{out}");
-        assert!(!out.contains("过窄"), "{out}");
+        assert!(out.contains("Next: drop path_filter and retry"), "{out}");
+        assert!(!out.contains("too narrow"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -604,25 +617,28 @@ mod behaviour {
         p.group = Some(true);
         let out = text(&server.search_code(Parameters(p.clone())));
         assert!(
-            out.contains("L4 [定义] in f0@3-5:") || out.contains(" in f0@3-5:"),
+            out.contains("L4 [def] in f0@3-5:") || out.contains(" in f0@3-5:"),
             "{out}"
         );
         assert!(
-            out.contains("命中行标注"),
+            out.contains("Hit-line tags"),
             "first grouped result has the legend: {out}"
         );
-        let listed = out.lines().filter(|l| l.contains("in TestG")).count();
+        let listed = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with('L') && l.contains("in TestG"))
+            .count();
         assert_eq!(listed, 2, "test rows capped at 2: {out}");
         assert!(
-            out.contains("测试另有 3 处，在 TestG2、TestG3、TestG4"),
+            out.contains("tests have 3 more hits, in TestG2, TestG3, TestG4"),
             "{out}"
         );
         assert!(
-            out.contains("测试文件各列 2 处，其余 3 处已按文件计数"),
+            out.contains("2 hits shown per test file; remaining 3 counted per file"),
             "{out}"
         );
         let again = text(&server.search_code(Parameters(p)));
-        assert!(!again.contains("命中行标注"), "legend once: {again}");
+        assert!(!again.contains("Hit-line tags"), "legend once: {again}");
         assert!(again.contains("confidence: exact\n"), "{again}");
         let _ = std::fs::remove_dir_all(&dir);
     }

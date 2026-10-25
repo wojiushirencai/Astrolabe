@@ -12,6 +12,7 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ### Fixed
 
+- **MCP tool descriptions and return text are English-only**: `#[tool]` / schema descriptions, result bodies (headers, empty results, pagination, rename preview, diagnostics, install hints, section labels), hook deny/reminder copy, and server instructions — avoids bilingual ambiguity for agents.
 - **`explain_symbol` 调用期兼容别名**：目录仍固定 7 个工具、`tools/list` 不暴露该名；旧客户端（如 Cursor 残留提示）调用时转发到 `find_symbol(include_body=true, substring=false)`，并在结果中注明改用 `find_symbol` / `find_references`。Hook 将 `mcp__astrolabe__explain_symbol` 视为符号工具以清零计数。
 - **`get_diagnostics` 区分「未安装 LSP」与「超时」**：缺服务器时明确写 not installed/not configured + 安装提示，并提醒默认不主动起 LSP；`publishDiagnostics` / 请求超时写 timed out after Xs，标明服务器在但未应答，不附安装提示。`server_missing` 对含 `timed out` 的 note 不再推安装。
 - **hooks**：任意 Astrolabe MCP 工具（含 `search_code` 等非符号）在 PreToolUse 时全量清零 `n_grep` / `n_read` / `n_non_symbolic` / `n_slice`，并清除 `last_deny_ts` 结束静默窗；重置排在静默窗判定之前，避免 deny 后跟文案调用仍 sticky deny。

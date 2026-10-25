@@ -58,7 +58,7 @@ pub(super) fn outline_target(
     }
     let Some(filter) = path_filter.filter(|f| !f.is_empty()) else {
         return Some(Err(
-            "query=\"*\" 需配合 path_filter（文件或目录）才列出符号大纲；不支持列出全库符号。"
+            "query=\"*\" requires path_filter (file or directory) to list a symbol outline; listing the whole-repo symbol set is not supported."
                 .to_string(),
         ));
     };
@@ -71,7 +71,7 @@ pub(super) fn outline_target(
     matched.dedup_by_key(|(p, _)| *p);
     Some(match matched.as_slice() {
         [] => Err(format!(
-            "path_filter `{filter}` 只匹配到未入符号索引的文件，无符号大纲可列；请用 Read 或 search_code。"
+            "path_filter `{filter}` only matched files outside the symbol index; no outline to list — use Read or search_code."
         )),
         [(_, id)] => Ok(OutlineTarget::File {
             id: *id,
@@ -313,7 +313,9 @@ impl AstrolabeServer {
         let auto = single && requested == 0 && top_level <= AUTO_EXPAND_TOP_LEVEL && kind.is_none();
         let wanted = if auto { 1 } else { requested };
 
-        let mut head = "confidence: syntactic (文件符号大纲；行号来自语法索引)\n".to_string();
+        let mut head =
+            "confidence: syntactic (file symbol outline; line numbers from the syntax index)\n"
+                .to_string();
         let generation = index.generation();
         if let Some(note) = self.symbol_page_drift_note(params, generation) {
             head.push_str(&note);
@@ -321,7 +323,7 @@ impl AstrolabeServer {
         let title = if single {
             format!("outline: {}", path_of(files[0]))
         } else {
-            format!("outline: {} 个文件", files.len())
+            format!("outline: {} files", files.len())
         };
         let limit_for = |head: &str| {
             params.budget_tokens.saturating_sub(
@@ -350,21 +352,21 @@ impl AstrolabeServer {
         }
         let degraded = depth < requested;
         let mut header = title;
-        header.push_str(&format!("（depth={depth}"));
+        header.push_str(&format!("(depth={depth}"));
         if auto && depth == 1 {
-            header.push_str("，顶层符号少，已自动展开一层");
+            header.push_str("; few top-level symbols, auto-expanded one level");
         }
-        header.push_str("）\n");
+        header.push_str(")\n");
         head.push_str(&header);
         if degraded {
             head.push_str(&format!(
-                "注意：depth={wanted} 超出预算，已退到 depth={depth}；展开单个类型可用 query=<类型名> depth=1。\n"
+                "Note: depth={wanted} exceeded budget; fell back to depth={depth}. To expand one type use query=<TypeName> depth=1.\n"
             ));
         }
         if !others.is_empty() {
             let listed: Vec<&str> = others.iter().take(3).map(String::as_str).collect();
             head.push_str(&format!(
-                "注意：另有 {} 个文件路径以此结尾（{}{}），需要时请写完整路径。\n",
+                "Note: {} more file path(s) end with this ({}{}); use a full path when needed.\n",
                 others.len(),
                 listed.join(", "),
                 if others.len() > 3 { " …" } else { "" }
@@ -400,7 +402,7 @@ impl AstrolabeServer {
             params.offset,
         ));
         if truncated {
-            body.push_str(&format!("按类型计数：{}\n", kind_counts(index, &files)));
+            body.push_str(&format!("Counts by kind: {}\n", kind_counts(index, &files)));
         }
         // A page starting mid-file in a multi-file outline names its file.
         if !single && offset > 0 && kept_count > 0 && !kept[0].contains('\n') {
@@ -416,9 +418,9 @@ impl AstrolabeServer {
         body.push_str(&implementors);
         if total == 0 {
             body.push_str(if kind.is_some() {
-                "(该文件没有此类型的符号)\n"
+                "(no symbols of this kind in this file)\n"
             } else {
-                "(该文件没有已索引的符号)\n"
+                "(no indexed symbols in this file)\n"
             });
         }
         self.result_on(
@@ -609,7 +611,7 @@ pub(super) fn word_fallback_block(
         .collect();
     let lines = decorated_symbol_lines(index, &hits);
     let head = format!(
-        "按子词（{}）相关度排序的近似候选，名字并不包含整串查询，请核验：\n",
+        "Approximate candidates ranked by sub-token ({}) relevance; names do not contain the full query — verify:\n",
         words.join(" ")
     );
     let (kept, _) = truncate_ranked(&lines, budget.saturating_sub(estimate_tokens(&head)), |l| {
@@ -704,7 +706,7 @@ def make_client():
             let result = server.find_symbol(Parameters(query(q)));
             assert_eq!(result.is_error, Some(true), "query={q}");
             let text = result.content[0].as_text().unwrap().text.clone();
-            assert!(text.contains("文件路径"), "{q}: {text}");
+            assert!(text.contains("file path"), "{q}: {text}");
             assert!(text.contains("path_filter"), "{q}: {text}");
             assert!(!text.contains("outline:"), "{q}: {text}");
         }
@@ -735,14 +737,14 @@ def make_client():
         params.path_filter = Some("pkg/cloud.py".into());
         let cloud = run(&server, params);
         assert!(cloud.contains("outline: pkg/cloud.py"), "{cloud}");
-        assert!(cloud.contains("已自动展开一层"), "{cloud}");
+        assert!(cloud.contains("auto-expanded one level"), "{cloud}");
         assert!(cloud.contains("\nclass CloudClient:  L1-"), "{cloud}");
         assert!(cloud.contains("(+1 fields)"), "{cloud}");
 
         let mut params = query("*");
         params.path_filter = Some("pkg/".into());
         let many = run(&server, params);
-        assert!(many.contains("outline: 2 个文件"), "{many}");
+        assert!(many.contains("outline: 2 files"), "{many}");
         assert!(
             many.contains("\npkg/cloud.py\n  class CloudClient:"),
             "{many}"
@@ -796,9 +798,15 @@ def make_client():
         params.depth = 1;
         params.budget_tokens = 400;
         let text = run(&server, params);
-        assert!(text.contains("depth=1 超出预算，已退到 depth=0"), "{text}");
+        assert!(
+            text.contains("depth=1 exceeded budget; fell back to depth=0"),
+            "{text}"
+        );
         assert!(text.contains("next_offset="), "{text}");
-        assert!(text.contains("按类型计数：class 40, method 40"), "{text}");
+        assert!(
+            text.contains("Counts by kind: class 40, method 40"),
+            "{text}"
+        );
         assert!(!text.contains("method_with_a_long_name"), "{text}");
         let mut params = query("*");
         params.path_filter = Some("w.py".into());
@@ -845,9 +853,9 @@ def make_client():
             ("pkg/store.py", "def update_store():\n    pass\n"),
         ]);
         let text = run(&server, query("update cloud client"));
-        assert!(text.contains("(未找到匹配的符号)"), "{text}");
+        assert!(text.contains("(no matching symbols)"), "{text}");
         assert!(
-            text.contains("按子词（client cloud update）相关度"),
+            text.contains("sub-token (client cloud update) relevance"),
             "{text}"
         );
         let first = text
@@ -865,7 +873,7 @@ def make_client():
         params.kind = Some("function".into());
         params.path_filter = Some("store".into());
         let filtered = run(&server, params);
-        assert!(!filtered.contains("按子词"), "{filtered}");
+        assert!(!filtered.contains("sub-token"), "{filtered}");
         // camelCase spelling of the same words.
         let camel = run(&server, query("clientCloudUpdate"));
         assert!(camel.contains("@pkg/cloud.py:4"), "{camel}");
