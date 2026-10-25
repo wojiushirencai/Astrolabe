@@ -257,7 +257,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 
 ## Supported languages & unindexed files
 
-Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, vb, kotlin, shell, ruby, lua.
+Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, vb, kotlin, shell, ruby, lua, proto.
 Source files in other languages are not indexed: empty results from `search_code` and `find_symbol` do not cover them. Use Grep/Read directly when searching or examining unsupported language files. `get_languages` summarises them by file type. Files of supported languages are indexed even with syntax errors (symbols in the broken region may be missing); `get_languages` lists up to 10 such files, or gives the path of a Markdown report with all of them.
 
 ## Language-server install (session-gated)
@@ -377,7 +377,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
 
 ## Supported languages & unindexed files
 
-Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, vb, kotlin, shell, ruby, lua.
+Astrolabe indexes the following languages: python, go, java, rust, typescript, tsx, javascript, c, cpp, objc, objcpp, swift, php, vue, dart, csharp, vb, kotlin, shell, ruby, lua, proto.
 Source files in other languages are not indexed: empty results from `search_code` and `find_symbol` do not cover them. Use Grep/Read directly when searching or examining unsupported language files. `get_languages` summarises them by file type. Files of supported languages are indexed even with syntax errors (symbols in the broken region may be missing); `get_languages` lists up to 10 such files, or gives the path of a Markdown report with all of them.
 
 ## Language-server install (session-gated)

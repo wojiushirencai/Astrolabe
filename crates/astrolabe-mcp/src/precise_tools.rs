@@ -84,10 +84,15 @@ pub(crate) struct FindReferencesParams {
     pub root: Option<String>,
     #[schemars(description = "Symbol name.")]
     pub symbol: String,
-    // Optional: a missing or wrong path is fixed from the index
-    // (`refs_graph::fix_path`); requiring it only made models guess.
+    // Optional on purpose: models often omit it. Prefer an explicit path for
+    // ambiguous names. When omitted, the server first reuses this session's
+    // last find_symbol / goto_definition hit for the same symbol, else the
+    // unique index definition, else lists ranked candidates (no silent guess
+    // among many).
     #[serde(default)]
-    #[schemars(description = "File declaring or using it (inferred if omitted).")]
+    #[schemars(
+        description = "Repo-relative file of the definition or a use site. Strongly preferred for ambiguous names (Init, Run, …). If omitted: this session's last find_symbol/goto_definition hit for the same symbol, else unique index definition, else ranked candidates."
+    )]
     pub path: Option<String>,
     #[serde(default)]
     #[schemars(description = "0-based line (disambiguates).")]
@@ -151,7 +156,7 @@ pub(crate) struct GetDiagnosticsParams {
 
 /// Tool descriptions shared by `PreciseTools` and `AstrolabeServer`, so the
 /// two catalogs cannot drift apart.
-pub(crate) const FIND_REFERENCES_DESC: &str = "精确引用（索引优先，语言服务器兜底）：调用点与用法，改名和调用方分析用它。Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
+pub(crate) const FIND_REFERENCES_DESC: &str = "精确引用（索引优先，语言服务器兜底）：调用点与用法，改名和调用方分析用它。传 path（定义或使用处）消歧；省略时沿用本会话最近 find_symbol/goto_definition 命中，否则唯一索引定义或候选列表。Hits show source line, enclosing func, [声明]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
 pub(crate) const GOTO_DEFINITION_DESC: &str =
     "Jump to definition: 按使用处文件 + 符号名返回定义锚点。";
 pub(crate) const GET_DIAGNOSTICS_DESC: &str =
@@ -1146,8 +1151,15 @@ fn server_missing(note: Option<&str>) -> bool {
     let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) else {
         return true;
     };
+    // A timeout means the server is present; installing again does not help.
+    // Match before the "not installed" substring checks so a carefully worded
+    // timeout note cannot trip an install hint.
+    if note.contains("timed out") || note.contains("超时") {
+        return false;
+    }
     [
         "not installed",
+        "not configured",
         "no language server available",
         "failed to start",
         "尚未接通",
@@ -1257,6 +1269,9 @@ fn install_hint_one(language: Language) -> String {
         }
         Language::Lua => {
             "Lua（lua-language-server）：`brew install lua-language-server`。".into()
+        }
+        Language::Proto => {
+            "Protobuf：无专用语言服务器；message / enum / service / rpc 由 tree-sitter 索引，用 find_symbol / search_code。".into()
         }
         Language::Php => {
             "PHP（intelephense）：`npm i -g intelephense`。".into()
@@ -1461,7 +1476,15 @@ mod tests {
         assert!(required.iter().any(|f| f == "symbol"), "{required:?}");
         assert!(
             !required.iter().any(|f| f == "path"),
-            "path is optional (fixed from the index): {required:?}"
+            "path stays optional (session inherit / index fix / candidates): {required:?}"
+        );
+        let path_desc = refs
+            .pointer("/properties/path/description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            path_desc.contains("Strongly preferred") || path_desc.contains("session"),
+            "path description should steer models: {path_desc}"
         );
 
         let diags = schema_for_tool("get_diagnostics");
@@ -2262,5 +2285,23 @@ mod tests {
             text.contains("安装提示") && text.contains("go install"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn diagnostics_timeout_note_does_not_trigger_install_hint() {
+        let note = "language server timed out after 2.5s waiting for textDocument/publishDiagnostics on src/a.ts;                     the server never published — this is a timeout (server present), not a missing install";
+        let text = unknown_preamble(Some(note), Some("src/a.ts"), false);
+        assert!(text.contains("timed out"), "{text}");
+        assert!(
+            !text.contains("安装提示"),
+            "timeout must not append an install block: {text}"
+        );
+        assert!(
+            !server_missing(Some(note)),
+            "server_missing must treat timed-out notes as present"
+        );
+        assert!(server_missing(Some(
+            "language server not installed or not configured for TypeScript"
+        )));
     }
 }

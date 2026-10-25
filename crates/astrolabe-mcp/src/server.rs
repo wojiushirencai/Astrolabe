@@ -74,7 +74,7 @@ const MAX_MATCH_SPAN_CHARS: usize = 40;
 const SEARCH_HEADER_TOKENS: usize = 35;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-fn default_budget() -> usize {
+pub(crate) fn default_budget() -> usize {
     DEFAULT_BUDGET
 }
 
@@ -173,6 +173,48 @@ fn looks_like_regex_query(query: &str) -> bool {
         || (query.ends_with('$') && query.len() > 1 && !query.ends_with("\\$"))
 }
 
+/// Heuristic: query looks like a function signature / call / code snippet.
+/// Models often pass these with `regex=true` (parens read as "exact"), which
+/// either fails to compile (unclosed groups) or matches the wrong thing
+/// (`foo(bar)` as a capture group ≠ the literal `foo(bar)`).
+fn looks_like_code_fragment(query: &str) -> bool {
+    // Leave intentional regex alone.
+    if looks_like_regex_query(query) {
+        return false;
+    }
+    // Escaped parens mean the caller wanted a literal `(` under regex mode.
+    if query.contains(r"\(") || query.contains(r"\)") {
+        return false;
+    }
+    let Some(paren) = query.find('(') else {
+        return false;
+    };
+    // Leading `(…)` is usually a regex group; only treat as code when the
+    // rest of the line is clearly a snippet (arrow / block).
+    if paren == 0 {
+        return query.contains("=>") || query.contains(") {") || query.contains("){");
+    }
+    let before = query[..paren].trim_end();
+    if before.is_empty() {
+        return false;
+    }
+    // Require an identifier-ish token immediately before `(` (`foo(`, `Type::new(`,
+    // `obj.method(`, `fn process(`).
+    let last = before.chars().last().unwrap_or('\0');
+    last.is_alphanumeric() || last == '_'
+}
+
+/// When `regex=true` but the query looks like a code snippet, force literal.
+/// Returns whether the flag was downgraded.
+fn apply_code_fragment_literal(params: &mut SearchParams) -> bool {
+    if params.regex && looks_like_code_fragment(&params.query) {
+        params.regex = false;
+        true
+    } else {
+        false
+    }
+}
+
 fn quote_query_for_note(query: &str) -> String {
     const MAX: usize = 80;
     let count = query.chars().count();
@@ -183,16 +225,27 @@ fn quote_query_for_note(query: &str) -> String {
     format!("{clipped}…")
 }
 
-fn render_search_mode_header(regex: bool, query: &str) -> String {
+fn render_search_mode_header(regex: bool, query: &str, downgraded_from_regex: bool) -> String {
     let mode = if regex { "regex" } else { "literal" };
     let mut header = format!("mode: {mode}\n");
-    if !regex && looks_like_regex_query(query) {
+    if downgraded_from_regex {
+        header.push_str(&format!(
+            "注意：query 像函数签名/代码片段，已忽略 regex=true，按字面搜索「{}」。确需正则请写明确模式（如 a|b、foo\\(.*\\)），不要把源码片段直接当正则。\n",
+            quote_query_for_note(query)
+        ));
+    } else if !regex && looks_like_regex_query(query) {
         header.push_str(&format!(
             "注意：query 含正则元字符，但 regex=false，已按字面搜索「{}」。要按正则请传 regex=true；多符号请拆成多次字面搜索。\n",
             quote_query_for_note(query)
         ));
     }
     header
+}
+
+fn invalid_regex_message(error: impl std::fmt::Display) -> String {
+    format!(
+        "无效正则表达式：{error}。若本意是字面搜索该字符串，请传 regex=false（默认即为字面量）；不要把函数签名或源码片段当作正则。"
+    )
 }
 
 /// search_code 的分页状态行：保留 `shown= omitted= truncated=` 机器可读格式，
@@ -1947,6 +2000,9 @@ pub struct AstrolabeServer {
     /// Per-session coverage-note memory for leader-side session views
     /// (the root session's own slot otherwise).
     coverage_note_override: Option<Arc<Mutex<Option<String>>>>,
+    /// Last unambiguous symbol → path[:line] from find_symbol / goto_definition
+    /// in this MCP process, so find_references can inherit a missing path.
+    recent_symbols: Arc<crate::recent_symbol::RecentSymbols>,
 }
 
 impl AstrolabeServer {
@@ -2070,6 +2126,7 @@ impl AstrolabeServer {
             shown_once: Arc::new(Mutex::new(std::collections::HashSet::new())),
             shared: None,
             coverage_note_override: None,
+            recent_symbols: Arc::new(crate::recent_symbol::RecentSymbols::new()),
         }
     }
 
@@ -2141,6 +2198,48 @@ impl AstrolabeServer {
                 Err(msg) => Err(self.finish(text_error(msg))),
             },
         }
+    }
+
+    /// Remember a single unambiguous symbol hit for later find_references.
+    fn remember_symbol_anchor(
+        &self,
+        root: &Path,
+        symbol: &str,
+        path: &str,
+        line_0based: Option<u32>,
+    ) {
+        self.recent_symbols
+            .remember(root, symbol, path, line_0based);
+    }
+
+    /// When find_symbol / path-query yields exactly one exact-name hit, remember it.
+    fn remember_if_unique_symbol_hit(
+        &self,
+        root: &Path,
+        typed: &str,
+        index: &crate::index::RepoIndex,
+        hits: &[(String, usize)],
+    ) {
+        let typed = typed.trim();
+        if typed.is_empty() || hits.is_empty() {
+            return;
+        }
+        let symbols = &index.graph().symbols;
+        let exact: Vec<&astrolabe_core::CodeSymbol> = hits
+            .iter()
+            .map(|(_, idx)| &symbols[*idx])
+            .filter(|s| s.name == typed || s.name.eq_ignore_ascii_case(typed))
+            .collect();
+        if exact.len() != 1 {
+            return;
+        }
+        let s = exact[0];
+        let Some(file) = index.file(s.file) else {
+            return;
+        };
+        // Index lines are 1-based; find_references line is 0-based.
+        let line = s.start_line.saturating_sub(1);
+        self.remember_symbol_anchor(root, &s.name, file.path.as_str(), Some(line));
     }
 
     /// Resolve which sub-repo a call targets. Priority: explicit `root` >
@@ -2232,6 +2331,8 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         const MAX_SHOWN: usize = 60;
         const MAX_SECONDS: u64 = 20;
+        let mut params = params.clone();
+        let regex_downgraded = apply_code_fragment_literal(&mut params);
         let sensitive = search_shape::literal_case_sensitive(
             &params.query,
             params.regex,
@@ -2239,7 +2340,7 @@ impl AstrolabeServer {
         );
         let matcher = match build_search_matcher(&params.query, params.regex, Some(sensitive)) {
             Ok(matcher) => matcher,
-            Err(error) => return text_error(format!("无效正则表达式：{error}")),
+            Err(error) => return text_error(invalid_regex_message(error)),
         };
         let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
             Ok(set) => set,
@@ -2293,7 +2394,11 @@ impl AstrolabeServer {
         let mut body = String::from(
             "confidence: exact (磁盘源码字面扫描；索引仍在后台构建，本结果无符号/角色标注，[text-only])\n",
         );
-        body.push_str(&render_search_mode_header(params.regex, &params.query));
+        body.push_str(&render_search_mode_header(
+            params.regex,
+            &params.query,
+            regex_downgraded,
+        ));
         if params.aggregate.is_some() {
             body.push_str("aggregate 需索引就绪后才分组，此处只给总数。\n");
         }
@@ -2897,6 +3002,18 @@ fn custom_request_error(method: &str) -> ErrorData {
     }
 }
 
+/// Put `note` at the start of the first text block (after any leading blank).
+fn prepend_tool_note(result: CallToolResult, note: &str) -> CallToolResult {
+    let mut result = result;
+    if let Some(first) = result.content.first_mut() {
+        if let Some(existing) = first.as_text() {
+            let new_text = format!("{note}{}", existing.text);
+            result.content[0] = ContentBlock::text(new_text);
+        }
+    }
+    result
+}
+
 /// Where a call goes after routing (see [`AstrolabeServer::resolve_route`]).
 struct RouteOutcome {
     hint: String,
@@ -3134,11 +3251,41 @@ impl AstrolabeServer {
             Err(err) => return err,
         };
         params.path = route.path;
+        // Inherit path from this session's last unambiguous symbol hit when
+        // the model omitted it (common after find_symbol / goto_definition).
+        let mut inherit_note: Option<String> = None;
+        if params.path.is_none() {
+            if let Ok(session) = self.session_for(&route.hint) {
+                if let Some(anchor) = self
+                    .recent_symbols
+                    .recall(&session.root, params.symbol.trim())
+                {
+                    let line_disp = anchor
+                        .line
+                        .map(|l| format!(":{}", l + 1))
+                        .unwrap_or_default();
+                    inherit_note = Some(format!(
+                        "未给 path；沿用本会话最近对 `{}` 的定位 {}{}。\n",
+                        params.symbol.trim(),
+                        anchor.path,
+                        line_disp
+                    ));
+                    if params.line.is_none() {
+                        params.line = anchor.line;
+                    }
+                    params.path = Some(anchor.path);
+                }
+            }
+        }
         self.with_precise(&route.hint, true, move |session| {
-            self.coord_note_once(crate::precise_tools::run_find_references(
+            let mut result = self.coord_note_once(crate::precise_tools::run_find_references(
                 params,
                 session.precise.as_ref(),
-            ))
+            ));
+            if let Some(note) = inherit_note.as_deref() {
+                result = prepend_tool_note(result, note);
+            }
+            result
         })
     }
 
@@ -3153,6 +3300,16 @@ impl AstrolabeServer {
         };
         params.path = route.path.unwrap_or_default();
         self.with_precise(&route.hint, true, move |session| {
+            // Use site is enough for a later find_references without path
+            // (fix_path keeps a file that contains the symbol).
+            if let Some(sym) = params
+                .symbol
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                self.remember_symbol_anchor(&session.root, sym, &params.path, params.line);
+            }
             self.coord_note_once(crate::precise_tools::run_goto_definition(
                 params,
                 session.precise.as_ref(),
@@ -3384,6 +3541,8 @@ impl AstrolabeServer {
                     (symbol_line(symbol, path), idx)
                 })
                 .collect();
+            // One exact hit → later find_references can omit path.
+            self.remember_if_unique_symbol_hit(&session.root, typed, index, &hits);
             let total = hits.len();
             let offset = params.offset.min(total);
             let mut body = if self.once("find_symbol.confidence") {
@@ -3526,7 +3685,8 @@ impl AstrolabeServer {
         Self::with_route_note(result, &route.note)
     }
 
-    fn search_code_inner(&self, params: SearchParams) -> CallToolResult {
+    fn search_code_inner(&self, mut params: SearchParams) -> CallToolResult {
+        let regex_downgraded = apply_code_fragment_literal(&mut params);
         self.with_fresh_index(
             params.root.as_deref().unwrap_or(""),
             |session, index| {
@@ -3572,7 +3732,7 @@ impl AstrolabeServer {
                     Some(sensitive),
                 ) {
                     Ok(matcher) => matcher,
-                    Err(error) => return text_error(format!("无效正则表达式：{error}")),
+                    Err(error) => return text_error(invalid_regex_message(error)),
                 };
                 // Whole-buffer candidate lines (a superset of the lines the
                 // per-line matchers accept; see `line_scan`). With smart case
@@ -3657,7 +3817,7 @@ impl AstrolabeServer {
                             .unwrap_or_default();
                         let body = format!(
                             "{conf}{}同一查询已在本会话第 {c} 次工具调用返回（文件未改动），不再重发全文。\n{digest}若你没看到那份结果（如子任务或上下文已压缩后丢失），传 dedup=false 重新取全文。\n",
-                            render_search_mode_header(params.regex, &params.query)
+                            render_search_mode_header(params.regex, &params.query, regex_downgraded)
                         );
                         return self.result_on(
                             &session.root,
@@ -3914,7 +4074,7 @@ impl AstrolabeServer {
                     }
                     let body = format!(
                         "{conf}{}{}",
-                        render_search_mode_header(params.regex, &params.query),
+                        render_search_mode_header(params.regex, &params.query, regex_downgraded),
                         render_search_counts(&matches, params.aggregate.as_deref(), params.offset),
                     ) + &variant_note
                         + &skip_note;
@@ -3958,7 +4118,7 @@ impl AstrolabeServer {
                     );
                     let mut body = format!(
                         "{conf}{}",
-                        render_search_mode_header(params.regex, &params.query)
+                        render_search_mode_header(params.regex, &params.query, regex_downgraded)
                     );
                     body.push_str(&format!(
                         "grouped=true total={total} shown={shown}\n"
@@ -3990,7 +4150,7 @@ impl AstrolabeServer {
                 if broad {
                     let mut body = format!(
                         "{conf}{}",
-                        render_search_mode_header(params.regex, &params.query)
+                        render_search_mode_header(params.regex, &params.query, regex_downgraded)
                     );
                     let ranked = rank_broad_hits(index, &matches);
                     let preview_budget = clamped_budget.saturating_sub(SEARCH_HEADER_TOKENS) / 2;
@@ -4102,7 +4262,7 @@ impl AstrolabeServer {
                 let mode = if params.regex { "regex" } else { "literal" };
                 let mut body = format!(
                     "{conf}{}",
-                    render_search_mode_header(params.regex, &params.query)
+                    render_search_mode_header(params.regex, &params.query, regex_downgraded)
                 );
                 body.push_str(&render_search_page_status(
                     total,
@@ -4438,6 +4598,8 @@ impl AstrolabeServer {
             .find(|seg| !seg.is_empty())
             .unwrap_or_default();
         hits.sort_by_key(|(_, idx)| symbols[*idx].name != last_segment);
+        // Path query that resolves to one leaf: same inherit as name search.
+        self.remember_if_unique_symbol_hit(root, last_segment, index, &hits);
         let total = hits.len();
         let offset = params.offset.min(total);
         let mut body = if self.once("find_symbol.path_confidence") {
@@ -4725,13 +4887,20 @@ impl ServerHandler for AstrolabeServer {
         let server = self.clone();
         let tool_name = request.name.to_string();
         let runtime = tokio::runtime::Handle::current();
-        let work = tokio::task::spawn_blocking(move || {
-            cancel::scope(worker_flag, || {
-                runtime.block_on(async {
-                    let tcc = ToolCallContext::new(&server, request, context);
-                    server.tool_router.call(tcc).await
+        let work = tokio::task::spawn_blocking({
+            let tool_name = tool_name.clone();
+            move || {
+                cancel::scope(worker_flag, || {
+                    // Stale clients still call explain_symbol; alias without listing it.
+                    if tool_name == crate::compat::EXPLAIN_SYMBOL {
+                        return Ok(server.explain_symbol_compat(request.arguments).into());
+                    }
+                    runtime.block_on(async {
+                        let tcc = ToolCallContext::new(&server, request, context);
+                        server.tool_router.call(tcc).await
+                    })
                 })
-            })
+            }
         });
         let timeout = tool_timeout_from_env();
         let deadline = async {
@@ -5278,7 +5447,13 @@ fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> 
         "path_filter '{filter}' 不匹配任何已索引路径（区分大小写的仓库相对路径子串，不是 glob，不要带绝对路径或 ./ 前缀）。"
     );
     if !closest.is_empty() {
-        message.push_str(&format!("最接近的已索引路径：{}", closest.join(", ")));
+        message.push_str(&format!("最接近的已索引路径：{}。", closest.join(", ")));
+        message.push_str(&format!(
+            "下一步：改用上述路径之一作 path_filter（例如 \"{}\"），或去掉 path_filter 后重试。",
+            closest[0]
+        ));
+    } else {
+        message.push_str("下一步：去掉 path_filter 后重试。");
     }
     Some(message)
 }
@@ -5300,7 +5475,7 @@ fn mark_blocked(mut result: CallToolResult, note: &str) -> CallToolResult {
     result
 }
 
-fn text_error(message: impl Into<String>) -> CallToolResult {
+pub(crate) fn text_error(message: impl Into<String>) -> CallToolResult {
     let message = message.into();
     CallToolResult::error(vec![ContentBlock::text(if message.trim().is_empty() {
         "未知错误".to_string()
@@ -6200,6 +6375,72 @@ mod tests {
     const CALC_PY: &str = "def compute(a, b):\n    total = a + b\n    total *= 2\n    marker_x = total - 1\n    return marker_x\n\n\ndef caller():\n    return compute(1, 2)\n";
 
     #[test]
+    fn explain_symbol_compat_aliases_to_find_symbol() {
+        let (server, dir) = smart_server(&[(
+            "calc.py",
+            "def compute(a, b):\n    return a + b\n\ndef caller():\n    return compute(1, 2)\n"
+                .into(),
+        )]);
+        let args = json!({"name": "compute"})
+            .as_object()
+            .cloned()
+            .expect("object");
+        let via_dispatch = server
+            .dispatch_tool(crate::compat::EXPLAIN_SYMBOL, Some(args.clone()))
+            .expect("dispatch");
+        assert_ne!(
+            via_dispatch.is_error,
+            Some(true),
+            "{}",
+            text_of(&via_dispatch)
+        );
+        let out = text_of(&via_dispatch);
+        assert!(out.starts_with("index_root:"), "{out}");
+        assert!(out.contains("[compat] explain_symbol"), "{out}");
+        assert!(out.contains("find_symbol"), "{out}");
+        assert!(out.contains("compute"), "{out}");
+        assert!(
+            out.contains("def compute") || out.contains("function compute"),
+            "expected body via include_body: {out}"
+        );
+        let sc = via_dispatch.structured_content.expect("structured");
+        assert_eq!(sc["compat_alias"], "find_symbol");
+        assert_eq!(sc["compat_from"], "explain_symbol");
+
+        // Catalog stays at 7 — alias is call-time only.
+        let listed: Vec<_> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(listed.len(), crate::TOOL_COUNT);
+        assert!(!listed.iter().any(|n| n == "explain_symbol"), "{listed:?}");
+
+        let missing = server
+            .dispatch_tool(crate::compat::EXPLAIN_SYMBOL, Some(Default::default()))
+            .expect("dispatch empty");
+        assert_eq!(missing.is_error, Some(true));
+        let err = text_of(&missing);
+        assert!(err.contains("find_symbol"), "{err}");
+        assert!(err.contains("find_references"), "{err}");
+
+        let via_query = server
+            .dispatch_tool(
+                crate::compat::EXPLAIN_SYMBOL,
+                Some(json!({"query": "compute"}).as_object().cloned().unwrap()),
+            )
+            .expect("dispatch query");
+        assert!(
+            text_of(&via_query).contains("compute"),
+            "{}",
+            text_of(&via_query)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn search_code_few_hits_expand_to_enclosing_symbol_once() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
         let text = text_of(&server.search_code(Parameters(search("marker_x"))));
@@ -6337,6 +6578,80 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_code_fragment_detects_signatures_not_regex() {
+        assert!(looks_like_code_fragment("fn process(data: &str)"));
+        assert!(looks_like_code_fragment("compute(a, b)"));
+        assert!(looks_like_code_fragment("Type::new(cfg)"));
+        assert!(looks_like_code_fragment("obj.method(")); // unclosed call
+        assert!(looks_like_code_fragment("(x) => x + 1"));
+        assert!(!looks_like_code_fragment("foo|bar"));
+        assert!(!looks_like_code_fragment(r"foo\(.*\)"));
+        assert!(!looks_like_code_fragment(r"^\s*fn\s+"));
+        assert!(!looks_like_code_fragment("[a-z]+"));
+        assert!(!looks_like_code_fragment("(foo|bar)"));
+        assert!(!looks_like_code_fragment("plain_name"));
+    }
+
+    #[test]
+    fn search_code_downgrades_signature_query_from_regex_to_literal() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        // As regex, `compute(a, b)` is a capture group and would match `computea, b`
+        // (no parens). As literal it matches the call site in CALC_PY.
+        let mut p = search("compute(a, b)");
+        p.regex = true;
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("mode: literal"), "{text}");
+        assert!(text.contains("已忽略 regex=true"), "{text}");
+        assert!(text.contains("compute(a, b)"), "{text}");
+        assert!(text.contains("calc.py"), "{text}");
+        assert!(!text.contains("(未找到匹配的代码行)"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_downgrades_unclosed_call_instead_of_invalid_regex() {
+        let (server, dir) =
+            smart_server(&[("calc.py", "def helper(x):\n    return helper(x\n".into())]);
+        let mut p = search("helper(x");
+        p.regex = true;
+        let r = server.search_code(Parameters(p));
+        assert_ne!(r.is_error, Some(true), "{}", text_of(&r));
+        let text = text_of(&r);
+        assert!(text.contains("mode: literal"), "{text}");
+        assert!(text.contains("已忽略 regex=true"), "{text}");
+        assert!(text.contains("helper(x"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_invalid_regex_suggests_literal() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        // Character class left open — not a code-fragment shape, so still an error.
+        let mut p = search("[unclosed");
+        p.regex = true;
+        let r = server.search_code(Parameters(p));
+        assert_eq!(r.is_error, Some(true));
+        let text = text_of(&r);
+        assert!(text.contains("无效正则表达式"), "{text}");
+        assert!(text.contains("regex=false"), "{text}");
+        assert!(text.contains("字面"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_keeps_intentional_regex_with_groups() {
+        let (server, dir) = smart_server(&[("calc.py", "alpha_hit\nbeta_hit\n".into())]);
+        let mut p = search("alpha_hit|beta_hit");
+        p.regex = true;
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(text.contains("mode: regex"), "{text}");
+        assert!(!text.contains("已忽略 regex=true"), "{text}");
+        assert!(text.contains("alpha_hit"), "{text}");
+        assert!(text.contains("beta_hit"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn hit_role_matches_words_not_substrings() {
         assert_eq!(hit_role(false, "return thread"), "使用");
         assert_eq!(hit_role(false, "x = spread(a)"), "使用");
@@ -6379,6 +6694,99 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
         }
+    }
+
+    #[test]
+    fn find_references_inherits_path_from_unique_find_symbol() {
+        let (server, dir) = smart_server(&[(
+            "svc/channel.go",
+            "package svc\n\nfunc ShouldDisableChannel() bool { return false }\n".into(),
+        )]);
+        // Unique exact hit → remembered for this session.
+        let sym = text_of(&server.find_symbol(Parameters(find("ShouldDisableChannel"))));
+        assert!(
+            sym.contains("svc/channel.go"),
+            "find_symbol should hit the definition: {sym}"
+        );
+        let refs = text_of(&server.find_references(Parameters(
+            crate::precise_tools::FindReferencesParams {
+                root: None,
+                symbol: "ShouldDisableChannel".into(),
+                path: None,
+                line: None,
+                character: None,
+                budget_tokens: 2500,
+                offset: None,
+                dry_run_rename: None,
+            },
+        )));
+        assert!(
+            refs.contains("沿用本会话最近") && refs.contains("svc/channel.go"),
+            "expected session inherit note: {refs}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_references_does_not_inherit_when_find_symbol_is_ambiguous() {
+        let (server, dir) = smart_server(&[
+            ("a/x.go", "package a\n\nfunc Dup() {}\n".into()),
+            ("b/y.go", "package b\n\nfunc Dup() {}\n".into()),
+        ]);
+        let sym = text_of(&server.find_symbol(Parameters(find("Dup"))));
+        assert!(sym.contains("a/x.go") && sym.contains("b/y.go"), "{sym}");
+        // Two exact hits → nothing remembered; missing path stays Ambiguous.
+        let refs = text_of(&server.find_references(Parameters(
+            crate::precise_tools::FindReferencesParams {
+                root: None,
+                symbol: "Dup".into(),
+                path: None,
+                line: None,
+                character: None,
+                budget_tokens: 2500,
+                offset: None,
+                dry_run_rename: None,
+            },
+        )));
+        assert!(
+            !refs.contains("沿用本会话最近"),
+            "must not invent a path from an ambiguous find_symbol: {refs}"
+        );
+        assert!(
+            refs.contains("a/x.go") && refs.contains("b/y.go"),
+            "expected ranked candidates: {refs}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_references_inherits_after_path_filter_narrows_to_one() {
+        let (server, dir) = smart_server(&[
+            ("a/x.go", "package a\n\nfunc Init() {}\n".into()),
+            ("b/y.go", "package b\n\nfunc Init() {}\n".into()),
+        ]);
+        let mut q = find("Init");
+        q.path_filter = Some("a/".into());
+        let sym = text_of(&server.find_symbol(Parameters(q)));
+        assert!(sym.contains("a/x.go"), "{sym}");
+        assert!(!sym.contains("b/y.go"), "{sym}");
+        let refs = text_of(&server.find_references(Parameters(
+            crate::precise_tools::FindReferencesParams {
+                root: None,
+                symbol: "Init".into(),
+                path: None,
+                line: None,
+                character: None,
+                budget_tokens: 2500,
+                offset: None,
+                dry_run_rename: None,
+            },
+        )));
+        assert!(
+            refs.contains("沿用本会话最近") && refs.contains("a/x.go"),
+            "path_filter-narrowed find_symbol should be inherited: {refs}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6477,6 +6885,7 @@ mod tests {
         assert!(text.contains("最接近的符号名"), "{text}");
         assert!(text.contains("def compute(a, b):"), "{text}");
         assert!(text.contains("全仓库都没有这个字面量"), "{text}");
+        assert!(text.contains("去掉 path_filter 也搜不到"), "{text}");
         assert!(!text.contains("过窄"), "{text}");
         // Nothing close: no suggestion block, still the generic hint.
         let none = text_of(&server.search_code(Parameters(search("zzzqqq"))));
@@ -8603,6 +9012,11 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = fs_text(&result);
         assert!(text.contains("relay/channel"), "{text}");
+        assert!(text.contains("下一步："), "{text}");
+        assert!(
+            text.contains("去掉 path_filter") || text.contains("改用上述路径"),
+            "{text}"
+        );
 
         let result = server.search_code(Parameters(SearchParams {
             root: None,

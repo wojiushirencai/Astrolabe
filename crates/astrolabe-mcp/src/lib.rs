@@ -10,6 +10,7 @@
 mod alloc;
 mod cli;
 mod code_mask;
+mod compat;
 mod context;
 mod context_page;
 mod coverage;
@@ -31,6 +32,7 @@ mod loop_guard;
 mod openai_schema;
 mod precise_tools;
 mod py_refs;
+mod recent_symbol;
 mod refs_graph;
 mod refs_graph_ts;
 mod refs_render;

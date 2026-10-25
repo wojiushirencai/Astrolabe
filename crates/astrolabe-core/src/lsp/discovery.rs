@@ -1069,6 +1069,8 @@ fn candidates(language: Language) -> &'static [Candidate] {
         Language::Shell => SHELL,
         Language::Ruby => RUBY,
         Language::Lua => LUA,
+        // No dedicated protobuf language server in v1; graph tools cover .proto.
+        Language::Proto => &[],
     }
 }
 
@@ -1094,6 +1096,7 @@ fn env_override_keys(language: Language) -> &'static [&'static str] {
         Language::Shell => &["ASTROLABE_LSP_SHELL"],
         Language::Ruby => &["ASTROLABE_LSP_RUBY"],
         Language::Lua => &["ASTROLABE_LSP_LUA"],
+        Language::Proto => &[],
     }
 }
 
@@ -1554,6 +1557,8 @@ mod tests {
                 Language::Shell => assert!(result.install_hint.contains("bash-language-server")),
                 Language::Ruby => assert!(result.install_hint.contains("ruby-lsp")),
                 Language::Lua => assert!(result.install_hint.contains("lua-language-server")),
+                // Proto is graph-only (not in PROBED_LANGUAGES); arm keeps the match exhaustive.
+                Language::Proto => unreachable!("proto is not probed for LSP"),
             }
             assert!(
                 result.needs_install.is_some(),
