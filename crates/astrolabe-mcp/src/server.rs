@@ -1863,6 +1863,9 @@ pub struct AstrolabeServer {
     /// Per-session coverage-note memory for leader-side session views
     /// (the root session's own slot otherwise).
     coverage_note_override: Option<Arc<Mutex<Option<String>>>>,
+    /// Last unambiguous symbol → path[:line] from find_symbol / goto_definition
+    /// in this MCP process, so find_references can inherit a missing path.
+    recent_symbols: Arc<crate::recent_symbol::RecentSymbols>,
 }
 
 impl AstrolabeServer {
@@ -1986,6 +1989,7 @@ impl AstrolabeServer {
             shown_once: Arc::new(Mutex::new(std::collections::HashSet::new())),
             shared: None,
             coverage_note_override: None,
+            recent_symbols: Arc::new(crate::recent_symbol::RecentSymbols::new()),
         }
     }
 
@@ -2057,6 +2061,48 @@ impl AstrolabeServer {
                 Err(msg) => Err(self.finish(text_error(msg))),
             },
         }
+    }
+
+    /// Remember a single unambiguous symbol hit for later find_references.
+    fn remember_symbol_anchor(
+        &self,
+        root: &Path,
+        symbol: &str,
+        path: &str,
+        line_0based: Option<u32>,
+    ) {
+        self.recent_symbols
+            .remember(root, symbol, path, line_0based);
+    }
+
+    /// When find_symbol / path-query yields exactly one exact-name hit, remember it.
+    fn remember_if_unique_symbol_hit(
+        &self,
+        root: &Path,
+        typed: &str,
+        index: &crate::index::RepoIndex,
+        hits: &[(String, usize)],
+    ) {
+        let typed = typed.trim();
+        if typed.is_empty() || hits.is_empty() {
+            return;
+        }
+        let symbols = &index.graph().symbols;
+        let exact: Vec<&astrolabe_core::CodeSymbol> = hits
+            .iter()
+            .map(|(_, idx)| &symbols[*idx])
+            .filter(|s| s.name == typed || s.name.eq_ignore_ascii_case(typed))
+            .collect();
+        if exact.len() != 1 {
+            return;
+        }
+        let s = exact[0];
+        let Some(file) = index.file(s.file) else {
+            return;
+        };
+        // Index lines are 1-based; find_references line is 0-based.
+        let line = s.start_line.saturating_sub(1);
+        self.remember_symbol_anchor(root, &s.name, file.path.as_str(), Some(line));
     }
 
     /// Resolve which sub-repo a call targets. Priority: explicit `root` >
@@ -2813,6 +2859,18 @@ fn custom_request_error(method: &str) -> ErrorData {
     }
 }
 
+/// Put `note` at the start of the first text block (after any leading blank).
+fn prepend_tool_note(result: CallToolResult, note: &str) -> CallToolResult {
+    let mut result = result;
+    if let Some(first) = result.content.first_mut() {
+        if let Some(existing) = first.as_text() {
+            let new_text = format!("{note}{}", existing.text);
+            result.content[0] = ContentBlock::text(new_text);
+        }
+    }
+    result
+}
+
 /// Where a call goes after routing (see [`AstrolabeServer::resolve_route`]).
 struct RouteOutcome {
     hint: String,
@@ -3050,11 +3108,41 @@ impl AstrolabeServer {
             Err(err) => return err,
         };
         params.path = route.path;
+        // Inherit path from this session's last unambiguous symbol hit when
+        // the model omitted it (common after find_symbol / goto_definition).
+        let mut inherit_note: Option<String> = None;
+        if params.path.is_none() {
+            if let Ok(session) = self.session_for(&route.hint) {
+                if let Some(anchor) = self
+                    .recent_symbols
+                    .recall(&session.root, params.symbol.trim())
+                {
+                    let line_disp = anchor
+                        .line
+                        .map(|l| format!(":{}", l + 1))
+                        .unwrap_or_default();
+                    inherit_note = Some(format!(
+                        "未给 path；沿用本会话最近对 `{}` 的定位 {}{}。\n",
+                        params.symbol.trim(),
+                        anchor.path,
+                        line_disp
+                    ));
+                    if params.line.is_none() {
+                        params.line = anchor.line;
+                    }
+                    params.path = Some(anchor.path);
+                }
+            }
+        }
         self.with_precise(&route.hint, true, move |session| {
-            self.coord_note_once(crate::precise_tools::run_find_references(
+            let mut result = self.coord_note_once(crate::precise_tools::run_find_references(
                 params,
                 session.precise.as_ref(),
-            ))
+            ));
+            if let Some(note) = inherit_note.as_deref() {
+                result = prepend_tool_note(result, note);
+            }
+            result
         })
     }
 
@@ -3069,6 +3157,16 @@ impl AstrolabeServer {
         };
         params.path = route.path.unwrap_or_default();
         self.with_precise(&route.hint, true, move |session| {
+            // Use site is enough for a later find_references without path
+            // (fix_path keeps a file that contains the symbol).
+            if let Some(sym) = params
+                .symbol
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                self.remember_symbol_anchor(&session.root, sym, &params.path, params.line);
+            }
             self.coord_note_once(crate::precise_tools::run_goto_definition(
                 params,
                 session.precise.as_ref(),
@@ -3297,6 +3395,8 @@ impl AstrolabeServer {
                     (symbol_line(symbol, path), idx)
                 })
                 .collect();
+            // One exact hit → later find_references can omit path.
+            self.remember_if_unique_symbol_hit(&session.root, typed, index, &hits);
             let total = hits.len();
             let offset = params.offset.min(total);
             let mut body = if self.once("find_symbol.confidence") {
@@ -4351,6 +4451,8 @@ impl AstrolabeServer {
             .find(|seg| !seg.is_empty())
             .unwrap_or_default();
         hits.sort_by_key(|(_, idx)| symbols[*idx].name != last_segment);
+        // Path query that resolves to one leaf: same inherit as name search.
+        self.remember_if_unique_symbol_hit(root, last_segment, index, &hits);
         let total = hits.len();
         let offset = params.offset.min(total);
         let mut body = if self.once("find_symbol.path_confidence") {
@@ -6371,6 +6473,99 @@ mod tests {
             budget_tokens: 2500,
             offset: 0,
         }
+    }
+
+    #[test]
+    fn find_references_inherits_path_from_unique_find_symbol() {
+        let (server, dir) = smart_server(&[(
+            "svc/channel.go",
+            "package svc\n\nfunc ShouldDisableChannel() bool { return false }\n".into(),
+        )]);
+        // Unique exact hit → remembered for this session.
+        let sym = text_of(&server.find_symbol(Parameters(find("ShouldDisableChannel"))));
+        assert!(
+            sym.contains("svc/channel.go"),
+            "find_symbol should hit the definition: {sym}"
+        );
+        let refs = text_of(&server.find_references(Parameters(
+            crate::precise_tools::FindReferencesParams {
+                root: None,
+                symbol: "ShouldDisableChannel".into(),
+                path: None,
+                line: None,
+                character: None,
+                budget_tokens: 2500,
+                offset: None,
+                dry_run_rename: None,
+            },
+        )));
+        assert!(
+            refs.contains("沿用本会话最近") && refs.contains("svc/channel.go"),
+            "expected session inherit note: {refs}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_references_does_not_inherit_when_find_symbol_is_ambiguous() {
+        let (server, dir) = smart_server(&[
+            ("a/x.go", "package a\n\nfunc Dup() {}\n".into()),
+            ("b/y.go", "package b\n\nfunc Dup() {}\n".into()),
+        ]);
+        let sym = text_of(&server.find_symbol(Parameters(find("Dup"))));
+        assert!(sym.contains("a/x.go") && sym.contains("b/y.go"), "{sym}");
+        // Two exact hits → nothing remembered; missing path stays Ambiguous.
+        let refs = text_of(&server.find_references(Parameters(
+            crate::precise_tools::FindReferencesParams {
+                root: None,
+                symbol: "Dup".into(),
+                path: None,
+                line: None,
+                character: None,
+                budget_tokens: 2500,
+                offset: None,
+                dry_run_rename: None,
+            },
+        )));
+        assert!(
+            !refs.contains("沿用本会话最近"),
+            "must not invent a path from an ambiguous find_symbol: {refs}"
+        );
+        assert!(
+            refs.contains("a/x.go") && refs.contains("b/y.go"),
+            "expected ranked candidates: {refs}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_references_inherits_after_path_filter_narrows_to_one() {
+        let (server, dir) = smart_server(&[
+            ("a/x.go", "package a\n\nfunc Init() {}\n".into()),
+            ("b/y.go", "package b\n\nfunc Init() {}\n".into()),
+        ]);
+        let mut q = find("Init");
+        q.path_filter = Some("a/".into());
+        let sym = text_of(&server.find_symbol(Parameters(q)));
+        assert!(sym.contains("a/x.go"), "{sym}");
+        assert!(!sym.contains("b/y.go"), "{sym}");
+        let refs = text_of(&server.find_references(Parameters(
+            crate::precise_tools::FindReferencesParams {
+                root: None,
+                symbol: "Init".into(),
+                path: None,
+                line: None,
+                character: None,
+                budget_tokens: 2500,
+                offset: None,
+                dry_run_rename: None,
+            },
+        )));
+        assert!(
+            refs.contains("沿用本会话最近") && refs.contains("a/x.go"),
+            "path_filter-narrowed find_symbol should be inherited: {refs}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
