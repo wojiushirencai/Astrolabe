@@ -53,19 +53,31 @@ message GetUserRequest {
             names.iter().any(|n| *n == "demo.v1" || n.contains("demo")),
             "package symbol missing: {names:?}"
         );
-        assert!(names.iter().any(|n| *n == "User"), "message User: {names:?}");
-        assert!(names.iter().any(|n| *n == "Status"), "enum Status: {names:?}");
+        assert!(
+            names.iter().any(|n| *n == "User"),
+            "message User: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| *n == "Status"),
+            "enum Status: {names:?}"
+        );
         assert!(
             names.iter().any(|n| *n == "UserService"),
             "service: {names:?}"
         );
-        assert!(names.iter().any(|n| *n == "GetUser"), "rpc GetUser: {names:?}");
+        assert!(
+            names.iter().any(|n| *n == "GetUser"),
+            "rpc GetUser: {names:?}"
+        );
         assert!(
             names.iter().any(|n| *n == "ListUsers"),
             "rpc ListUsers: {names:?}"
         );
         // Nested enum Role should appear
-        assert!(names.iter().any(|n| *n == "Role"), "nested enum Role: {names:?}");
+        assert!(
+            names.iter().any(|n| *n == "Role"),
+            "nested enum Role: {names:?}"
+        );
 
         let kinds: Vec<SymbolKind> = file.symbols.iter().map(|s| s.kind).collect();
         assert!(
@@ -90,12 +102,16 @@ message GetUserRequest {
         );
 
         assert!(
-            file.imports.iter().any(|t| t.contains("timestamp.proto") || t.contains("google/protobuf")),
+            file.imports
+                .iter()
+                .any(|t| t.contains("timestamp.proto") || t.contains("google/protobuf")),
             "imports: {:?}",
             file.imports
         );
         assert!(
-            file.imports.iter().any(|t| t.contains("common/types.proto") || t.contains("types.proto")),
+            file.imports
+                .iter()
+                .any(|t| t.contains("common/types.proto") || t.contains("types.proto")),
             "imports: {:?}",
             file.imports
         );

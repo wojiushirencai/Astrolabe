@@ -103,7 +103,11 @@ mod tests {
 
     #[test]
     fn relative_and_repo_root_imports() {
-        let files = index(&["api/v1/user.proto", "api/v1/common.proto", "api/common.proto"]);
+        let files = index(&[
+            "api/v1/user.proto",
+            "api/v1/common.proto",
+            "api/common.proto",
+        ]);
         assert_eq!(
             resolve(&files, "api/v1/user.proto", "common.proto").as_deref(),
             Some("api/v1/common.proto")
@@ -127,6 +131,9 @@ mod tests {
     fn missing_and_self_are_none() {
         let files = index(&["a.proto"]);
         assert_eq!(resolve(&files, "a.proto", "a.proto"), None);
-        assert_eq!(resolve(&files, "a.proto", "google/protobuf/timestamp.proto"), None);
+        assert_eq!(
+            resolve(&files, "a.proto", "google/protobuf/timestamp.proto"),
+            None
+        );
     }
 }
