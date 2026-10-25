@@ -74,7 +74,7 @@ const MAX_MATCH_SPAN_CHARS: usize = 40;
 const SEARCH_HEADER_TOKENS: usize = 35;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-fn default_budget() -> usize {
+pub(crate) fn default_budget() -> usize {
     DEFAULT_BUDGET
 }
 
@@ -4638,13 +4638,20 @@ impl ServerHandler for AstrolabeServer {
         let server = self.clone();
         let tool_name = request.name.to_string();
         let runtime = tokio::runtime::Handle::current();
-        let work = tokio::task::spawn_blocking(move || {
-            cancel::scope(worker_flag, || {
-                runtime.block_on(async {
-                    let tcc = ToolCallContext::new(&server, request, context);
-                    server.tool_router.call(tcc).await
+        let work = tokio::task::spawn_blocking({
+            let tool_name = tool_name.clone();
+            move || {
+                cancel::scope(worker_flag, || {
+                    // Stale clients still call explain_symbol; alias without listing it.
+                    if tool_name == crate::compat::EXPLAIN_SYMBOL {
+                        return Ok(server.explain_symbol_compat(request.arguments).into());
+                    }
+                    runtime.block_on(async {
+                        let tcc = ToolCallContext::new(&server, request, context);
+                        server.tool_router.call(tcc).await
+                    })
                 })
-            })
+            }
         });
         let timeout = tool_timeout_from_env();
         let deadline = async {
@@ -5219,7 +5226,7 @@ fn mark_blocked(mut result: CallToolResult, note: &str) -> CallToolResult {
     result
 }
 
-fn text_error(message: impl Into<String>) -> CallToolResult {
+pub(crate) fn text_error(message: impl Into<String>) -> CallToolResult {
     let message = message.into();
     CallToolResult::error(vec![ContentBlock::text(if message.trim().is_empty() {
         "未知错误".to_string()
@@ -6117,6 +6124,72 @@ mod tests {
     }
 
     const CALC_PY: &str = "def compute(a, b):\n    total = a + b\n    total *= 2\n    marker_x = total - 1\n    return marker_x\n\n\ndef caller():\n    return compute(1, 2)\n";
+
+    #[test]
+    fn explain_symbol_compat_aliases_to_find_symbol() {
+        let (server, dir) = smart_server(&[(
+            "calc.py",
+            "def compute(a, b):\n    return a + b\n\ndef caller():\n    return compute(1, 2)\n"
+                .into(),
+        )]);
+        let args = json!({"name": "compute"})
+            .as_object()
+            .cloned()
+            .expect("object");
+        let via_dispatch = server
+            .dispatch_tool(crate::compat::EXPLAIN_SYMBOL, Some(args.clone()))
+            .expect("dispatch");
+        assert_ne!(
+            via_dispatch.is_error,
+            Some(true),
+            "{}",
+            text_of(&via_dispatch)
+        );
+        let out = text_of(&via_dispatch);
+        assert!(out.starts_with("index_root:"), "{out}");
+        assert!(out.contains("[compat] explain_symbol"), "{out}");
+        assert!(out.contains("find_symbol"), "{out}");
+        assert!(out.contains("compute"), "{out}");
+        assert!(
+            out.contains("def compute") || out.contains("function compute"),
+            "expected body via include_body: {out}"
+        );
+        let sc = via_dispatch.structured_content.expect("structured");
+        assert_eq!(sc["compat_alias"], "find_symbol");
+        assert_eq!(sc["compat_from"], "explain_symbol");
+
+        // Catalog stays at 7 — alias is call-time only.
+        let listed: Vec<_> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(listed.len(), crate::TOOL_COUNT);
+        assert!(!listed.iter().any(|n| n == "explain_symbol"), "{listed:?}");
+
+        let missing = server
+            .dispatch_tool(crate::compat::EXPLAIN_SYMBOL, Some(Default::default()))
+            .expect("dispatch empty");
+        assert_eq!(missing.is_error, Some(true));
+        let err = text_of(&missing);
+        assert!(err.contains("find_symbol"), "{err}");
+        assert!(err.contains("find_references"), "{err}");
+
+        let via_query = server
+            .dispatch_tool(
+                crate::compat::EXPLAIN_SYMBOL,
+                Some(json!({"query": "compute"}).as_object().cloned().unwrap()),
+            )
+            .expect("dispatch query");
+        assert!(
+            text_of(&via_query).contains("compute"),
+            "{}",
+            text_of(&via_query)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn search_code_few_hits_expand_to_enclosing_symbol_once() {
