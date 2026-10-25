@@ -680,7 +680,11 @@ impl PreciseCapability for LiveBackend {
             query_server(server, &rel, FetchOptions::default())
         }) {
             Ok(result) => result,
-            Err(error) => Precise::unknown(Vec::new(), error.to_string()),
+            // Distinguish missing LSP vs timeout the same way as query_server.
+            Err(error) => Precise::unknown(
+                Vec::new(),
+                astrolabe_core::lsp::diagnostics::error_note(&error, &rel),
+            ),
         }
     }
 }
