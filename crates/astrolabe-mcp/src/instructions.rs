@@ -225,7 +225,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
     → issue them as parallel Astrolabe calls in ONE turn, not one per turn. All
       Astrolabe tools are read-only, so the client runs them concurrently.
 - The definition / body of a function, method, class or type you can name
-    → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
+    → find_symbol query=<name> (include_body defaults true). It returns the whole body; no Read.
 - Who calls / uses X (callers, implementations, every reference)
     → find_references (precise). Not search_code.
 - Where X is defined from a use site → goto_definition.
@@ -345,7 +345,7 @@ Most wasted turns are search_code → Read on the same file. Pick by what you ne
     → issue them as parallel Astrolabe calls in ONE turn, not one per turn. All
       Astrolabe tools are read-only, so the client runs them concurrently.
 - The definition / body of a function, method, class or type you can name
-    → find_symbol query=<name> include_body=true. It returns the whole body; no Read.
+    → find_symbol query=<name> (include_body defaults true). It returns the whole body; no Read.
 - Who calls / uses X (callers, implementations, every reference)
     → find_references (precise). Not search_code.
 - Where X is defined from a use site → goto_definition.
@@ -446,7 +446,7 @@ Task                                    Tool to use
 First context for a coding task         resolve_context
 Repo structure / language coverage      resolve_context / get_languages
 Locate a symbol by name                 find_symbol
-Read a symbol's body (no whole file)    find_symbol include_body=true (not search_code + Read)
+Read a symbol's body (no whole file)    find_symbol (include_body defaults true; not search_code + Read)
 Find references / callers (precise)     find_references
 Jump to a definition                    goto_definition
 Literal substring / explicit regex      search_code + path_filter (matches come with context; no follow-up Read)
