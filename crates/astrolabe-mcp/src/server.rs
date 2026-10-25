@@ -4641,17 +4641,18 @@ impl ServerHandler for AstrolabeServer {
         let work = tokio::task::spawn_blocking({
             let tool_name = tool_name.clone();
             move || {
-            cancel::scope(worker_flag, || {
-                // Stale clients still call explain_symbol; alias without listing it.
-                if tool_name == crate::compat::EXPLAIN_SYMBOL {
-                    return Ok(server.explain_symbol_compat(request.arguments).into());
-                }
-                runtime.block_on(async {
-                    let tcc = ToolCallContext::new(&server, request, context);
-                    server.tool_router.call(tcc).await
+                cancel::scope(worker_flag, || {
+                    // Stale clients still call explain_symbol; alias without listing it.
+                    if tool_name == crate::compat::EXPLAIN_SYMBOL {
+                        return Ok(server.explain_symbol_compat(request.arguments).into());
+                    }
+                    runtime.block_on(async {
+                        let tcc = ToolCallContext::new(&server, request, context);
+                        server.tool_router.call(tcc).await
+                    })
                 })
-            })
-        }});
+            }
+        });
         let timeout = tool_timeout_from_env();
         let deadline = async {
             match timeout {
@@ -6132,7 +6133,12 @@ mod tests {
         let via_dispatch = server
             .dispatch_tool(crate::compat::EXPLAIN_SYMBOL, Some(args.clone()))
             .expect("dispatch");
-        assert_ne!(via_dispatch.is_error, Some(true), "{}", text_of(&via_dispatch));
+        assert_ne!(
+            via_dispatch.is_error,
+            Some(true),
+            "{}",
+            text_of(&via_dispatch)
+        );
         let out = text_of(&via_dispatch);
         assert!(out.starts_with("index_root:"), "{out}");
         assert!(out.contains("[compat] explain_symbol"), "{out}");
@@ -10200,5 +10206,4 @@ mod mcp_routing_tests {
         });
         assert!(!cancel::is_cancelled());
     }
-
 }

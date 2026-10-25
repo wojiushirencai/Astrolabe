@@ -40,10 +40,7 @@ struct ExplainCompatParams {
 
 impl AstrolabeServer {
     /// Map a stale `explain_symbol` call onto `find_symbol`.
-    pub(crate) fn explain_symbol_compat(
-        &self,
-        args: Option<Map<String, Value>>,
-    ) -> CallToolResult {
+    pub(crate) fn explain_symbol_compat(&self, args: Option<Map<String, Value>>) -> CallToolResult {
         let value = Value::Object(args.unwrap_or_default());
         let params: ExplainCompatParams = match serde_json::from_value(value) {
             Ok(p) => p,
