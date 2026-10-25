@@ -6,6 +6,10 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-10-25
+
+自 v0.17.0 以来的 PR：#97–#108（proto 索引、MCP/hook UX、tokio 安全补丁等）。完整说明见 GitHub Release。
+
 ### 新增
 
 - **Protobuf（`.proto`）图索引**：tree-sitter-proto 提取 `package` / `message` / `enum` / `service` / `rpc`；`import` 按仓库相对路径解析。无专用 LSP（`get_diagnostics` 等精确工具为图/语法路径）。缓解会话里反复撞「未索引 .proto」的问题。
@@ -13,10 +17,19 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 ### Fixed
 
 - **MCP tool descriptions and return text are English-only**: `#[tool]` / schema descriptions, result bodies (headers, empty results, pagination, rename preview, diagnostics, install hints, section labels), hook deny/reminder copy, and server instructions — avoids bilingual ambiguity for agents. `scripts/recall-gate/recall_gate.py` now waits on the English index-building status string.
+- **`find_symbol` UX**：拒绝文件系统形态的 query（引导 `path_filter` / `query="*"`+`path_filter`）；拒绝未知 QueryParams（如 `name`）；默认 `include_body=true`，减少整文件 Read。
+- **`search_code` 代码片段式 regex**：模型常把函数签名/`()` 当「精确」并设 `regex=true`；检测到该形态后改字面搜索并注明；真正的非法 regex 错误提示改用 `regex=false`。
+- **`find_references` 继承会话符号 path**：`find_symbol` / `goto_definition` 后省略 `path` 时复用进程内最近唯一精确命中；多定义时返回排序候选（导出 / 非测试优先）而不盲目猜。
+- **`path_filter` 零命中提示可执行**：有过滤范围外命中时给出下一步（放宽/建议 path_filter）；全仓无命中时提示勿再收窄。
+- **hooks deny 文案与 Bash rg**：优先指向 `find_symbol` / `resolve_context`（全量计数清零），并说明 `search_code` 只清 `n_slice`；soft 模式将非管道的 shell 文本搜索（`rg`/`grep -rn`/`git grep`）计为 Grep，管道过滤（如 `go test | grep FAIL`）仍 Neutral。
 - **`explain_symbol` 调用期兼容别名**：目录仍固定 7 个工具、`tools/list` 不暴露该名；旧客户端（如 Cursor 残留提示）调用时转发到 `find_symbol(include_body=true, substring=false)`，并在结果中注明改用 `find_symbol` / `find_references`。Hook 将 `mcp__astrolabe__explain_symbol` 视为符号工具以清零计数。
 - **`get_diagnostics` 区分「未安装 LSP」与「超时」**：缺服务器时明确写 not installed/not configured + 安装提示，并提醒默认不主动起 LSP；`publishDiagnostics` / 请求超时写 timed out after Xs，标明服务器在但未应答，不附安装提示。`server_missing` 对含 `timed out` 的 note 不再推安装。
 - **hooks**：任意 Astrolabe MCP 工具（含 `search_code` 等非符号）在 PreToolUse 时全量清零 `n_grep` / `n_read` / `n_non_symbolic` / `n_slice`，并清除 `last_deny_ts` 结束静默窗；重置排在静默窗判定之前，避免 deny 后跟文案调用仍 sticky deny。
 - **`astrolabe setup --with-hooks` / Cursor & ZCode**：Cursor 现在会写入 `~/.cursor/hooks.json`（`preToolUse` → `astrolabe hooks remind --client=cursor`，matcher 含 `mcp__astrolabe__.*`；`sessionEnd` cleanup），并强制 MCP `--context=cursor`（修正错配 `claude-code`）。ZCode 会把错误的 `--client=claude-code` remind 替换为 `--client=zcode`，删除 `SessionEnd`，并 scrub 掉挂在 `Stop` 上的 cleanup（避免每轮清零计数）。
+
+### 依赖
+
+- **tokio** 1.53.3（RUSTSEC-2026-0386），解除 cargo-deny 阻断。
 
 ## [0.17.0] - 2026-10-23
 
