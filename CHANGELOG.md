@@ -6,6 +6,10 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+### Fixed
+
+- **`astrolabe setup --with-hooks` / Cursor & ZCode**：Cursor 现在会写入 `~/.cursor/hooks.json`（`preToolUse` → `astrolabe hooks remind --client=cursor`，matcher 含 `mcp__astrolabe__.*`；`sessionEnd` cleanup），并强制 MCP `--context=cursor`（修正错配 `claude-code`）。ZCode 会把错误的 `--client=claude-code` remind 替换为 `--client=zcode`，删除 `SessionEnd`，并 scrub 掉挂在 `Stop` 上的 cleanup（避免每轮清零计数）。
+
 ## [0.17.0] - 2026-10-23
 
 自 v0.16.0 以来的 PR：#90（npm 改发个人 scope `@zlnap`）、#91（DeepSeek Harness 原生 hook 插件）、#92（`astrolabe setup` 一键探测并合并 MCP）、#93（setup 支持 OpenCode / DSH）、#94（setup 支持 Codebuddy / Grok Build / Kimi Code / ZCode）。本版以 **npm/CLI 安装体验** 为主；Rust 索引与工具行为相对 0.16.0 无功能变更。完整说明见 GitHub Release。
