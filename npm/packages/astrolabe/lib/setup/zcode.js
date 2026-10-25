@@ -59,10 +59,6 @@ function entryHasAstrolabeRemind(entry) {
   return hookCommands(entry).some((cmd) => cmd.includes('astrolabe hooks remind'));
 }
 
-function entryHasCleanup(entry) {
-  return hookCommands(entry).some((cmd) => cmd.includes('astrolabe hooks cleanup'));
-}
-
 /**
  * Strip cleanup hooks from a Stop entry; drop the entry if nothing remains.
  * Returns { entry | null, stripped }.
@@ -79,9 +75,26 @@ function scrubStopEntry(entry) {
 }
 
 /**
+ * True when a Stop (or similar) event entry hangs `astrolabe hooks cleanup`.
+ * ZCode fires Stop at every turn end — cleanup there would wipe counters each turn.
+ */
+function entryHasCleanup(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
+  return hooks.some(
+    (h) =>
+      h &&
+      typeof h.command === 'string' &&
+      h.command.includes('astrolabe hooks cleanup'),
+  );
+}
+
+
+/**
  * Merge mcp.servers.astrolabe and (optional) hooks.events.PreToolUse into
- * ~/.zcode/cli/config.json. Never writes SessionEnd; never hangs cleanup on Stop.
- * Replaces any prior Astrolabe remind (including wrong --client=claude-code).
+ * ~/.zcode/cli/config.json. Never writes SessionEnd; never hangs cleanup on Stop
+ * (Stop is turn-end — use `astrolabe hooks gc`). Replaces any prior Astrolabe
+ * remind (including wrong --client=claude-code).
  */
 function mergeZcodeConfigFile(
   filePath,

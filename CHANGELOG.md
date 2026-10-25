@@ -8,6 +8,7 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ### Fixed
 
+- **hooks**：任意 Astrolabe MCP 工具（含 `search_code` 等非符号）在 PreToolUse 时全量清零 `n_grep` / `n_read` / `n_non_symbolic` / `n_slice`，并清除 `last_deny_ts` 结束静默窗；重置排在静默窗判定之前，避免 deny 后跟文案调用仍 sticky deny。
 - **`astrolabe setup --with-hooks` / Cursor & ZCode**：Cursor 现在会写入 `~/.cursor/hooks.json`（`preToolUse` → `astrolabe hooks remind --client=cursor`，matcher 含 `mcp__astrolabe__.*`；`sessionEnd` cleanup），并强制 MCP `--context=cursor`（修正错配 `claude-code`）。ZCode 会把错误的 `--client=claude-code` remind 替换为 `--client=zcode`，删除 `SessionEnd`，并 scrub 掉挂在 `Stop` 上的 cleanup（避免每轮清零计数）。
 
 ## [0.17.0] - 2026-10-23
