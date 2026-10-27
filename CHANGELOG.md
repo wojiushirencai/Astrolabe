@@ -6,6 +6,8 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-10-27
+
 ### Added
 
 - **Per-call `index_root` on every MCP tool**: optional absolute or cwd-relative directory overrides the startup index root for that call; omitted calls keep the process default. Arbitrary directories are allowed (no TooLarge / MultiProject refuse on the override). Sessions for override roots reuse the multi-project residency / idle-eviction map (`ASTROLABE_RESIDENT_ROOTS`, `ASTROLABE_IDLE_EVICT_SECS`), including roots outside the startup child set. Shared-index leadership stays per-root.
