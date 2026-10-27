@@ -42,9 +42,10 @@ use crate::{
     index::RepoIndex,
     knobs::McpKnobs,
     openai_schema::sanitize_for_openai_tools,
+    root::resolve_call_index_root,
     session::{
-        self, append_stale_note, run_barrier, start_idle_ticker, start_root_indexing, teardown_all,
-        BarrierEffect, DispatchState, RootSession,
+        self, activate_absolute_root, append_stale_note, run_barrier, start_idle_ticker,
+        start_root_indexing, teardown_all, BarrierEffect, DispatchState, RootSession,
     },
     TOOL_CATALOG_TTL_MS,
 };
@@ -1740,6 +1741,11 @@ pub(crate) struct BudgetOnly {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
+    )]
+    pub index_root: Option<String>,
     #[serde(default = "default_budget")]
     #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
@@ -1750,6 +1756,11 @@ pub(crate) struct ResolveContextParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
+    )]
+    pub index_root: Option<String>,
     #[schemars(description = "Task.")]
     pub task_description: String,
     #[serde(default = "default_budget")]
@@ -1772,6 +1783,11 @@ pub(crate) struct QueryParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
+    )]
+    pub index_root: Option<String>,
     #[schemars(
         description = "Symbol name, substring, or 'Class/method' / Type.method. Not a file path — use path_filter (outline: query='*' + path_filter)."
     )]
@@ -1846,6 +1862,11 @@ pub(crate) struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
+    )]
+    pub index_root: Option<String>,
     #[schemars(description = "Search string (literal; regex when regex=true).")]
     pub query: String,
     #[serde(default)]
@@ -1978,6 +1999,9 @@ pub struct AstrolabeServer {
     root: PathBuf,
     primary: Arc<RootSession>,
     dispatch: Option<Arc<DispatchState>>,
+    /// Lazily created when a single-repo server first receives `index_root`
+    /// pointing outside the startup root. Multi-project reuses `dispatch`.
+    dynamic_roots: Arc<Mutex<Option<Arc<DispatchState>>>>,
     ticker_stop: Arc<AtomicBool>,
     resources: Arc<Mutex<ResourceStore>>,
     next_resource: Arc<AtomicU64>,
@@ -2119,6 +2143,7 @@ impl AstrolabeServer {
             cache_budget_bytes: budget_bytes,
             primary,
             dispatch,
+            dynamic_roots: Arc::new(Mutex::new(None)),
             ticker_stop: Arc::new(AtomicBool::new(false)),
             resources: Arc::new(Mutex::new(ResourceStore::new())),
             next_resource: Arc::new(AtomicU64::new(1)),
@@ -2172,6 +2197,14 @@ impl AstrolabeServer {
         if let Some(dispatch) = &self.dispatch {
             teardown_all(dispatch);
         }
+        if let Some(dispatch) = self
+            .dynamic_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            teardown_all(dispatch);
+        }
     }
 
     /// Server shutdown: close every session — which cancels in-flight cold
@@ -2191,6 +2224,21 @@ impl AstrolabeServer {
                     .cloned(),
             );
         }
+        if let Some(dispatch) = self
+            .dynamic_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            sessions.extend(
+                dispatch
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .cloned(),
+            );
+        }
         self.stop_watching();
         let deadline = std::time::Instant::now() + timeout;
         sessions.iter().all(|session| {
@@ -2199,13 +2247,86 @@ impl AstrolabeServer {
     }
 
     fn session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
-        match &self.dispatch {
-            None => Ok(Arc::clone(&self.primary)),
-            Some(dispatch) => match session::route_session(dispatch, hint) {
+        if hint.is_empty() {
+            return Ok(Arc::clone(&self.primary));
+        }
+        let hint_path = Path::new(hint);
+        if hint_path == self.primary.root.as_path() || self.primary.root.to_string_lossy() == hint {
+            return Ok(Arc::clone(&self.primary));
+        }
+        if let Some(dispatch) = &self.dispatch {
+            return match session::route_session(dispatch, hint) {
                 Ok(s) => Ok(s),
                 Err(msg) => Err(self.finish(text_error(msg))),
-            },
+            };
         }
+        if let Some(dispatch) = self
+            .dynamic_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return match session::route_session(dispatch, hint) {
+                Ok(s) => Ok(s),
+                Err(msg) => Err(self.finish(text_error(msg))),
+            };
+        }
+        Ok(Arc::clone(&self.primary))
+    }
+
+    /// Resolve optional per-call `index_root`, then fall back to multi-project
+    /// `root` / path / task routing. `index_root` wins and keeps `path` /
+    /// `path_filter` relative to that directory.
+    fn resolve_call_root(
+        &self,
+        index_root: Option<&str>,
+        root: Option<&str>,
+        path: Option<&str>,
+        text: Option<&str>,
+    ) -> Result<RouteOutcome, CallToolResult> {
+        let override_raw = index_root.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(raw) = override_raw {
+            let resolved = match resolve_call_index_root(raw) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return Err(self.finish(text_error(format!("{msg}\nconfidence: unknown"))))
+                }
+            };
+            let session = self.ensure_index_root_session(&resolved)?;
+            let keep_path = path.map(str::to_string).filter(|p| !p.is_empty());
+            return Ok(RouteOutcome {
+                hint: session.root.to_string_lossy().into_owned(),
+                path: keep_path,
+                note: None,
+            });
+        }
+        self.resolve_route(root, path, text)
+    }
+
+    /// Open or reuse a [`RootSession`] for an absolute index root.
+    fn ensure_index_root_session(
+        &self,
+        resolved: &Path,
+    ) -> Result<Arc<RootSession>, CallToolResult> {
+        if resolved == self.primary.root.as_path() {
+            return Ok(Arc::clone(&self.primary));
+        }
+        if let Some(dispatch) = &self.dispatch {
+            return Ok(activate_absolute_root(dispatch, resolved));
+        }
+        let mut slot = self.dynamic_roots.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let dispatch = DispatchState::new(
+                Vec::new(),
+                self.primary.knobs.clone(),
+                self.cache_budget_bytes,
+            );
+            start_idle_ticker(Arc::clone(&dispatch), Arc::clone(&self.ticker_stop));
+            *slot = Some(dispatch);
+        }
+        let dispatch = Arc::clone(slot.as_ref().expect("just inserted"));
+        drop(slot);
+        Ok(activate_absolute_root(&dispatch, resolved))
     }
 
     /// Remember a single unambiguous symbol hit for later find_references.
@@ -3111,7 +3232,8 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
     ) -> CallToolResult {
-        let route = match self.resolve_route(
+        let route = match self.resolve_call_root(
+            params.index_root.as_deref(),
             params.root.as_deref(),
             params.path_filter.as_deref(),
             Some(&params.task_description),
@@ -3258,7 +3380,12 @@ impl AstrolabeServer {
         &self,
         Parameters(mut params): Parameters<crate::precise_tools::FindReferencesParams>,
     ) -> CallToolResult {
-        let route = match self.resolve_route(params.root.as_deref(), params.path.as_deref(), None) {
+        let route = match self.resolve_call_root(
+            params.index_root.as_deref(),
+            params.root.as_deref(),
+            params.path.as_deref(),
+            None,
+        ) {
             Ok(route) => route,
             Err(err) => return err,
         };
@@ -3306,7 +3433,12 @@ impl AstrolabeServer {
         &self,
         Parameters(mut params): Parameters<crate::precise_tools::GotoDefinitionParams>,
     ) -> CallToolResult {
-        let route = match self.resolve_route(params.root.as_deref(), Some(&params.path), None) {
+        let route = match self.resolve_call_root(
+            params.index_root.as_deref(),
+            params.root.as_deref(),
+            Some(&params.path),
+            None,
+        ) {
             Ok(route) => route,
             Err(err) => return err,
         };
@@ -3334,7 +3466,12 @@ impl AstrolabeServer {
         &self,
         Parameters(mut params): Parameters<crate::precise_tools::GetDiagnosticsParams>,
     ) -> CallToolResult {
-        let route = match self.resolve_route(params.root.as_deref(), Some(&params.path), None) {
+        let route = match self.resolve_call_root(
+            params.index_root.as_deref(),
+            params.root.as_deref(),
+            Some(&params.path),
+            None,
+        ) {
             Ok(route) => route,
             Err(err) => return err,
         };
@@ -3353,11 +3490,15 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         let signature = format!("{params:?}");
         // The query is a symbol name, never a routing hint.
-        let route =
-            match self.resolve_route(params.root.as_deref(), params.path_filter.as_deref(), None) {
-                Ok(route) => route,
-                Err(err) => return err,
-            };
+        let route = match self.resolve_call_root(
+            params.index_root.as_deref(),
+            params.root.as_deref(),
+            params.path_filter.as_deref(),
+            None,
+        ) {
+            Ok(route) => route,
+            Err(err) => return err,
+        };
         params.path_filter = route.path.clone();
         params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
         let result = self.guarded("find_symbol", &route.hint, &signature, || {
@@ -3680,11 +3821,15 @@ impl AstrolabeServer {
     ) -> CallToolResult {
         let signature = format!("{params:?}");
         // The query is a search string, never a routing hint.
-        let route =
-            match self.resolve_route(params.root.as_deref(), params.path_filter.as_deref(), None) {
-                Ok(route) => route,
-                Err(err) => return err,
-            };
+        let route = match self.resolve_call_root(
+            params.index_root.as_deref(),
+            params.root.as_deref(),
+            params.path_filter.as_deref(),
+            None,
+        ) {
+            Ok(route) => route,
+            Err(err) => return err,
+        };
         params.path_filter = route.path.clone();
         params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
         if let Some(building) = self.building_session(&route.hint) {
@@ -4732,7 +4877,12 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<BudgetOnly>,
     ) -> CallToolResult {
-        let route = match self.resolve_route(params.root.as_deref(), None, None) {
+        let route = match self.resolve_call_root(
+            params.index_root.as_deref(),
+            params.root.as_deref(),
+            None,
+            None,
+        ) {
             Ok(route) => route,
             Err(err) => return err,
         };
@@ -5937,6 +6087,7 @@ mod tests {
         let server = ready_server();
         assert_first_text(server.resolve_context(Parameters(ResolveContextParams {
             root: None,
+            index_root: None,
             task_description: "alpha".into(),
             budget_tokens: 100,
             dedup: None,
@@ -5945,6 +6096,7 @@ mod tests {
         })));
         assert_first_text(server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -5956,6 +6108,7 @@ mod tests {
         })));
         assert_first_text(server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "definitely absent".into(),
             regex: false,
             path_filter: None,
@@ -5973,6 +6126,7 @@ mod tests {
         })));
         assert_first_text(server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 100,
         })));
     }
@@ -5982,6 +6136,7 @@ mod tests {
         let server = ready_server();
         let result = server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -6010,6 +6165,7 @@ mod tests {
         server.structured_output = true;
         let result = server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 100,
         }));
         let text = result.content[0].as_text().unwrap().text.clone();
@@ -6222,6 +6378,7 @@ mod tests {
 
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "marker".into(),
             regex: false,
             path_filter: None,
@@ -6268,6 +6425,7 @@ mod tests {
         // budget=1：扣掉头部 35 tokens 后剩余 0，首条匹配单项就超预算。
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "needle".into(),
             regex: false,
             path_filter: None,
@@ -6351,6 +6509,7 @@ mod tests {
     fn search(query: &str) -> SearchParams {
         SearchParams {
             root: None,
+            index_root: None,
             query: query.into(),
             regex: false,
             path_filter: None,
@@ -6716,6 +6875,7 @@ mod tests {
     fn find(query: &str) -> QueryParams {
         QueryParams {
             root: None,
+            index_root: None,
             query: query.into(),
             include_body: true,
             substring: Some(false),
@@ -6742,6 +6902,7 @@ mod tests {
         let refs = text_of(&server.find_references(Parameters(
             crate::precise_tools::FindReferencesParams {
                 root: None,
+                index_root: None,
                 symbol: "ShouldDisableChannel".into(),
                 path: None,
                 line: None,
@@ -6770,6 +6931,7 @@ mod tests {
         let refs = text_of(&server.find_references(Parameters(
             crate::precise_tools::FindReferencesParams {
                 root: None,
+                index_root: None,
                 symbol: "Dup".into(),
                 path: None,
                 line: None,
@@ -6804,6 +6966,7 @@ mod tests {
         let refs = text_of(&server.find_references(Parameters(
             crate::precise_tools::FindReferencesParams {
                 root: None,
+                index_root: None,
                 symbol: "Init".into(),
                 path: None,
                 line: None,
@@ -7515,6 +7678,7 @@ mod tests {
         let server = ready_server();
         let result = server.resolve_context(Parameters(ResolveContextParams {
             root: None,
+            index_root: None,
             task_description: "rename alpha".into(),
             budget_tokens: 2000,
             dedup: None,
@@ -7529,6 +7693,7 @@ mod tests {
     fn rc(task: &str, budget: usize, dedup: Option<bool>) -> ResolveContextParams {
         ResolveContextParams {
             root: None,
+            index_root: None,
             task_description: task.into(),
             budget_tokens: budget,
             dedup,
@@ -7906,6 +8071,7 @@ mod tests {
         };
         let languages = server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 1000,
         }));
         let text = languages.content[0].as_text().unwrap().text.as_str();
@@ -7928,6 +8094,7 @@ mod tests {
         let server = ready_server();
         let result = server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 100,
         }));
         let text = result.content[0].as_text().unwrap().text.as_str();
@@ -7984,6 +8151,7 @@ mod tests {
         let (server, dir) = ready_server_with_disk();
         let params = SearchParams {
             root: None,
+            index_root: None,
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
@@ -8016,6 +8184,7 @@ mod tests {
 
         let languages = server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 200,
         }));
         let languages_text = languages.content[0].as_text().unwrap().text.as_str();
@@ -8043,6 +8212,7 @@ mod tests {
 
         let _ = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "payload".into(),
             regex: false,
             path_filter: None,
@@ -8077,6 +8247,7 @@ mod tests {
         let (server, dir) = ready_server_with_disk();
         let _ = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
@@ -8102,6 +8273,7 @@ mod tests {
 
         let after = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "fresh-content".into(),
             regex: false,
             path_filter: None,
@@ -8136,6 +8308,7 @@ mod tests {
     fn guarded_search(server: &AstrolabeServer, q: &str, budget: usize) -> String {
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: q.into(),
             regex: false,
             path_filter: None,
@@ -8213,6 +8386,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             let _ = server.find_symbol(Parameters(QueryParams {
                 root: None,
+                index_root: None,
                 query: q.into(),
                 include_body: false,
                 substring,
@@ -8228,6 +8402,7 @@ mod tests {
             for _ in 0..5 {
                 let r = server.find_symbol(Parameters(QueryParams {
                     root: None,
+                    index_root: None,
                     query: q.into(),
                     include_body: false,
                     substring,
@@ -8270,6 +8445,7 @@ mod tests {
         let page = |offset: usize, path: bool| {
             let r = server.find_symbol(Parameters(QueryParams {
                 root: None,
+                index_root: None,
                 query: if path {
                     "/pager".into()
                 } else {
@@ -8349,6 +8525,7 @@ mod tests {
         let page = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
                 root: None,
+                index_root: None,
                 context_lines: Some(0),
                 page: false,
                 group: None,
@@ -8411,6 +8588,7 @@ mod tests {
         let at = |offset: usize| {
             let r = server.search_code(Parameters(SearchParams {
                 root: None,
+                index_root: None,
                 context_lines: Some(0),
                 page: false,
                 group: None,
@@ -8487,6 +8665,7 @@ mod tests {
         let bad = |s: &AstrolabeServer| {
             s.search_code(Parameters(SearchParams {
                 root: None,
+                index_root: None,
                 query: "(".into(),
                 regex: true,
                 path_filter: None,
@@ -8616,6 +8795,7 @@ mod tests {
         let (server, dir) = ready_server_with_disk();
         let params = |context_lines| SearchParams {
             root: None,
+            index_root: None,
             query: "cache-me".into(),
             regex: false,
             path_filter: None,
@@ -8650,6 +8830,7 @@ mod tests {
         let (server, dir) = ready_server_with_disk();
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "totally-absent-needle".into(),
             regex: false,
             path_filter: None,
@@ -8684,6 +8865,7 @@ mod tests {
         let (server, dir) = ready_server_with_disk();
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "scanForBrandHint|RewriteStreamingBody".into(),
             regex: false,
             path_filter: None,
@@ -8727,6 +8909,7 @@ mod tests {
 
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "needle".into(),
             regex: false,
             path_filter: None,
@@ -8805,6 +8988,7 @@ mod tests {
     fn fs_query(query: &str) -> QueryParams {
         QueryParams {
             root: None,
+            index_root: None,
             query: query.into(),
             include_body: false,
             substring: None,
@@ -9100,6 +9284,7 @@ mod tests {
 
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "send".into(),
             regex: false,
             path_filter: Some("./relay/channel".into()),
@@ -9142,6 +9327,7 @@ mod tests {
         // 误导性的"无可提取的符号体"。
         let named = server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "NoSuchSymbolAnywhere".into(),
             include_body: true,
             substring: None,
@@ -9161,6 +9347,7 @@ mod tests {
         // 层级路径分支（query 含 '/'）同样需要显式零命中声明。
         let by_path = server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "NoSuch/Path".into(),
             include_body: false,
             substring: None,
@@ -9194,6 +9381,7 @@ mod tests {
 
         let result = server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "spacious".into(),
             include_body: true,
             substring: None,
@@ -9342,6 +9530,7 @@ mod tests {
         while std::time::Instant::now() < visible_deadline {
             text = first_text(server.find_symbol(Parameters(QueryParams {
                 root: None,
+                index_root: None,
                 query: "during_build_xyz".into(),
                 include_body: false,
                 substring: None,
@@ -9375,6 +9564,7 @@ mod tests {
         wait_ready(&server, Duration::from_secs(20));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -9411,6 +9601,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "alpha_v2".into(),
             include_body: false,
             substring: None,
@@ -9443,6 +9634,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -9460,6 +9652,7 @@ mod tests {
         loop {
             let probe = first_text(server.find_symbol(Parameters(QueryParams {
                 root: None,
+                index_root: None,
                 query: "alpha_v3".into(),
                 include_body: false,
                 substring: None,
@@ -9516,6 +9709,7 @@ mod tests {
         let before = log.watermark();
         let _ = server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -9567,6 +9761,7 @@ mod tests {
         // the symbol `alpha_unique` without taking the path-query branch.
         let priming = server.find_symbol(Parameters(QueryParams {
             root: Some("alpha".into()),
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -9595,6 +9790,7 @@ mod tests {
         wait_session_ready(&session, Duration::from_secs(20));
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             root: Some("alpha".into()),
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -9650,6 +9846,7 @@ mod tests {
 
         let _ = server.find_symbol(Parameters(QueryParams {
             root: Some("alpha".into()),
+            index_root: None,
             query: "alpha".into(),
             include_body: false,
             substring: None,
@@ -9680,6 +9877,7 @@ mod tests {
 
         let _ = server.find_symbol(Parameters(QueryParams {
             root: Some("beta".into()),
+            index_root: None,
             query: "beta".into(),
             include_body: false,
             substring: None,
@@ -9728,6 +9926,7 @@ mod tests {
         server.structured_output = false;
         let text = first_text(server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "compare alpha and beta".into(),
             include_body: false,
             substring: None,
@@ -9772,6 +9971,7 @@ mod tests {
         // 1. search_code 零命中且无 path_filter，含 .scala×3 (N>=3) 时提示尚未支持语言且带计数
         let search_miss = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "nonexistent_code_pattern".into(),
             regex: false,
             path_filter: None,
@@ -9815,6 +10015,7 @@ mod tests {
         // 1b. 带 path_filter 的 search_code 零命中：filter 范围内 N>=3
         let search_filter_hit_hint = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "nonexistent".into(),
             regex: false,
             path_filter: Some(".scala".into()),
@@ -9849,6 +10050,7 @@ mod tests {
         // 1c. 带 path_filter 的 search_code 零命中：filter 范围内 N<3 (仅 A.scala 匹配，计 1)
         let search_filter_miss = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "nonexistent".into(),
             regex: false,
             path_filter: Some("A.scala".into()),
@@ -9883,6 +10085,7 @@ mod tests {
         // 2. find_symbol 零命中提示
         let symbol_miss = server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "NonExistentSymbol".into(),
             budget_tokens: 2500,
             offset: 0,
@@ -9905,6 +10108,7 @@ mod tests {
         // 4. get_languages 首行 supported、末尾 unindexed 行
         let langs_res = server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 2500,
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
@@ -9932,6 +10136,7 @@ mod tests {
         // 5b. .dart 源码能被 search_code 命中
         let search_dart = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "dart service running".into(),
             regex: false,
             path_filter: None,
@@ -9967,6 +10172,7 @@ mod tests {
     ) -> (String, Value) {
         let result = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: query.into(),
             regex,
             path_filter: None,
@@ -10151,6 +10357,7 @@ mod tests {
         // search_code 零命中：N<3 不应触发提示
         let search_miss = server.search_code(Parameters(SearchParams {
             root: None,
+            index_root: None,
             query: "nonexistent".into(),
             regex: false,
             path_filter: None,
@@ -10179,6 +10386,7 @@ mod tests {
         // find_symbol 零命中：N<3 不应触发提示
         let symbol_miss = server.find_symbol(Parameters(QueryParams {
             root: None,
+            index_root: None,
             query: "NonExistent".into(),
             budget_tokens: 2500,
             offset: 0,
@@ -10201,6 +10409,7 @@ mod tests {
         // get_languages: >=1 就显示统计，这里有 2 个 .scala 仍会显示
         let langs_res = server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 2500,
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
@@ -10224,6 +10433,7 @@ mod tests {
 
         let langs_res = server.get_languages(Parameters(BudgetOnly {
             root: None,
+            index_root: None,
             budget_tokens: 2500,
         }));
         let langs_text = langs_res.content[0].as_text().unwrap().text.as_str();
@@ -10320,6 +10530,7 @@ mod mcp_routing_tests {
     fn sym(query: &str, root: Option<&str>, path_filter: Option<&str>) -> QueryParams {
         QueryParams {
             root: root.map(str::to_string),
+            index_root: None,
             query: query.into(),
             include_body: false,
             substring: None,
@@ -10377,6 +10588,7 @@ mod mcp_routing_tests {
         let langs = until_ready(|| {
             server.get_languages(Parameters(BudgetOnly {
                 root: Some("DOCS".into()),
+                index_root: None,
                 budget_tokens: 200,
             }))
         });
@@ -10394,6 +10606,7 @@ mod mcp_routing_tests {
         let out = until_ready(|| {
             server.search_code(Parameters(SearchParams {
                 root: None,
+                index_root: None,
                 path_filter: Some("api/src".into()),
                 ..search_params("shared")
             }))
@@ -10408,6 +10621,7 @@ mod mcp_routing_tests {
         let bare = until_ready(|| {
             server.search_code(Parameters(SearchParams {
                 root: None,
+                index_root: None,
                 path_filter: Some("web/".into()),
                 ..search_params("shared")
             }))
@@ -10421,6 +10635,7 @@ mod mcp_routing_tests {
     fn search_params(query: &str) -> SearchParams {
         SearchParams {
             root: None,
+            index_root: None,
             query: query.into(),
             regex: false,
             path_filter: None,
@@ -10473,6 +10688,7 @@ mod mcp_routing_tests {
         // "web" is an everyday word: prose alone must not pick a repo.
         let prose = text(&server.resolve_context(Parameters(ResolveContextParams {
             root: None,
+            index_root: None,
             task_description: "set up a web server".into(),
             budget_tokens: 400,
             dedup: None,
@@ -10484,6 +10700,7 @@ mod mcp_routing_tests {
         let guessed = until_ready(|| {
             server.resolve_context(Parameters(ResolveContextParams {
                 root: None,
+                index_root: None,
                 task_description: "fix the invoice rounding in billing".into(),
                 budget_tokens: 400,
                 dedup: None,
@@ -10507,6 +10724,7 @@ mod mcp_routing_tests {
         let out = text(&server.get_diagnostics(Parameters(
             crate::precise_tools::GetDiagnosticsParams {
                 root: None,
+                index_root: None,
                 path: file.to_string_lossy().into_owned(),
                 severity: None,
                 budget_tokens: 300,
@@ -10517,6 +10735,149 @@ mod mcp_routing_tests {
             out.starts_with(&format!("index_root: {}", parent.join("web").display())),
             "{out}"
         );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn per_call_index_root_overrides_startup_root() {
+        // Startup indexes repo A; calls with index_root=B must hit B only.
+        let parent = tmp("idxroot");
+        let a = parent.join("repo_a");
+        let b = parent.join("repo_b");
+        for (dir, name) in [(&a, "alpha_only"), (&b, "beta_only")] {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(
+                dir.join("src").join("lib.rs"),
+                format!("pub fn {name}() -> u8 {{ 1 }}\n"),
+            )
+            .unwrap();
+        }
+        let knobs = crate::knobs::McpKnobs {
+            watch_mode: None,
+            loop_guard: crate::loop_guard::LoopGuardConfig {
+                repeat_max: 0,
+                rate_max: 0,
+                ..Default::default()
+            },
+            ..crate::knobs::McpKnobs::default()
+        };
+        let mut server = AstrolabeServer::new_with_knobs(a.clone(), knobs, 8 << 20);
+        server.structured_output = false;
+        server.start_indexing();
+
+        let on_a = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                root: None,
+                index_root: None,
+                query: "alpha_only".into(),
+                include_body: false,
+                substring: None,
+                kind: None,
+                path_filter: None,
+                depth: 0,
+                budget_tokens: 800,
+                offset: 0,
+            }))
+        });
+        assert!(on_a.contains("alpha_only"), "{on_a}");
+        assert!(
+            on_a.starts_with(&format!(
+                "index_root: {}",
+                a.canonicalize().unwrap().display()
+            )),
+            "{on_a}"
+        );
+
+        let on_b = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                root: None,
+                index_root: Some(b.to_string_lossy().into_owned()),
+                query: "beta_only".into(),
+                include_body: false,
+                substring: None,
+                kind: None,
+                path_filter: None,
+                depth: 0,
+                budget_tokens: 800,
+                offset: 0,
+            }))
+        });
+        assert!(on_b.contains("beta_only"), "{on_b}");
+        assert!(
+            on_b.starts_with(&format!(
+                "index_root: {}",
+                b.canonicalize().unwrap().display()
+            )),
+            "{on_b}"
+        );
+        assert!(!on_b.contains("alpha_only"), "{on_b}");
+
+        // Relative index_root resolves against process cwd.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&parent).unwrap();
+        let rel = until_ready(|| {
+            server.search_code(Parameters(SearchParams {
+                root: None,
+                index_root: Some("repo_b".into()),
+                query: "beta_only".into(),
+                ..search_params("beta_only")
+            }))
+        });
+        std::env::set_current_dir(&prev).unwrap();
+        assert!(
+            rel.starts_with(&format!(
+                "index_root: {}",
+                b.canonicalize().unwrap().display()
+            )),
+            "{rel}"
+        );
+        assert!(rel.contains("beta_only"), "{rel}");
+
+        // Nonexistent path errors in English without indexing.
+        let bad = text(&server.find_symbol(Parameters(QueryParams {
+            root: None,
+            index_root: Some("/no/such/astrolabe/index_root_xyz".into()),
+            query: "x".into(),
+            include_body: false,
+            substring: None,
+            kind: None,
+            path_filter: None,
+            depth: 0,
+            budget_tokens: 200,
+            offset: 0,
+        })));
+        assert!(bad.contains("not an existing path"), "{bad}");
+        assert!(bad.contains("confidence: unknown"), "{bad}");
+
+        // Two roots do not mix: A-only symbol under index_root=B has no hit.
+        let miss = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                root: None,
+                index_root: Some(b.to_string_lossy().into_owned()),
+                query: "alpha_only".into(),
+                include_body: false,
+                substring: None,
+                kind: None,
+                path_filter: None,
+                depth: 0,
+                budget_tokens: 800,
+                offset: 0,
+            }))
+        });
+        assert!(
+            miss.starts_with(&format!(
+                "index_root: {}",
+                b.canonicalize().unwrap().display()
+            )),
+            "{miss}"
+        );
+        assert!(
+            !miss.lines().any(|l| l.contains("alpha_only") && (l.contains(".rs:") || l.contains("function"))),
+            "mixed hit from repo A under index_root=B: {miss}"
+        );
+
         server.stop_watching();
         let _ = std::fs::remove_dir_all(&parent);
     }
@@ -10541,6 +10902,15 @@ mod mcp_routing_tests {
                 "{} advertises `root` in a single-repo session",
                 tool.name
             );
+            // Per-call override must always be advertised (single- and multi-repo).
+            assert!(
+                tool.input_schema
+                    .get("properties")
+                    .and_then(|p| p.get("index_root"))
+                    .is_some(),
+                "{} must advertise optional index_root",
+                tool.name
+            );
             let required = tool
                 .input_schema
                 .get("required")
@@ -10559,7 +10929,7 @@ mod mcp_routing_tests {
     }
 
     /// Upper bound for the compact `tools` array. Raise only with a reason.
-    const TOOLS_LIST_MAX_BYTES: usize = 4_500;
+    const TOOLS_LIST_MAX_BYTES: usize = 5_200;
 
     /// Snapshot of the advertised parameters. Everything else is still
     /// accepted (see `unadvertised_params_are_still_accepted`); add a name
@@ -10597,24 +10967,28 @@ mod mcp_routing_tests {
         let want = vec![
             (
                 "find_references".to_string(),
-                s(&["line", "path", "symbol"]),
+                s(&["index_root", "line", "path", "symbol"]),
                 s(&["symbol"]),
             ),
             (
                 "find_symbol".to_string(),
-                s(&["include_body", "path_filter", "query"]),
+                s(&["include_body", "index_root", "path_filter", "query"]),
                 s(&["query"]),
             ),
-            ("get_diagnostics".to_string(), s(&["path"]), s(&["path"])),
-            ("get_languages".to_string(), s(&[]), s(&[])),
+            (
+                "get_diagnostics".to_string(),
+                s(&["index_root", "path"]),
+                s(&["path"]),
+            ),
+            ("get_languages".to_string(), s(&["index_root"]), s(&[])),
             (
                 "goto_definition".to_string(),
-                s(&["line", "path", "symbol"]),
+                s(&["index_root", "line", "path", "symbol"]),
                 s(&["path"]),
             ),
             (
                 "resolve_context".to_string(),
-                s(&["path_filter", "task_description"]),
+                s(&["index_root", "path_filter", "task_description"]),
                 s(&["task_description"]),
             ),
             (
@@ -10622,6 +10996,7 @@ mod mcp_routing_tests {
                 s(&[
                     "aggregate",
                     "case_sensitive",
+                    "index_root",
                     "path_filter",
                     "query",
                     "skip_comments",
@@ -10635,7 +11010,17 @@ mod mcp_routing_tests {
         for tool in multi.listed_tools() {
             assert!(props(&tool).iter().any(|p| p == "root"), "{}", tool.name);
             assert!(
+                props(&tool).iter().any(|p| p == "index_root"),
+                "{}",
+                tool.name
+            );
+            assert!(
                 !required(&tool).iter().any(|p| p == "root"),
+                "{}",
+                tool.name
+            );
+            assert!(
+                !required(&tool).iter().any(|p| p == "index_root"),
                 "{}",
                 tool.name
             );
@@ -10797,6 +11182,7 @@ mod mcp_routing_tests {
         assert!(out.contains("2 hits / 2 files"), "{out}");
         // path_filter and count_only apply.
         let counted = text(&server.search_code(Parameters(SearchParams {
+            index_root: None,
             path_filter: Some("a.py".into()),
             count_only: true,
             ..search_params("needle_text")

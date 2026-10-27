@@ -26,6 +26,8 @@ Use find_references for call sites; switch to these two tools and stop calling e
 struct ExplainCompatParams {
     #[serde(default)]
     root: Option<String>,
+    #[serde(default)]
+    index_root: Option<String>,
     /// Historical `explain_symbol` parameter.
     #[serde(default)]
     name: Option<String>,
@@ -60,6 +62,7 @@ impl AstrolabeServer {
         }
         let result = self.find_symbol(Parameters(QueryParams {
             root: params.root,
+            index_root: params.index_root,
             query,
             include_body: true,
             substring: Some(false),

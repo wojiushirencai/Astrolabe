@@ -924,6 +924,24 @@ pub(crate) fn route_session(
     Ok(ensure_session(dispatch, &path))
 }
 
+/// Activate (or register) an absolute index root and return its session.
+///
+/// Used by per-call `index_root`: the path may be outside the startup child
+/// set; [`RootDispatcher::activate`] registers it, residency / idle eviction
+/// apply, and a cold build starts on first use.
+pub(crate) fn activate_absolute_root(dispatch: &DispatchState, root: &Path) -> Arc<RootSession> {
+    let (path, evicted) = {
+        let mut disp = dispatch.dispatcher.lock_or_recover();
+        let path = root.to_path_buf();
+        let evicted = disp.activate(&path, Instant::now());
+        (path, evicted)
+    };
+    for evicted in evicted {
+        teardown_child(dispatch, &evicted);
+    }
+    ensure_session(dispatch, &path)
+}
+
 fn ensure_session(dispatch: &DispatchState, root: &Path) -> Arc<RootSession> {
     let mut map = dispatch.sessions.lock_or_recover();
     if let Some(existing) = map.get(root) {
