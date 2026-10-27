@@ -7,11 +7,11 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 
 > **Not to be confused with** the npm packages `astrolabe` (a 2014 Protractor page-object library) and `astrolabe-ai` (an unrelated resume tool), or other MCP servers named "astrolabe". This project lives at `github.com/wojiushirencai/Astrolabe`; the binary is `astrolabe`.
 
-## Fact card (as of 2026-10-23)
+## Fact card (as of 2026-10-27)
 
 | | |
 |---|---|
-| Latest release | [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0), published 2026-10-23 |
+| Latest release | [v0.17.2](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.2), published 2026-10-27 |
 | What it exposes | 7 MCP tools: `resolve_context`, `search_code`, `find_symbol`, `find_references`, `goto_definition`, `get_diagnostics`, `get_languages` |
 | `tools/list` size | about 3.6 KB compact JSON (3,607 B measured on Linux for v0.16.0; not re-measured on macOS) |
 | Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |
@@ -57,7 +57,9 @@ Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/I
 | `get_diagnostics` | Syntax and type errors for a file. |
 | `get_languages` | Languages, file counts, lines of code, language-server status, and index coverage (see below). |
 
-`tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn). The others — `regex`, `exclude`, `count_only`, `context_lines`, `group`, `dedup`, `kind`, `depth`, `substring`, `dry_run_rename`, `character`, `severity`, `offset`, `page`, `budget_tokens`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
+`tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn), including optional per-call `index_root` on every tool (absolute or cwd-relative directory; omit to keep the process startup root). The others — `regex`, `exclude`, `count_only`, `context_lines`, `group`, `dedup`, `kind`, `depth`, `substring`, `dry_run_rename`, `character`, `severity`, `offset`, `page`, `budget_tokens`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
+
+Tool descriptions and return text are **English-only** (schema copy, result bodies, hook reminders), so agents are not split across bilingual phrasing.
 
 **Index coverage.** Every file of a supported language is indexed, including files with syntax or compile errors: the symbols that parse are kept, but symbols inside the broken region may be missing. `get_languages` reports:
 - files *not* in the index, as counts by reason (over the size cap, read failure, parser timeout);
@@ -68,7 +70,7 @@ Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/I
   Listed inline (path, kind label, first error line with a snippet of that line) when there are 10 or fewer; otherwise only the counts plus the absolute path of a Markdown report (`<repo>/.astrolabe/coverage-report.md`, self-gitignored; temp dir if that is not writable) with path, language, kind and first error for each file (other syntax errors first), capped at 1,000 entries per section;
 - unsupported-language files, summarised by extension (top 8, the rest folded into one count), never per file.
 
-Other tools append one short line (`注意：N 个文件…；详见 get_languages。`) only when such gaps exist.
+Other tools append one short English line pointing at `get_languages` only when such gaps exist.
 
 ## Evidence: what we measured, and what we did not
 

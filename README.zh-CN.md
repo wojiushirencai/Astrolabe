@@ -7,11 +7,11 @@
 
 > **同名消歧**：不是 npm 上的 `astrolabe`（2014 年的 Protractor 页面对象库）或 `astrolabe-ai`（无关的简历工具），也不是其它叫 “astrolabe” 的 MCP 服务。本项目在 `github.com/wojiushirencai/Astrolabe`，二进制名是 `astrolabe`。
 
-## 事实卡（截至 2026-10-23）
+## 事实卡（截至 2026-10-27）
 
 | | |
 |---|---|
-| 最新版本 | [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0)，2026-10-23 发布 |
+| 最新版本 | [v0.17.2](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.2)，2026-10-27 发布 |
 | 暴露的工具 | 7 个 MCP 工具：`resolve_context`、`search_code`、`find_symbol`、`find_references`、`goto_definition`、`get_diagnostics`、`get_languages` |
 | `tools/list` 体积 | 紧凑 JSON 约 3.6 KB（v0.16.0 Linux 实测 3,607 B；macOS 未重测） |
 | 二进制 | 单文件、无运行时；Release 压缩包 7.4–9.1 MB，Linux x64 解压后约 50 MB |
@@ -56,7 +56,9 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 | `get_diagnostics` | 文件的语法与类型错误。 |
 | `get_languages` | 语言、文件数、代码行数、语言服务器状态，以及索引覆盖情况（见下）。 |
 
-`tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发）。其余参数——`regex`、`exclude`、`count_only`、`context_lines`、`group`、`dedup`、`kind`、`depth`、`substring`、`dry_run_rename`、`character`、`severity`、`offset`、`page`、`budget_tokens`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
+`tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发），其中包含每个工具上可选的按次 `index_root`（绝对路径或相对 cwd 的目录；省略则沿用进程启动时的索引根）。其余参数——`regex`、`exclude`、`count_only`、`context_lines`、`group`、`dedup`、`kind`、`depth`、`substring`、`dry_run_rename`、`character`、`severity`、`offset`、`page`、`budget_tokens`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
+
+工具描述与返回文本为**纯英文**（schema 文案、结果正文、hook 提醒），避免中英双语让模型歧义。
 
 **索引覆盖。** 支持语言的文件全部进入索引，包括有语法或编译错误的文件：能解析的符号会保留，出错区域里的符号可能缺失。`get_languages` 报告：
 - 未进入索引的文件：按原因计数（超过大小上限、读取失败、解析超时）；
@@ -67,7 +69,7 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
   不超过 10 个时逐个列出（路径、类别标注、首个错误的行号和该行片段）；超过 10 个时只给各类数量和一份 Markdown 报告的绝对路径（`<仓库>/.astrolabe/coverage-report.md`，该目录自带 `.gitignore`，不可写时退到系统临时目录），报告里每个文件有路径、语言、类别和首个错误，其他语法错误排在前面，每节最多 1000 条；
 - 不支持语言的文件：只按扩展名汇总（前 8 种，其余合并为一项），不列具体文件。
 
-其它工具只在存在这些缺口时，在结果末尾附一行简短提示，指向 `get_languages`。
+其它工具只在存在这些缺口时，在结果末尾附一行简短**英文**提示，指向 `get_languages`。
 
 ## 证据：测了什么，没测什么
 
