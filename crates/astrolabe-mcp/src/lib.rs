@@ -45,8 +45,8 @@ mod word_index;
 pub use cli::{parse_launch, Launch, USAGE};
 pub use context::{resolve_context_name, ClientContext};
 pub use root::{
-    child_git_repos, count_root_files, find_project_root, is_cwd_sentinel, resolve_index_root,
-    resolve_root, ResolvedRoot, DEFAULT_MAX_ROOT_FILES,
+    child_git_repos, count_root_files, find_project_root, is_cwd_sentinel, resolve_call_index_root,
+    resolve_index_root, resolve_root, ResolvedRoot, DEFAULT_MAX_ROOT_FILES,
 };
 pub use server::{AstrolabeServer, StartupFailedServer};
 

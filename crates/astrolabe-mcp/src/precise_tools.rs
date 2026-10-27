@@ -80,6 +80,11 @@ pub(crate) struct FindReferencesParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
+    )]
+    pub index_root: Option<String>,
     #[schemars(description = "Symbol name.")]
     pub symbol: String,
     // Optional on purpose: models often omit it. Prefer an explicit path for
@@ -114,6 +119,11 @@ pub(crate) struct GotoDefinitionParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
+    )]
+    pub index_root: Option<String>,
     #[schemars(description = "File containing the use site.")]
     pub path: String,
     #[serde(default)]
@@ -138,6 +148,11 @@ pub(crate) struct GetDiagnosticsParams {
     #[serde(default)]
     #[schemars(description = "Sub-repo name or abs path.")]
     pub root: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
+    )]
+    pub index_root: Option<String>,
     #[schemars(description = "Repo-relative file.")]
     pub path: String,
     #[serde(default)]
@@ -1561,6 +1576,7 @@ mod tests {
         let tools = PreciseTools::new();
         assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "Handler".into(),
             path: None,
             line: None,
@@ -1571,6 +1587,7 @@ mod tests {
         })));
         assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
             root: None,
+            index_root: None,
             path: "src/main.go".into(),
             symbol: Some("Handler".into()),
             line: None,
@@ -1580,6 +1597,7 @@ mod tests {
         })));
         assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
             root: None,
+            index_root: None,
             path: "src/main.go".into(),
             severity: None,
             budget_tokens: 800,
@@ -1597,6 +1615,7 @@ mod tests {
 
         let refs = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "Handler".into(),
             path: Some("pkg/server.go".into()),
             line: None,
@@ -1623,6 +1642,7 @@ mod tests {
 
         let diags = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
             root: None,
+            index_root: None,
             path: "pkg/server.go".into(),
             severity: None,
             budget_tokens: 800,
@@ -1636,6 +1656,7 @@ mod tests {
 
         let defs = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
             root: None,
+            index_root: None,
             path: "pkg/server.go".into(),
             symbol: Some("Handler".into()),
             line: None,
@@ -1667,6 +1688,7 @@ mod tests {
 
         let refs = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "x".into(),
             path: None,
             line: None,
@@ -1688,6 +1710,7 @@ mod tests {
 
         let diags = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
             root: None,
+            index_root: None,
             path: "src/lib.rs".into(),
             severity: None,
             budget_tokens: 0,
@@ -1706,6 +1729,7 @@ mod tests {
         });
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "x".into(),
             path: None,
             line: None,
@@ -1736,6 +1760,7 @@ mod tests {
         });
         let filtered = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
             root: None,
+            index_root: None,
             path: "src/a.rs".into(),
             severity: Some("error".into()),
             budget_tokens: 800,
@@ -1748,6 +1773,7 @@ mod tests {
 
         let invalid = assert_first_text(tools.get_diagnostics(Parameters(GetDiagnosticsParams {
             root: None,
+            index_root: None,
             path: "src/a.rs".into(),
             severity: Some("fatal".into()),
             budget_tokens: 800,
@@ -1771,6 +1797,7 @@ mod tests {
         });
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "old_name".into(),
             path: None,
             line: None,
@@ -1794,6 +1821,7 @@ mod tests {
         // No preview without the parameter.
         let plain = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "old_name".into(),
             path: None,
             line: None,
@@ -1847,6 +1875,7 @@ mod tests {
         });
         let result = assert_first_text(tools.find_references(Parameters(FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "neverDefined".into(),
             path: None,
             line: None,
@@ -1871,6 +1900,7 @@ mod tests {
         });
         let result = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
             root: None,
+            index_root: None,
             path: "src/main.rs".into(),
             symbol: Some("Widget".into()),
             line: None,
@@ -1897,6 +1927,7 @@ mod tests {
         });
         let result = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
             root: None,
+            index_root: None,
             path: "src/main.rs".into(),
             symbol: Some("neverDefined".into()),
             line: None,
@@ -1917,6 +1948,7 @@ mod tests {
         let missing_path =
             assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
                 root: None,
+                index_root: None,
                 path: "".into(),
                 symbol: Some("x".into()),
                 line: None,
@@ -1931,6 +1963,7 @@ mod tests {
         let missing_locator =
             assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
                 root: None,
+                index_root: None,
                 path: "src/main.rs".into(),
                 symbol: None,
                 line: None,
@@ -1957,6 +1990,7 @@ mod tests {
         });
         let result = assert_first_text(tools.goto_definition(Parameters(GotoDefinitionParams {
             root: None,
+            index_root: None,
             path: "src/lib.rs".into(),
             symbol: Some("x".into()),
             line: None,
@@ -1985,6 +2019,7 @@ mod tests {
     ) -> FindReferencesParams {
         FindReferencesParams {
             root: None,
+            index_root: None,
             symbol: "Run".into(),
             path: Some("a.go".into()),
             line: None,
@@ -2119,6 +2154,7 @@ mod tests {
         });
         let r = tools.goto_definition(Parameters(GotoDefinitionParams {
             root: None,
+            index_root: None,
             path: "a.go".into(),
             symbol: Some("Run".into()),
             line: None,

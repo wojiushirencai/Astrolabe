@@ -677,6 +677,7 @@ def make_client():
     fn query(q: &str) -> QueryParams {
         QueryParams {
             root: None,
+            index_root: None,
             query: q.into(),
             include_body: false,
             substring: None,

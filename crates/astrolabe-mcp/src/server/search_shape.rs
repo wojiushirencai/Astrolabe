@@ -361,6 +361,7 @@ mod behaviour {
     fn search(query: &str) -> SearchParams {
         SearchParams {
             root: None,
+            index_root: None,
             query: query.into(),
             regex: false,
             path_filter: None,
@@ -381,6 +382,7 @@ mod behaviour {
     fn find(query: &str) -> QueryParams {
         QueryParams {
             root: None,
+            index_root: None,
             query: query.into(),
             include_body: false,
             substring: None,
@@ -521,6 +523,7 @@ mod behaviour {
         );
         let rc = ResolveContextParams {
             root: None,
+            index_root: None,
             task_description: "which types implement the Provider interface?".into(),
             budget_tokens: 2500,
             dedup: Some(false),

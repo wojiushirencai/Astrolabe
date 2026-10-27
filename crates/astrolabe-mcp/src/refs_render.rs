@@ -364,6 +364,7 @@ mod tests {
         let r = run_find_references(
             FindReferencesParams {
                 root: None,
+                index_root: None,
                 symbol: "callee".into(),
                 path: Some("a.go".into()),
                 line: None,
