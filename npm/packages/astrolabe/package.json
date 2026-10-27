@@ -1,6 +1,6 @@
 {
   "name": "@zlnap/astrolabe",
-  "version": "0.17.1",
+  "version": "0.17.2",
   "mcpName": "io.github.wojiushirencai/astrolabe",
   "description": "Local MCP server for code search and navigation (search_code, find_symbol, find_references, goto_definition) for AI coding agents. Node shim for the native Astrolabe AI binary.",
   "keywords": [
@@ -40,12 +40,12 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@zlnap/darwin-arm64": "0.17.1",
-    "@zlnap/darwin-x64": "0.17.1",
-    "@zlnap/linux-x64-gnu": "0.17.1",
-    "@zlnap/linux-x64-musl": "0.17.1",
-    "@zlnap/linux-arm64-gnu": "0.17.1",
-    "@zlnap/win32-x64-msvc": "0.17.1"
+    "@zlnap/darwin-arm64": "0.17.2",
+    "@zlnap/darwin-x64": "0.17.2",
+    "@zlnap/linux-x64-gnu": "0.17.2",
+    "@zlnap/linux-x64-musl": "0.17.2",
+    "@zlnap/linux-arm64-gnu": "0.17.2",
+    "@zlnap/win32-x64-msvc": "0.17.2"
   },
   "publishConfig": {
     "access": "public"

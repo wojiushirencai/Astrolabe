@@ -1,6 +1,6 @@
 {
   "name": "@zlnap/linux-arm64-gnu",
-  "version": "0.17.1",
+  "version": "0.17.2",
   "description": "The Linux ARM 64-bit glibc binary for Astrolabe AI (aarch64-unknown-linux-gnu)",
   "license": "MIT OR Apache-2.0",
   "repository": {
