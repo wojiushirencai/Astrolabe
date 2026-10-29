@@ -3123,8 +3123,6 @@ mod dedup_agent {
     }
 }
 
-
-
 /// Per-call wall-clock cap. `ASTROLABE_TOOL_TIMEOUT_SECS=0` disables it.
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
 
@@ -8611,9 +8609,9 @@ mod tests {
                 depth: 0,
                 budget_tokens: 2000,
                 offset: 0,
-            dedup: None,
-            agent_id: None,
-        }));
+                dedup: None,
+                agent_id: None,
+            }));
             eprintln!("BENCH first call {q:?}: {:?}", t0.elapsed());
             let t = std::time::Instant::now();
             let mut last = 0;
@@ -8629,9 +8627,9 @@ mod tests {
                     depth: 0,
                     budget_tokens: 2000,
                     offset: 0,
-            dedup: None,
-            agent_id: None,
-        }));
+                    dedup: None,
+                    agent_id: None,
+                }));
                 last = r.content[0].as_text().unwrap().text.len();
             }
             eprintln!(
@@ -8678,9 +8676,9 @@ mod tests {
                 depth: 0,
                 budget_tokens: 300,
                 offset,
-            dedup: None,
-            agent_id: None,
-        }));
+                dedup: None,
+                agent_id: None,
+            }));
             r.content[0].as_text().unwrap().text.clone()
         };
         for path in [false, true] {
@@ -9769,9 +9767,9 @@ mod tests {
                 depth: 0,
                 budget_tokens: 500,
                 offset: 0,
-            dedup: None,
-            agent_id: None,
-        })));
+                dedup: None,
+                agent_id: None,
+            })));
             if text.contains("during_build_xyz") {
                 break;
             }
@@ -9899,9 +9897,9 @@ mod tests {
                 depth: 0,
                 budget_tokens: 500,
                 offset: 0,
-            dedup: None,
-            agent_id: None,
-        })));
+                dedup: None,
+                agent_id: None,
+            })));
             if probe.contains("alpha_v3") {
                 break;
             }
@@ -11037,9 +11035,9 @@ mod mcp_routing_tests {
                 depth: 0,
                 budget_tokens: 800,
                 offset: 0,
-            dedup: None,
-            agent_id: None,
-        }))
+                dedup: None,
+                agent_id: None,
+            }))
         });
         assert!(on_a.contains("alpha_only"), "{on_a}");
         assert!(
@@ -11062,9 +11060,9 @@ mod mcp_routing_tests {
                 depth: 0,
                 budget_tokens: 800,
                 offset: 0,
-            dedup: None,
-            agent_id: None,
-        }))
+                dedup: None,
+                agent_id: None,
+            }))
         });
         assert!(on_b.contains("beta_only"), "{on_b}");
         assert!(
@@ -11128,9 +11126,9 @@ mod mcp_routing_tests {
                 depth: 0,
                 budget_tokens: 800,
                 offset: 0,
-            dedup: None,
-            agent_id: None,
-        }))
+                dedup: None,
+                agent_id: None,
+            }))
         });
         assert!(
             miss.starts_with(&format!(
