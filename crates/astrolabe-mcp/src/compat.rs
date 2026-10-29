@@ -73,6 +73,8 @@ impl AstrolabeServer {
                 .budget_tokens
                 .unwrap_or_else(crate::server::default_budget),
             offset: 0,
+            dedup: None,
+            agent_id: None,
         }));
         annotate_compat(result)
     }

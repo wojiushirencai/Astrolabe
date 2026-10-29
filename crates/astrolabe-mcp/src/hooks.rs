@@ -505,7 +505,7 @@ fn hashed_session_id(raw: &str) -> String {
 ///
 /// trim 后非空、长度 ≤ 128、且能通过 [`sanitize_session_id`] 校验（`[A-Za-z0-9_-]`）
 /// 时原样返回；否则返回 `ag-<fnv1a64 十六进制>`（防路径穿越，兼容带冒号/点/斜杠的 agent 名）。
-fn sanitize_agent_component(raw: &str) -> String {
+pub(crate) fn sanitize_agent_component(raw: &str) -> String {
     let trimmed = raw.trim();
     if !trimmed.is_empty() && trimmed.len() <= 128 && sanitize_session_id(trimmed).is_ok() {
         trimmed.to_string()
