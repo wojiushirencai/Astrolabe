@@ -47,7 +47,7 @@ impl AstrolabeServer {
         view.search_digests = Arc::new(Mutex::new(Default::default()));
         view.symbol_page_generations = Arc::new(Mutex::new(Default::default()));
         view.context_page_generations = Arc::new(Mutex::new(Default::default()));
-        view.call_seq = Arc::new(AtomicU64::new(0));
+        view.call_seq = Arc::new(Mutex::new(Default::default()));
         view.shown_once = Arc::new(Mutex::new(Default::default()));
         view.coverage_note_override = Some(Arc::new(Mutex::new(None)));
         view.recent_symbols = Arc::new(crate::recent_symbol::RecentSymbols::new());
@@ -310,7 +310,10 @@ impl SessionView for View {
             .name("astrolabe-shared-tool".into())
             .spawn(move || {
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cancel::scope(worker_flag, || server.dispatch_tool(&tool, args))
+                    cancel::scope(worker_flag, || {
+                        let agent = super::dedup_agent::extract(None, args.as_ref());
+                        super::dedup_agent::scope(agent, || server.dispatch_tool(&tool, args))
+                    })
                 }));
                 let _ = tx.send(out);
             });

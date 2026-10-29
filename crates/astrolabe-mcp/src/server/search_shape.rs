@@ -391,6 +391,8 @@ mod behaviour {
             depth: 0,
             budget_tokens: 2500,
             offset: 0,
+            dedup: None,
+            agent_id: None,
         }
     }
 
