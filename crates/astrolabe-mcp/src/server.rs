@@ -2003,6 +2003,10 @@ impl ResourceStore {
         self.map.len()
     }
 }
+/// Per-agent map of already-returned definition ranges (agent → range key → (generation, call #)).
+type AgentSentRanges = HashMap<String, HashMap<String, (u64, u64)>>;
+/// Per-agent map of already-returned search/resolve digests (agent → result key → digest).
+type AgentSearchDigests = HashMap<String, HashMap<String, String>>;
 
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
@@ -2026,10 +2030,10 @@ pub struct AstrolabeServer {
     /// nested by dedup agent id → root+path+range → (index generation, call #).
     /// Parent/subagent shards stay independent so one agent's FULL body does
     /// not starve another. Cleared when the session view is rebuilt.
-    sent_ranges: Arc<Mutex<HashMap<String, HashMap<String, (u64, u64)>>>>,
+    sent_ranges: Arc<Mutex<AgentSentRanges>>,
     /// One-line digest of each whole `search_code` / resolve result, nested by
     /// dedup agent id then result key.
-    search_digests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    search_digests: Arc<Mutex<AgentSearchDigests>>,
     /// Index generation each `find_symbol` query (offset and budget aside) was
     /// last served at, so a later page can say the index changed in between.
     symbol_page_generations: Arc<Mutex<HashMap<String, u64>>>,
@@ -3048,6 +3052,7 @@ mod cancel {
 /// 1. tool argument `agent_id` / `agentId` (tests + hosts that pass it in args)
 /// 2. request `_meta` keys used by Claude Code / common hosts:
 ///    `claudecode/agentId`, `agent_id`, `agentId`, `agent`
+///
 /// Missing identity falls back to `""` (one shared shard — prior behavior).
 mod dedup_agent {
     use std::cell::RefCell;
@@ -3878,12 +3883,13 @@ impl AstrolabeServer {
                 }
             }
             if params.include_body && !hits.is_empty() {
+                let page = &hits[offset..];
+                let kept = &page[..kept_count.min(page.len())];
                 self.attach_include_bodies(
                     &session.root,
                     index,
                     &mut body,
-                    &hits[offset..],
-                    kept_count,
+                    kept,
                     params.budget_tokens,
                     params.dedup,
                 );
@@ -4690,7 +4696,6 @@ impl AstrolabeServer {
         index: &RepoIndex,
         body: &mut String,
         hits: &[(String, usize)],
-        kept_count: usize,
         budget_tokens: usize,
         dedup: Option<bool>,
     ) {
@@ -4701,7 +4706,7 @@ impl AstrolabeServer {
         let generation = index.generation();
         let call = self.next_call();
         let root_key = root.display().to_string();
-        for (line, idx) in hits.iter().take(kept_count).take(5) {
+        for (line, idx) in hits.iter().take(5) {
             let symbol = &index.graph().symbols[*idx];
             let Some(file) = index.file(symbol.file) else {
                 failed += 1;
@@ -4988,12 +4993,13 @@ impl AstrolabeServer {
             }
         }
         if params.include_body && !hits.is_empty() {
+            let page = &hits[offset..];
+            let kept = &page[..kept_count.min(page.len())];
             self.attach_include_bodies(
                 root,
                 index,
                 &mut body,
-                &hits[offset..],
-                kept_count,
+                kept,
                 params.budget_tokens,
                 params.dedup,
             );
