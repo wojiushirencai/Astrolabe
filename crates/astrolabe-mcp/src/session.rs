@@ -944,7 +944,12 @@ pub(crate) fn activate_absolute_root(dispatch: &DispatchState, root: &Path) -> A
 
 fn ensure_session(dispatch: &DispatchState, root: &Path) -> Arc<RootSession> {
     let mut map = dispatch.sessions.lock_or_recover();
-    if let Some(existing) = map.get(root) {
+    // Match Windows verbatim / plain forms of the same path so one project
+    // does not get two sessions (and two cold builds).
+    if let Some((_, existing)) = map
+        .iter()
+        .find(|(k, _)| astrolabe_core::paths::paths_eq_normalized(k, root))
+    {
         return Arc::clone(existing);
     }
     let session = RootSession::new(
@@ -952,14 +957,21 @@ fn ensure_session(dispatch: &DispatchState, root: &Path) -> Arc<RootSession> {
         dispatch.knobs.clone(),
         dispatch.cache_budget_bytes,
     );
-    map.insert(root.to_path_buf(), Arc::clone(&session));
+    // Key by the session's canonical root (RootSession::new canonicalize's).
+    map.insert(session.root.clone(), Arc::clone(&session));
     drop(map);
     start_root_indexing(Arc::clone(&session));
     session
 }
 
 pub(crate) fn teardown_child(dispatch: &DispatchState, root: &Path) {
-    let session = dispatch.sessions.lock_or_recover().remove(root);
+    let mut map = dispatch.sessions.lock_or_recover();
+    let key = map
+        .keys()
+        .find(|k| astrolabe_core::paths::paths_eq_normalized(k, root))
+        .cloned();
+    let session = key.and_then(|k| map.remove(&k));
+    drop(map);
     if let Some(session) = session {
         session.teardown();
     }
