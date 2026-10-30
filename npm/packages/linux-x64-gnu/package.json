@@ -1,6 +1,6 @@
 {
   "name": "@zlnap/linux-x64-gnu",
-  "version": "0.17.2",
+  "version": "0.17.3",
   "description": "The Linux x86_64 glibc binary for Astrolabe AI (x86_64-unknown-linux-gnu)",
   "license": "MIT OR Apache-2.0",
   "repository": {

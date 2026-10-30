@@ -6,6 +6,62 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-10-30
+
+自 v0.17.2 以来的 PR：#113（按 `agent_id` 分片会话去重）、#114（无身份不做 body 去重 + Hooks 注入）。完整说明见 GitHub Release。
+
+### 中文
+
+#### 问题与修复
+
+1. **同一 MCP stdio 上主会话与子 Agent 共用一份 body / search 去重表**  
+   一方已拿到定义正文后，另一方只看到 SKIP /「已返回」指针，子 Agent 被饿死。  
+   **修复（#113）**：`sent_ranges` / `search_digests` / `call_seq` 按 `agent_id` 分片；`find_symbol` 可传 `dedup=false` 强制全文。
+
+2. **实测 Claude Code 几乎不传 `agent_id` / `_meta`（0/144）**  
+   空身份仍落在共享 `""` 分片，仅靠 #113 不够。  
+   **修复（#114）**：缺失或空身份时**不做** body / search-digest 去重（始终 FULL）；Claude 系 Hooks 在 PreToolUse 已知 `agent_id` 时经 `updatedInput` 注入；有身份的同一 Agent 仍跳过重复；`dedup=false` 仍强制 FULL。
+
+#### 新增支持
+
+- **未广告参数**：`agent_id` / `agentId` / `agent`；`_meta` 键如 `claudecode/agentId`；`find_symbol` 的 `dedup=false`。
+- **Hook**：`ResetSymbolic` / `ResetSlice` PreToolUse 在已知身份时合并注入 `agent_id`。
+
+#### 前后对比
+
+| 场景 | 0.17.2 | 0.17.3 |
+| --- | --- | --- |
+| 共用 MCP 的主会话 + 子 Agent 取同一符号正文 | 后到者常 SKIP / 指针，子 Agent 饿死 | 按 `agent_id` 分片；无身份则双方都 FULL（#113+#114） |
+| 客户端不传 `agent_id` / `_meta` | 落在共享 `""`，跨调用仍去重 | **不做** body/search 去重，始终 FULL |
+| 同一已知 `agent_id` 重复请求同一正文 | 去重（SKIP） | 仍去重（SKIP） |
+| `find_symbol(dedup=false)` | 无此开关（#113 起才有） | 强制全文，忽略去重表 |
+
+### English
+
+#### Problems & fixes
+
+1. **Parent and subagent siblings sharing one MCP stdio shared one body / search dedup table**  
+   After one side received a definition body, the other often saw SKIP / “already returned” pointers — subagents starved.  
+   **Fix (#113)**: nest `sent_ranges` / `search_digests` / `call_seq` by `agent_id`; `find_symbol` accepts `dedup=false` for a forced full body.
+
+2. **Claude Code almost never sends `agent_id` / `_meta` (0/144 in the field)**  
+   Empty identity still landed on the shared `""` shard, so #113 alone was not enough.  
+   **Fix (#114)**: missing/empty identity → **no** body / search-digest dedup (always FULL); Claude-family PreToolUse hooks inject `agent_id` via `updatedInput` when hooks know it; a known agent still skips repeats; `dedup=false` still forces FULL.
+
+#### New support
+
+- **Undocumented params**: `agent_id` / `agentId` / `agent`; `_meta` keys such as `claudecode/agentId`; `find_symbol` `dedup=false`.
+- **Hooks**: `ResetSymbolic` / `ResetSlice` PreToolUse merge-inject `agent_id` when identity is known.
+
+#### Before / after
+
+| Scenario | 0.17.2 | 0.17.3 |
+| --- | --- | --- |
+| Shared-MCP parent + subagent fetching the same symbol body | Later caller often SKIP / pointer; subagent starves | Sharded by `agent_id`; missing identity → both get FULL (#113+#114) |
+| Client omits `agent_id` / `_meta` | Shared `""` shard still dedups across calls | **No** body/search dedup; always FULL |
+| Same known `agent_id` repeats the same body | Dedup (SKIP) | Still dedup (SKIP) |
+| `find_symbol(dedup=false)` | N/A before #113 | Forced full body; ignores dedup tables |
+
 ## [0.17.2] - 2026-10-27
 
 ### Added
