@@ -8887,7 +8887,7 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
-            agent_id: None,
+                agent_id: None,
                 aggregate: None,
                 exclude: None,
                 count_only: false,
@@ -8951,7 +8951,7 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
-            agent_id: None,
+                agent_id: None,
                 aggregate: None,
                 exclude: None,
                 count_only: false,
@@ -9035,7 +9035,7 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
-            agent_id: None,
+                agent_id: None,
                 aggregate: None,
                 exclude: None,
                 count_only: false,
@@ -11012,7 +11012,7 @@ mod mcp_routing_tests {
         let (server, parent) = multi_server(&["api", "web"]);
         let out = until_ready(|| {
             server.search_code(Parameters(SearchParams {
-            agent_id: None,
+                agent_id: None,
                 root: None,
                 index_root: None,
                 path_filter: Some("api/src".into()),
@@ -11028,7 +11028,7 @@ mod mcp_routing_tests {
         // Bare sub-repo name routes and drops the (now empty) filter.
         let bare = until_ready(|| {
             server.search_code(Parameters(SearchParams {
-            agent_id: None,
+                agent_id: None,
                 root: None,
                 index_root: None,
                 path_filter: Some("web/".into()),
@@ -11115,7 +11115,7 @@ mod mcp_routing_tests {
                 task_description: "fix the invoice rounding in billing".into(),
                 budget_tokens: 400,
                 dedup: None,
-            agent_id: None,
+                agent_id: None,
                 offset: 0,
                 path_filter: None,
             }))
@@ -11235,7 +11235,7 @@ mod mcp_routing_tests {
         std::env::set_current_dir(&parent).unwrap();
         let rel = until_ready(|| {
             server.search_code(Parameters(SearchParams {
-            agent_id: None,
+                agent_id: None,
                 root: None,
                 index_root: Some("repo_b".into()),
                 query: "beta_only".into(),

@@ -2398,7 +2398,9 @@ mod tests {
         let out = build_agent_id_inject_output(Client::ClaudeCode, &input, "agent-x").unwrap();
         let val: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(val["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-        assert!(val["hookSpecificOutput"].get("permissionDecision").is_none());
+        assert!(val["hookSpecificOutput"]
+            .get("permissionDecision")
+            .is_none());
         let updated = &val["hookSpecificOutput"]["updatedInput"];
         assert_eq!(updated["query"], "Foo");
         assert_eq!(updated["path_filter"], "src");
@@ -2458,7 +2460,9 @@ mod tests {
             true
         );
         // No permissionDecision — keep host default permission flow
-        assert!(val["hookSpecificOutput"].get("permissionDecision").is_none());
+        assert!(val["hookSpecificOutput"]
+            .get("permissionDecision")
+            .is_none());
 
         // Parent (no agent_id) → silent reset, no inject
         out.clear();
