@@ -372,6 +372,7 @@ mod behaviour {
             page: false,
             group: None,
             dedup: Some(false),
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -529,6 +530,7 @@ mod behaviour {
             task_description: "which types implement the Provider interface?".into(),
             budget_tokens: 2500,
             dedup: Some(false),
+            agent_id: None,
             offset: 0,
             path_filter: None,
         };

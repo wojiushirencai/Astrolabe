@@ -1652,6 +1652,62 @@ pub(crate) fn decide_with(
 /// 就不是禁止探索而是给出更省 token 的探索方式）。
 /// 文案口径：直接给出切换指令（Stop using ... Call ... now），不再出现
 /// "You can continue using ... the counter was reset" 软口径。
+/// When PreToolUse carries a subagent `agent_id` for an Astrolabe MCP tool,
+/// rewrite `tool_input` so the MCP server receives that identity (Claude Code
+/// does not put agent id on MCP `_meta` today). `updatedInput` replaces the
+/// whole input — copy every original field and only add `agent_id`.
+///
+/// Returns `None` when the client is not known to honor `updatedInput`, when
+/// `agent_id` is already present, or when there is nothing to inject.
+fn build_agent_id_inject_output(
+    client: Client,
+    tool_input: &serde_json::Value,
+    agent_id: &str,
+) -> Option<String> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return None;
+    }
+    match client {
+        // Claude Code family documents PreToolUse `updatedInput`.
+        Client::ClaudeCode
+        | Client::Codebuddy
+        | Client::Vscode
+        | Client::KimiCode
+        | Client::ZCode
+        | Client::Other => {}
+        // Cursor / Grok / OpenCode / Codex: do not emit — MCP side treats
+        // missing identity as no-dedup so siblings still get FULL bodies.
+        Client::Cursor | Client::Grok | Client::OpenCode | Client::Codex => return None,
+    }
+    let mut updated = match tool_input {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let already = ["agent_id", "agentId", "agent"].iter().any(|k| {
+        updated
+            .get(*k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    if already {
+        return None;
+    }
+    updated.insert(
+        "agent_id".to_string(),
+        serde_json::Value::String(agent_id.to_string()),
+    );
+    Some(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "updatedInput": updated,
+            }
+        })
+        .to_string(),
+    )
+}
+
 pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let max_limit = config().slice_read_max_limit;
     let slice_threshold = config().slice_read_threshold;
@@ -2139,12 +2195,22 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
             // 静默窗内或中立工具：不写盘，无输出
             0
         }
-        Decision::ResetSymbolic => {
-            // 符号工具：已清零 burst 计数并保存，无输出
-            0
-        }
-        Decision::ResetSlice => {
-            // 非符号 astrolabe 工具：已全量清零 burst（含 grep/read）并结束静默窗
+        Decision::ResetSymbolic | Decision::ResetSlice => {
+            // Astrolabe MCP tool: burst cleared. When the host payload carries
+            // agent_id (subagent), inject it into tool_input so the MCP server
+            // can shard body dedup — Claude Code omits agent id on MCP `_meta`.
+            if let Some(agent) = agent_id.as_deref() {
+                if let Some(ti) = raw_tool_input {
+                    if let Some(out) = build_agent_id_inject_output(client, ti, agent) {
+                        tracing::debug!(
+                            agent_id = %agent,
+                            tool_name = %tool_name,
+                            "injecting agent_id into Astrolabe tool_input via updatedInput"
+                        );
+                        let _ = writeln!(stdout, "{out}");
+                    }
+                }
+            }
             0
         }
         Decision::Allow => {
@@ -2324,6 +2390,100 @@ mod tests {
         assert_eq!(counter.n_non_symbolic, 0);
         assert_eq!(counter.last_grep_ts, None);
         assert_eq!(counter.last_deny_ts, Some(t0 + 2.0));
+    }
+
+    #[test]
+    fn test_build_agent_id_inject_output_merges_and_skips_when_present() {
+        let input = serde_json::json!({"query": "Foo", "path_filter": "src"});
+        let out = build_agent_id_inject_output(Client::ClaudeCode, &input, "agent-x").unwrap();
+        let val: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert!(val["hookSpecificOutput"].get("permissionDecision").is_none());
+        let updated = &val["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["query"], "Foo");
+        assert_eq!(updated["path_filter"], "src");
+        assert_eq!(updated["agent_id"], "agent-x");
+
+        // Already present → None
+        let with_id = serde_json::json!({"query": "Foo", "agent_id": "existing"});
+        assert!(build_agent_id_inject_output(Client::ClaudeCode, &with_id, "agent-x").is_none());
+
+        // Cursor does not get injection
+        assert!(build_agent_id_inject_output(Client::Cursor, &input, "agent-x").is_none());
+    }
+
+    #[test]
+    fn test_astrolabe_pretooluse_injects_agent_id_via_updated_input() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_inject_agent_{rand_id}"));
+        let sess_id = "inject_agent_sess";
+        let payload = serde_json::json!({
+            "session_id": sess_id,
+            "agent_id": "sub-agent-42",
+            "tool_name": "mcp__astrolabe__find_symbol",
+            "tool_input": { "query": "FormatScript", "include_body": true }
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_remind_impl(
+            "claude-code",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0, "stderr={}", String::from_utf8_lossy(&err));
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("updatedInput"),
+            "expected updatedInput inject: {out_str}"
+        );
+        let val: serde_json::Value = serde_json::from_str(&out_str).unwrap();
+        assert_eq!(
+            val["hookSpecificOutput"]["updatedInput"]["agent_id"],
+            "sub-agent-42"
+        );
+        assert_eq!(
+            val["hookSpecificOutput"]["updatedInput"]["query"],
+            "FormatScript"
+        );
+        assert_eq!(
+            val["hookSpecificOutput"]["updatedInput"]["include_body"],
+            true
+        );
+        // No permissionDecision — keep host default permission flow
+        assert!(val["hookSpecificOutput"].get("permissionDecision").is_none());
+
+        // Parent (no agent_id) → silent reset, no inject
+        out.clear();
+        let parent = serde_json::json!({
+            "session_id": sess_id,
+            "tool_name": "mcp__astrolabe__find_symbol",
+            "tool_input": { "query": "FormatScript" }
+        })
+        .to_string();
+        let code = run_remind_impl(
+            "claude-code",
+            parent.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(101.0),
+            Some(&temp_home),
+        );
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "parent Astrolabe call must stay silent: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_home);
     }
 
     #[test]
