@@ -23,7 +23,7 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
          After edits, if build/tests already pass (e.g. go test, cargo test), skip get_diagnostics; use it only when you cannot run build/tests.\
          When a language server is missing, precise tools say so and suggest alternatives — do not install one yourself (see get_languages).\
          Source files in other languages are not indexed: empty search_code/find_symbol does not cover them — use Grep/Read.{}",
-        root.display(),
+        astrolabe_core::paths::display_path(root),
         go_layout_hint(root).map(|h| format!("\n{h}")).unwrap_or_default()
     )
 }

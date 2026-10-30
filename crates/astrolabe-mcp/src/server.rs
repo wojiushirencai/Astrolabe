@@ -2278,7 +2278,10 @@ impl AstrolabeServer {
             return Ok(Arc::clone(&self.primary));
         }
         let hint_path = Path::new(hint);
-        if hint_path == self.primary.root.as_path() || self.primary.root.to_string_lossy() == hint {
+        if astrolabe_core::paths::paths_eq_normalized(hint_path, self.primary.root.as_path())
+            || self.primary.root.to_string_lossy() == hint
+            || astrolabe_core::paths::display_path(&self.primary.root) == hint
+        {
             return Ok(Arc::clone(&self.primary));
         }
         if let Some(dispatch) = &self.dispatch {
@@ -2304,6 +2307,11 @@ impl AstrolabeServer {
     /// Resolve optional per-call `index_root`, then fall back to multi-project
     /// `root` / path / task routing. `index_root` wins and keeps `path` /
     /// `path_filter` relative to that directory.
+    ///
+    /// When the override directory sits under an already-active session root
+    /// (startup primary or a previously activated root), that parent session is
+    /// reused and the override is folded into `path` / `path_filter` so a
+    /// subdirectory argument does not kick off a second cold build.
     fn resolve_call_root(
         &self,
         index_root: Option<&str>,
@@ -2316,9 +2324,32 @@ impl AstrolabeServer {
             let resolved = match resolve_call_index_root(raw) {
                 Ok(p) => p,
                 Err(msg) => {
-                    return Err(self.finish(text_error(format!("{msg}\nconfidence: unknown"))))
+                    return Err(self.finish(text_error(format!(
+                        "{msg}
+confidence: unknown"
+                    ))))
                 }
             };
+            if let Some((session, rel_under)) = self.find_covering_session(&resolved) {
+                let keep_path = nest_path_under_rel(path, &rel_under);
+                let note = if rel_under.as_os_str().is_empty() {
+                    None
+                } else {
+                    let filter = keep_path.as_deref().unwrap_or(".");
+                    Some(format!(
+                        "note: index_root is under active root {}; reusing that index and scoping to path_filter=\"{}\"",
+                        astrolabe_core::paths::display_path(&session.root),
+                        filter
+                    ))
+                };
+                // Touch residency when the covering session lives in a dispatcher.
+                let _ = self.ensure_index_root_session(&session.root)?;
+                return Ok(RouteOutcome {
+                    hint: session.root.to_string_lossy().into_owned(),
+                    path: keep_path,
+                    note,
+                });
+            }
             let session = self.ensure_index_root_session(&resolved)?;
             let keep_path = path.map(str::to_string).filter(|p| !p.is_empty());
             return Ok(RouteOutcome {
@@ -2330,12 +2361,56 @@ impl AstrolabeServer {
         self.resolve_route(root, path, text)
     }
 
+    /// Longest active session root that equals or contains `resolved`.
+    ///
+    /// Returns the session and the path of `resolved` relative to that root
+    /// (empty when equal). Used so `index_root=<subdir>` reuses the parent
+    /// project index instead of starting a parallel cold build.
+    fn find_covering_session(&self, resolved: &Path) -> Option<(Arc<RootSession>, PathBuf)> {
+        let mut best: Option<(Arc<RootSession>, PathBuf)> = None;
+        let mut consider = |session: &Arc<RootSession>| {
+            let Some(rel) = astrolabe_core::paths::strip_prefix_normalized(&session.root, resolved)
+            else {
+                return;
+            };
+            let better = match &best {
+                None => true,
+                Some((cur, _)) => {
+                    astrolabe_core::paths::path_norm_key(&session.root).len()
+                        > astrolabe_core::paths::path_norm_key(&cur.root).len()
+                }
+            };
+            if better {
+                best = Some((Arc::clone(session), rel));
+            }
+        };
+        consider(&self.primary);
+        let mut scan_dispatch = |dispatch: &DispatchState| {
+            let map = dispatch.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            for session in map.values() {
+                consider(session);
+            }
+        };
+        if let Some(dispatch) = &self.dispatch {
+            scan_dispatch(dispatch);
+        }
+        if let Some(dispatch) = self
+            .dynamic_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            scan_dispatch(dispatch);
+        }
+        best
+    }
+
     /// Open or reuse a [`RootSession`] for an absolute index root.
     fn ensure_index_root_session(
         &self,
         resolved: &Path,
     ) -> Result<Arc<RootSession>, CallToolResult> {
-        if resolved == self.primary.root.as_path() {
+        if astrolabe_core::paths::paths_eq_normalized(resolved, self.primary.root.as_path()) {
             return Ok(Arc::clone(&self.primary));
         }
         if let Some(dispatch) = &self.dispatch {
@@ -2639,10 +2714,15 @@ impl AstrolabeServer {
             IndexState::Ready(index) => Snap::Ready(Arc::clone(index)),
         };
         let result = match snap {
-            Snap::Building => self.finish_at(
-                &session.root,
-                text_error("Index is building in the background; MCP handshake is done — retry shortly. confidence: unknown"),
-            ),
+            Snap::Building => {
+                let root_disp = astrolabe_core::paths::display_path(&session.root);
+                self.finish_at(
+                    &session.root,
+                    text_error(format!(
+                        "Index is building in the background for {root_disp}; MCP handshake is done — retry shortly. confidence: unknown"
+                    )),
+                )
+            }
             Snap::Failed(error) => self.finish_at(
                 &session.root,
                 text_error(format!("Index build failed: {error}\nconfidence: unknown")),
@@ -2821,7 +2901,8 @@ impl AstrolabeServer {
     }
 
     fn finish_at(&self, root: &Path, mut result: CallToolResult) -> CallToolResult {
-        let root = root.display().to_string();
+        // Strip Windows verbatim prefix so agents see ordinary `C:\…` in index_root lines.
+        let root = astrolabe_core::paths::display_path(root);
         let mut first_text = None;
         let mut content = Vec::with_capacity(result.content.len());
         for (index, block) in result.content.into_iter().enumerate() {
@@ -3279,11 +3360,31 @@ struct RouteOutcome {
 fn relativize_to_child(child: &Path, path: &str) -> String {
     let p = Path::new(path.trim());
     if p.is_absolute() {
-        if let Ok(rel) = p.strip_prefix(child) {
+        if let Some(rel) = astrolabe_core::paths::strip_prefix_normalized(child, p) {
             return rel.to_string_lossy().replace('\\', "/");
         }
     }
     path.to_string()
+}
+
+/// Fold a caller `path` / `path_filter` (relative to an override `index_root`)
+/// under the relative path of that override inside a reused parent session.
+///
+/// When `rel_under` is empty the override equalled the parent root and the
+/// caller path is kept as-is. When the caller omitted path, `rel_under` itself
+/// becomes the scoped filter (so `index_root=<subdir>` still narrows results).
+fn nest_path_under_rel(path: Option<&str>, rel_under: &Path) -> Option<String> {
+    let rel = rel_under.to_string_lossy().replace('\\', "/");
+    let caller = path.map(str::trim).filter(|p| !p.is_empty());
+    match (caller, rel.as_str()) {
+        (Some(p), "") => Some(p.to_string()),
+        (None, "") => None,
+        (None, r) => Some(r.to_string()),
+        (Some(p), r) => {
+            let joined = Path::new(r).join(p);
+            Some(joined.to_string_lossy().replace('\\', "/"))
+        }
+    }
 }
 
 fn top_unindexed_exts(
@@ -10205,7 +10306,10 @@ mod tests {
             agent_id: None,
         })));
         assert!(
-            text.starts_with(&format!("index_root: {}", session.root.display())),
+            text.starts_with(&format!(
+                "index_root: {}",
+                astrolabe_core::paths::display_path(&session.root)
+            )),
             "dispatch must declare the child root, got {text}"
         );
         assert!(text.contains("alpha_unique"), "{text}");
@@ -11214,7 +11318,7 @@ mod mcp_routing_tests {
         assert!(
             on_a.starts_with(&format!(
                 "index_root: {}",
-                a.canonicalize().unwrap().display()
+                astrolabe_core::paths::display_path(&a.canonicalize().unwrap())
             )),
             "{on_a}"
         );
@@ -11239,7 +11343,7 @@ mod mcp_routing_tests {
         assert!(
             on_b.starts_with(&format!(
                 "index_root: {}",
-                b.canonicalize().unwrap().display()
+                astrolabe_core::paths::display_path(&b.canonicalize().unwrap())
             )),
             "{on_b}"
         );
@@ -11261,7 +11365,7 @@ mod mcp_routing_tests {
         assert!(
             rel.starts_with(&format!(
                 "index_root: {}",
-                b.canonicalize().unwrap().display()
+                astrolabe_core::paths::display_path(&b.canonicalize().unwrap())
             )),
             "{rel}"
         );
@@ -11305,7 +11409,7 @@ mod mcp_routing_tests {
         assert!(
             miss.starts_with(&format!(
                 "index_root: {}",
-                b.canonicalize().unwrap().display()
+                astrolabe_core::paths::display_path(&b.canonicalize().unwrap())
             )),
             "{miss}"
         );
@@ -11316,6 +11420,142 @@ mod mcp_routing_tests {
 
         server.stop_watching();
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn per_call_index_root_subdir_reuses_parent_session() {
+        // Startup indexes the repo root; index_root pointing at a subdirectory
+        // must reuse that session (no second cold build) and scope path_filter.
+        let parent = tmp("idxroot_subdir");
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(repo.join("src").join("daemon")).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(
+            repo.join("src").join("daemon").join("main.rs"),
+            "pub fn daemon_only() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src").join("lib.rs"),
+            "pub fn root_only() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        let knobs = crate::knobs::McpKnobs {
+            watch_mode: None,
+            loop_guard: crate::loop_guard::LoopGuardConfig {
+                repeat_max: 0,
+                rate_max: 0,
+                ..Default::default()
+            },
+            ..crate::knobs::McpKnobs::default()
+        };
+        let mut server = AstrolabeServer::new_with_knobs(repo.clone(), knobs, 8 << 20);
+        server.structured_output = false;
+        server.start_indexing();
+
+        let ready = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                root: None,
+                index_root: None,
+                query: "root_only".into(),
+                include_body: false,
+                substring: None,
+                kind: None,
+                path_filter: None,
+                depth: 0,
+                budget_tokens: 800,
+                offset: 0,
+                dedup: None,
+                agent_id: None,
+            }))
+        });
+        assert!(ready.contains("root_only"), "{ready}");
+        let canon = repo.canonicalize().unwrap();
+        let sessions_before = server
+            .dynamic_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|d| d.sessions.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .unwrap_or(0);
+
+        let sub = repo.join("src").join("daemon");
+        let route = server
+            .resolve_call_root(Some(sub.to_str().unwrap()), None, None, None)
+            .expect("subdir index_root should resolve");
+        assert_eq!(
+            route.hint,
+            canon.to_string_lossy().as_ref(),
+            "must reuse parent session root, got hint={}",
+            route.hint
+        );
+        assert_eq!(
+            route.path.as_deref(),
+            Some("src/daemon"),
+            "override subdir becomes path_filter"
+        );
+        assert!(
+            route.note.as_deref().is_some_and(|n| n.contains("reusing")),
+            "expected reuse note, got {:?}",
+            route.note
+        );
+
+        let hit = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                root: None,
+                index_root: Some(sub.to_string_lossy().into_owned()),
+                query: "daemon_only".into(),
+                include_body: false,
+                substring: None,
+                kind: None,
+                path_filter: None,
+                depth: 0,
+                budget_tokens: 800,
+                offset: 0,
+                dedup: None,
+                agent_id: None,
+            }))
+        });
+        assert!(hit.contains("daemon_only"), "{hit}");
+        assert!(
+            hit.starts_with(&format!(
+                "index_root: {}",
+                astrolabe_core::paths::display_path(&canon)
+            )),
+            "{hit}"
+        );
+        // Still no dynamic extra root for the subdir.
+        let sessions_after = server
+            .dynamic_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|d| d.sessions.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .unwrap_or(0);
+        assert_eq!(
+            sessions_after, sessions_before,
+            "subdir index_root must not open a new RootSession"
+        );
+
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn nest_path_under_rel_joins_caller_filter() {
+        assert_eq!(nest_path_under_rel(None, Path::new("")), None);
+        assert_eq!(
+            nest_path_under_rel(None, Path::new("src/daemon")).as_deref(),
+            Some("src/daemon")
+        );
+        assert_eq!(
+            nest_path_under_rel(Some("main.rs"), Path::new("src/daemon")).as_deref(),
+            Some("src/daemon/main.rs")
+        );
+        assert_eq!(
+            nest_path_under_rel(Some("main.rs"), Path::new("")).as_deref(),
+            Some("main.rs")
+        );
     }
 
     #[test]

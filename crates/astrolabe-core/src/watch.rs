@@ -1355,7 +1355,9 @@ impl Intake {
             self.freshness.note_distrust();
         }
         for p in paths {
-            if p.is_absolute() && !p.starts_with(&self.root) {
+            // Compare after stripping Windows `\\?\` so notify's `C:\…`
+            // events still count as under a canonicalize()'d `\\?\C:\…` root.
+            if p.is_absolute() && !crate::paths::is_under_normalized(&self.root, &p) {
                 self.foreign_events += 1;
             } else {
                 self.rooted_events += 1;
@@ -1921,7 +1923,9 @@ fn crosses_symlink_dir(root: &Path, abs: &Path) -> bool {
 }
 
 fn relativize(root: &Path, path: &Path) -> Option<RelPath> {
-    let stripped = path.strip_prefix(root).ok()?;
+    // Strip Windows verbatim prefixes so `\\?\C:\root` and `C:\root\file`
+    // still relativize (notify events omit the prefix canonicalize adds).
+    let stripped = crate::paths::strip_prefix_normalized(root, path)?;
     if stripped.as_os_str().is_empty() {
         return None;
     }
@@ -3732,5 +3736,57 @@ mod tests {
         assert_eq!(log.poll_cycle(), None, "event mode clears the poll cycle");
         stop.store(true, Ordering::SeqCst);
         let _ = thread.join();
+    }
+
+    #[test]
+    fn relativize_accepts_mixed_windows_verbatim_prefix() {
+        let root = PathBuf::from(r"\\?\C:\proj");
+        let file = PathBuf::from(r"C:\proj\src\main.rs");
+        let rel = relativize(&root, &file).expect("relativize across prefix forms");
+        assert_eq!(rel.as_str().replace('\\', "/"), "src/main.rs");
+    }
+
+    #[test]
+    fn absorb_counts_non_verbatim_event_under_verbatim_root_as_rooted() {
+        // Membership helper (used by absorb) must treat mixed prefix forms as under.
+        let root = PathBuf::from(r"\\?\C:\proj");
+        let event = PathBuf::from(r"C:\proj\src\a.rs");
+        assert!(
+            crate::paths::is_under_normalized(&root, &event),
+            "non-verbatim child of verbatim root must count as under"
+        );
+        assert!(!crate::paths::is_under_normalized(
+            &root,
+            &PathBuf::from(r"C:\other\a.rs")
+        ));
+        // On Windows, Path::is_absolute is true for `C:\…`, so absorb exercises
+        // the foreign/rooted counters and keep_event_path. On Unix those strings
+        // are not absolute, so only assert the helper + relativize path.
+        #[cfg(windows)]
+        {
+            let mut intake = Intake {
+                root: root.clone(),
+                scan: ScanOptions::default(),
+                freshness: Arc::new(FreshnessLog::new()),
+                storm_paths: 5000,
+                pending: HashSet::new(),
+                all_dirty: false,
+                foreign_events: 0,
+                rooted_events: 0,
+                last_event: None,
+                first_event: None,
+            };
+            intake.absorb(vec![event], false);
+            assert_eq!(
+                intake.rooted_events, 1,
+                "same logical path must not look foreign"
+            );
+            assert_eq!(intake.foreign_events, 0);
+            assert!(
+                !intake.pending.is_empty(),
+                "event under root should be kept"
+            );
+            assert!(!intake.only_foreign());
+        }
     }
 }
