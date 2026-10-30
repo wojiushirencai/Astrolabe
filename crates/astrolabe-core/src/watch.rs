@@ -3738,7 +3738,6 @@ mod tests {
         let _ = thread.join();
     }
 
-
     #[test]
     fn relativize_accepts_mixed_windows_verbatim_prefix() {
         let root = PathBuf::from(r"\\?\C:\proj");
@@ -3778,9 +3777,15 @@ mod tests {
                 first_event: None,
             };
             intake.absorb(vec![event], false);
-            assert_eq!(intake.rooted_events, 1, "same logical path must not look foreign");
+            assert_eq!(
+                intake.rooted_events, 1,
+                "same logical path must not look foreign"
+            );
             assert_eq!(intake.foreign_events, 0);
-            assert!(!intake.pending.is_empty(), "event under root should be kept");
+            assert!(
+                !intake.pending.is_empty(),
+                "event under root should be kept"
+            );
             assert!(!intake.only_foreign());
         }
     }

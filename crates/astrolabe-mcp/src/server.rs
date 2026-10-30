@@ -2324,8 +2324,10 @@ impl AstrolabeServer {
             let resolved = match resolve_call_index_root(raw) {
                 Ok(p) => p,
                 Err(msg) => {
-                    return Err(self.finish(text_error(format!("{msg}
-confidence: unknown"))))
+                    return Err(self.finish(text_error(format!(
+                        "{msg}
+confidence: unknown"
+                    ))))
                 }
             };
             if let Some((session, rel_under)) = self.find_covering_session(&resolved) {
@@ -2367,8 +2369,7 @@ confidence: unknown"))))
     fn find_covering_session(&self, resolved: &Path) -> Option<(Arc<RootSession>, PathBuf)> {
         let mut best: Option<(Arc<RootSession>, PathBuf)> = None;
         let mut consider = |session: &Arc<RootSession>| {
-            let Some(rel) =
-                astrolabe_core::paths::strip_prefix_normalized(&session.root, resolved)
+            let Some(rel) = astrolabe_core::paths::strip_prefix_normalized(&session.root, resolved)
             else {
                 return;
             };
@@ -2385,10 +2386,7 @@ confidence: unknown"))))
         };
         consider(&self.primary);
         let mut scan_dispatch = |dispatch: &DispatchState| {
-            let map = dispatch
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let map = dispatch.sessions.lock().unwrap_or_else(|e| e.into_inner());
             for session in map.values() {
                 consider(session);
             }
@@ -10308,7 +10306,10 @@ mod tests {
             agent_id: None,
         })));
         assert!(
-            text.starts_with(&format!("index_root: {}", astrolabe_core::paths::display_path(&session.root))),
+            text.starts_with(&format!(
+                "index_root: {}",
+                astrolabe_core::paths::display_path(&session.root)
+            )),
             "dispatch must declare the child root, got {text}"
         );
         assert!(text.contains("alpha_unique"), "{text}");
@@ -11480,12 +11481,7 @@ mod mcp_routing_tests {
 
         let sub = repo.join("src").join("daemon");
         let route = server
-            .resolve_call_root(
-                Some(sub.to_str().unwrap()),
-                None,
-                None,
-                None,
-            )
+            .resolve_call_root(Some(sub.to_str().unwrap()), None, None, None)
             .expect("subdir index_root should resolve");
         assert_eq!(
             route.hint,
@@ -11522,7 +11518,10 @@ mod mcp_routing_tests {
         });
         assert!(hit.contains("daemon_only"), "{hit}");
         assert!(
-            hit.starts_with(&format!("index_root: {}", astrolabe_core::paths::display_path(&canon))),
+            hit.starts_with(&format!(
+                "index_root: {}",
+                astrolabe_core::paths::display_path(&canon)
+            )),
             "{hit}"
         );
         // Still no dynamic extra root for the subdir.
