@@ -7392,8 +7392,12 @@ mod tests {
     #[test]
     fn dedup_pointer_carries_signature_and_match_line() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let _ = server.search_code(Parameters(search("marker_x")));
-        let again = text_of(&server.search_code(Parameters(search("total *= 2"))));
+        let mut first = search("marker_x");
+        first.agent_id = Some("agent-dedup".into());
+        let _ = server.search_code(Parameters(first));
+        let mut again_q = search("total *= 2");
+        again_q.agent_id = Some("agent-dedup".into());
+        let again = text_of(&server.search_code(Parameters(again_q)));
         assert!(again.contains("@calc.py:3 total *= 2"), "{again}");
         assert!(again.contains("signature: def compute(a, b):"), "{again}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -7992,6 +7996,7 @@ mod tests {
         let (server, dir) = counting_fixture();
         let mut p = search("SysLog(");
         p.group = Some(false);
+        p.agent_id = Some("agent-dedup".into());
         let _first = server.search_code(Parameters(p.clone()));
         let again = text_of(&server.search_code(Parameters(p)));
         assert!(again.contains("not resending full text"), "{again}");
@@ -8241,12 +8246,18 @@ mod tests {
     fn resolve_context_repeat_returns_pointer_with_top_files_and_dedup_hint() {
         let (server, dir) = many_file_server();
         let task = "where is repeat_budget_check in the loop guard";
-        let first = text_of(&server.resolve_context(Parameters(rc(task, 2500, None))));
-        let again = text_of(&server.resolve_context(Parameters(rc(task, 2500, None))));
+        let mut first_p = rc(task, 2500, None);
+        first_p.agent_id = Some("agent-dedup".into());
+        let first = text_of(&server.resolve_context(Parameters(first_p)));
+        let mut again_p = rc(task, 2500, None);
+        again_p.agent_id = Some("agent-dedup".into());
+        let again = text_of(&server.resolve_context(Parameters(again_p)));
         assert!(again.contains("not resending full text"), "{again}");
         assert!(again.contains("pkg/loop_guard.py"), "{again}");
         assert!(again.contains("dedup=false"), "{again}");
-        let full = text_of(&server.resolve_context(Parameters(rc(task, 2500, Some(false)))));
+        let mut full_p = rc(task, 2500, Some(false));
+        full_p.agent_id = Some("agent-dedup".into());
+        let full = text_of(&server.resolve_context(Parameters(full_p)));
         assert_eq!(
             full.contains("repeat_budget_check"),
             first.contains("repeat_budget_check")
@@ -8271,18 +8282,22 @@ mod tests {
     #[test]
     fn search_dedup_pointer_has_real_call_number_and_sample_hits() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let first = server.call_seq_current();
-        let _ = server.search_code(Parameters(search("marker_x")));
-        let second_seq_before = server.call_seq_current();
-        assert_eq!(second_seq_before, first + 1, "search must take an ordinal");
-        let again = text_of(&server.search_code(Parameters(search("marker_x"))));
-        assert!(
-            again.contains(&format!("tool call #{}", first + 1)),
-            "{again}"
-        );
-        assert!(again.contains("first hits: @calc.py:"), "{again}");
-        assert!(again.contains("compressed"), "{again}");
-        assert!(again.contains("dedup=false"), "{again}");
+        dedup_agent::scope("agent-dedup".into(), || {
+            let first = server.call_seq_current();
+            let mut p = search("marker_x");
+            p.agent_id = Some("agent-dedup".into());
+            let _ = server.search_code(Parameters(p.clone()));
+            let second_seq_before = server.call_seq_current();
+            assert_eq!(second_seq_before, first + 1, "search must take an ordinal");
+            let again = text_of(&server.search_code(Parameters(p)));
+            assert!(
+                again.contains(&format!("tool call #{}", first + 1)),
+                "{again}"
+            );
+            assert!(again.contains("first hits: @calc.py:"), "{again}");
+            assert!(again.contains("compressed"), "{again}");
+            assert!(again.contains("dedup=false"), "{again}");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
