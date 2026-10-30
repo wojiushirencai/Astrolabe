@@ -1769,6 +1769,10 @@ pub(crate) struct ResolveContextParams {
     #[serde(default)]
     #[schemars(description = "false: resend a repeated call.")]
     pub dedup: Option<bool>,
+    /// Host / test agent identity for session result dedup isolation (unadvertised).
+    #[serde(default)]
+    #[schemars(skip)]
+    pub agent_id: Option<String>,
     #[serde(default)]
     #[schemars(description = "Next-page offset.")]
     pub offset: usize,
@@ -1828,14 +1832,15 @@ pub(crate) struct QueryParams {
     #[schemars(description = "0-based match offset for pagination (see next_offset in result).")]
     pub offset: usize,
     /// Default true: reference a definition body already returned this session
-    /// for the current agent. Pass false to refetch the full body.
+    /// for the current *known* agent. Pass false to refetch the full body.
+    /// When agent identity is missing, bodies are always resent (no shared shard).
     #[serde(default)]
     #[schemars(
-        description = "Default true: reference a definition body already returned this session for this agent; false to refetch."
+        description = "Default true: reference a definition body already returned this session for this agent; false to refetch. No-op when agent identity is missing."
     )]
     pub dedup: Option<bool>,
-    /// Host / test agent identity for session body dedup isolation. Prefer the
-    /// request `_meta` agent id when the host provides one; this arg overrides.
+    /// Host / test / hook-injected agent identity for session body dedup isolation.
+    /// Prefer request `_meta` when the host provides one; this arg overrides.
     #[serde(default)]
     #[schemars(skip)]
     pub agent_id: Option<String>,
@@ -1912,6 +1917,10 @@ pub(crate) struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Default true: reference repeated symbol bodies by location.")]
     pub dedup: Option<bool>,
+    /// Host / test agent identity for session body dedup isolation (unadvertised).
+    #[serde(default)]
+    #[schemars(skip)]
+    pub agent_id: Option<String>,
     #[serde(default)]
     #[schemars(description = "top|dir|file: hit/file counts per dir or file + total.")]
     pub aggregate: Option<String>,
@@ -3049,11 +3058,14 @@ mod cancel {
 /// starve each other of definition bodies.
 ///
 /// Identity sources (first non-empty wins):
-/// 1. tool argument `agent_id` / `agentId` (tests + hosts that pass it in args)
+/// 1. tool argument `agent_id` / `agentId` (tests + hosts that pass it in args;
+///    Claude Code PreToolUse hooks inject this when the payload carries agent id)
 /// 2. request `_meta` keys used by Claude Code / common hosts:
 ///    `claudecode/agentId`, `agent_id`, `agentId`, `agent`
 ///
-/// Missing identity falls back to `""` (one shared shard — prior behavior).
+/// Missing / empty identity disables body and search-digest dedup for that call
+/// (always FULL). Only a known agent shard records and skips repeats — never a
+/// shared `""` bucket that would starve siblings when the host omits identity.
 mod dedup_agent {
     use std::cell::RefCell;
 
@@ -3077,6 +3089,11 @@ mod dedup_agent {
 
     pub(super) fn current() -> String {
         CURRENT.with(|c| c.borrow().clone())
+    }
+
+    /// True when the current call has a non-empty agent shard (dedup allowed).
+    pub(super) fn known() -> bool {
+        CURRENT.with(|c| !c.borrow().is_empty())
     }
 
     fn from_str(raw: &str) -> Option<String> {
@@ -3109,7 +3126,8 @@ mod dedup_agent {
         None
     }
 
-    /// Prefer an explicit tool arg, then MCP request `_meta`. Empty = shared shard.
+    /// Prefer an explicit tool arg, then MCP request `_meta`.
+    /// Empty string means "unknown agent" — callers must not dedup on it.
     pub(super) fn extract(
         meta: Option<&MetaObject>,
         arguments: Option<&Map<String, serde_json::Value>>,
@@ -3334,19 +3352,31 @@ impl AstrolabeServer {
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
     ) -> CallToolResult {
-        let route = match self.resolve_call_root(
-            params.index_root.as_deref(),
-            params.root.as_deref(),
-            params.path_filter.as_deref(),
-            Some(&params.task_description),
-        ) {
-            Ok(route) => route,
-            Err(err) => return err,
+        let agent_override = params
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::hooks::sanitize_agent_component);
+        let run = || {
+            let route = match self.resolve_call_root(
+                params.index_root.as_deref(),
+                params.root.as_deref(),
+                params.path_filter.as_deref(),
+                Some(&params.task_description),
+            ) {
+                Ok(route) => route,
+                Err(err) => return err,
+            };
+            let mut params = params;
+            params.path_filter = route.path.clone();
+            let result = self.resolve_context_inner(params, &route.hint);
+            Self::with_route_note(result, &route.note)
         };
-        let mut params = params;
-        params.path_filter = route.path.clone();
-        let result = self.resolve_context_inner(params, &route.hint);
-        Self::with_route_note(result, &route.note)
+        match agent_override {
+            Some(agent) => dedup_agent::scope(agent, run),
+            None => run(),
+        }
     }
 
     fn resolve_context_inner(&self, params: ResolveContextParams, hint: &str) -> CallToolResult {
@@ -3920,26 +3950,38 @@ impl AstrolabeServer {
         Parameters(mut params): Parameters<SearchParams>,
     ) -> CallToolResult {
         let signature = format!("{params:?}");
-        // The query is a search string, never a routing hint.
-        let route = match self.resolve_call_root(
-            params.index_root.as_deref(),
-            params.root.as_deref(),
-            params.path_filter.as_deref(),
-            None,
-        ) {
-            Ok(route) => route,
-            Err(err) => return err,
+        let agent_override = params
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::hooks::sanitize_agent_component);
+        let run = || {
+            // The query is a search string, never a routing hint.
+            let route = match self.resolve_call_root(
+                params.index_root.as_deref(),
+                params.root.as_deref(),
+                params.path_filter.as_deref(),
+                None,
+            ) {
+                Ok(route) => route,
+                Err(err) => return err,
+            };
+            params.path_filter = route.path.clone();
+            params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
+            if let Some(building) = self.building_session(&route.hint) {
+                let result = self.search_while_building(&building, &params);
+                return Self::with_route_note(result, &route.note);
+            }
+            let result = self.guarded("search_code", &route.hint, &signature, || {
+                self.search_code_inner(params)
+            });
+            Self::with_route_note(result, &route.note)
         };
-        params.path_filter = route.path.clone();
-        params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
-        if let Some(building) = self.building_session(&route.hint) {
-            let result = self.search_while_building(&building, &params);
-            return Self::with_route_note(result, &route.note);
+        match agent_override {
+            Some(agent) => dedup_agent::scope(agent, run),
+            None => run(),
         }
-        let result = self.guarded("search_code", &route.hint, &signature, || {
-            self.search_code_inner(params)
-        });
-        Self::with_route_note(result, &route.note)
     }
 
     fn search_code_inner(&self, mut params: SearchParams) -> CallToolResult {
@@ -4626,7 +4668,8 @@ impl AstrolabeServer {
     }
 
     fn lookup_sent(&self, key: &str, dedup: bool, generation: u64) -> Option<u64> {
-        if !dedup {
+        // Unknown agent: never skip — missing identity must not share a shard.
+        if !dedup || !dedup_agent::known() {
             return None;
         }
         let agent = dedup_agent::current();
@@ -4638,7 +4681,11 @@ impl AstrolabeServer {
     }
 
     /// Remember a range as fully returned for the current agent.
+    /// No-op when agent identity is missing (avoids a shared `""` bucket).
     fn commit_sent(&self, root: &Path, path: &str, range: (u32, u32), generation: u64, call: u64) {
+        if !dedup_agent::known() {
+            return;
+        }
         let agent = dedup_agent::current();
         let key = format!("{}|{path}:{}-{}", root.display(), range.0, range.1);
         self.sent_ranges
@@ -4651,7 +4698,11 @@ impl AstrolabeServer {
 
     /// Claim a whole-result dedup key for the current agent, or return the
     /// earlier call number if already claimed at this index generation.
+    /// When agent identity is missing, always treats the call as new (no store).
     fn claim_result_key(&self, key: &str, generation: u64, call: u64) -> Option<u64> {
+        if !dedup_agent::known() {
+            return None;
+        }
         let agent = dedup_agent::current();
         let mut outer = self.sent_ranges.lock().unwrap_or_else(|e| e.into_inner());
         let map = outer.entry(agent).or_default();
@@ -4665,6 +4716,9 @@ impl AstrolabeServer {
     }
 
     fn digest_get(&self, key: &str) -> String {
+        if !dedup_agent::known() {
+            return String::new();
+        }
         let agent = dedup_agent::current();
         self.search_digests
             .lock()
@@ -4676,6 +4730,9 @@ impl AstrolabeServer {
     }
 
     fn digest_put(&self, key: String, digest: String) {
+        if !dedup_agent::known() {
+            return;
+        }
         let agent = dedup_agent::current();
         self.search_digests
             .lock()
@@ -5200,8 +5257,8 @@ impl ServerHandler for AstrolabeServer {
         let worker_flag = Arc::clone(&flag);
         let server = self.clone();
         let tool_name = request.name.to_string();
-        // Prefer tool-arg agent_id; else MCP `_meta` (Claude Code / hosts). Empty
-        // falls back to the shared shard (prior behavior).
+        // Prefer tool-arg agent_id (hooks may inject); else MCP `_meta`.
+        // Empty disables body/search digest dedup for this call (no shared shard).
         let mut agent = dedup_agent::extract(Some(&*context.meta), request.arguments.as_ref());
         if agent.is_empty() {
             if let Some(ref meta) = request.meta {
@@ -6253,6 +6310,7 @@ mod tests {
             task_description: "alpha".into(),
             budget_tokens: 100,
             dedup: None,
+            agent_id: None,
             offset: 0,
             path_filter: None,
         })));
@@ -6283,6 +6341,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -6555,6 +6614,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -6602,6 +6662,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -6686,6 +6747,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -6809,8 +6871,12 @@ mod tests {
     #[test]
     fn search_code_session_dedup_references_resent_bodies() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let _ = server.search_code(Parameters(search("marker_x")));
-        let again = text_of(&server.search_code(Parameters(search("total *= 2"))));
+        let mut first = search("marker_x");
+        first.agent_id = Some("agent-dedup".into());
+        let _ = server.search_code(Parameters(first));
+        let mut second = search("total *= 2");
+        second.agent_id = Some("agent-dedup".into());
+        let again = text_of(&server.search_code(Parameters(second)));
         assert!(!again.contains("  1| def compute"), "{again}");
         assert!(again.contains("@calc.py:3 total *= 2"), "{again}");
         assert!(
@@ -6818,6 +6884,7 @@ mod tests {
             "{again}"
         );
         let mut opt_out = search("total = a");
+        opt_out.agent_id = Some("agent-dedup".into());
         opt_out.dedup = Some(false);
         let full = text_of(&server.search_code(Parameters(opt_out)));
         assert!(full.contains("  1| def compute(a, b):"), "{full}");
@@ -7153,26 +7220,32 @@ mod tests {
 
     #[test]
     fn find_symbol_bodies_and_repeat_search_are_deduplicated() {
+        // Dedup only applies inside a known agent shard (hooks / _meta / arg).
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let first = text_of(&server.find_symbol(Parameters(find("compute"))));
+        let mut q = find("compute");
+        q.agent_id = Some("agent-dedup".into());
+        let first = text_of(&server.find_symbol(Parameters(q.clone())));
         assert!(first.contains("total *= 2"), "{first}");
-        let again = text_of(&server.find_symbol(Parameters(find("compute"))));
+        let again = text_of(&server.find_symbol(Parameters(q)));
         assert!(
             (again.contains("already returned") && again.contains("definition body"))
                 || again.contains("already returned on tool call"),
             "{again}"
         );
         assert!(!again.contains("total *= 2"), "{again}");
-        // A search whose body find_symbol already sent references it.
-        let hit = text_of(&server.search_code(Parameters(search("marker_x"))));
+        // A search whose body find_symbol already sent references it (same agent).
+        let mut s = search("marker_x");
+        s.agent_id = Some("agent-dedup".into());
+        let hit = text_of(&server.search_code(Parameters(s.clone())));
         assert!(hit.contains("already returned on tool call #"), "{hit}");
         // The identical query again is not resent at all.
-        let repeat = text_of(&server.search_code(Parameters(search("marker_x"))));
+        let repeat = text_of(&server.search_code(Parameters(s)));
         assert!(
             repeat.contains("Same query already returned on tool call #"),
             "{repeat}"
         );
         let mut fresh = search("marker_x");
+        fresh.agent_id = Some("agent-dedup".into());
         fresh.dedup = Some(false);
         let full = text_of(&server.search_code(Parameters(fresh)));
         assert!(full.contains("@calc.py:4 marker_x = total - 1"), "{full}");
@@ -7209,6 +7282,57 @@ mod tests {
             "same agent second call still skips: {second_a}"
         );
         assert!(!second_a.contains("total *= 2"), "{second_a}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_missing_agent_never_dedups_across_calls() {
+        // Claude Code today often omits agent identity on MCP calls. Empty must
+        // NOT share a "" shard — two "anonymous" calls both get FULL bodies.
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        let first = text_of(&server.find_symbol(Parameters(find("compute"))));
+        assert!(
+            first.contains("total *= 2"),
+            "first anonymous call FULL: {first}"
+        );
+        let second = text_of(&server.find_symbol(Parameters(find("compute"))));
+        assert!(
+            second.contains("total *= 2"),
+            "second anonymous call must still be FULL (no shared shard): {second}"
+        );
+        assert!(
+            !second.contains("already returned") && !second.contains("not resending"),
+            "anonymous must not see skip pointer: {second}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_symbol_missing_agent_does_not_poison_known_agent_shard() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        // Anonymous call would formerly populate the "" shard.
+        let anon = text_of(&server.find_symbol(Parameters(find("compute"))));
+        assert!(anon.contains("total *= 2"), "{anon}");
+
+        let mut known = find("compute");
+        known.agent_id = Some("agent-a".into());
+        let first_known = text_of(&server.find_symbol(Parameters(known.clone())));
+        assert!(
+            first_known.contains("total *= 2"),
+            "known agent must get FULL after anonymous (no shared bucket): {first_known}"
+        );
+        assert!(
+            !first_known.contains("already returned") && !first_known.contains("not resending"),
+            "{first_known}"
+        );
+
+        let second_known = text_of(&server.find_symbol(Parameters(known)));
+        assert!(
+            (second_known.contains("already returned") && second_known.contains("definition body"))
+                || second_known.contains("already returned on tool call"),
+            "same known agent still skips: {second_known}"
+        );
+        assert!(!second_known.contains("total *= 2"), "{second_known}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7268,8 +7392,12 @@ mod tests {
     #[test]
     fn dedup_pointer_carries_signature_and_match_line() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let _ = server.search_code(Parameters(search("marker_x")));
-        let again = text_of(&server.search_code(Parameters(search("total *= 2"))));
+        let mut first = search("marker_x");
+        first.agent_id = Some("agent-dedup".into());
+        let _ = server.search_code(Parameters(first));
+        let mut again_q = search("total *= 2");
+        again_q.agent_id = Some("agent-dedup".into());
+        let again = text_of(&server.search_code(Parameters(again_q)));
         assert!(again.contains("@calc.py:3 total *= 2"), "{again}");
         assert!(again.contains("signature: def compute(a, b):"), "{again}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -7868,6 +7996,7 @@ mod tests {
         let (server, dir) = counting_fixture();
         let mut p = search("SysLog(");
         p.group = Some(false);
+        p.agent_id = Some("agent-dedup".into());
         let _first = server.search_code(Parameters(p.clone()));
         let again = text_of(&server.search_code(Parameters(p)));
         assert!(again.contains("not resending full text"), "{again}");
@@ -7902,6 +8031,7 @@ mod tests {
             task_description: "rename alpha".into(),
             budget_tokens: 2000,
             dedup: None,
+            agent_id: None,
             offset: 0,
             path_filter: None,
         }));
@@ -7917,6 +8047,7 @@ mod tests {
             task_description: task.into(),
             budget_tokens: budget,
             dedup,
+            agent_id: None,
             offset: 0,
             path_filter: None,
         }
@@ -8115,12 +8246,18 @@ mod tests {
     fn resolve_context_repeat_returns_pointer_with_top_files_and_dedup_hint() {
         let (server, dir) = many_file_server();
         let task = "where is repeat_budget_check in the loop guard";
-        let first = text_of(&server.resolve_context(Parameters(rc(task, 2500, None))));
-        let again = text_of(&server.resolve_context(Parameters(rc(task, 2500, None))));
+        let mut first_p = rc(task, 2500, None);
+        first_p.agent_id = Some("agent-dedup".into());
+        let first = text_of(&server.resolve_context(Parameters(first_p)));
+        let mut again_p = rc(task, 2500, None);
+        again_p.agent_id = Some("agent-dedup".into());
+        let again = text_of(&server.resolve_context(Parameters(again_p)));
         assert!(again.contains("not resending full text"), "{again}");
         assert!(again.contains("pkg/loop_guard.py"), "{again}");
         assert!(again.contains("dedup=false"), "{again}");
-        let full = text_of(&server.resolve_context(Parameters(rc(task, 2500, Some(false)))));
+        let mut full_p = rc(task, 2500, Some(false));
+        full_p.agent_id = Some("agent-dedup".into());
+        let full = text_of(&server.resolve_context(Parameters(full_p)));
         assert_eq!(
             full.contains("repeat_budget_check"),
             first.contains("repeat_budget_check")
@@ -8145,18 +8282,22 @@ mod tests {
     #[test]
     fn search_dedup_pointer_has_real_call_number_and_sample_hits() {
         let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
-        let first = server.call_seq_current();
-        let _ = server.search_code(Parameters(search("marker_x")));
-        let second_seq_before = server.call_seq_current();
-        assert_eq!(second_seq_before, first + 1, "search must take an ordinal");
-        let again = text_of(&server.search_code(Parameters(search("marker_x"))));
-        assert!(
-            again.contains(&format!("tool call #{}", first + 1)),
-            "{again}"
-        );
-        assert!(again.contains("first hits: @calc.py:"), "{again}");
-        assert!(again.contains("compressed"), "{again}");
-        assert!(again.contains("dedup=false"), "{again}");
+        dedup_agent::scope("agent-dedup".into(), || {
+            let first = server.call_seq_current();
+            let mut p = search("marker_x");
+            p.agent_id = Some("agent-dedup".into());
+            let _ = server.search_code(Parameters(p.clone()));
+            let second_seq_before = server.call_seq_current();
+            assert_eq!(second_seq_before, first + 1, "search must take an ordinal");
+            let again = text_of(&server.search_code(Parameters(p)));
+            assert!(
+                again.contains(&format!("tool call #{}", first + 1)),
+                "{again}"
+            );
+            assert!(again.contains("first hits: @calc.py:"), "{again}");
+            assert!(again.contains("compressed"), "{again}");
+            assert!(again.contains("dedup=false"), "{again}");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8382,6 +8523,7 @@ mod tests {
             page: false,
             group: None,
             dedup: Some(false),
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -8443,6 +8585,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -8478,6 +8621,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -8504,6 +8648,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -8539,6 +8684,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -8756,6 +8902,7 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
+                agent_id: None,
                 aggregate: None,
                 exclude: None,
                 count_only: false,
@@ -8819,6 +8966,7 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
+                agent_id: None,
                 aggregate: None,
                 exclude: None,
                 count_only: false,
@@ -8902,6 +9050,7 @@ mod tests {
                 page: false,
                 group: None,
                 dedup: None,
+                agent_id: None,
                 aggregate: None,
                 exclude: None,
                 count_only: false,
@@ -9032,6 +9181,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -9067,6 +9217,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -9102,6 +9253,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -9146,6 +9298,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -9523,6 +9676,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10238,6 +10392,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10282,6 +10437,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10317,6 +10473,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10405,6 +10562,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10441,6 +10599,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10626,6 +10785,7 @@ mod tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10867,6 +11027,7 @@ mod mcp_routing_tests {
         let (server, parent) = multi_server(&["api", "web"]);
         let out = until_ready(|| {
             server.search_code(Parameters(SearchParams {
+                agent_id: None,
                 root: None,
                 index_root: None,
                 path_filter: Some("api/src".into()),
@@ -10882,6 +11043,7 @@ mod mcp_routing_tests {
         // Bare sub-repo name routes and drops the (now empty) filter.
         let bare = until_ready(|| {
             server.search_code(Parameters(SearchParams {
+                agent_id: None,
                 root: None,
                 index_root: None,
                 path_filter: Some("web/".into()),
@@ -10908,6 +11070,7 @@ mod mcp_routing_tests {
             page: false,
             group: None,
             dedup: None,
+            agent_id: None,
             aggregate: None,
             exclude: None,
             count_only: false,
@@ -10954,6 +11117,7 @@ mod mcp_routing_tests {
             task_description: "set up a web server".into(),
             budget_tokens: 400,
             dedup: None,
+            agent_id: None,
             offset: 0,
             path_filter: None,
         })));
@@ -10966,6 +11130,7 @@ mod mcp_routing_tests {
                 task_description: "fix the invoice rounding in billing".into(),
                 budget_tokens: 400,
                 dedup: None,
+                agent_id: None,
                 offset: 0,
                 path_filter: None,
             }))
@@ -11085,6 +11250,7 @@ mod mcp_routing_tests {
         std::env::set_current_dir(&parent).unwrap();
         let rel = until_ready(|| {
             server.search_code(Parameters(SearchParams {
+                agent_id: None,
                 root: None,
                 index_root: Some("repo_b".into()),
                 query: "beta_only".into(),
@@ -11455,6 +11621,7 @@ mod mcp_routing_tests {
         assert!(out.contains("2 hits / 2 files"), "{out}");
         // path_filter and count_only apply.
         let counted = text(&server.search_code(Parameters(SearchParams {
+            agent_id: None,
             index_root: None,
             path_filter: Some("a.py".into()),
             count_only: true,
