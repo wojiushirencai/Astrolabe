@@ -33,11 +33,11 @@ test('catalog names are the seven reserved tools', () => {
   assert.deepEqual(new Set(CATALOG_TOOL_NAMES), new Set([
     'search_code',
     'find_symbol',
-    'resolve_context',
-    'get_diagnostics',
-    'find_references',
-    'goto_definition',
-    'get_languages',
+    'resolve_contx',
+    'get_diag',
+    'find_refs',
+    'goto_def',
+    'get_lang',
   ]));
   assert.equal(new Set(CATALOG_TOOL_NAMES).size, 7);
 });

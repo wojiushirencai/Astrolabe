@@ -11,9 +11,9 @@
 //! plus a short text summary.
 //!
 //! Keep the tool surface small. Seven tools ([`astrolabe_mcp::TOOL_COUNT`]):
-//! `resolve_context`, `search_code`, `find_symbol`, `get_languages`,
-//! `find_references`, `goto_definition`, `get_diagnostics`.
-//! `resolve_context` is the front door.
+//! `resolve_contx`, `search_code`, `find_symbol`, `get_lang`,
+//! `find_refs`, `goto_def`, `get_diag`.
+//! `resolve_contx` is the front door.
 //!
 //! Declare a generous `ttlMs` on `tools/list` so clients stop re-fetching the
 //! tool definitions every session.

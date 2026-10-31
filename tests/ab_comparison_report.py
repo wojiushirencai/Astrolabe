@@ -39,7 +39,7 @@ class McpClient:
         t0 = time.time()
         while time.time() - t0 < 20:
             resp = self.call("tools/call", {
-                "name": "get_languages",
+                "name": "get_lang",
                 "arguments": {}
             })
             text = resp.get("result", {}).get("content", [{}])[0].get("text", "")
@@ -115,11 +115,11 @@ def main():
     print("\n--- 3. BEHAVIORAL PARITY VERIFICATION ACROSS COMMON TOOLS ---")
     common_queries = [
         ("search_code", {"query": "fn assemble", "context_lines": 0}, "Literal search_code"),
-        ("search_code", {"query": "resolve_context", "regex": False}, "Exact string search_code"),
+        ("search_code", {"query": "resolve_contx", "regex": False}, "Exact string search_code"),
         ("search_code", {"query": "fn\\s+assemble", "regex": True}, "Regex search_code"),
         ("find_symbol", {"query": "AstrolabeServer", "substring": False}, "Exact find_symbol"),
         ("find_symbol", {"query": "AstrolabeServer/new"}, "Hierarchical find_symbol"),
-        ("get_languages", {}, "get_languages status"),
+        ("get_lang", {}, "get_lang status"),
     ]
 
     parity_passed = 0

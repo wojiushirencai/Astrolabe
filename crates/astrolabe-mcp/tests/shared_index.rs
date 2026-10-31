@@ -201,7 +201,7 @@ fn two_followers_forward_to_one_leader() {
     assert!(listed["result"]["tools"]
         .as_array()
         .is_some_and(|t| !t.is_empty()));
-    let refs = f2.call_text("find_references", json!({"symbol": "greet"}));
+    let refs = f2.call_text("find_refs", json!({"symbol": "greet"}));
     assert!(refs.contains("other.py"), "{refs}");
 
     for f in [&f1, &f2] {

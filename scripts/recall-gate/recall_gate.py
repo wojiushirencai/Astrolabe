@@ -115,7 +115,7 @@ def run(binary, lang):
     t0 = time.time()
     m = MCP(binary, root)
     try:
-        while "Index is building in the background" in m.call("get_languages", {}):
+        while "Index is building in the background" in m.call("get_lang", {}):
             time.sleep(0.1)
         ready = time.time() - t0
         byname = collections.defaultdict(list)

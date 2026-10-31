@@ -89,6 +89,77 @@ pub fn strip_prefix_normalized(root: &Path, path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(rest))
 }
 
+/// `/`-separated form of a caller-supplied path: backslashes become `/` and a
+/// Windows verbatim prefix (`\\?\` / `\\?\UNC\`) is dropped.
+///
+/// Leading `./` and `/` are preserved: an absolute path must stay absolute for
+/// [`normalize_path_filter_under`] to be able to trim it.
+fn slashes_preserving_root(path: &str) -> String {
+    let raw = path.trim().replace('\\', "/");
+    // `\\?\C:\…` / `\\?\UNC\server\share\…` arrive as `//?/C:/…` /
+    // `//?/UNC/server/share/…` once the separators are unified.
+    if let Some(rest) = raw.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = raw.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        raw
+    }
+}
+
+/// Drop every leading `/` and `./` (the [`RelPath`] contract).
+///
+/// [`RelPath`]: crate::types::RelPath
+fn strip_leading_dot_slash(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        let trimmed = rest.trim_start_matches('/');
+        match trimmed.strip_prefix("./") {
+            Some(next) => rest = next,
+            None => return trimmed,
+        }
+    }
+}
+
+/// Repo-relative, `/`-separated form of a caller `path_filter`.
+///
+/// Index paths are always `/`-separated and repo-relative, but callers (and
+/// Windows MCP clients) often spell them natively:
+///
+/// - `crates\astrolabe-mcp` → `crates/astrolabe-mcp`
+/// - `.\crates\astrolabe-mcp` → `crates/astrolabe-mcp`
+/// - `C:\proj\crates\astrolabe-mcp` with `root = C:\proj` → `crates/astrolabe-mcp`
+///
+/// An absolute path outside `root` is only slash-normalised (it cannot be
+/// read as repo-relative). Case is preserved: matching stays case-sensitive.
+pub fn normalize_path_filter_under(root: &Path, filter: &str) -> String {
+    let slashed = slashes_preserving_root(filter);
+    // Platform-independent absolute test: unit tests feed `C:\…` on Unix too.
+    if slashed.starts_with('/') || looks_windows_path(&slashed) {
+        if let Some(rel) = strip_prefix_normalized(root, Path::new(&slashed)) {
+            let rel = rel.to_string_lossy();
+            // `path_norm_key` lowercases Windows paths; recover the caller's
+            // spelling from the same-length tail of the slashed input. ASCII
+            // lowercasing preserves byte length, so the tail lines up.
+            let n = slashed.len();
+            let k = rel.len();
+            let tail = if k <= n && slashed.is_char_boundary(n - k) {
+                &slashed[n - k..]
+            } else {
+                rel.as_ref()
+            };
+            return strip_leading_dot_slash(tail).to_string();
+        }
+    }
+    strip_leading_dot_slash(&slashed).to_string()
+}
+
+/// [`normalize_path_filter_under`] without an index root: `\` → `/` plus the
+/// leading `./` / `/` strip; absolute paths cannot be made repo-relative.
+pub fn normalize_path_filter(filter: &str) -> String {
+    strip_leading_dot_slash(&slashes_preserving_root(filter)).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +227,91 @@ mod tests {
                 .unwrap()
                 .to_string_lossy(),
             "crates/x"
+        );
+    }
+
+    #[test]
+    fn normalize_path_filter_unifies_windows_separators() {
+        // The defect repro: an index path is `crates/astrolabe-mcp/src/…`, so
+        // a backslash filter must match after normalization.
+        assert_eq!(
+            normalize_path_filter(r"crates\astrolabe-mcp"),
+            "crates/astrolabe-mcp"
+        );
+        assert_eq!(
+            normalize_path_filter(r".\crates\astrolabe-mcp"),
+            "crates/astrolabe-mcp"
+        );
+        assert_eq!(
+            normalize_path_filter(r"crates\astrolabe-mcp\src\server.rs"),
+            "crates/astrolabe-mcp/src/server.rs"
+        );
+        // Forward-slash filters keep working unchanged.
+        assert_eq!(
+            normalize_path_filter("crates/astrolabe-mcp"),
+            "crates/astrolabe-mcp"
+        );
+        // Leading `/` and `./` are stripped like `RelPath::new` does; case is
+        // preserved (matching stays case-sensitive).
+        assert_eq!(normalize_path_filter("/src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path_filter("./src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path_filter("././src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path_filter("Src/Lib.RS"), "Src/Lib.RS");
+        // Surrounding whitespace is not part of the path.
+        assert_eq!(normalize_path_filter("  src\\lib.rs  "), "src/lib.rs");
+        assert_eq!(normalize_path_filter(""), "");
+    }
+
+    #[test]
+    fn normalize_path_filter_trims_absolute_paths_under_root() {
+        let root = PathBuf::from(r"C:\proj");
+        assert_eq!(
+            normalize_path_filter_under(&root, r"C:\proj\crates\astrolabe-mcp"),
+            "crates/astrolabe-mcp"
+        );
+        // Verbatim root / caller form, and a differing separators mix.
+        assert_eq!(
+            normalize_path_filter_under(&root, r"\\?\C:\proj\crates\astrolabe-mcp"),
+            "crates/astrolabe-mcp"
+        );
+        assert_eq!(
+            normalize_path_filter_under(&PathBuf::from(r"\\?\C:\proj"), r"C:\proj\src\main.rs"),
+            "src/main.rs"
+        );
+        // The caller's relative spelling (case) survives the trimming.
+        assert_eq!(
+            normalize_path_filter_under(&root, r"C:\Proj\Crates\Astrolabe-Mcp"),
+            "Crates/Astrolabe-Mcp"
+        );
+        // Relative filters are only slash-normalized.
+        assert_eq!(
+            normalize_path_filter_under(&root, r"crates\astrolabe-mcp"),
+            "crates/astrolabe-mcp"
+        );
+        // Absolute but outside the root: cannot be repo-relative, so only the
+        // separators change (the caller gets the usual "matches no path" hint).
+        assert_eq!(
+            normalize_path_filter_under(&root, r"D:\other\repo"),
+            "D:/other/repo"
+        );
+        assert_eq!(
+            normalize_path_filter_under(&root, r"C:\projectile\x"),
+            "C:/projectile/x"
+        );
+    }
+
+    #[test]
+    fn normalize_path_filter_under_unix_root() {
+        let root = PathBuf::from("/Users/zhoulei/tmp/Astrolabe");
+        assert_eq!(
+            normalize_path_filter_under(&root, "/Users/zhoulei/tmp/Astrolabe/crates/x"),
+            "crates/x"
+        );
+        assert_eq!(normalize_path_filter_under(&root, "crates/x"), "crates/x");
+        // Same path as the root: empty filter (whole repo).
+        assert_eq!(
+            normalize_path_filter_under(&root, "/Users/zhoulei/tmp/Astrolabe"),
+            ""
         );
     }
 }

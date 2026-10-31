@@ -214,8 +214,14 @@ pub(crate) fn config() -> &'static HooksConfig {
 
 /// 非符号工具子串：仍用于分类（AstrolabeNonSymbolic vs Symbolic），
 /// 但两类工具在 decide 中都会 `reset_burst`（含 grep/read/non_symbolic/slice）。
-pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] =
-    &["search_code", "diagnostics", "languages"];
+pub(crate) const NON_SYMBOLIC_ASTROLABE_SUBSTRINGS: &[&str] = &[
+    "search_code",
+    "get_diag",
+    "get_lang",
+    // Legacy long names, still accepted as call-time aliases.
+    "diagnostics",
+    "languages",
+];
 
 /// 非 Claude-Code 客户端判定 read_file 的动作动词子串
 pub(crate) const READ_FILE_VERB_SUBSTRINGS: &[&str] = &["read", "view", "open", "show"];
@@ -648,18 +654,18 @@ fn command_value_to_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// 本服务固定目录里的 7 个工具名
+/// 本服务固定目录里的 7 个工具名（canonical 短名）。
 const ASTROLABE_CATALOG_TOOLS: &[&str] = &[
-    "resolve_context",
+    "resolve_contx",
     "search_code",
     "find_symbol",
-    "find_references",
-    "goto_definition",
-    "get_diagnostics",
-    "get_languages",
+    "find_refs",
+    "goto_def",
+    "get_diag",
+    "get_lang",
 ];
 
-/// 工具名是否属于 Astrolabe：含 "astrolabe" 且含固定目录或兼容别名里的某个工具名。
+/// 工具名是否属于 Astrolabe：含 "astrolabe" 且含固定目录、别名或兼容别名里的某个工具名。
 /// 第三方 `mcp__astrolabe_docs__fetch` 之类仅名字撞上的工具不算。
 pub(crate) fn is_astrolabe_tool(tool_name: &str) -> bool {
     if !tool_name.contains("astrolabe") {
@@ -668,6 +674,9 @@ pub(crate) fn is_astrolabe_tool(tool_name: &str) -> bool {
     ASTROLABE_CATALOG_TOOLS
         .iter()
         .any(|t| tool_name.contains(t))
+        || crate::compat::TOOL_ALIAS_NAMES
+            .iter()
+            .any(|t| tool_name.contains(t))
         || crate::compat::COMPAT_TOOL_NAMES
             .iter()
             .any(|t| tool_name.contains(t))
@@ -1712,43 +1721,43 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let max_limit = config().slice_read_max_limit;
     let slice_threshold = config().slice_read_threshold;
     let readonly_note = format!(" Note: all Astrolabe tools are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
-    let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_languages tool), grep is the correct tool for them — ignore this reminder.";
+    let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_lang tool), grep is the correct tool for them — ignore this reminder.";
     // Prefer symbolic tools: they reset n_grep/n_read/n_non_symbolic. search_code only
     // clears n_slice — following a search_code-only hint can still hit Read/Grep deny.
     let switch_instruction =
-        "Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (they reset grep/read burst counters); mcp__astrolabe__search_code is for literal/regex text search but only clears the slice-read counter, not n_grep/n_read. Call a symbolic Astrolabe tool now (read-only, safe).";
+        "Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset grep/read burst counters); mcp__astrolabe__search_code is for literal/regex text search but only clears the slice-read counter, not n_grep/n_read. Call a symbolic Astrolabe tool now (read-only, safe).";
     let (reason, ctx) = match deny_kind {
         DenyKind::Grep => (
-            "Too many consecutive grep/rg calls without using symbolic tools. Stop using Grep/grep/rg (including Bash rg/grep -rn) for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
+            "Too many consecutive grep/rg calls without using symbolic tools. Stop using Grep/grep/rg (including Bash rg/grep -rn) for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were using many Grep/grep/rg calls recently (host Grep or Bash text-search). Prefer Astrolabe symbolic tools: find_symbol / resolve_context reset the grep/read burst counters; find_references returns path:line anchors. search_code is fine for literal/regex but only clears the slice-read counter — it will not clear n_grep/n_read, so you may still hit Read deny afterward. {switch_instruction}{unindexed_lang_note}"
+                "You were using many Grep/grep/rg calls recently (host Grep or Bash text-search). Prefer Astrolabe symbolic tools: find_symbol / resolve_contx reset the grep/read burst counters; find_refs returns path:line anchors. search_code is fine for literal/regex but only clears the slice-read counter — it will not clear n_grep/n_read, so you may still hit Read deny afterward. {switch_instruction}{unindexed_lang_note}"
             ),
         ),
         DenyKind::TextSearch => (
-            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code for literal/regex (slice counter only); also find_references / goto_definition. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
+            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code for literal/regex (slice counter only); also find_refs / goto_def. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
             format!(
-                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (they reset burst counters); use mcp__astrolabe__search_code for literal/regex enclosing bodies (clears slice-read counter only); also find_references / goto_definition (read-only, safe).{unindexed_lang_note}"
+                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset burst counters); use mcp__astrolabe__search_code for literal/regex enclosing bodies (clears slice-read counter only); also find_refs / goto_def (read-only, safe).{unindexed_lang_note}"
             ),
         ),
         DenyKind::Glob => (
-            "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first; also search_code / find_references / goto_definition.",
-            "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context to locate symbols and paths (full burst reset); mcp__astrolabe__search_code is an alternative for text/path discovery (slice counter only).".to_string(),
+            "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first; also search_code / find_refs / goto_def.",
+            "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx to locate symbols and paths (full burst reset); mcp__astrolabe__search_code is an alternative for text/path discovery (slice counter only).".to_string(),
         ),
         DenyKind::Read => (
-            "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
+            "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were using many read calls on files recently. Prefer Astrolabe symbolic tools for targeted reads: find_symbol / resolve_context return exact bodies and path:line anchors and reset grep/read burst counters; search_code helps locate text but only clears the slice-read counter. {switch_instruction}"
+                "You were using many read calls on files recently. Prefer Astrolabe symbolic tools for targeted reads: find_symbol / resolve_contx return exact bodies and path:line anchors and reset grep/read burst counters; search_code helps locate text but only clears the slice-read counter. {switch_instruction}"
             ),
         ),
         DenyKind::Mixed => (
-            "Too many consecutive non-symbolic tool calls (mixed grep and read). Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
+            "Too many consecutive non-symbolic tool calls (mixed grep and read). Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were alternating between grep/rg and read file calls recently without using Astrolabe's symbolic mcp tools. Prefer find_symbol / resolve_context (reset burst counters); search_code is for literal/regex and only clears the slice-read counter. {switch_instruction}{unindexed_lang_note}"
+                "You were alternating between grep/rg and read file calls recently without using Astrolabe's symbolic mcp tools. Prefer find_symbol / resolve_contx (reset burst counters); search_code is for literal/regex and only clears the slice-read counter. {switch_instruction}{unindexed_lang_note}"
             ),
         ),
         DenyKind::Slice => (
-            "Too many consecutive file-slice reads without using any Astrolabe tool. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context first; mcp__astrolabe__search_code also clears the slice-read counter — they are read-only and return exact bodies with path:line anchors.",
-            "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_context; mcp__astrolabe__search_code also clears this slice-read counter (unlike grep/read counters). Call an Astrolabe tool now (read-only, safe).".to_string(),
+            "Too many consecutive file-slice reads without using any Astrolabe tool. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first; mcp__astrolabe__search_code also clears the slice-read counter — they are read-only and return exact bodies with path:line anchors.",
+            "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx; mcp__astrolabe__search_code also clears this slice-read counter (unlike grep/read counters). Call an Astrolabe tool now (read-only, safe).".to_string(),
         ),
     };
     let ctx = format!("{ctx}{readonly_note}");
@@ -2525,21 +2534,13 @@ mod tests {
     fn test_3_search_code_resets_burst_counters() {
         // 分类仍区分非符号 vs 符号（观测/文案用），但 decide 一律 reset_burst
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__search_code"));
-        assert!(!is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__get_diagnostics"
-        ));
-        assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_languages"));
+        assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_diag"));
+        assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__get_lang"));
 
         assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__find_symbol"));
-        assert!(is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__find_references"
-        ));
-        assert!(is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__goto_definition"
-        ));
-        assert!(is_astrolabe_symbolic_tool(
-            "mcp__astrolabe__resolve_context"
-        ));
+        assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__find_refs"));
+        assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__goto_def"));
+        assert!(is_astrolabe_symbolic_tool("mcp__astrolabe__resolve_contx"));
 
         let kind = classify_tool(
             "mcp__astrolabe__search_code",
@@ -4060,7 +4061,7 @@ mod tests {
 
     #[test]
     fn test_deny_texts_direct_switch_instruction() {
-        // Grep/Read/Mixed：优先推 find_symbol / resolve_context（清零 burst），
+        // Grep/Read/Mixed：优先推 find_symbol / resolve_contx（清零 burst），
         // 诚实说明 search_code 只清 n_slice；不得残留软口径
         for kind in [DenyKind::Grep, DenyKind::Read, DenyKind::Mixed] {
             let out = build_output(Client::ClaudeCode, kind);
@@ -4069,8 +4070,8 @@ mod tests {
                 "{kind:?} deny output should prefer find_symbol: {out}"
             );
             assert!(
-                out.contains("resolve_context"),
-                "{kind:?} deny output should prefer resolve_context: {out}"
+                out.contains("resolve_contx"),
+                "{kind:?} deny output should prefer resolve_contx: {out}"
             );
             assert!(
                 out.contains("search_code"),
@@ -5966,7 +5967,7 @@ mod tests {
         let out = build_output(Client::ClaudeCode, DenyKind::TextSearch);
         assert!(out.contains("ASTROLABE_DENY_TEXT_SEARCH"), "{out}");
         assert!(out.contains("find_symbol"), "{out}");
-        assert!(out.contains("resolve_context"), "{out}");
+        assert!(out.contains("resolve_contx"), "{out}");
         assert!(out.contains("search_code"), "{out}");
         assert!(out.contains("\"permissionDecision\":\"deny\""));
         let glob = build_output(Client::ClaudeCode, DenyKind::Glob);
@@ -6331,9 +6332,7 @@ mod tests {
             "mcp__astrolabe_docs__fetch_page"
         ));
         assert!(is_astrolabe_tool("mcp__astrolabe__find_symbol"));
-        assert!(is_astrolabe_symbolic_tool(
-            "mcp__astrolabe-ai__find_references"
-        ));
+        assert!(is_astrolabe_symbolic_tool("mcp__astrolabe-ai__find_refs"));
         assert!(is_astrolabe_tool("mcp__astrolabe__search_code"));
         assert!(!is_astrolabe_symbolic_tool("mcp__astrolabe__search_code"));
     }
@@ -6396,7 +6395,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_resets_all_burst_counters_by_design() {
+    fn resolve_contx_resets_all_burst_counters_by_design() {
         // resolve_context 是入口导航工具：它的回答取代了之前 grep/read 的探索，
         // 因此与 find_symbol 等一样清零全部 burst 计数。
         let cfg = HooksConfig::default();
@@ -6408,7 +6407,7 @@ mod tests {
             ..Default::default()
         };
         let kind = classify_tool(
-            "mcp__astrolabe__resolve_context",
+            "mcp__astrolabe__resolve_contx",
             Client::ClaudeCode,
             None,
             None,

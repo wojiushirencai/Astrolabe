@@ -53,7 +53,7 @@ use crate::{
 pub(crate) use crate::session::IndexState;
 
 const DEFAULT_BUDGET: usize = 2_500;
-/// `resolve_context` budget for counting/caller tasks (~3 KB of output).
+/// `resolve_contx` budget for counting/caller tasks (~3 KB of output).
 const COMPACT_CONTEXT_BUDGET: usize = 700;
 /// 资源卸载阈值基线：正文 token 估算超过阈值（含 SLACK）时转存为
 /// MCP resource。`ASTROLABE_RESOURCE_THRESHOLD` 可调，格式错误回退默认。
@@ -873,7 +873,7 @@ fn grouped_closure_line(hits: &[SearchHit], shown: usize, folded_tests: usize) -
 /// Next-step line for results with many hits (> `GROUP_FULL_HITS`).
 fn many_hits_hint(total: usize) -> String {
     if total > GROUP_FULL_HITS {
-        "Next: to count hit lines per directory/file (per line; multiple hits on one line count as 1; for exact occurrence counts use rg -o) use aggregate=top|dir|file (optional skip_comments=true, exclude=[\"_test.go\",\"vendor\"]); for batch rename use find_references dry_run_rename.\n".to_string()
+        "Next: to count hit lines per directory/file (per line; multiple hits on one line count as 1; for exact occurrence counts use rg -o) use aggregate=top|dir|file (optional skip_comments=true, exclude=[\"_test.go\",\"vendor\"]); for batch rename use find_refs dry_run_rename.\n".to_string()
     } else {
         String::new()
     }
@@ -1156,10 +1156,10 @@ fn classify_task(task: &str) -> TaskKind {
 /// One-line pointer to the follow-up tool that fits the task wording.
 fn next_step_hint(task: &str) -> &'static str {
     match classify_task(task) {
-        TaskKind::Rename => "Next: find_references(symbol, dry_run_rename=new_name) for a per-file rename checklist; then run build/tests to verify (use get_diagnostics only if you cannot).\n",
+        TaskKind::Rename => "Next: find_refs(symbol, dry_run_rename=new_name) for a per-file rename checklist; then run build/tests to verify (use get_diag only if you cannot).\n",
         TaskKind::Count => "Next: search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) for N lines / M files per dir/file (per line; multiple hits on one line count as 1); add count_only=true for totals only.\n",
-        TaskKind::Refs => "Next: find_references(symbol) for precise call sites; use goto_definition for the definition.\n",
-        TaskKind::Other => "Next: for a known name use find_symbol (include_body=true for source); for literals/copy use search_code; for callers use find_references.\n",
+        TaskKind::Refs => "Next: find_refs(symbol) for precise call sites; use goto_def for the definition.\n",
+        TaskKind::Other => "Next: for a known name use find_symbol (include_body=true for source); for literals/copy use search_code; for callers use find_refs.\n",
     }
 }
 
@@ -2046,7 +2046,7 @@ pub struct AstrolabeServer {
     /// Index generation each `find_symbol` query (offset and budget aside) was
     /// last served at, so a later page can say the index changed in between.
     symbol_page_generations: Arc<Mutex<HashMap<String, u64>>>,
-    /// Same for `resolve_context` pages.
+    /// Same for `resolve_contx` pages.
     context_page_generations: Arc<Mutex<HashMap<String, u64>>>,
     /// Per-agent monotonic tool-call counters for "already returned on call #N".
     call_seq: Arc<Mutex<HashMap<String, u64>>>,
@@ -2059,8 +2059,8 @@ pub struct AstrolabeServer {
     /// Per-session coverage-note memory for leader-side session views
     /// (the root session's own slot otherwise).
     coverage_note_override: Option<Arc<Mutex<Option<String>>>>,
-    /// Last unambiguous symbol → path[:line] from find_symbol / goto_definition
-    /// in this MCP process, so find_references can inherit a missing path.
+    /// Last unambiguous symbol → path[:line] from find_symbol / goto_def
+    /// in this MCP process, so find_refs can inherit a missing path.
     recent_symbols: Arc<crate::recent_symbol::RecentSymbols>,
 }
 
@@ -2431,7 +2431,7 @@ confidence: unknown"
         Ok(activate_absolute_root(&dispatch, resolved))
     }
 
-    /// Remember a single unambiguous symbol hit for later find_references.
+    /// Remember a single unambiguous symbol hit for later find_refs.
     fn remember_symbol_anchor(
         &self,
         root: &Path,
@@ -2468,7 +2468,7 @@ confidence: unknown"
         let Some(file) = index.file(s.file) else {
             return;
         };
-        // Index lines are 1-based; find_references line is 0-based.
+        // Index lines are 1-based; find_refs line is 0-based.
         let line = s.start_line.saturating_sub(1);
         self.remember_symbol_anchor(root, &s.name, file.path.as_str(), Some(line));
     }
@@ -2564,6 +2564,8 @@ confidence: unknown"
         const MAX_SECONDS: u64 = 20;
         let mut params = params.clone();
         let regex_downgraded = apply_code_fragment_literal(&mut params);
+        params.path_filter =
+            normalize_filter_for_root(&session.root, params.path_filter.as_deref());
         let sensitive = search_shape::literal_case_sensitive(
             &params.query,
             params.regex,
@@ -2663,7 +2665,7 @@ confidence: unknown"
     }
 
     /// Index access without a write barrier and without the per-query
-    /// coverage note: for `get_languages`, whose own body already carries the
+    /// coverage note: for `get_lang`, whose own body already carries the
     /// full coverage block.
     fn with_index_without_coverage_note(
         &self,
@@ -2773,7 +2775,7 @@ confidence: unknown"
         }
     }
 
-    /// The coordinate legend of find_references / goto_definition is the
+    /// The coordinate legend of find_refs / goto_def is the
     /// same sentence every time (seven times in one A/B run); keep the
     /// first one in the session and drop the rest.
     fn coord_note_once(&self, mut result: CallToolResult) -> CallToolResult {
@@ -3371,12 +3373,17 @@ fn relativize_to_child(child: &Path, path: &str) -> String {
 /// under the relative path of that override inside a reused parent session.
 ///
 /// When `rel_under` is empty the override equalled the parent root and the
-/// caller path is kept as-is. When the caller omitted path, `rel_under` itself
-/// becomes the scoped filter (so `index_root=<subdir>` still narrows results).
+/// caller path is kept as-is (still with `/` separators: array `path_filter`
+/// matching is byte-wise against `/`-normalized index paths). When the caller
+/// omitted path, `rel_under` itself becomes the scoped filter (so
+/// `index_root=<subdir>` still narrows results).
 fn nest_path_under_rel(path: Option<&str>, rel_under: &Path) -> Option<String> {
     let rel = rel_under.to_string_lossy().replace('\\', "/");
-    let caller = path.map(str::trim).filter(|p| !p.is_empty());
-    match (caller, rel.as_str()) {
+    let caller = path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.replace('\\', "/"));
+    match (caller.as_deref(), rel.as_str()) {
         (Some(p), "") => Some(p.to_string()),
         (None, "") => None,
         (None, r) => Some(r.to_string()),
@@ -3385,6 +3392,20 @@ fn nest_path_under_rel(path: Option<&str>, rel_under: &Path) -> Option<String> {
             Some(joined.to_string_lossy().replace('\\', "/"))
         }
     }
+}
+
+/// Bring a caller `path_filter` into the repo's own spelling before matching:
+/// `/` separators, no leading `./`, and absolute paths under `root` trimmed to
+/// repo-relative.
+///
+/// Index paths are always `/`-separated repo-relative strings, so a Windows
+/// client sending `crates\astrolabe-mcp` (or an absolute
+/// `C:\repo\crates\astrolabe-mcp`) would otherwise match nothing. Empty after
+/// normalization (filter == root) means "whole repo".
+fn normalize_filter_for_root(root: &Path, filter: Option<&str>) -> Option<String> {
+    let filter = filter.map(str::trim).filter(|f| !f.is_empty())?;
+    let normalized = astrolabe_core::paths::normalize_path_filter_under(root, filter);
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn top_unindexed_exts(
@@ -3449,7 +3470,7 @@ fn format_find_symbol_unindexed_hint(
 #[tool_router]
 impl AstrolabeServer {
     #[tool(description = "When the task is unclear: task-ranked related files and symbols.")]
-    pub(crate) fn resolve_context(
+    pub(crate) fn resolve_contx(
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
     ) -> CallToolResult {
@@ -3471,7 +3492,7 @@ impl AstrolabeServer {
             };
             let mut params = params;
             params.path_filter = route.path.clone();
-            let result = self.resolve_context_inner(params, &route.hint);
+            let result = self.resolve_contx_inner(params, &route.hint);
             Self::with_route_note(result, &route.note)
         };
         match agent_override {
@@ -3480,8 +3501,12 @@ impl AstrolabeServer {
         }
     }
 
-    fn resolve_context_inner(&self, params: ResolveContextParams, hint: &str) -> CallToolResult {
+    fn resolve_contx_inner(&self, mut params: ResolveContextParams, hint: &str) -> CallToolResult {
         self.with_fresh_index(hint, |session, index| {
+            // Windows clients may send `crates\astrolabe-mcp` (or an absolute
+            // path): match against `/`-separated index paths.
+            params.path_filter =
+                normalize_filter_for_root(&session.root, params.path_filter.as_deref());
             let graph = index.graph();
             let kind = classify_task(&params.task_description);
             let compact_task = matches!(kind, TaskKind::Count | TaskKind::Refs);
@@ -3512,12 +3537,12 @@ impl AstrolabeServer {
                 if let Some(c) = earlier {
                     let digest = self.digest_get(&key);
                     let body = format!(
-                        "Same resolve_context already returned on tool call #{c} this session (index unchanged); not resending full text.\n{digest}If you did not see that result (e.g. subtask or compressed context), pass dedup=false to refetch.\n{}",
+                        "Same resolve_contx already returned on tool call #{c} this session (index unchanged); not resending full text.\n{digest}If you did not see that result (e.g. subtask or compressed context), pass dedup=false to refetch.\n{}",
                         next_step_hint(&params.task_description)
                     );
                     return self.result_on(
                         &session.root,
-                        "resolve_context",
+                        "resolve_contx",
                         body,
                         json!({"deduplicated":true,"earlier_call":c,"budget_tokens":params.budget_tokens}),
                         Some(params.budget_tokens),
@@ -3575,7 +3600,7 @@ impl AstrolabeServer {
             let conf_label = if page.unmatched { "unknown" } else { "scoped" };
             self.result_on(
                 &session.root,
-                "resolve_context",
+                "resolve_contx",
                 body,
                 json!({"confidence":conf_label,"matched":!page.unmatched,"budget_tokens":budget,"offset":params.offset,"total":page.total}),
                 Some(budget),
@@ -3590,10 +3615,10 @@ impl AstrolabeServer {
     // `precise_tools`, which reports an actionable install hint (and
     // `confidence: unknown`) when no server is available — never an empty
     // result that reads like "there are no references".
-    #[tool(description = crate::precise_tools::FIND_REFERENCES_DESC)]
-    pub(crate) fn find_references(
+    #[tool(description = crate::precise_tools::FIND_REFS_DESC)]
+    pub(crate) fn find_refs(
         &self,
-        Parameters(mut params): Parameters<crate::precise_tools::FindReferencesParams>,
+        Parameters(mut params): Parameters<crate::precise_tools::FindRefsParams>,
     ) -> CallToolResult {
         let route = match self.resolve_call_root(
             params.index_root.as_deref(),
@@ -3606,7 +3631,7 @@ impl AstrolabeServer {
         };
         params.path = route.path;
         // Inherit path from this session's last unambiguous symbol hit when
-        // the model omitted it (common after find_symbol / goto_definition).
+        // the model omitted it (common after find_symbol / goto_def).
         let mut inherit_note: Option<String> = None;
         if params.path.is_none() {
             if let Ok(session) = self.session_for(&route.hint) {
@@ -3632,7 +3657,7 @@ impl AstrolabeServer {
             }
         }
         self.with_precise(&route.hint, true, move |session| {
-            let mut result = self.coord_note_once(crate::precise_tools::run_find_references(
+            let mut result = self.coord_note_once(crate::precise_tools::run_find_refs(
                 params,
                 session.precise.as_ref(),
             ));
@@ -3643,10 +3668,10 @@ impl AstrolabeServer {
         })
     }
 
-    #[tool(description = crate::precise_tools::GOTO_DEFINITION_DESC)]
-    pub(crate) fn goto_definition(
+    #[tool(description = crate::precise_tools::GOTO_DEF_DESC)]
+    pub(crate) fn goto_def(
         &self,
-        Parameters(mut params): Parameters<crate::precise_tools::GotoDefinitionParams>,
+        Parameters(mut params): Parameters<crate::precise_tools::GotoDefParams>,
     ) -> CallToolResult {
         let route = match self.resolve_call_root(
             params.index_root.as_deref(),
@@ -3659,7 +3684,7 @@ impl AstrolabeServer {
         };
         params.path = route.path.unwrap_or_default();
         self.with_precise(&route.hint, true, move |session| {
-            // Use site is enough for a later find_references without path
+            // Use site is enough for a later find_refs without path
             // (fix_path keeps a file that contains the symbol).
             if let Some(sym) = params
                 .symbol
@@ -3669,17 +3694,17 @@ impl AstrolabeServer {
             {
                 self.remember_symbol_anchor(&session.root, sym, &params.path, params.line);
             }
-            self.coord_note_once(crate::precise_tools::run_goto_definition(
+            self.coord_note_once(crate::precise_tools::run_goto_def(
                 params,
                 session.precise.as_ref(),
             ))
         })
     }
 
-    #[tool(description = crate::precise_tools::GET_DIAGNOSTICS_DESC)]
-    pub(crate) fn get_diagnostics(
+    #[tool(description = crate::precise_tools::GET_DIAG_DESC)]
+    pub(crate) fn get_diag(
         &self,
-        Parameters(mut params): Parameters<crate::precise_tools::GetDiagnosticsParams>,
+        Parameters(mut params): Parameters<crate::precise_tools::GetDiagParams>,
     ) -> CallToolResult {
         let route = match self.resolve_call_root(
             params.index_root.as_deref(),
@@ -3692,7 +3717,7 @@ impl AstrolabeServer {
         };
         params.path = route.path.unwrap_or_default();
         self.with_precise(&route.hint, false, move |session| {
-            crate::precise_tools::run_get_diagnostics(params, session.precise.as_ref())
+            crate::precise_tools::run_get_diag(params, session.precise.as_ref())
         })
     }
 
@@ -3761,7 +3786,7 @@ impl AstrolabeServer {
         })
     }
 
-    /// `resolve_context` pages are cut from a ranking recomputed per call; see
+    /// `resolve_contx` pages are cut from a ranking recomputed per call; see
     /// `symbol_page_drift_note`.
     fn context_page_drift_note(
         &self,
@@ -3784,7 +3809,7 @@ impl AstrolabeServer {
         })
     }
 
-    fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
+    fn find_symbol_inner(&self, mut params: QueryParams) -> CallToolResult {
         if params.query.trim().is_empty() {
             return text_error(
                 "find_symbol needs a non-empty query (symbol name, substring, or 'Class/method' path); a blank query does not return all symbols.".to_string(),
@@ -3793,7 +3818,12 @@ impl AstrolabeServer {
         if looks_like_filesystem_path(&params.query) {
             return text_error(filesystem_path_as_query_error(&params.query));
         }
-        self.with_fresh_index(params.root.as_deref().unwrap_or(""), |session, index| {
+        let hint = params.root.clone().unwrap_or_default();
+        self.with_fresh_index(&hint, |session, index| {
+            // Windows clients may send `crates\astrolabe-mcp` (or an absolute
+            // path): match against `/`-separated index paths.
+            params.path_filter =
+                normalize_filter_for_root(&session.root, params.path_filter.as_deref());
             if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
                 return self.finish_at(&session.root, text_error(message));
             }
@@ -3923,7 +3953,7 @@ impl AstrolabeServer {
                     (symbol_line(symbol, path), idx)
                 })
                 .collect();
-            // One exact hit → later find_references can omit path.
+            // One exact hit → later find_refs can omit path.
             self.remember_if_unique_symbol_hit(&session.root, typed, index, &hits);
             let total = hits.len();
             let offset = params.offset.min(total);
@@ -3988,7 +4018,7 @@ impl AstrolabeServer {
             }
             body.push_str(&implementors);
             body.push_str(&folded_note);
-            // 零命中时显式声明（对齐 find_references 空结果约定），并跳过
+            // 零命中时显式声明（对齐 find_refs 空结果约定），并跳过
             // include_body 附加，避免误导性的"无可提取的符号体"。
             if hits.is_empty() {
                 body.push_str("(no matching symbols)\n");
@@ -4087,14 +4117,19 @@ impl AstrolabeServer {
 
     fn search_code_inner(&self, mut params: SearchParams) -> CallToolResult {
         let regex_downgraded = apply_code_fragment_literal(&mut params);
-        self.with_fresh_index(
-            params.root.as_deref().unwrap_or(""),
-            |session, index| {
-                // A filter that only hits non-code text files (docs/, *.toml …)
-                // is valid here: those files are searched as [text-only].
-                // Computed once per call; the path_filter view, the text-only
-                // scan and `data_hits_outside` all derive from it.
-                let all_text_paths = index.text_only_paths(None);
+        // `hint` must be its own binding: the closure mutates `params`, so it
+        // cannot also borrow `params.root`.
+        let hint = params.root.clone().unwrap_or_default();
+        self.with_fresh_index(&hint, |session, index| {
+            // Windows clients may send `crates\astrolabe-mcp` (or an absolute
+            // path): match against `/`-separated index paths.
+            params.path_filter =
+                normalize_filter_for_root(&session.root, params.path_filter.as_deref());
+            // A filter that only hits non-code text files (docs/, *.toml …)
+            // is valid here: those files are searched as [text-only].
+            // Computed once per call; the path_filter view, the text-only
+            // scan and `data_hits_outside` all derive from it.
+            let all_text_paths = index.text_only_paths(None);
                 let filter_text_paths: Vec<&RelPath> = all_text_paths
                     .iter()
                     .copied()
@@ -4678,7 +4713,7 @@ impl AstrolabeServer {
                 body.push_str(&skip_note);
                     body.push_str(&data_note);
                 // 零命中时显式声明，区分"正常无匹配"与"服务故障/吞内容"
-                // (对齐 find_references 的 `未找到对 … 的引用.` 空结果约定).
+                // (对齐 find_refs 的 `未找到对 … 的引用.` 空结果约定).
                 let mut unindexed_hint = false;
                 if matches.is_empty() {
                     body.push_str("(no matching code lines)\n");
@@ -5183,10 +5218,7 @@ impl AstrolabeServer {
     #[tool(
         description = "Language distribution, code size, LSP readiness (Ready/needs_install/AST-only), index gaps, and files with syntax errors."
     )]
-    pub(crate) fn get_languages(
-        &self,
-        Parameters(params): Parameters<BudgetOnly>,
-    ) -> CallToolResult {
+    pub(crate) fn get_lang(&self, Parameters(params): Parameters<BudgetOnly>) -> CallToolResult {
         let route = match self.resolve_call_root(
             params.index_root.as_deref(),
             params.root.as_deref(),
@@ -5196,11 +5228,11 @@ impl AstrolabeServer {
             Ok(route) => route,
             Err(err) => return err,
         };
-        let result = self.get_languages_inner(params, &route.hint);
+        let result = self.get_lang_inner(params, &route.hint);
         Self::with_route_note(result, &route.note)
     }
 
-    fn get_languages_inner(&self, params: BudgetOnly, hint: &str) -> CallToolResult {
+    fn get_lang_inner(&self, params: BudgetOnly, hint: &str) -> CallToolResult {
         self.with_index_without_coverage_note(hint, |session, index| {
             let mut totals: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
             for file in &index.graph().files {
@@ -5276,7 +5308,7 @@ impl AstrolabeServer {
             }
             self.result_on(
                 &session.root,
-                "get_languages",
+                "get_lang",
                 body,
                 json!({
                     "confidence":"exact",
@@ -5337,9 +5369,15 @@ impl ServerHandler for AstrolabeServer {
     /// [`cancel::is_cancelled`] at its checkpoints.
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // Old long names and `ast_*` spellings stay callable: rewrite to the
+        // canonical catalog name before anything else looks at it (shared-index
+        // forwarding, loop guard, dispatch).
+        if let Some(canonical) = crate::compat::canonical_tool_name(&request.name) {
+            request.name = canonical.into();
+        }
         if self.shared.is_some() {
             let ct = context.ct.clone();
             let forwarded = self
@@ -5879,7 +5917,11 @@ fn symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
 /// path_filter 不匹配任何已索引路径（也不匹配未入索引的代码文件）时返回
 /// 显式错误，列出最接近的已索引路径，而不是静默返回 0 条。
 fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> {
-    let filter = filter.filter(|f| !f.is_empty())?;
+    let raw = filter.filter(|f| !f.is_empty())?;
+    // Match the repo's `/`-separated spelling so a Windows client sending
+    // `crates\astrolabe-mcp` is diagnosed as a hit, not as a missing path.
+    let normalized = normalize_filter_for_root(&index.root, Some(raw));
+    let filter = normalized.as_deref().unwrap_or(raw);
     let files = &index.graph().files;
     if files.iter().any(|file| file.path.as_str().contains(filter)) {
         return None;
@@ -6303,7 +6345,7 @@ mod tests {
     #[test]
     fn excluded_tools_are_omitted_from_catalog() {
         let mut ctx = crate::ClientContext::default_builtin();
-        ctx.excluded_tools = vec!["get_languages".into(), "find_symbol".into()];
+        ctx.excluded_tools = vec!["get_lang".into(), "find_symbol".into()];
         let server = AstrolabeServer::new_with_cache_budget_and_context(
             PathBuf::from("."),
             DEFAULT_MEMORY_BUDGET_BYTES,
@@ -6314,13 +6356,10 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert!(
-            !names.iter().any(|name| name == "get_languages"),
-            "{names:?}"
-        );
+        assert!(!names.iter().any(|name| name == "get_lang"), "{names:?}");
         assert!(!names.iter().any(|name| name == "find_symbol"), "{names:?}");
         assert!(
-            names.iter().any(|name| name == "resolve_context"),
+            names.iter().any(|name| name == "resolve_contx"),
             "{names:?}"
         );
         assert_eq!(names.len(), crate::TOOL_COUNT - 2);
@@ -6374,9 +6413,7 @@ mod tests {
             crate::ClientContext::default_builtin(),
         );
         let raw = Value::Object((*default_server.listed_tools()[0].input_schema).clone());
-        let line = raw
-            .pointer("/properties/line")
-            .expect("find_references line");
+        let line = raw.pointer("/properties/line").expect("find_refs line");
         assert_eq!(
             line.get("type"),
             Some(&json!("integer")),
@@ -6405,7 +6442,7 @@ mod tests {
     #[test]
     fn every_tool_returns_nonempty_first_text_block() {
         let server = ready_server();
-        assert_first_text(server.resolve_context(Parameters(ResolveContextParams {
+        assert_first_text(server.resolve_contx(Parameters(ResolveContextParams {
             root: None,
             index_root: None,
             task_description: "alpha".into(),
@@ -6448,7 +6485,7 @@ mod tests {
             count_only: false,
             skip_comments: false,
         })));
-        assert_first_text(server.get_languages(Parameters(BudgetOnly {
+        assert_first_text(server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 100,
@@ -6489,7 +6526,7 @@ mod tests {
     fn structured_output_opt_in_carries_root_and_full_text() {
         let mut server = ready_server();
         server.structured_output = true;
-        let result = server.get_languages(Parameters(BudgetOnly {
+        let result = server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 100,
@@ -6932,7 +6969,7 @@ mod tests {
         assert_eq!(missing.is_error, Some(true));
         let err = text_of(&missing);
         assert!(err.contains("find_symbol"), "{err}");
-        assert!(err.contains("find_references"), "{err}");
+        assert!(err.contains("find_refs"), "{err}");
 
         let via_query = server
             .dispatch_tool(
@@ -6946,6 +6983,65 @@ mod tests {
             text_of(&via_query)
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every catalog tool is callable by its canonical short name and by each
+    /// legacy alias (`resolve_context`, `ast_get_diag`, …). The alias is
+    /// rewritten before the router sees it, so the two paths answer alike.
+    #[test]
+    fn canonical_and_alias_names_reach_the_same_tool() {
+        let (server, dir) = smart_server(&[("calc.py", CALC_PY.into())]);
+        // (canonical, alias, arguments that exercise the tool without an LSP)
+        let cases: &[(&str, &str, Value)] = &[
+            (
+                "resolve_contx",
+                "resolve_context",
+                json!({"task_description": "compute"}),
+            ),
+            ("find_refs", "find_references", json!({"symbol": "compute"})),
+            (
+                "goto_def",
+                "goto_definition",
+                json!({"path": "calc.py", "symbol": "compute"}),
+            ),
+            ("get_diag", "get_diagnostics", json!({"path": "calc.py"})),
+            ("get_lang", "get_languages", json!({})),
+            ("search_code", "ast_search", json!({"query": "marker_x"})),
+            ("find_symbol", "ast_symbol", json!({"query": "compute"})),
+        ];
+        for (canonical, alias, args) in cases {
+            let by_canonical = server
+                .dispatch_tool(canonical, args.as_object().cloned())
+                .unwrap_or_else(|err| panic!("{canonical}: {err:?}"));
+            let by_alias = server
+                .dispatch_tool(alias, args.as_object().cloned())
+                .unwrap_or_else(|err| panic!("{alias}: {err:?}"));
+            assert_eq!(by_canonical.is_error, by_alias.is_error, "{canonical}");
+            assert!(
+                !text_of(&by_alias).trim().is_empty(),
+                "{alias} produced empty text"
+            );
+            assert!(
+                text_of(&by_alias).starts_with("index_root:"),
+                "{alias} lost the index_root header: {}",
+                text_of(&by_alias)
+            );
+        }
+        // Unknown names still fail: the alias table cannot hide typos.
+        assert!(server.dispatch_tool("ast_nope", None).is_err());
+        // Aliases never appear in tools/list.
+        let listed: Vec<String> = server
+            .listed_tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for (_, alias, _) in cases {
+            assert!(
+                !listed.iter().any(|name| name == alias),
+                "{alias} leaked into tools/list: {listed:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7224,7 +7320,7 @@ mod tests {
     }
 
     #[test]
-    fn find_references_inherits_path_from_unique_find_symbol() {
+    fn find_refs_inherits_path_from_unique_find_symbol() {
         let (server, dir) = smart_server(&[(
             "svc/channel.go",
             "package svc\n\nfunc ShouldDisableChannel() bool { return false }\n".into(),
@@ -7235,8 +7331,8 @@ mod tests {
             sym.contains("svc/channel.go"),
             "find_symbol should hit the definition: {sym}"
         );
-        let refs = text_of(&server.find_references(Parameters(
-            crate::precise_tools::FindReferencesParams {
+        let refs = text_of(
+            &server.find_refs(Parameters(crate::precise_tools::FindRefsParams {
                 root: None,
                 index_root: None,
                 symbol: "ShouldDisableChannel".into(),
@@ -7246,8 +7342,8 @@ mod tests {
                 budget_tokens: 2500,
                 offset: None,
                 dry_run_rename: None,
-            },
-        )));
+            })),
+        );
         assert!(
             refs.contains("reusing this session's latest") && refs.contains("svc/channel.go"),
             "expected session inherit note: {refs}"
@@ -7256,7 +7352,7 @@ mod tests {
     }
 
     #[test]
-    fn find_references_does_not_inherit_when_find_symbol_is_ambiguous() {
+    fn find_refs_does_not_inherit_when_find_symbol_is_ambiguous() {
         let (server, dir) = smart_server(&[
             ("a/x.go", "package a\n\nfunc Dup() {}\n".into()),
             ("b/y.go", "package b\n\nfunc Dup() {}\n".into()),
@@ -7264,8 +7360,8 @@ mod tests {
         let sym = text_of(&server.find_symbol(Parameters(find("Dup"))));
         assert!(sym.contains("a/x.go") && sym.contains("b/y.go"), "{sym}");
         // Two exact hits → nothing remembered; missing path stays Ambiguous.
-        let refs = text_of(&server.find_references(Parameters(
-            crate::precise_tools::FindReferencesParams {
+        let refs = text_of(
+            &server.find_refs(Parameters(crate::precise_tools::FindRefsParams {
                 root: None,
                 index_root: None,
                 symbol: "Dup".into(),
@@ -7275,8 +7371,8 @@ mod tests {
                 budget_tokens: 2500,
                 offset: None,
                 dry_run_rename: None,
-            },
-        )));
+            })),
+        );
         assert!(
             !refs.contains("reusing this session's latest"),
             "must not invent a path from an ambiguous find_symbol: {refs}"
@@ -7289,7 +7385,7 @@ mod tests {
     }
 
     #[test]
-    fn find_references_inherits_after_path_filter_narrows_to_one() {
+    fn find_refs_inherits_after_path_filter_narrows_to_one() {
         let (server, dir) = smart_server(&[
             ("a/x.go", "package a\n\nfunc Init() {}\n".into()),
             ("b/y.go", "package b\n\nfunc Init() {}\n".into()),
@@ -7299,8 +7395,8 @@ mod tests {
         let sym = text_of(&server.find_symbol(Parameters(q)));
         assert!(sym.contains("a/x.go"), "{sym}");
         assert!(!sym.contains("b/y.go"), "{sym}");
-        let refs = text_of(&server.find_references(Parameters(
-            crate::precise_tools::FindReferencesParams {
+        let refs = text_of(
+            &server.find_refs(Parameters(crate::precise_tools::FindRefsParams {
                 root: None,
                 index_root: None,
                 symbol: "Init".into(),
@@ -7310,8 +7406,8 @@ mod tests {
                 budget_tokens: 2500,
                 offset: None,
                 dry_run_rename: None,
-            },
-        )));
+            })),
+        );
         assert!(
             refs.contains("reusing this session's latest") && refs.contains("a/x.go"),
             "path_filter-narrowed find_symbol should be inherited: {refs}"
@@ -8112,10 +8208,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_next_step_hint_matches_task() {
+    fn resolve_contx_next_step_hint_matches_task() {
         assert!(next_step_hint("rename Foo to Bar everywhere").contains("dry_run_rename"));
         assert!(next_step_hint("count calls per directory").contains("aggregate=top|dir|file"));
-        assert!(next_step_hint("who calls parse").contains("find_references"));
+        assert!(next_step_hint("who calls parse").contains("find_refs"));
         assert!(next_step_hint("add a flag").contains("find_symbol"));
         for t in ["rename x", "how many hits", "callers of x", "other"] {
             let h = next_step_hint(t);
@@ -8124,9 +8220,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_output_ends_with_next_step_line() {
+    fn resolve_contx_output_ends_with_next_step_line() {
         let server = ready_server();
-        let result = server.resolve_context(Parameters(ResolveContextParams {
+        let result = server.resolve_contx(Parameters(ResolveContextParams {
             root: None,
             index_root: None,
             task_description: "rename alpha".into(),
@@ -8175,7 +8271,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_pages_via_offset_and_warns_when_index_changed() {
+    fn resolve_contx_pages_via_offset_and_warns_when_index_changed() {
         let files: Vec<(String, String)> = (0..80)
             .map(|i| {
                 (
@@ -8191,7 +8287,7 @@ mod tests {
         let page = |offset: usize| {
             let mut p = rc(task, 2500, Some(false));
             p.offset = offset;
-            text_of(&server.resolve_context(Parameters(p)))
+            text_of(&server.resolve_contx(Parameters(p)))
         };
         let first = page(0);
         assert!(first.contains("Matched 80 files"), "{first}");
@@ -8213,7 +8309,7 @@ mod tests {
         // path_filter narrows instead of paging.
         let mut p = rc(task, 2500, Some(false));
         p.path_filter = Some("pkg1/".into());
-        let narrowed = text_of(&server.resolve_context(Parameters(p)));
+        let narrowed = text_of(&server.resolve_contx(Parameters(p)));
         assert!(narrowed.contains("Matched 20 files"), "{narrowed}");
         assert!(narrowed
             .lines()
@@ -8252,12 +8348,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_lists_go_implementors_and_package_after_the_interface() {
+    fn resolve_contx_lists_go_implementors_and_package_after_the_interface() {
         let files = go_iface_repo();
         let refs: Vec<(&str, String)> =
             files.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
         let (server, dir) = smart_server(&refs);
-        let text = text_of(&server.resolve_context(Parameters(rc(
+        let text = text_of(&server.resolve_contx(Parameters(rc(
             "which types implement the `Provider` interface in oauth/provider.go?",
             2500,
             Some(false),
@@ -8292,9 +8388,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_ranks_symbols_and_files_by_task_words() {
+    fn resolve_contx_ranks_symbols_and_files_by_task_words() {
         let (server, dir) = many_file_server();
-        let text = text_of(&server.resolve_context(Parameters(rc(
+        let text = text_of(&server.resolve_contx(Parameters(rc(
             "where is repeat_budget_check in the loop guard",
             2500,
             None,
@@ -8313,9 +8409,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_without_match_says_so_and_stays_small() {
+    fn resolve_contx_without_match_says_so_and_stays_small() {
         let (server, dir) = many_file_server();
-        let text = text_of(&server.resolve_context(Parameters(rc(
+        let text = text_of(&server.resolve_contx(Parameters(rc(
             "zzzz qqqq nonexistent thing",
             2500,
             None,
@@ -8331,34 +8427,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_counting_task_is_short() {
+    fn resolve_contx_counting_task_is_short() {
         let (server, dir) = many_file_server();
-        let text = text_of(&server.resolve_context(Parameters(rc(
+        let text = text_of(&server.resolve_contx(Parameters(rc(
             "how many callers of filler_3 per directory",
             2500,
             None,
         ))));
         assert!(text.len() < 3_000, "{} bytes\n{text}", text.len());
-        assert!(text.contains("find_references"), "{text}");
+        assert!(text.contains("find_refs"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resolve_context_repeat_returns_pointer_with_top_files_and_dedup_hint() {
+    fn resolve_contx_repeat_returns_pointer_with_top_files_and_dedup_hint() {
         let (server, dir) = many_file_server();
         let task = "where is repeat_budget_check in the loop guard";
         let mut first_p = rc(task, 2500, None);
         first_p.agent_id = Some("agent-dedup".into());
-        let first = text_of(&server.resolve_context(Parameters(first_p)));
+        let first = text_of(&server.resolve_contx(Parameters(first_p)));
         let mut again_p = rc(task, 2500, None);
         again_p.agent_id = Some("agent-dedup".into());
-        let again = text_of(&server.resolve_context(Parameters(again_p)));
+        let again = text_of(&server.resolve_contx(Parameters(again_p)));
         assert!(again.contains("not resending full text"), "{again}");
         assert!(again.contains("pkg/loop_guard.py"), "{again}");
         assert!(again.contains("dedup=false"), "{again}");
         let mut full_p = rc(task, 2500, Some(false));
         full_p.agent_id = Some("agent-dedup".into());
-        let full = text_of(&server.resolve_context(Parameters(full_p)));
+        let full = text_of(&server.resolve_contx(Parameters(full_p)));
         assert_eq!(
             full.contains("repeat_budget_check"),
             first.contains("repeat_budget_check")
@@ -8371,13 +8467,13 @@ mod tests {
     fn next_step_hint_uses_word_boundaries_and_caller_priority() {
         assert!(next_step_hint("account balance count").contains("find_symbol"));
         assert!(next_step_hint("the country discount").contains("find_symbol"));
-        assert!(next_step_hint("how many callers of resolve_context").contains("find_references"));
+        assert!(next_step_hint("how many callers of resolve_contx").contains("find_refs"));
         assert!(next_step_hint("how many calls per directory").contains("aggregate"));
-        assert!(next_step_hint("count the usages of foo").contains("find_references"));
+        assert!(next_step_hint("count the usages of foo").contains("find_refs"));
         assert!(next_step_hint("count TODO comments").contains("aggregate"));
         assert!(next_step_hint("rename account to user").contains("dry_run_rename"));
         assert!(next_step_hint("count occurrences of foo").contains("aggregate"));
-        assert!(next_step_hint("who calls parse").contains("find_references"));
+        assert!(next_step_hint("who calls parse").contains("find_refs"));
     }
 
     #[test]
@@ -8489,20 +8585,14 @@ mod tests {
         let find_symbol = desc("find_symbol");
         assert!(find_symbol.contains("include_body"), "{find_symbol}");
         assert!(!find_symbol.contains("offset=next_offset"), "{find_symbol}");
-        let find_references = desc("find_references");
+        let find_refs = desc("find_refs");
         // One source of truth: index-first, language server as fallback.
-        assert!(
-            !find_references.contains("LSP-resolved"),
-            "{find_references}"
-        );
-        assert!(find_references.contains("index first"), "{find_references}");
-        assert!(find_references.contains("rename"), "{find_references}");
-        assert!(
-            find_references.contains("dry_run_rename"),
-            "{find_references}"
-        );
-        let goto_definition = desc("goto_definition");
-        assert!(goto_definition.contains("definition"), "{goto_definition}");
+        assert!(!find_refs.contains("LSP-resolved"), "{find_refs}");
+        assert!(find_refs.contains("index first"), "{find_refs}");
+        assert!(find_refs.contains("rename"), "{find_refs}");
+        assert!(find_refs.contains("dry_run_rename"), "{find_refs}");
+        let goto_def = desc("goto_def");
+        assert!(goto_def.contains("definition"), "{goto_def}");
     }
 
     #[test]
@@ -8519,7 +8609,7 @@ mod tests {
     }
 
     #[test]
-    fn get_languages_does_not_repeat_the_per_query_coverage_note() {
+    fn get_lang_does_not_repeat_the_per_query_coverage_note() {
         let (server, dir) = smart_server(&[
             ("ok.py", "def fine():\n    return 1\n".to_string()),
             ("bad.py", "def broken(:\n    pass\n".to_string()),
@@ -8531,17 +8621,14 @@ mod tests {
             };
             index.coverage_note().expect("partial parse yields a note")
         };
-        let languages = server.get_languages(Parameters(BudgetOnly {
+        let languages = server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 1000,
         }));
         let text = languages.content[0].as_text().unwrap().text.as_str();
         assert!(text.contains("syntax/compile errors: 1"), "{text}");
-        assert!(
-            !text.contains(&note),
-            "note duplicated in get_languages: {text}"
-        );
+        assert!(!text.contains(&note), "note duplicated in get_lang: {text}");
         let search = server.search_code(Parameters(search("fine")));
         let search_text = search.content[0].as_text().unwrap().text.as_str();
         assert!(
@@ -8552,9 +8639,9 @@ mod tests {
     }
 
     #[test]
-    fn get_languages_reports_file_cache_occupancy() {
+    fn get_lang_reports_file_cache_occupancy() {
         let server = ready_server();
-        let result = server.get_languages(Parameters(BudgetOnly {
+        let result = server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 100,
@@ -8562,7 +8649,7 @@ mod tests {
         let text = result.content[0].as_text().unwrap().text.as_str();
         assert!(
             text.contains("file_cache:"),
-            "get_languages should expose cache occupancy: {text}"
+            "get_lang should expose cache occupancy: {text}"
         );
         assert!(
             text.contains(&format!("/{} bytes", DEFAULT_MEMORY_BUDGET_BYTES)),
@@ -8645,7 +8732,7 @@ mod tests {
             "second search of an unchanged file must hit"
         );
 
-        let languages = server.get_languages(Parameters(BudgetOnly {
+        let languages = server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 200,
@@ -9769,7 +9856,7 @@ mod tests {
             index_root: None,
             query: "send".into(),
             regex: false,
-            path_filter: Some("./relay/channel".into()),
+            path_filter: Some("./relay/chanel".into()),
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
@@ -9789,6 +9876,40 @@ mod tests {
             "{}",
             fs_text(&result)
         );
+        // A leading `./` (and `.\`) is not an error any more: it is trimmed to
+        // the repo-relative spelling and matches.
+        for filter in ["./relay/channel", r".\relay\channel", "relay/channel"] {
+            let result = server.search_code(Parameters(SearchParams {
+                root: None,
+                index_root: None,
+                query: "send".into(),
+                regex: false,
+                path_filter: Some(filter.into()),
+                case_sensitive: None,
+                budget_tokens: 2500,
+                offset: 0,
+                context_lines: Some(0),
+                page: false,
+                group: None,
+                dedup: None,
+                agent_id: None,
+                aggregate: None,
+                exclude: None,
+                count_only: false,
+                skip_comments: false,
+            }));
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "{filter}: {}",
+                fs_text(&result)
+            );
+            assert!(
+                fs_text(&result).contains("relay/channel/openai.py"),
+                "{filter}: {}",
+                fs_text(&result)
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10624,8 +10745,8 @@ mod tests {
             "{symbol_text}"
         );
 
-        // 4. get_languages 首行 supported、末尾 unindexed 行
-        let langs_res = server.get_languages(Parameters(BudgetOnly {
+        // 4. get_lang 首行 supported、末尾 unindexed 行
+        let langs_res = server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 2500,
@@ -10930,8 +11051,8 @@ mod tests {
             "{symbol_text}"
         );
 
-        // get_languages: >=1 就显示统计，这里有 2 个 .scala 仍会显示
-        let langs_res = server.get_languages(Parameters(BudgetOnly {
+        // get_lang: >=1 就显示统计，这里有 2 个 .scala 仍会显示
+        let langs_res = server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 2500,
@@ -10955,7 +11076,7 @@ mod tests {
         let index = crate::index::build(&dir).expect("index");
         *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
 
-        let langs_res = server.get_languages(Parameters(BudgetOnly {
+        let langs_res = server.get_lang(Parameters(BudgetOnly {
             root: None,
             index_root: None,
             budget_tokens: 2500,
@@ -11112,7 +11233,7 @@ mod mcp_routing_tests {
         });
         assert!(by_abs.contains("handler_core"), "{by_abs}");
         let langs = until_ready(|| {
-            server.get_languages(Parameters(BudgetOnly {
+            server.get_lang(Parameters(BudgetOnly {
                 root: Some("DOCS".into()),
                 index_root: None,
                 budget_tokens: 200,
@@ -11215,7 +11336,7 @@ mod mcp_routing_tests {
     fn task_text_routing_is_guessed_noted_and_ignores_generic_words() {
         let (server, parent) = multi_server(&["api", "web", "billing"]);
         // "web" is an everyday word: prose alone must not pick a repo.
-        let prose = text(&server.resolve_context(Parameters(ResolveContextParams {
+        let prose = text(&server.resolve_contx(Parameters(ResolveContextParams {
             root: None,
             index_root: None,
             task_description: "set up a web server".into(),
@@ -11228,7 +11349,7 @@ mod mcp_routing_tests {
         assert!(prose.contains("cannot route"), "{prose}");
         // A distinctive name routes, and the result says it was a guess.
         let guessed = until_ready(|| {
-            server.resolve_context(Parameters(ResolveContextParams {
+            server.resolve_contx(Parameters(ResolveContextParams {
                 root: None,
                 index_root: None,
                 task_description: "fix the invoice rounding in billing".into(),
@@ -11252,16 +11373,16 @@ mod mcp_routing_tests {
     fn absolute_path_routes_precise_tools_to_the_owning_sub_repo() {
         let (server, parent) = multi_server(&["api", "web"]);
         let file = parent.join("web").join("src").join("lib.rs");
-        let out = text(&server.get_diagnostics(Parameters(
-            crate::precise_tools::GetDiagnosticsParams {
+        let out = text(
+            &server.get_diag(Parameters(crate::precise_tools::GetDiagParams {
                 root: None,
                 index_root: None,
                 path: file.to_string_lossy().into_owned(),
                 severity: None,
                 budget_tokens: 300,
                 lsp: None,
-            },
-        )));
+            })),
+        );
         assert!(
             out.starts_with(&format!("index_root: {}", parent.join("web").display())),
             "{out}"
@@ -11556,6 +11677,114 @@ mod mcp_routing_tests {
             nest_path_under_rel(Some("main.rs"), Path::new("")).as_deref(),
             Some("main.rs")
         );
+        // A Windows-style caller path keeps `/` separators in the folded
+        // filter, and a backslash-only caller path is slash-normalized too.
+        assert_eq!(
+            nest_path_under_rel(Some(r"src\daemon"), Path::new("crates")).as_deref(),
+            Some("crates/src/daemon")
+        );
+        assert_eq!(
+            nest_path_under_rel(Some(r"src\daemon"), Path::new("")).as_deref(),
+            Some("src/daemon")
+        );
+        assert_eq!(
+            nest_path_under_rel(Some(r"src\daemon"), Path::new("crates/")).as_deref(),
+            Some("crates/src/daemon")
+        );
+    }
+
+    /// Windows clients send `crates\astrolabe-mcp` (or an absolute
+    /// `C:\…\crates\astrolabe-mcp`) while index paths use `/`; both must match
+    /// in `search_code` and `find_symbol` instead of returning 0 hits /
+    /// "path_filter matches no indexed path".
+    #[test]
+    fn windows_backslash_path_filter_matches_indexed_paths() {
+        let repo = tmp("win-filter");
+        std::fs::create_dir_all(repo.join("crates").join("astrolabe-mcp").join("src")).unwrap();
+        std::fs::write(
+            repo.join("crates")
+                .join("astrolabe-mcp")
+                .join("src")
+                .join("server.rs"),
+            "pub fn backslash_probe() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("elsewhere.rs"), "pub fn elsewhere() {}\n").unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(repo.clone(), 8 << 20);
+        let index = crate::index::build(&repo).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+
+        let check = |filter: &str, label: &str| {
+            let searched = text(&server.search_code(Parameters(SearchParams {
+                agent_id: None,
+                path_filter: Some(filter.to_string()),
+                ..search_params("backslash_probe")
+            })));
+            assert!(
+                searched.contains("crates/astrolabe-mcp/src/server.rs"),
+                "search_code {label} ({filter}): {searched}"
+            );
+            assert!(
+                !searched.contains("matches no indexed path"),
+                "search_code {label} ({filter}): {searched}"
+            );
+            assert!(
+                !searched.contains("elsewhere.rs"),
+                "search_code {label} ({filter}) leaked outside the filter: {searched}"
+            );
+            let found =
+                text(&server.find_symbol(Parameters(sym("backslash_probe", None, Some(filter)))));
+            assert!(
+                found.contains("crates/astrolabe-mcp/src/server.rs"),
+                "find_symbol {label} ({filter}): {found}"
+            );
+            assert!(
+                !found.contains("matches no indexed path"),
+                "find_symbol {label} ({filter}): {found}"
+            );
+        };
+
+        check(r"crates\astrolabe-mcp", "backslashes");
+        check(r".\crates\astrolabe-mcp", "dot-backslashes");
+        check("crates/astrolabe-mcp", "slashes");
+        check(
+            r"crates\astrolabe-mcp\src\server.rs",
+            "backslashes to a file",
+        );
+        // Absolute Windows paths, verbatim (as `canonicalize` returns) and
+        // plain, are trimmed to repo-relative.
+        check(
+            &repo.join("crates").join("astrolabe-mcp").to_string_lossy(),
+            "absolute verbatim",
+        );
+        let plain_abs = astrolabe_core::paths::display_path(&repo).replace('/', r"\")
+            + r"\crates\astrolabe-mcp";
+        check(&plain_abs, "absolute plain");
+
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The zero-hit diagnostic must see through backslashes too: a filter that
+    /// matches nothing is still reported as such (not silently 0 hits).
+    #[test]
+    fn windows_backslash_filter_error_still_reports_unknown_paths() {
+        let server = AstrolabeServer::new(tmp("win-filter-miss"));
+        let index = crate::index::build(server.primary.root.as_path()).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        let index = {
+            let state = server.primary.state.read().unwrap();
+            let IndexState::Ready(index) = &*state else {
+                panic!("index not ready")
+            };
+            Arc::clone(index)
+        };
+        let message = path_filter_error(&index, Some(r"no-such\dir"))
+            .expect("an unmatched filter must produce an explicit error");
+        assert!(message.contains("matches no indexed path"), "{message}");
+        assert!(path_filter_error(&index, Some("no-such/dir")).is_some());
+        server.stop_watching();
     }
 
     #[test]
@@ -11642,7 +11871,7 @@ mod mcp_routing_tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let want = vec![
             (
-                "find_references".to_string(),
+                "find_refs".to_string(),
                 s(&["index_root", "line", "path", "symbol"]),
                 s(&["symbol"]),
             ),
@@ -11652,18 +11881,18 @@ mod mcp_routing_tests {
                 s(&["query"]),
             ),
             (
-                "get_diagnostics".to_string(),
+                "get_diag".to_string(),
                 s(&["index_root", "path"]),
                 s(&["path"]),
             ),
-            ("get_languages".to_string(), s(&["index_root"]), s(&[])),
+            ("get_lang".to_string(), s(&["index_root"]), s(&[])),
             (
-                "goto_definition".to_string(),
+                "goto_def".to_string(),
                 s(&["index_root", "line", "path", "symbol"]),
                 s(&["path"]),
             ),
             (
-                "resolve_context".to_string(),
+                "resolve_contx".to_string(),
                 s(&["index_root", "path_filter", "task_description"]),
                 s(&["task_description"]),
             ),
@@ -11722,14 +11951,14 @@ mod mcp_routing_tests {
         }))
         .unwrap();
         assert!(sp.regex && sp.page && sp.count_only);
-        let r: crate::precise_tools::FindReferencesParams = serde_json::from_value(json!({
+        let r: crate::precise_tools::FindRefsParams = serde_json::from_value(json!({
             "symbol": "X", "character": 2, "budget_tokens": 10, "offset": 1,
             "dry_run_rename": "Y"
         }))
         .unwrap();
         assert!(r.path.is_none(), "path is optional");
         assert_eq!(r.dry_run_rename.as_deref(), Some("Y"));
-        let d: crate::precise_tools::GetDiagnosticsParams =
+        let d: crate::precise_tools::GetDiagParams =
             serde_json::from_value(json!({ "path": "a.go", "severity": "error" })).unwrap();
         assert_eq!(d.severity.as_deref(), Some("error"));
         let c: ResolveContextParams = serde_json::from_value(json!({

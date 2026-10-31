@@ -534,7 +534,7 @@ mod behaviour {
             offset: 0,
             path_filter: None,
         };
-        let out = text(&server.resolve_context(Parameters(rc)));
+        let out = text(&server.resolve_contx(Parameters(rc)));
         assert!(out.contains("Go implicit implementors"), "{out}");
         assert!(out.contains("DiscordProvider @oauth/discord.go:3"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
