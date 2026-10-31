@@ -6,6 +6,48 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.5] - 2026-10-31
+
+自 v0.17.4 以来的 PR：#119（Windows `path_filter` 反斜杠/绝对路径归一化；MCP 工具短名 + 全量旧名别名）。完整说明见 GitHub Release。
+
+### 中文
+
+#### 问题与修复 / 改进
+
+1. **Windows 上 `path_filter` 带反斜杠或绝对路径时匹配失败**  
+   索引路径是 `/` 分隔的仓库相对路径，而 Windows 客户端常传 `crates\…`、`.\…` 或 `C:\proj\…`。  
+   **修复（#119）**：统一把 `path_filter` 归一化为仓库相对 `/` 路径（含 `\\?\` 绝对路径裁剪）；`search_code` / `find_symbol` / `resolve_context` / 错误提示共用同一套逻辑。
+
+2. **MCP 工具名过长**  
+   **改进（#119）**：规范短名 `resolve_contx` / `get_diag` / `get_lang` / `find_refs` / `goto_def`（`search_code` / `find_symbol` 不变）；旧名与 `ast_*` 全量兼容别名。
+
+#### 前后对比
+
+| 场景 | 0.17.4 | 0.17.5 |
+| --- | --- | --- |
+| `path_filter=crates\foo`（Windows） | 可能零命中 | 归一化为 `crates/foo` 后正常匹配 |
+| `path_filter=C:\repo\src`（在 repo 下） | 可能零命中 | 裁成 `src` |
+| 调用 `resolve_context` / `find_references` | 仍可用（别名） | 规范名为 `resolve_contx` / `find_refs` |
+
+### English
+
+#### Problems & fixes / improvements
+
+1. **Windows `path_filter` with backslashes or absolute paths failed to match**  
+   Index paths are `/`-separated and repo-relative; Windows clients often send `crates\…`, `.\…`, or `C:\proj\…`.  
+   **Fix (#119)**: normalize `path_filter` to a repo-relative `/` path (including trimming `\\?\` absolute paths under the root); shared by `search_code` / `find_symbol` / `resolve_context` / error hints.
+
+2. **Long MCP tool names**  
+   **Improvement (#119)**: canonical short names `resolve_contx` / `get_diag` / `get_lang` / `find_refs` / `goto_def` (`search_code` / `find_symbol` unchanged); full backwards-compatible aliases for legacy and `ast_*` names.
+
+#### Before / after
+
+| Scenario | 0.17.4 | 0.17.5 |
+| --- | --- | --- |
+| `path_filter=crates\foo` (Windows) | May zero-hit | Normalized to `crates/foo` |
+| `path_filter=C:\repo\src` (under repo) | May zero-hit | Trimmed to `src` |
+| Calling `resolve_context` / `find_references` | Still works (alias) | Canonical `resolve_contx` / `find_refs` |
+
 ## [0.17.4] - 2026-10-31
 
 自 v0.17.3 以来的 PR：#117（Windows `\\?\\` 路径归一化、watcher 归属、状态文案、子目录 `index_root` 复用父 Ready 会话）。完整说明见 GitHub Release。
