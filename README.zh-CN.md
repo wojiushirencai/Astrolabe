@@ -11,7 +11,7 @@
 
 | | |
 |---|---|
-| 最新版本 | [v0.17.2](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.2)，2026-10-27 发布 |
+| 最新版本 | [v0.17.4](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.4)，2026-10-31 发布 |
 | 暴露的工具 | 7 个 MCP 工具：`resolve_context`、`search_code`、`find_symbol`、`find_references`、`goto_definition`、`get_diagnostics`、`get_languages` |
 | `tools/list` 体积 | 紧凑 JSON 约 3.6 KB（v0.16.0 Linux 实测 3,607 B；macOS 未重测） |
 | 二进制 | 单文件、无运行时；Release 压缩包 7.4–9.1 MB，Linux x64 解压后约 50 MB |
