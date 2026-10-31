@@ -2,7 +2,7 @@
   "name": "@zlnap/astrolabe",
   "version": "0.17.4",
   "mcpName": "io.github.wojiushirencai/astrolabe",
-  "description": "Local MCP server for code search and navigation (search_code, find_symbol, find_references, goto_definition) for AI coding agents. Node shim for the native Astrolabe AI binary.",
+  "description": "Local MCP server for code search and navigation (search_code, find_symbol, find_refs, goto_def) for AI coding agents. Node shim for the native Astrolabe AI binary.",
   "keywords": [
     "mcp",
     "mcp-server",

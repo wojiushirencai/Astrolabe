@@ -36,7 +36,7 @@ const RELEVANT = /^(grep|read|glob|bash|shell|rg)$/i
 
 /** Astrolabe tool names as they appear after an MCP server prefix. */
 const ASTROLABE_TOOL =
-  /(?:^|__)(search_code|find_symbol|find_references|goto_definition|resolve_context|get_diagnostics|get_languages)$/
+  /(?:^|__)(search_code|find_symbol|find_refs|find_references|goto_def|goto_definition|resolve_contx|resolve_context|get_diag|get_diagnostics|get_lang|get_languages)$/
 
 /**
  * Whether this call can change Astrolabe's drift counter.

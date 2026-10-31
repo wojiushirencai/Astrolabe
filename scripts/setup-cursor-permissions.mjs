@@ -23,11 +23,11 @@ export const SERVER_NAME = 'astrolabe';
 export const CATALOG_TOOL_NAMES = [
   'search_code',
   'find_symbol',
-  'resolve_context',
-  'get_diagnostics',
-  'find_references',
-  'goto_definition',
-  'get_languages',
+  'resolve_contx',
+  'get_diag',
+  'find_refs',
+  'goto_def',
+  'get_lang',
 ];
 
 export const IDE_ALLOW_ENTRIES = CATALOG_TOOL_NAMES.map((name) => `${SERVER_NAME}:${name}`);

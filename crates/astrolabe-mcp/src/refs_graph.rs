@@ -373,7 +373,7 @@ pub(crate) fn fix_path(
             };
             PathFix::Ambiguous {
                 note: format!(
-                    "{why}, and the index has `{symbol}` defined in {n} files (exported/non-test first): {}{more}. Pass one as path and retry (or find_symbol to narrow, then find_references).",
+                    "{why}, and the index has `{symbol}` defined in {n} files (exported/non-test first): {}{more}. Pass one as path and retry (or find_symbol to narrow, then find_refs).",
                     list.join(", ")
                 ),
             }

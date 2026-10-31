@@ -113,12 +113,12 @@ fn assert_tool_catalog(response: &Value) {
     let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     names.sort_unstable();
     let mut expected = vec![
-        "find_references",
+        "find_refs",
         "find_symbol",
-        "get_diagnostics",
-        "get_languages",
-        "goto_definition",
-        "resolve_context",
+        "get_diag",
+        "get_lang",
+        "goto_def",
+        "resolve_contx",
         "search_code",
     ];
     expected.sort_unstable();
@@ -177,7 +177,7 @@ fn stdio_tools_list_after_initialize_includes_ttl() {
 }
 
 #[test]
-fn stdio_get_languages_returns_nonempty_text() {
+fn stdio_get_lang_returns_nonempty_text() {
     let mut server = Server::spawn();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last;
@@ -189,7 +189,7 @@ fn stdio_get_languages_returns_nonempty_text() {
             id,
             "tools/call",
             json!({
-                "name": "get_languages",
+                "name": "get_lang",
                 "arguments": {"budget_tokens": 2500}
             }),
         );
