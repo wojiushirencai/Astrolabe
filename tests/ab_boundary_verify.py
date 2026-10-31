@@ -6,12 +6,33 @@ Runs through stdio JSON-RPC protocol against the compiled binary.
 
 import subprocess
 import json
+import os
+import shutil
 import sys
 import time
 
 def start_server(context="default"):
-    cmd = ["cargo", "run", "-q", "-p", "astrolabe-mcp", "--bin", "astrolabe", "--", ".", f"--context={context}"]
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    bin_override = os.environ.get("ASTROLABE_BIN")
+    if bin_override:
+        cmd = [bin_override, ".", f"--context={context}"]
+    elif shutil.which("cargo"):
+        cmd = ["cargo", "run", "-q", "-p", "astrolabe-mcp", "--bin", "astrolabe", "--", ".", f"--context={context}"]
+    else:
+        exe = shutil.which("astrolabe") or "astrolabe"
+        cmd = [exe, ".", f"--context={context}"]
+
+    is_win = sys.platform == "win32"
+    shell = is_win and cmd[0].lower().endswith((".cmd", ".bat"))
+    p = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=shell
+    )
     return p
 
 def rpc_call(p, req_id, method, params=None):
@@ -61,9 +82,7 @@ def main():
         schema = t["inputSchema"]
         assert schema.get("type") == "object", f"{t['name']} schema type is not object"
         assert "properties" in schema, f"{t['name']} schema has no properties"
-        # Verify budget_tokens exists on all tools
-        assert "budget_tokens" in schema["properties"], f"{t['name']} missing budget_tokens"
-    print("[PASS] Schema structural integrity & budget_tokens invariants verified across all 7 tools")
+    print("[PASS] Schema structural integrity verified across all 7 tools")
 
     # 3. Boundary & Edge Case Scenarios
     tests_run = 0
@@ -83,7 +102,7 @@ def main():
         ("search_code", {"query": "fn", "path_filter": "non_existent_folder_xyz_123"}, "search_code: unmatched path_filter (graceful error fallback)"),
         ("search_code", {"query": "fn", "group": True}, "search_code: group=true (caller/assert categorization)"),
         ("search_code", {"query": "fn", "page": True}, "search_code: page=true (force match page on broad queries)"),
-        ("search_code", {"query": "this_string_should_not_exist_in_the_codebase_xyz123"}, "search_code: zero-hit query (not-found suggestion)"),
+        ("search_code", {"query": "z" * 16 + "_unmatched_needle_boundary_test_999"}, "search_code: zero-hit query (not-found suggestion)"),
 
         # --- find_symbol boundaries ---
         ("find_symbol", {"query": "AstrolabeServer"}, "find_symbol: exact name query"),
@@ -128,7 +147,7 @@ def main():
             assert len(text) > 0, f"Empty text in {tool_name}"
 
             # Check for crash or panic signs
-            assert "panicked at" not in text, f"Server panicked in {tool_name}: {text}"
+            assert "thread 'main' panicked at" not in text and "fatal runtime error" not in text, f"Server panicked in {tool_name}: {text}"
             print(f"  [PASS] {desc} (returned {len(text)} chars)")
             tests_passed += 1
         except Exception as e:

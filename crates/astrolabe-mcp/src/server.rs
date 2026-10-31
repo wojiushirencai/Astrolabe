@@ -2564,6 +2564,8 @@ confidence: unknown"
         const MAX_SECONDS: u64 = 20;
         let mut params = params.clone();
         let regex_downgraded = apply_code_fragment_literal(&mut params);
+        params.path_filter =
+            normalize_filter_for_root(&session.root, params.path_filter.as_deref());
         let sensitive = search_shape::literal_case_sensitive(
             &params.query,
             params.regex,
@@ -3371,12 +3373,17 @@ fn relativize_to_child(child: &Path, path: &str) -> String {
 /// under the relative path of that override inside a reused parent session.
 ///
 /// When `rel_under` is empty the override equalled the parent root and the
-/// caller path is kept as-is. When the caller omitted path, `rel_under` itself
-/// becomes the scoped filter (so `index_root=<subdir>` still narrows results).
+/// caller path is kept as-is (still with `/` separators: array `path_filter`
+/// matching is byte-wise against `/`-normalized index paths). When the caller
+/// omitted path, `rel_under` itself becomes the scoped filter (so
+/// `index_root=<subdir>` still narrows results).
 fn nest_path_under_rel(path: Option<&str>, rel_under: &Path) -> Option<String> {
     let rel = rel_under.to_string_lossy().replace('\\', "/");
-    let caller = path.map(str::trim).filter(|p| !p.is_empty());
-    match (caller, rel.as_str()) {
+    let caller = path
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.replace('\\', "/"));
+    match (caller.as_deref(), rel.as_str()) {
         (Some(p), "") => Some(p.to_string()),
         (None, "") => None,
         (None, r) => Some(r.to_string()),
@@ -3385,6 +3392,20 @@ fn nest_path_under_rel(path: Option<&str>, rel_under: &Path) -> Option<String> {
             Some(joined.to_string_lossy().replace('\\', "/"))
         }
     }
+}
+
+/// Bring a caller `path_filter` into the repo's own spelling before matching:
+/// `/` separators, no leading `./`, and absolute paths under `root` trimmed to
+/// repo-relative.
+///
+/// Index paths are always `/`-separated repo-relative strings, so a Windows
+/// client sending `crates\astrolabe-mcp` (or an absolute
+/// `C:\repo\crates\astrolabe-mcp`) would otherwise match nothing. Empty after
+/// normalization (filter == root) means "whole repo".
+fn normalize_filter_for_root(root: &Path, filter: Option<&str>) -> Option<String> {
+    let filter = filter.map(str::trim).filter(|f| !f.is_empty())?;
+    let normalized = astrolabe_core::paths::normalize_path_filter_under(root, filter);
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn top_unindexed_exts(
@@ -3480,8 +3501,16 @@ impl AstrolabeServer {
         }
     }
 
-    fn resolve_context_inner(&self, params: ResolveContextParams, hint: &str) -> CallToolResult {
+    fn resolve_context_inner(
+        &self,
+        mut params: ResolveContextParams,
+        hint: &str,
+    ) -> CallToolResult {
         self.with_fresh_index(hint, |session, index| {
+            // Windows clients may send `crates\astrolabe-mcp` (or an absolute
+            // path): match against `/`-separated index paths.
+            params.path_filter =
+                normalize_filter_for_root(&session.root, params.path_filter.as_deref());
             let graph = index.graph();
             let kind = classify_task(&params.task_description);
             let compact_task = matches!(kind, TaskKind::Count | TaskKind::Refs);
@@ -3784,7 +3813,7 @@ impl AstrolabeServer {
         })
     }
 
-    fn find_symbol_inner(&self, params: QueryParams) -> CallToolResult {
+    fn find_symbol_inner(&self, mut params: QueryParams) -> CallToolResult {
         if params.query.trim().is_empty() {
             return text_error(
                 "find_symbol needs a non-empty query (symbol name, substring, or 'Class/method' path); a blank query does not return all symbols.".to_string(),
@@ -3793,7 +3822,12 @@ impl AstrolabeServer {
         if looks_like_filesystem_path(&params.query) {
             return text_error(filesystem_path_as_query_error(&params.query));
         }
-        self.with_fresh_index(params.root.as_deref().unwrap_or(""), |session, index| {
+        let hint = params.root.clone().unwrap_or_default();
+        self.with_fresh_index(&hint, |session, index| {
+            // Windows clients may send `crates\astrolabe-mcp` (or an absolute
+            // path): match against `/`-separated index paths.
+            params.path_filter =
+                normalize_filter_for_root(&session.root, params.path_filter.as_deref());
             if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
                 return self.finish_at(&session.root, text_error(message));
             }
@@ -4087,14 +4121,19 @@ impl AstrolabeServer {
 
     fn search_code_inner(&self, mut params: SearchParams) -> CallToolResult {
         let regex_downgraded = apply_code_fragment_literal(&mut params);
-        self.with_fresh_index(
-            params.root.as_deref().unwrap_or(""),
-            |session, index| {
-                // A filter that only hits non-code text files (docs/, *.toml …)
-                // is valid here: those files are searched as [text-only].
-                // Computed once per call; the path_filter view, the text-only
-                // scan and `data_hits_outside` all derive from it.
-                let all_text_paths = index.text_only_paths(None);
+        // `hint` must be its own binding: the closure mutates `params`, so it
+        // cannot also borrow `params.root`.
+        let hint = params.root.clone().unwrap_or_default();
+        self.with_fresh_index(&hint, |session, index| {
+            // Windows clients may send `crates\astrolabe-mcp` (or an absolute
+            // path): match against `/`-separated index paths.
+            params.path_filter =
+                normalize_filter_for_root(&session.root, params.path_filter.as_deref());
+            // A filter that only hits non-code text files (docs/, *.toml …)
+            // is valid here: those files are searched as [text-only].
+            // Computed once per call; the path_filter view, the text-only
+            // scan and `data_hits_outside` all derive from it.
+            let all_text_paths = index.text_only_paths(None);
                 let filter_text_paths: Vec<&RelPath> = all_text_paths
                     .iter()
                     .copied()
@@ -5879,7 +5918,11 @@ fn symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
 /// path_filter 不匹配任何已索引路径（也不匹配未入索引的代码文件）时返回
 /// 显式错误，列出最接近的已索引路径，而不是静默返回 0 条。
 fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> {
-    let filter = filter.filter(|f| !f.is_empty())?;
+    let raw = filter.filter(|f| !f.is_empty())?;
+    // Match the repo's `/`-separated spelling so a Windows client sending
+    // `crates\astrolabe-mcp` is diagnosed as a hit, not as a missing path.
+    let normalized = normalize_filter_for_root(&index.root, Some(raw));
+    let filter = normalized.as_deref().unwrap_or(raw);
     let files = &index.graph().files;
     if files.iter().any(|file| file.path.as_str().contains(filter)) {
         return None;
@@ -9769,7 +9812,7 @@ mod tests {
             index_root: None,
             query: "send".into(),
             regex: false,
-            path_filter: Some("./relay/channel".into()),
+            path_filter: Some("./relay/chanel".into()),
             case_sensitive: None,
             budget_tokens: 2500,
             offset: 0,
@@ -9789,6 +9832,40 @@ mod tests {
             "{}",
             fs_text(&result)
         );
+        // A leading `./` (and `.\`) is not an error any more: it is trimmed to
+        // the repo-relative spelling and matches.
+        for filter in ["./relay/channel", r".\relay\channel", "relay/channel"] {
+            let result = server.search_code(Parameters(SearchParams {
+                root: None,
+                index_root: None,
+                query: "send".into(),
+                regex: false,
+                path_filter: Some(filter.into()),
+                case_sensitive: None,
+                budget_tokens: 2500,
+                offset: 0,
+                context_lines: Some(0),
+                page: false,
+                group: None,
+                dedup: None,
+                agent_id: None,
+                aggregate: None,
+                exclude: None,
+                count_only: false,
+                skip_comments: false,
+            }));
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "{filter}: {}",
+                fs_text(&result)
+            );
+            assert!(
+                fs_text(&result).contains("relay/channel/openai.py"),
+                "{filter}: {}",
+                fs_text(&result)
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11556,6 +11633,114 @@ mod mcp_routing_tests {
             nest_path_under_rel(Some("main.rs"), Path::new("")).as_deref(),
             Some("main.rs")
         );
+        // A Windows-style caller path keeps `/` separators in the folded
+        // filter, and a backslash-only caller path is slash-normalized too.
+        assert_eq!(
+            nest_path_under_rel(Some(r"src\daemon"), Path::new("crates")).as_deref(),
+            Some("crates/src/daemon")
+        );
+        assert_eq!(
+            nest_path_under_rel(Some(r"src\daemon"), Path::new("")).as_deref(),
+            Some("src/daemon")
+        );
+        assert_eq!(
+            nest_path_under_rel(Some(r"src\daemon"), Path::new("crates/")).as_deref(),
+            Some("crates/src/daemon")
+        );
+    }
+
+    /// Windows clients send `crates\astrolabe-mcp` (or an absolute
+    /// `C:\…\crates\astrolabe-mcp`) while index paths use `/`; both must match
+    /// in `search_code` and `find_symbol` instead of returning 0 hits /
+    /// "path_filter matches no indexed path".
+    #[test]
+    fn windows_backslash_path_filter_matches_indexed_paths() {
+        let repo = tmp("win-filter");
+        std::fs::create_dir_all(repo.join("crates").join("astrolabe-mcp").join("src")).unwrap();
+        std::fs::write(
+            repo.join("crates")
+                .join("astrolabe-mcp")
+                .join("src")
+                .join("server.rs"),
+            "pub fn backslash_probe() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("elsewhere.rs"), "pub fn elsewhere() {}\n").unwrap();
+        let mut server = AstrolabeServer::new_with_cache_budget(repo.clone(), 8 << 20);
+        let index = crate::index::build(&repo).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        server.structured_output = false;
+
+        let check = |filter: &str, label: &str| {
+            let searched = text(&server.search_code(Parameters(SearchParams {
+                agent_id: None,
+                path_filter: Some(filter.to_string()),
+                ..search_params("backslash_probe")
+            })));
+            assert!(
+                searched.contains("crates/astrolabe-mcp/src/server.rs"),
+                "search_code {label} ({filter}): {searched}"
+            );
+            assert!(
+                !searched.contains("matches no indexed path"),
+                "search_code {label} ({filter}): {searched}"
+            );
+            assert!(
+                !searched.contains("elsewhere.rs"),
+                "search_code {label} ({filter}) leaked outside the filter: {searched}"
+            );
+            let found =
+                text(&server.find_symbol(Parameters(sym("backslash_probe", None, Some(filter)))));
+            assert!(
+                found.contains("crates/astrolabe-mcp/src/server.rs"),
+                "find_symbol {label} ({filter}): {found}"
+            );
+            assert!(
+                !found.contains("matches no indexed path"),
+                "find_symbol {label} ({filter}): {found}"
+            );
+        };
+
+        check(r"crates\astrolabe-mcp", "backslashes");
+        check(r".\crates\astrolabe-mcp", "dot-backslashes");
+        check("crates/astrolabe-mcp", "slashes");
+        check(
+            r"crates\astrolabe-mcp\src\server.rs",
+            "backslashes to a file",
+        );
+        // Absolute Windows paths, verbatim (as `canonicalize` returns) and
+        // plain, are trimmed to repo-relative.
+        check(
+            &repo.join("crates").join("astrolabe-mcp").to_string_lossy(),
+            "absolute verbatim",
+        );
+        let plain_abs = astrolabe_core::paths::display_path(&repo).replace('/', r"\")
+            + r"\crates\astrolabe-mcp";
+        check(&plain_abs, "absolute plain");
+
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The zero-hit diagnostic must see through backslashes too: a filter that
+    /// matches nothing is still reported as such (not silently 0 hits).
+    #[test]
+    fn windows_backslash_filter_error_still_reports_unknown_paths() {
+        let server = AstrolabeServer::new(tmp("win-filter-miss"));
+        let index = crate::index::build(server.primary.root.as_path()).expect("index");
+        *server.primary.state.write().unwrap() = IndexState::Ready(Arc::new(index));
+        let index = {
+            let state = server.primary.state.read().unwrap();
+            let IndexState::Ready(index) = &*state else {
+                panic!("index not ready")
+            };
+            Arc::clone(index)
+        };
+        let message = path_filter_error(&index, Some(r"no-such\dir"))
+            .expect("an unmatched filter must produce an explicit error");
+        assert!(message.contains("matches no indexed path"), "{message}");
+        assert!(path_filter_error(&index, Some("no-such/dir")).is_some());
+        server.stop_watching();
     }
 
     #[test]

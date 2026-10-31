@@ -107,6 +107,7 @@ impl AstrolabeServer {
         }
     }
 
+    #[cfg(unix)]
     /// Hash of the full (context-independent) tool catalog.
     fn tools_hash(&self) -> String {
         let tools = self.tool_router.list_all();
