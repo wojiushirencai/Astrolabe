@@ -6,6 +6,50 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-10-31
+
+自 v0.17.3 以来的 PR：#117（Windows `\\?\\` 路径归一化、watcher 归属、状态文案、子目录 `index_root` 复用父 Ready 会话）。完整说明见 GitHub Release。
+
+### 中文
+
+#### 问题与修复
+
+1. **Windows 上 `canonicalize` 得到 `\\?\\C:\\...`，与普通 `C:\\...` 不一致**  
+   watcher 误判路径为 foreign，增量更新退化成轮询；状态 / 错误文案也带着 `\\?\\` 前缀。  
+   **修复（#117）**：统一路径归一化（比较与 watcher 成员判断）；展示时去掉 `\\?\\`。
+
+2. **把 `index_root` 设成仓库子目录会另开一套冷索引**  
+   父 root 已 Ready 时，子目录仍返回 *Index is building…*，看起来像坏了。  
+   **修复（#117）**：子目录 `index_root` 复用已 Ready 的父会话，并带上 path_filter，不再冷建一套。
+
+#### 前后对比
+
+| 场景 | 0.17.3 | 0.17.4 |
+| --- | --- | --- |
+| Windows `\\?\\` vs `C:\\` 同一路径 | watcher 可能误判 foreign → 轮询 | 归一化后视为同一路径 |
+| 状态文案里的 Windows 路径 | 可能带 `\\?\\` | 显示为普通 `C:\\...` |
+| 子目录 `index_root`（父 root 已 Ready） | 另开冷索引，短暂 Building | 复用父 Ready + path_filter |
+
+### English
+
+#### Problems & fixes
+
+1. **Windows `canonicalize` yields `\\?\\C:\\...`, which did not match plain `C:\\...`**  
+   The watcher could treat the path as foreign and fall back to polling; status / error text also showed the `\\?\\` prefix.  
+   **Fix (#117)**: normalize paths for comparison and watcher membership; strip `\\?\\` in display strings.
+
+2. **A subdirectory `index_root` started a separate cold index**  
+   Even when the parent root was Ready, a child root returned *Index is building…* and looked broken.  
+   **Fix (#117)**: reuse an already-Ready parent session for a subdirectory `index_root`, with a path_filter — no extra cold build.
+
+#### Before / after
+
+| Scenario | 0.17.3 | 0.17.4 |
+| --- | --- | --- |
+| Windows `\\?\\` vs `C:\\` for the same path | Watcher may treat as foreign → polling | Normalized as the same path |
+| Windows paths in status text | May show `\\?\\` | Plain `C:\\...` |
+| Subdir `index_root` (parent Ready) | Separate cold index; brief Building | Reuse parent Ready + path_filter |
+
 ## [0.17.3] - 2026-10-30
 
 自 v0.17.2 以来的 PR：#113（按 `agent_id` 分片会话去重）、#114（无身份不做 body 去重 + Hooks 注入）。完整说明见 GitHub Release。

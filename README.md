@@ -11,7 +11,7 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 
 | | |
 |---|---|
-| Latest release | [v0.17.3](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.3), published 2026-10-30 |
+| Latest release | [v0.17.4](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.4), published 2026-10-31 |
 | What it exposes | 7 MCP tools: `resolve_context`, `search_code`, `find_symbol`, `find_references`, `goto_definition`, `get_diagnostics`, `get_languages` |
 | `tools/list` size | about 3.6 KB compact JSON (3,607 B measured on Linux for v0.16.0; not re-measured on macOS) |
 | Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |

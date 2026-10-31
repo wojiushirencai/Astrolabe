@@ -1,6 +1,6 @@
 {
   "name": "astrolabe-dsh-guard",
-  "version": "0.17.3",
+  "version": "0.17.4",
   "private": true,
   "description": "Astrolabe drift guard for DeepSeek Harness: deny repeated grep/read calls and steer the model to Astrolabe's MCP code-navigation tools.",
   "type": "module",
