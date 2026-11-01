@@ -7,12 +7,12 @@
 
 > **同名消歧**：不是 npm 上的 `astrolabe`（2014 年的 Protractor 页面对象库）或 `astrolabe-ai`（无关的简历工具），也不是其它叫 “astrolabe” 的 MCP 服务。本项目在 `github.com/wojiushirencai/Astrolabe`，二进制名是 `astrolabe`。
 
-## 事实卡（截至 2026-10-27）
+## 事实卡（截至 2026-11-01）
 
 | | |
 |---|---|
 | 最新版本 | [v0.17.5](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.5)，2026-10-31 发布 |
-| 暴露的工具 | 7 个 MCP 工具：`resolve_context`、`search_code`、`find_symbol`、`find_references`、`goto_definition`、`get_diagnostics`、`get_languages` |
+| 暴露的工具 | 7 个 MCP 工具（短名）：`resolve_contx`、`search_code`、`find_symbol`、`find_refs`、`goto_def`、`get_diag`、`get_lang`（旧长名仍可作为别名调用） |
 | `tools/list` 体积 | 紧凑 JSON 约 3.6 KB（v0.16.0 Linux 实测 3,607 B；macOS 未重测） |
 | 二进制 | 单文件、无运行时；Release 压缩包 7.4–9.1 MB，Linux x64 解压后约 50 MB |
 | 平台 | macOS arm64/x64、Linux x64（glibc/musl）、Linux arm64、Windows x64 |
@@ -22,45 +22,74 @@
 | 许可证 | MIT OR Apache-2.0 |
 | 测试 | `cargo test --workspace -- --list` 列出 1,117 个测试用例（2026-10-18） |
 
+## Windows 稳定性（v0.17.4–v0.17.5）
+
+近期版本在 **Windows 真机**上重点修了稳定性：
+
+- **`\\?\` 路径归一化**（#117）：Windows 上 `canonicalize` 常得到 `\\?\C:\…`。现与普通 `C:\…` 视为同一路径（watcher 归属与比较），状态 / 错误文案会去掉 `\\?\`。
+- **子目录 `index_root` 复用**（#117）：父仓库已 Ready 时，把 `index_root` 指到子目录会复用父索引并带 path_filter，不再另开冷索引（避免一直 *Index is building…*）。
+- **`path_filter`（#119）**：反斜杠、`.\…`、绝对路径 `C:\repo\…` 会归一成仓库相对 `/` 路径，检索 / 符号 / 上下文才能命中。
+
+尽量不传 `index_root`，或只传**仓库根**；全新 root 首次冷建时稍等再重试。
+
 ## 三步上手
 
-**1. 安装**（macOS / Linux，会校验 Release 的 sha256）：
+**1. 安装**二进制（任选其一）：
 
 ```bash
+# macOS / Linux（会校验 Release 的 sha256）
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
+
+# 或 npm（按平台拉取原生二进制）
+npm i -g @zlnap/astrolabe
+# Windows（PowerShell）同样：npm i -g @zlnap/astrolabe
 ```
 
-其它方式（手动下载、Windows、源码编译）见 [安装指南](docs/INSTALL_GUIDE.zh-CN.md)。npm 包：`npx -y @zlnap/astrolabe`（已发布）；配置客户端：`npx -y @zlnap/astrolabe setup`。
+其它方式（手动下载、Windows zip、源码编译）见 [安装指南](docs/INSTALL_GUIDE.zh-CN.md)。
 
-**2. 接入客户端。** Claude Code：
+**2. 必须跑 `setup`（写入 MCP；建议加 `--with-hooks`，否则智能体往往不会真正调用这些工具）。**  
+只装二进制**不会**接入客户端，也**不会**装防漂移 Hook。不跑 `setup`（以及客户端支持时的 hooks），很多智能体仍会用 Grep/Read，等于没在用 Astrolabe。
 
 ```bash
-npx -y @zlnap/astrolabe setup   # 探测本机 agent 并合并写入 MCP 配置
-# 或手动：
+# 推荐（npm / npx）— MCP + hooks
+npx -y @zlnap/astrolabe setup --with-hooks
+# 全局 npm / PATH 上已有二进制时：
+astrolabe setup --with-hooks
+
+# 非交互：配置所有探测到的客户端
+npx -y @zlnap/astrolabe setup --yes --with-hooks
+```
+
+Claude Code（仅手动写 MCP 时仍建议先跑上面的 `setup`）：
+
+```bash
 claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=claude-code
 ```
 
-Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`。Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安装指南](docs/INSTALL_GUIDE.zh-CN.md)。
+Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`。  
+Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安装指南](docs/INSTALL_GUIDE.zh-CN.md)。常用参数：`--yes`、`--clients=…`、`--dry-run`、`--native`、`--list`、`--with-hooks`、`--no-cursor-permissions`。
 
-**3. 验证。** `astrolabe --version` 输出版本；在客户端里让它调用 `get_languages` 或 `search_code`。添加后请重启客户端会话。
+**3. 验证。** `astrolabe --version` 输出版本；在客户端里让它调用 `get_lang` 或 `search_code`。跑完 `setup` 后请重启客户端会话。
 
 ## 七个工具
+
+`tools/list` 声明的是**短名**。旧长名（`resolve_context`、`find_references`、`goto_definition`、`get_diagnostics`、`get_languages`）以及更早的 `ast_*` 别名在 `tools/call` 上仍然可用。
 
 | 工具 | 用途 |
 |---|---|
 | `search_code` | 字面量/正则检索，支持路径过滤；结果分组并标注定义/使用/注释；末尾有可核验的汇总（如“23/23 处，无截断”）。统计：`aggregate=top\|dir\|file`（按顶层目录/目录/文件给出命中数和文件数）、`count_only`、`skip_comments`、`exclude`（如 `_test.go`、`vendor`）。 |
-| `resolve_context` | 给一句任务描述，按相关度分页返回相关文件与符号（`offset` 翻页、`path_filter` 缩小范围），页头写明共匹配多少、剩余在哪些目录，并提示下一步该用哪个工具。 |
+| `resolve_contx` | 给一句任务描述，按相关度分页返回相关文件与符号（`offset` 翻页、`path_filter` 缩小范围），页头写明共匹配多少、剩余在哪些目录，并提示下一步该用哪个工具。（别名：`resolve_context`） |
 | `find_symbol` | 按名字或子串找函数、类、类型。 |
-| `find_references` | 经语言服务器的编译器级引用；`dry_run_rename=新名` 只读列出每个文件要改的位置，不写盘。 |
-| `goto_definition` | 经语言服务器跳到真实定义。 |
-| `get_diagnostics` | 文件的语法与类型错误。 |
-| `get_languages` | 语言、文件数、代码行数、语言服务器状态，以及索引覆盖情况（见下）。 |
+| `find_refs` | 经语言服务器的编译器级引用；`dry_run_rename=新名` 只读列出每个文件要改的位置，不写盘。（别名：`find_references`） |
+| `goto_def` | 经语言服务器跳到真实定义。（别名：`goto_definition`） |
+| `get_diag` | 文件的语法与类型错误。（别名：`get_diagnostics`） |
+| `get_lang` | 语言、文件数、代码行数、语言服务器状态，以及索引覆盖情况（见下）。（别名：`get_languages`） |
 
 `tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发），其中包含每个工具上可选的按次 `index_root`（绝对路径或相对 cwd 的目录；省略则沿用进程启动时的索引根）。其余参数——`regex`、`exclude`、`count_only`、`context_lines`、`group`、`dedup`、`kind`、`depth`、`substring`、`dry_run_rename`、`character`、`severity`、`offset`、`page`、`budget_tokens`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
 
 工具描述与返回文本为**纯英文**（schema 文案、结果正文、hook 提醒），避免中英双语让模型歧义。
 
-**索引覆盖。** 支持语言的文件全部进入索引，包括有语法或编译错误的文件：能解析的符号会保留，出错区域里的符号可能缺失。`get_languages` 报告：
+**索引覆盖。** 支持语言的文件全部进入索引，包括有语法或编译错误的文件：能解析的符号会保留，出错区域里的符号可能缺失。`get_lang` 报告：
 - 未进入索引的文件：按原因计数（超过大小上限、读取失败、解析超时）；
 - 有语法错误的文件，按类别分别计数：
   - **其他语法错误**，标注为 `has syntax errors, index may be incomplete (symbols may be missing)`（有语法错误，索引可能不完整）；
@@ -69,7 +98,7 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
   不超过 10 个时逐个列出（路径、类别标注、首个错误的行号和该行片段）；超过 10 个时只给各类数量和一份 Markdown 报告的绝对路径（`<仓库>/.astrolabe/coverage-report.md`，该目录自带 `.gitignore`，不可写时退到系统临时目录），报告里每个文件有路径、语言、类别和首个错误，其他语法错误排在前面，每节最多 1000 条；
 - 不支持语言的文件：只按扩展名汇总（前 8 种，其余合并为一项），不列具体文件。
 
-其它工具只在存在这些缺口时，在结果末尾附一行简短**英文**提示，指向 `get_languages`。
+其它工具只在存在这些缺口时，在结果末尾附一行简短**英文**提示，指向 `get_lang`。
 
 ## 证据：测了什么，没测什么
 
@@ -103,7 +132,7 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 
 - **实测有用：** 按目录/模块统计或列出出现次数并带排除条件（N5、N8），以及一个大范围发现任务（N1）：同一个模型比用 shell 脚本做更少轮、更省钱。
 - **没有证明有用：** 简单定位或小改动任务（H2、H3、H6、H7、E2、N6、N7 基本持平，区间含 0）；v0.12.0 矩阵里 40 个通用对照格接 Astrolabe 反而更贵；批量改文件流程（N4、E3b）平均更便宜但不显著。
-- **功能重叠：** Claude Code 可通过自带的 LSP 插件提供跳转定义与查引用（[文档](https://code.claude.com/docs/en/plugins/code-intelligence)），与我们的 `goto_definition`、`find_references` 重叠。
+- **功能重叠：** Claude Code 可通过自带的 LSP 插件提供跳转定义与查引用（[文档](https://code.claude.com/docs/en/plugins/code-intelligence)），与我们的 `goto_def`、`find_refs` 重叠。
 - **采用率没有保证：** 模型有时会忽略 MCP 工具。v0.12.0 时模型在 N5 的 0/5、N8 的 1/5 里用了 Astrolabe；v0.13.0 在 15 个任务共 95 次里用了 92 次。这是对这个模型和这些任务的观察，不是承诺。
 
 ## 相关项目
@@ -112,7 +141,7 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 
 ## 更多文档
 
-[安装与客户端](docs/INSTALL_GUIDE.zh-CN.md) · [FAQ](docs/FAQ.md) · [参考手册：配置、环境变量、语言矩阵、质量门禁](docs/REFERENCE.zh-CN.md) · [架构](docs/ARCHITECTURE.md) · [性能口径](docs/PERFORMANCE.md) · [可选防漂移 Hook（效果未做基准）](docs/HOOKS.md) · [发版流程](.github/RELEASING.md) · [llms.txt](llms.txt)
+[安装与客户端](docs/INSTALL_GUIDE.zh-CN.md) · [FAQ](docs/FAQ.md) · [参考手册：配置、环境变量、语言矩阵、质量门禁](docs/REFERENCE.zh-CN.md) · [架构](docs/ARCHITECTURE.md) · [性能口径](docs/PERFORMANCE.md) · [防漂移 Hook（`setup --with-hooks`；成本效果未做 A/B 基准）](docs/HOOKS.md) · [发版流程](.github/RELEASING.md) · [llms.txt](llms.txt)
 
 源码编译：`cargo build --release --bin astrolabe`（Rust 1.90+）；测试：`cargo test --workspace`。
 

@@ -1,6 +1,6 @@
 # Astrolabe AI — install and client setup
 
-Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-10-25 for v0.17.0.
+Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-11-01 for v0.17.5+ (Windows stability #117/#119, MCP short names, required `setup`).
 
 > **Name check.** This project is *Astrolabe AI* (GitHub: `wojiushirencai/Astrolabe`, binary: `astrolabe`). It is **not** the npm packages `astrolabe` (a 2014 Protractor page-object library) or `astrolabe-ai` (an unrelated resume tool), nor the other MCP servers that happen to be called "astrolabe". Install only from this repository's GitHub Releases or the `@zlnap/*` npm scope.
 
@@ -41,11 +41,29 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 
 ### Option 3 — Windows
 
-Download `astrolabe-<version>-x86_64-pc-windows-msvc.zip`, compare `Get-FileHash -Algorithm SHA256` with `SHA256SUMS`, unzip `astrolabe.exe` to a fixed folder and add it to `PATH`. (The Windows steps were not exercised in this change.)
+```powershell
+# Prefer npm (pulls the matching platform package):
+npm i -g @zlnap/astrolabe
+# Then REQUIRED — wire MCP (+ hooks so agents actually use the tools):
+npx -y @zlnap/astrolabe setup --with-hooks
+# or: astrolabe setup --with-hooks
+```
 
-### Option 4 — npm
+Or download `astrolabe-<version>-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/wojiushirencai/Astrolabe/releases), compare `Get-FileHash -Algorithm SHA256` with `SHA256SUMS`, unzip `astrolabe.exe` to a fixed folder, add it to `PATH`, then still run `astrolabe setup --with-hooks`.
 
-The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with platform packages `@zlnap/<platform>`. **Published** under the personal npm scope `zlnap` as of [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0) (no org needed; the npm org `astrolabe-ai` belongs to someone else). Install: `npx -y @zlnap/astrolabe .` then `npx -y @zlnap/astrolabe setup` to wire MCP clients. Unscoped `astrolabe` / `astrolabe-ai` on npm are unrelated — do not use them.
+**Windows stability (tested on real machines, v0.17.4–v0.17.5):** `#117` normalizes `\?\` vs plain `C:\` for watcher membership / comparisons and strips `\?\` in status text; subdirectory `index_root` reuses a Ready parent index with a path filter (no second cold build). `#119` normalizes Windows `path_filter` (backslashes / absolute paths) to repo-relative `/` paths. Prefer omitting `index_root` or passing the **repo root**.
+
+### Option 4 — npm (install alone is not enough)
+
+The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with platform packages `@zlnap/<platform>`. **Published** under the personal npm scope `zlnap` (no org needed; the npm org `astrolabe-ai` belongs to someone else). Unscoped `astrolabe` / `astrolabe-ai` on npm are unrelated — do not use them.
+
+```bash
+npm i -g @zlnap/astrolabe          # or: npx -y @zlnap/astrolabe --version
+# REQUIRED after every fresh install / upgrade:
+npx -y @zlnap/astrolabe setup --with-hooks
+```
+
+**Why `setup` is required:** `npm i` only places the binary shim. Without `astrolabe setup`, no client MCP entry is written. Without hooks (`--with-hooks` where supported), many agents keep Grep/Read and never call Astrolabe tools in practice. `setup` detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo, Continue, OpenCode, DeepSeek Harness, Codebuddy, Grok Build, Kimi Code, and ZCode and **merges** MCP config (it never wipes other servers).
 
 ### Option 5 — build from source (Rust 1.90+)
 
@@ -54,19 +72,25 @@ git clone https://github.com/wojiushirencai/Astrolabe.git && cd Astrolabe
 cargo build --release --bin astrolabe      # target/release/astrolabe
 ```
 
-Verify with `astrolabe --version`, then restart your client so it picks up the new MCP server.
+Verify with `astrolabe --version`, then run `npx -y @zlnap/astrolabe setup --with-hooks` (or `astrolabe setup --with-hooks`) and restart your client so it picks up MCP + hooks.
 
 ## 2. Client configuration
 
-### One-shot setup (recommended)
+### One-shot setup (required after install)
 
-After installing the npm package (or with `npx`), run:
+After installing the binary or npm package (or with `npx`), run:
 
 ```bash
-npx -y @zlnap/astrolabe setup
+npx -y @zlnap/astrolabe setup --with-hooks
+# non-interactive:
+npx -y @zlnap/astrolabe setup --yes --with-hooks
 ```
 
+**Install without `setup` leaves you with a binary that clients do not call.** Hooks (`--with-hooks`) nudge agents away from Grep/Read toward Astrolabe; skip them only if you intentionally want MCP-only wiring.
+
 The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin plus Cursor / Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`.
+
+**MCP tool short names** (what `tools/list` shows): `resolve_contx`, `search_code`, `find_symbol`, `find_refs`, `goto_def`, `get_diag`, `get_lang`. Legacy long names remain aliases on `tools/call`.
 
 - **Cursor:** MCP into `~/.cursor/mcp.json` with `--context=cursor`; optional `--with-hooks` writes `~/.cursor/hooks.json` (`preToolUse` → `astrolabe hooks remind --client=cursor` with matcher `Shell|Read|Grep|mcp__astrolabe__.*`, plus `sessionEnd` cleanup).
 - **OpenCode:** merges into `~/.config/opencode/opencode.jsonc` (or `.json` / older `config.json`, or `~/.opencode/…` if that is what exists). Auto-detects V1 (`mcp.<name>` + `enabled`), V2 (`mcp.servers`), or Claude-like `mcpServers`. JSONC comments are preserved when the parent object already exists. Optional `--with-hooks` writes `~/.config/opencode/plugins/astrolabe-guard.ts`.
@@ -108,7 +132,7 @@ Equivalent JSON (`~/.claude.json` or project `.mcp.json`):
 { "mcpServers": { "astrolabe": { "command": "astrolabe", "args": [".", "--context=cursor"] } } }
 ```
 
-To skip Cursor's per-tool MCP approval for the seven read-only tools, merge entries `astrolabe:<tool>` into `~/.cursor/permissions.json` → `mcpAllowlist` (do not write `astrolabe:*`; Cursor Run Mode must be enabled). `node scripts/setup-cursor-permissions.mjs` does the merge safely (`--dry-run` to preview, `--cli` for `~/.cursor/cli-config.json`). Tools: `search_code`, `find_symbol`, `resolve_context`, `get_diagnostics`, `find_references`, `goto_definition`, `get_languages`.
+To skip Cursor's per-tool MCP approval for the seven read-only tools, merge entries `astrolabe:<tool>` into `~/.cursor/permissions.json` → `mcpAllowlist` (do not write `astrolabe:*`; Cursor Run Mode must be enabled). `node scripts/setup-cursor-permissions.mjs` does the merge safely (`--dry-run` to preview, `--cli` for `~/.cursor/cli-config.json`). Tools (short names + legacy aliases): `search_code`, `find_symbol`, `resolve_contx`/`resolve_context`, `get_diag`/`get_diagnostics`, `find_refs`/`find_references`, `goto_def`/`goto_definition`, `get_lang`/`get_languages`.
 
 ### Codex
 
@@ -143,5 +167,5 @@ Stdio server args are `["."]` with the mild `default` context (no `--context` un
 ## 3. Environment variables and language servers
 
 - `find_symbol`, `search_code` and the file graph use built-in tree-sitter and need no language server.
-- `find_references`, `goto_definition`, `get_diagnostics` need the language's server on `PATH` (otherwise they answer `unknown` with an install hint; servers are only downloaded if you opt in with `ASTROLABE_AUTO_INSTALL=on`, with mandatory checksums; `ASTROLABE_OFFLINE=1` forbids downloads). Override paths with `ASTROLABE_LSP_<LANG>`.
+- `find_refs`, `goto_def`, `get_diag` (legacy: `find_references` / `goto_definition` / `get_diagnostics`) need the language's server on `PATH` (otherwise they answer `unknown` with an install hint; servers are only downloaded if you opt in with `ASTROLABE_AUTO_INSTALL=on`, with mandatory checksums; `ASTROLABE_OFFLINE=1` forbids downloads). Override paths with `ASTROLABE_LSP_<LANG>`.
 - Full variable table, language matrix and per-language install commands: [REFERENCE.zh-CN.md](REFERENCE.zh-CN.md) (Chinese) and the Chinese guide [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md).

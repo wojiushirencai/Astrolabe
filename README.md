@@ -7,12 +7,12 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 
 > **Not to be confused with** the npm packages `astrolabe` (a 2014 Protractor page-object library) and `astrolabe-ai` (an unrelated resume tool), or other MCP servers named "astrolabe". This project lives at `github.com/wojiushirencai/Astrolabe`; the binary is `astrolabe`.
 
-## Fact card (as of 2026-10-27)
+## Fact card (as of 2026-11-01)
 
 | | |
 |---|---|
 | Latest release | [v0.17.5](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.5), published 2026-10-31 |
-| What it exposes | 7 MCP tools: `resolve_context`, `search_code`, `find_symbol`, `find_references`, `goto_definition`, `get_diagnostics`, `get_languages` |
+| What it exposes | 7 MCP tools (short names): `resolve_contx`, `search_code`, `find_symbol`, `find_refs`, `goto_def`, `get_diag`, `get_lang` (legacy long names still work as aliases) |
 | `tools/list` size | about 3.6 KB compact JSON (3,607 B measured on Linux for v0.16.0; not re-measured on macOS) |
 | Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |
 | Platforms | macOS arm64/x64, Linux x64 (glibc/musl), Linux arm64, Windows x64 |
@@ -22,46 +22,74 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 | License | MIT OR Apache-2.0 |
 | Tests | `cargo test --workspace -- --list` lists 1,117 test cases (2026-10-18) |
 
+## Windows stability (v0.17.4–v0.17.5)
+
+Recent releases focused on **Windows reliability** after real machine testing:
+
+- **`\\?\` path normalize** (#117): `canonicalize` on Windows often yields `\\?\C:\…`. Astrolabe now treats that as the same path as plain `C:\…` for watcher membership and comparisons, and strips `\\?\` in status / error text.
+- **Subdir `index_root` reuse** (#117): pointing `index_root` at a subdirectory of an already-Ready repo reuses the parent index with a path filter instead of starting a second cold build (no more stuck *Index is building…* for that case).
+- **`path_filter` on Windows** (#119): backslashes, `.\…`, and absolute `C:\repo\…` filters normalize to repo-relative `/` paths so search / symbol / context hits match.
+
+Prefer omitting `index_root`, or pass the **repo root**. If a brand-new root is still Building, retry shortly.
+
 ## Quick start (3 steps)
 
-**1. Install** (macOS / Linux; verifies the release sha256):
+**1. Install** the binary (pick one):
 
 ```bash
+# macOS / Linux (verifies the release sha256)
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
+
+# or npm (downloads the native binary for your platform)
+npm i -g @zlnap/astrolabe
+# / Windows (PowerShell): npm i -g @zlnap/astrolabe
 ```
 
-Other ways (manual download, Windows, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md). npm: `npx -y @zlnap/astrolabe` (published); wire clients: `npx -y @zlnap/astrolabe setup`.
+Other ways (manual download, Windows zip, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md).
 
-**2. Connect your client.** Claude Code:
+**2. Required — run `setup` (writes MCP config; use `--with-hooks` so agents actually call the tools).**  
+Installing the binary alone does **not** wire clients and does **not** install anti-drift hooks. Without `setup` (and hooks where the client supports them), many agents keep using Grep/Read and never exercise Astrolabe.
 
 ```bash
-npx -y @zlnap/astrolabe setup   # detect agents and merge MCP configs
-# or manually:
+# recommended (npm / npx) — MCP + hooks
+npx -y @zlnap/astrolabe setup --with-hooks
+# after a global npm install / PATH binary:
+astrolabe setup --with-hooks
+
+# non-interactive: configure every detected client
+npx -y @zlnap/astrolabe setup --yes --with-hooks
+```
+
+Claude Code (manual MCP only, still prefer `setup` above):
+
+```bash
 claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=claude-code
 ```
 
-Cursor (`.cursor/mcp.json`): `{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`.
-Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-client-configuration).
+Cursor (`.cursor/mcp.json`): `{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`.  
+Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-client-configuration). Flags: `--yes`, `--clients=…`, `--dry-run`, `--native`, `--list`, `--with-hooks`, `--no-cursor-permissions`.
 
-**3. Verify.** `astrolabe --version` prints the version; in your client, ask it to call `get_languages` or `search_code`. Restart the client session after adding the server.
+**3. Verify.** `astrolabe --version` prints the version; in your client, ask it to call `get_lang` or `search_code`. Restart the client session after `setup`.
 
 ## The seven tools
+
+`tools/list` advertises **short names**. Legacy long names (`resolve_context`, `find_references`, `goto_definition`, `get_diagnostics`, `get_languages`) and older `ast_*` aliases are still accepted on `tools/call`.
 
 | Tool | Use it for |
 |---|---|
 | `search_code` | Literal/regex search with path filters. Groups hits and labels each as definition / use / comment; ends with a verifiable summary ("23/23 hits, no truncation"). Counting: `aggregate=top\|dir\|file` (hits and files per top-level dir / dir / file), `count_only`, `skip_comments`, `exclude` (e.g. `_test.go`, `vendor`). |
-| `resolve_context` | Give it a task description; it returns relevant files and symbols ranked by relevance, as pages (`offset`, `path_filter`) whose header says how many matched and where the rest lives, and hints which tool to use next. |
+| `resolve_contx` | Give it a task description; it returns relevant files and symbols ranked by relevance, as pages (`offset`, `path_filter`) whose header says how many matched and where the rest lives, and hints which tool to use next. (alias: `resolve_context`) |
 | `find_symbol` | Find a function, class or type by name or substring. |
-| `find_references` | Compiler-grade references via the language server; `dry_run_rename=<new name>` lists per-file edit locations without writing anything. |
-| `goto_definition` | Jump to the real definition through the language server. |
-| `get_diagnostics` | Syntax and type errors for a file. |
-| `get_languages` | Languages, file counts, lines of code, language-server status, and index coverage (see below). |
+| `find_refs` | Compiler-grade references via the language server; `dry_run_rename=<new name>` lists per-file edit locations without writing anything. (alias: `find_references`) |
+| `goto_def` | Jump to the real definition through the language server. (alias: `goto_definition`) |
+| `get_diag` | Syntax and type errors for a file. (alias: `get_diagnostics`) |
+| `get_lang` | Languages, file counts, lines of code, language-server status, and index coverage (see below). (alias: `get_languages`) |
 
 `tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn), including optional per-call `index_root` on every tool (absolute or cwd-relative directory; omit to keep the process startup root). The others — `regex`, `exclude`, `count_only`, `context_lines`, `group`, `dedup`, `kind`, `depth`, `substring`, `dry_run_rename`, `character`, `severity`, `offset`, `page`, `budget_tokens`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
 
 Tool descriptions and return text are **English-only** (schema copy, result bodies, hook reminders), so agents are not split across bilingual phrasing.
 
-**Index coverage.** Every file of a supported language is indexed, including files with syntax or compile errors: the symbols that parse are kept, but symbols inside the broken region may be missing. `get_languages` reports:
+**Index coverage.** Every file of a supported language is indexed, including files with syntax or compile errors: the symbols that parse are kept, but symbols inside the broken region may be missing. `get_lang` reports:
 - files *not* in the index, as counts by reason (over the size cap, read failure, parser timeout);
 - files with syntax errors, counted by kind:
   - *other syntax errors* — `has syntax errors, index may be incomplete (symbols may be missing)`;
@@ -70,7 +98,7 @@ Tool descriptions and return text are **English-only** (schema copy, result bodi
   Listed inline (path, kind label, first error line with a snippet of that line) when there are 10 or fewer; otherwise only the counts plus the absolute path of a Markdown report (`<repo>/.astrolabe/coverage-report.md`, self-gitignored; temp dir if that is not writable) with path, language, kind and first error for each file (other syntax errors first), capped at 1,000 entries per section;
 - unsupported-language files, summarised by extension (top 8, the rest folded into one count), never per file.
 
-Other tools append one short English line pointing at `get_languages` only when such gaps exist.
+Other tools append one short English line pointing at `get_lang` only when such gaps exist.
 
 ## Evidence: what we measured, and what we did not
 
@@ -104,7 +132,7 @@ Reproduce the public part: `bash bench/fetch_corpora.sh && bash bench/run_pairs.
 
 - **Measured to help:** counting or listing occurrences per directory/module with exclusions (N5, N8) and one broad discovery task (N1): fewer turns and lower cost than the same model doing it with shell scripts.
 - **Not shown to help:** simple locating or small-edit tasks (H2, H3, H6, H7, E2, N6, N7 are about even, intervals include zero); the 40 general-purpose control cells of the v0.12.0 matrix cost more with Astrolabe; batch edit workflows (N4, E3b) were cheaper on average but not significantly.
-- **Overlap:** Claude Code can provide go-to-definition and find-references through its own LSP plugins ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)); our `goto_definition` / `find_references` overlap with that.
+- **Overlap:** Claude Code can provide go-to-definition and find-references through its own LSP plugins ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)); our `goto_def` / `find_refs` overlap with that.
 - **Adoption is not guaranteed:** models sometimes ignore MCP tools. In v0.12.0 the model used Astrolabe in 0/5 runs of N5 and 1/5 of N8; with v0.13.0 it did so in 92 of 95 runs across the 15 tasks. That is an observation about this model and these tasks, not a promise.
 
 ## Related projects
@@ -113,7 +141,7 @@ Reproduce the public part: `bash bench/fetch_corpora.sh && bash bench/run_pairs.
 
 ## More documentation
 
-[Install & clients](docs/INSTALL_GUIDE.md) · [FAQ](docs/FAQ.md) · [Reference (Chinese): config, env vars, language matrix, quality gates](docs/REFERENCE.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Performance method](docs/PERFORMANCE.md) · [Optional anti-drift hooks (effect not benchmarked)](docs/HOOKS.md) · [Releasing](.github/RELEASING.md) · [llms.txt](llms.txt)
+[Install & clients](docs/INSTALL_GUIDE.md) · [FAQ](docs/FAQ.md) · [Reference (Chinese): config, env vars, language matrix, quality gates](docs/REFERENCE.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Performance method](docs/PERFORMANCE.md) · [Anti-drift hooks (`setup --with-hooks`; cost effect not A/B-benchmarked)](docs/HOOKS.md) · [Releasing](.github/RELEASING.md) · [llms.txt](llms.txt)
 
 Build from source: `cargo build --release --bin astrolabe` (Rust 1.90+). Tests: `cargo test --workspace`.
 

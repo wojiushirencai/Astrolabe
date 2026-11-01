@@ -1,6 +1,6 @@
 # Astrolabe AI 安装与客户端配置指南（中文）
 
-英文版见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)。最后更新 2026-10-25（v0.17.0）。
+英文版见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)。最后更新 2026-11-01（v0.17.5+：Windows 稳定性 #117/#119、MCP 短名、安装后必须 `setup`）。
 
 本指南覆盖安装与各客户端的 MCP 配置。
 
@@ -45,11 +45,29 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 
 ### 方式 3：Windows
 
-下载 `astrolabe-<版本>-x86_64-pc-windows-msvc.zip`，用 `Get-FileHash -Algorithm SHA256` 对照 `SHA256SUMS`，解压出 `astrolabe.exe` 放到固定目录并加入 `PATH`。（Windows 路径未在本次改动中实机验证。）
+```powershell
+# 推荐 npm（自动拉对应平台包）：
+npm i -g @zlnap/astrolabe
+# 然后必须跑 setup（加 --with-hooks，否则智能体往往不会真正调用工具）：
+npx -y @zlnap/astrolabe setup --with-hooks
+# 或：astrolabe setup --with-hooks
+```
 
-### 方式 4：npm
+也可从 [Releases](https://github.com/wojiushirencai/Astrolabe/releases) 下载 `astrolabe-<版本>-x86_64-pc-windows-msvc.zip`，用 `Get-FileHash -Algorithm SHA256` 对照 `SHA256SUMS`，解压 `astrolabe.exe` 到固定目录并加入 `PATH`，然后同样执行 `astrolabe setup --with-hooks`。
 
-npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`），平台包为 `@zlnap/<platform>`，已在 npm 个人 scope `zlnap` **发布**（[v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0)；无需建 org；npm org `astrolabe-ai` 已被他人占用）。安装：`npx -y @zlnap/astrolabe .`，再 `npx -y @zlnap/astrolabe setup` 接入客户端。注意：npm 上未加 scope 的 `astrolabe` 和 `astrolabe-ai` 是与本项目无关的他人的包，请不要用它们。
+**Windows 稳定性（真机验证，v0.17.4–v0.17.5）：** #117 统一 `\?\` 与普通 `C:\`（watcher 归属 / 比较），状态文案去掉 `\?\`；子目录 `index_root` 复用已 Ready 的父索引并带 path_filter（不再另开冷索引）。#119 把 Windows 的 `path_filter`（反斜杠 / 绝对路径）归一成仓库相对 `/` 路径。尽量不传 `index_root`，或只传**仓库根**。
+
+### 方式 4：npm（只安装不够）
+
+npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`），平台包为 `@zlnap/<platform>`，已在 npm 个人 scope `zlnap` **发布**（无需建 org；npm org `astrolabe-ai` 已被他人占用）。注意：npm 上未加 scope 的 `astrolabe` 和 `astrolabe-ai` 是与本项目无关的他人的包，请不要用它们。
+
+```bash
+npm i -g @zlnap/astrolabe          # 或：npx -y @zlnap/astrolabe --version
+# 每次新装 / 升级后都必须：
+npx -y @zlnap/astrolabe setup --with-hooks
+```
+
+**为什么一定要 `setup`：** `npm i` 只放下二进制 shim。不跑 `astrolabe setup`，就不会写入任何客户端的 MCP 配置。不加 hooks（在支持的客户端上用 `--with-hooks`），很多智能体仍会用 Grep/Read，等于没用上 Astrolabe。`setup` 会探测 Claude Code、Cursor、Codex、Windsurf、Cline、Roo、Continue、OpenCode、DeepSeek Harness、Codebuddy、Grok Build、Kimi Code、ZCode，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。
 
 ### 方式 5：从源码编译（Rust 1.90+）
 
@@ -58,21 +76,27 @@ git clone https://github.com/wojiushirencai/Astrolabe.git && cd Astrolabe
 cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 ```
 
-验证：`astrolabe --version`。
+验证：`astrolabe --version`，然后执行 `npx -y @zlnap/astrolabe setup --with-hooks`（或 `astrolabe setup --with-hooks`），再重启客户端以加载 MCP + hooks。
 
 ---
 
 ## 三、各 AI 编程工具 MCP 配置配方
 
-### 一键配置（推荐）
+### 一键配置（安装后必做）
 
-安装 npm 包后（或直接用 `npx`）运行：
+装好二进制或 npm 包后（或直接用 `npx`）运行：
 
 ```bash
-npx -y @zlnap/astrolabe setup
+npx -y @zlnap/astrolabe setup --with-hooks
+# 非交互：
+npx -y @zlnap/astrolabe setup --yes --with-hooks
 ```
 
+**只安装不跑 `setup`，等于客户端根本不会调用 Astrolabe。** `--with-hooks` 会写入防漂移 Hook，推动智能体少用 Grep/Read、多用 Astrolabe；只有你明确只要 MCP、不要 Hook 时才省略。
+
 会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件，以及 Cursor / Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`。
+
+**MCP 工具短名**（`tools/list` 声明）：`resolve_contx`、`search_code`、`find_symbol`、`find_refs`、`goto_def`、`get_diag`、`get_lang`。旧长名在 `tools/call` 上仍是别名。
 
 - **Cursor：** MCP 写入 `~/.cursor/mcp.json`（`--context=cursor`）；可选 `--with-hooks` 写入 `~/.cursor/hooks.json`（`preToolUse` → `astrolabe hooks remind --client=cursor`，matcher 含 `mcp__astrolabe__.*`；`sessionEnd` cleanup）。
 - **OpenCode：** 合并进 `~/.config/opencode/opencode.jsonc`（或已有的 `.json` / 旧版 `config.json`，或 `~/.opencode/…`）。自动识别 V1（`mcp.<name>` + `enabled`）、V2（`mcp.servers`）或类 Claude 的 `mcpServers`；在父对象已存在时尽量保留 JSONC 注释。可选 `--with-hooks` 写入 `~/.config/opencode/plugins/astrolabe-guard.ts`。
@@ -177,11 +201,11 @@ claude mcp add --scope project astrolabe -- astrolabe . --context=claude-code # 
 
 - `search_code`
 - `find_symbol`
-- `resolve_context`
-- `get_diagnostics`
-- `find_references`
-- `goto_definition`
-- `get_languages`
+- `resolve_contx`（别名 `resolve_context`）
+- `get_diag`（别名 `get_diagnostics`）
+- `find_refs`（别名 `find_references`）
+- `goto_def`（别名 `goto_definition`）
+- `get_lang`（别名 `get_languages`）
 
 不要写 `astrolabe:*` 或 `*:*`。
 
@@ -200,11 +224,11 @@ node scripts/setup-cursor-permissions.mjs
   "mcpAllowlist": [
     "astrolabe:search_code",
     "astrolabe:find_symbol",
-    "astrolabe:resolve_context",
-    "astrolabe:get_diagnostics",
-    "astrolabe:find_references",
-    "astrolabe:goto_definition",
-    "astrolabe:get_languages"
+    "astrolabe:resolve_contx",
+    "astrolabe:get_diag",
+    "astrolabe:find_refs",
+    "astrolabe:goto_def",
+    "astrolabe:get_lang"
   ]
 }
 ```
@@ -299,7 +323,7 @@ args = [".", "--context=codex"]
 
 ### 语言服务器（可选）
 
-符号索引、`find_symbol`、文件图谱只靠内置 tree-sitter，不需要任何语言服务器。`find_references` / `goto_definition` / `get_diagnostics` / 改名需要对应的语言服务器在 `PATH` 上；找不到时这些工具返回 `unknown` 并给出安装提示，不会静默降级。也可用 `ASTROLABE_LSP_<LANG>` 指定可执行文件路径。Astrolabe 不会自动下载。
+符号索引、`find_symbol`、文件图谱只靠内置 tree-sitter，不需要任何语言服务器。`find_refs` / `goto_def` / `get_diag`（旧长名仍可用）/ 改名需要对应的语言服务器在 `PATH` 上；找不到时这些工具返回 `unknown` 并给出安装提示，不会静默降级。也可用 `ASTROLABE_LSP_<LANG>` 指定可执行文件路径。Astrolabe 不会自动下载。
 
 | 语言 | 扩展名 | 语言服务器（优先 → 回退） | 安装 | 覆盖变量 |
 |---|---|---|---|---|
@@ -316,7 +340,7 @@ args = [".", "--context=codex"]
 - 启动器：新版独立包用 `bin/intellij-server` 启动（旧的 `kotlin-lsp.sh` 已弃用）。Astrolabe 会在 PATH、Homebrew `libexec`、`/opt`、`~/.local/share`、`%LOCALAPPDATA%\Programs`、VS Code / Cursor 扩展目录里查找；`ASTROLABE_LSP_KOTLIN` 可以直接指向解压目录。
 - 缓存：每个仓库用独立的 `--system-path`（默认 `~/.astrolabe/kotlin-lsp/<仓库名>-<哈希>`，可用 `ASTROLABE_KOTLIN_SYSTEM_PATH` 覆盖）。首次 Gradle 导入成功后，Astrolabe 会导出 `workspace.json`；之后重启时只要构建文件（`settings.gradle*`、`build.gradle*`、`gradle.properties`、`libs.versions.toml`、`pom.xml`）没变，就用 `json` 导入器在几秒内恢复项目模型，不再重跑 Gradle 同步。
 - `ASTROLABE_KOTLIN_BUILD_TOOL`：强制指定导入方式（`gradle` / `maven` / `json` / `*`；空字符串表示不导入）。
-- 导入期间和 kotlin-lsp 返回空结果时（例如 Kotlin 多平台 / Android 源集没有被导入），`goto_definition` / `find_references` / 悬停会给出 tree-sitter 语法索引的结果，标为 `Syntactic` 并附说明，不会把空结果标成 `Exact`。
+- 导入期间和 kotlin-lsp 返回空结果时（例如 Kotlin 多平台 / Android 源集没有被导入），`goto_def` / `find_refs` / 悬停会给出 tree-sitter 语法索引的结果，标为 `Syntactic` 并附说明，不会把空结果标成 `Exact`。
 
 
 其余语言（Python、Go、Rust、Java、TS/JS、C/C++、PHP、Dart、C#/VB）见 [参考手册](REFERENCE.zh-CN.md) 的语言矩阵。
