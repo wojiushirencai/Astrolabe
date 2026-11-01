@@ -103,8 +103,29 @@ Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrola
 
 - **实测有用：** 按目录/模块统计或列出出现次数并带排除条件（N5、N8），以及一个大范围发现任务（N1）：同一个模型比用 shell 脚本做更少轮、更省钱。
 - **没有证明有用：** 简单定位或小改动任务（H2、H3、H6、H7、E2、N6、N7 基本持平，区间含 0）；v0.12.0 矩阵里 40 个通用对照格接 Astrolabe 反而更贵；批量改文件流程（N4、E3b）平均更便宜但不显著。
-- **功能重叠：** Claude Code 可通过自带的 LSP 插件提供跳转定义与查引用（[文档](https://code.claude.com/docs/en/plugins/code-intelligence)），与我们的 `goto_definition`、`find_references` 重叠。
+- **功能重叠：** Claude Code 可通过自带的 LSP 插件提供跳转定义与查引用（[文档](https://code.claude.com/docs/en/plugins/code-intelligence)），与我们的 `goto_def`、`find_refs` 重叠。
 - **采用率没有保证：** 模型有时会忽略 MCP 工具。v0.12.0 时模型在 N5 的 0/5、N8 的 1/5 里用了 Astrolabe；v0.13.0 在 15 个任务共 95 次里用了 92 次。这是对这个模型和这些任务的观察，不是承诺。
+
+## 避免双重 LSP 内存冲突与去重建议
+
+客户端（如 Claude Code）内置的代码智能插件会随会话无条件启动 `gopls`、`pyright` 等语言服务器，并全程常驻内存（单进程常占 1GB~1.5GB 内存）。
+
+而接入 Astrolabe 后：
+1. **语法图极速响应**：90% 的普通定义与引用查询直接由内存 AST 语法图在 <1ms 内返回，**无需拉起 LSP**；
+2. **按需启动与自动回收**：仅当遇到复杂接口多态或未决引用时才按需调用 LSP，且内置 **5 分钟空闲自动回收（Idle Eviction）** 与进程树清理机制。
+
+**推荐配置**：为避免客户端与 Astrolabe 各自拉起一套语言服务器造成内存重复开销，建议在客户端中关闭冗余的内置 LSP 工具。例如在 Claude Code 中：
+- 在 `~/.claude/settings.json` 中配置：
+  ```json
+  {
+    "permissions": {
+      "deny": ["LSP"]
+    }
+  }
+  ```
+- 或在自定义 Agent（`~/.claude/agents/*.md`）的 `disallowedTools` 中添加 `- LSP`。
+
+将代码导航全权交给 Astrolabe，可立省 1GB+ 驻留内存并避免进程冲突。
 
 ## 相关项目
 

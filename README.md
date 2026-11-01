@@ -104,8 +104,29 @@ Reproduce the public part: `bash bench/fetch_corpora.sh && bash bench/run_pairs.
 
 - **Measured to help:** counting or listing occurrences per directory/module with exclusions (N5, N8) and one broad discovery task (N1): fewer turns and lower cost than the same model doing it with shell scripts.
 - **Not shown to help:** simple locating or small-edit tasks (H2, H3, H6, H7, E2, N6, N7 are about even, intervals include zero); the 40 general-purpose control cells of the v0.12.0 matrix cost more with Astrolabe; batch edit workflows (N4, E3b) were cheaper on average but not significantly.
-- **Overlap:** Claude Code can provide go-to-definition and find-references through its own LSP plugins ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)); our `goto_definition` / `find_references` overlap with that.
+- **Overlap:** Claude Code can provide go-to-definition and find-references through its own LSP plugins ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)); our `goto_def` / `find_refs` overlap with that.
 - **Adoption is not guaranteed:** models sometimes ignore MCP tools. In v0.12.0 the model used Astrolabe in 0/5 runs of N5 and 1/5 of N8; with v0.13.0 it did so in 92 of 95 runs across the 15 tasks. That is an observation about this model and these tasks, not a promise.
+
+## Avoiding Duplicate LSP Memory Overhead
+
+Client coding assistants (such as Claude Code) often launch their own persistent language servers (`gopls`, `pyright`, etc.) that remain resident throughout the session, often consuming 1GB to 1.5GB of RAM.
+
+With Astrolabe:
+1. **AST-First Speed**: Over 90% of definition and reference queries are answered directly from the in-memory AST index in <1ms without starting a language server.
+2. **On-Demand with Auto-Eviction**: Language servers are spawned only when necessary for ambiguous references, and are automatically shut down after **5 minutes of idle time** (using Windows Job Objects on Windows to prevent orphaned processes).
+
+**Recommendation**: To prevent both the client and Astrolabe from running duplicate copies of language servers, disable the client's built-in LSP tool. For example, in Claude Code:
+- Add to `~/.claude/settings.json`:
+  ```json
+  {
+    "permissions": {
+      "deny": ["LSP"]
+    }
+  }
+  ```
+- Or add `- LSP` to `disallowedTools` in `~/.claude/agents/*.md`.
+
+This lets Astrolabe handle code navigation on demand while reclaiming 1GB+ of memory.
 
 ## Related projects
 

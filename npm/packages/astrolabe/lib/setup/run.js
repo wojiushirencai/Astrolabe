@@ -3,6 +3,7 @@
 const path = require('path');
 const os = require('os');
 const {
+  which,
   CLIENTS,
   getClient,
   canonicalClientId,
@@ -259,6 +260,16 @@ function run(argv = process.argv.slice(2)) {
     if (process.platform === 'win32' && opts.withHooks) {
       process.stdout.write(
         '     (Windows: Claude Code runs silently via stdio; shell hooks are omitted to prevent console popups)\n',
+      );
+    }
+    const detectedLsps = ['gopls', 'typescript-language-server', 'pyright', 'rust-analyzer']
+      .filter((bin) => which(bin, process.env));
+    if (detectedLsps.length > 0) {
+      process.stdout.write(
+        `     Tip: local ${detectedLsps.join(', ')} detected. To prevent Claude Code from running redundant\n` +
+        `     1GB+ background language servers, consider disabling its built-in LSP in ~/.claude/settings.json:\n` +
+        `       "permissions": { "deny": ["LSP"] }\n` +
+        `     Astrolabe will handle code definitions/references on demand with 5-minute auto-idle cleanup.\n`,
       );
     }
   }

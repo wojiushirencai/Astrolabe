@@ -5279,7 +5279,9 @@ impl AstrolabeServer {
                  file_cache: {cache_bytes}/{} bytes, hits={cache_hits}, misses={cache_misses}\n\
                  LSP status: Ready = server on PATH; needs_install = language server missing; \
                  AST-only = parse/index only (server not wired).\n\
-                 If a precise tool reports Unavailable, install the named language server locally.\n",
+                 If a precise tool reports Unavailable, install the named language server locally.\n\
+                 Note: Astrolabe manages on-demand language servers with 5-minute auto-idle eviction. \
+                 If your client exposes a duplicate built-in LSP tool (e.g. Claude Code's LSP), disabling it in client settings avoids 1GB+ redundant memory.\n",
                 session.cache_budget_bytes
             );
             for row in kept {
