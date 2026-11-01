@@ -6,6 +6,52 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-11-01
+
+自 v0.17.5 以来的 PR：#121（文档：Windows 稳定性着重说明、MCP 短名、安装路径强制 `setup --with-hooks`）。完整说明见 GitHub Release。
+
+### 中文
+
+#### 文档 / 发布说明
+
+1. **Windows 稳定性（着重）**  
+   在 README / 安装指南 / FAQ / npm README 中突出 v0.17.4–v0.17.5 真机修复：`\\?\` 路径归一化与 watcher 归属、子目录 `index_root` 复用父 Ready 索引、`path_filter` 反斜杠/绝对路径归一化（#117/#119）。
+
+2. **MCP 工具短名**  
+   文档统一以规范短名呈现：`resolve_contx` / `get_diag` / `get_lang` / `find_refs` / `goto_def`（`search_code` / `find_symbol` 不变）；标明旧长名仍为 `tools/call` 别名。
+
+3. **安装后必须 `setup`（含 hooks）**  
+   所有 npm / 安装路径写明：只装二进制不会写入 MCP，也没有 Hook；必须执行 `npx -y @zlnap/astrolabe setup --with-hooks`（或 `astrolabe setup --with-hooks`），否则智能体往往不会真正调用这些工具。
+
+#### 前后对比
+
+| 场景 | 0.17.5 文档 | 0.17.6 文档 |
+| --- | --- | --- |
+| Windows 用户看 README | 仅事实卡提到平台 | 专节强调 #117/#119 稳定性 |
+| 工具名 | 仍写旧长名 | 短名 + 别名说明 |
+| `npm i -g @zlnap/astrolabe` 之后 | setup 一笔带过 | **必做** `setup --with-hooks` |
+
+### English
+
+#### Docs / release notes
+
+1. **Windows stability (emphasized)**  
+   README / install guides / FAQ / npm README now highlight the v0.17.4–v0.17.5 real-machine fixes: `\\?\` path normalize and watcher membership, subdirectory `index_root` reuse of a Ready parent, and `path_filter` backslash/absolute normalize (#117/#119).
+
+2. **MCP short tool names**  
+   Docs use canonical short names: `resolve_contx` / `get_diag` / `get_lang` / `find_refs` / `goto_def` (`search_code` / `find_symbol` unchanged); legacy long names remain `tools/call` aliases.
+
+3. **`setup` required after install (with hooks)**  
+   Every npm/install path states that a binary-only install writes no MCP config and no hooks; run `npx -y @zlnap/astrolabe setup --with-hooks` (or `astrolabe setup --with-hooks`), or agents often will not actually use the tools.
+
+#### Before / after
+
+| Scenario | 0.17.5 docs | 0.17.6 docs |
+| --- | --- | --- |
+| Windows users reading README | Platform listed in fact card only | Dedicated section on #117/#119 |
+| Tool names | Legacy long names | Short names + aliases |
+| After `npm i -g @zlnap/astrolabe` | setup mentioned lightly | **Required** `setup --with-hooks` |
+
 ## [0.17.5] - 2026-10-31
 
 自 v0.17.4 以来的 PR：#119（Windows `path_filter` 反斜杠/绝对路径归一化；MCP 工具短名 + 全量旧名别名）。完整说明见 GitHub Release。
