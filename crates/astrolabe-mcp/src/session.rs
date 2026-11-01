@@ -767,12 +767,16 @@ fn wait_watermark_advance(log: &FreshnessLog, before: Instant, timeout: Duration
 fn inline_repair(session: &RootSession, paths: Vec<RelPath>) {
     // Suspects are raw event paths: classify them with the scan gates so a
     // gitignored / deleted / oversized path is removed instead of being
-    // blindly parsed into the index.
+    // blindly parsed into the index. A Windows exclusive lock (editor save
+    // in flight, antivirus scan) is NOT a deletion: keep the indexed copy
+    // and let a later event retry the read.
     let scan_opts = astrolabe_core::scan::ScanOptions::default();
     let mut repair = ChangeSet::default();
     for path in paths {
         match astrolabe_core::scan::path_admission(&session.root, &path, &scan_opts) {
             astrolabe_core::scan::PathAdmission::Indexed => repair.modified.push(path),
+            // File exists but is locked right now — leave it untouched.
+            astrolabe_core::scan::PathAdmission::Locked => {}
             _ => repair.removed.push(path),
         }
     }

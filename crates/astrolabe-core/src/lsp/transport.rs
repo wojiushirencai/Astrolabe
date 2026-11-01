@@ -205,6 +205,13 @@ impl LspTransport {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        // GUI hosts (VS Code extension host) would otherwise flash a console
+        // window for every server spawn. No effect on Unix.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
             // Roslyn's design-time builds would otherwise write obj/ into
@@ -2520,6 +2527,10 @@ pub(crate) fn path_to_file_uri(path: &Path) -> String {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     };
+    // `canonicalize`-style verbatim paths (`\\?\C:\…`) would percent-encode
+    // into a mangled `file:////%3F/C:/…` that no server can resolve.
+    // Stripping is a no-op on non-Windows and on already-plain paths.
+    let path = crate::paths::without_verbatim_prefix(&path);
     let rendered = path.to_string_lossy().replace('\\', "/");
     let mut uri = String::from("file://");
     if cfg!(windows) && !rendered.starts_with('/') {
@@ -2648,6 +2659,16 @@ mod tests {
         assert_eq!(exit_grace(Language::Kotlin), KOTLIN_EXIT_GRACE);
         assert!(exit_grace(Language::Rust) <= Duration::from_millis(500));
         assert!(exit_grace(Language::Python) <= Duration::from_millis(500));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn file_uri_strips_verbatim_prefix() {
+        // `\\?\` verbatim (as returned by `canonicalize`) must not leak into
+        // the URI as `%3F`; servers resolve `file:///C:/…` only.
+        let uri = path_to_file_uri(Path::new(r"\\?\C:\repo\a b.ts"));
+        assert_eq!(uri, "file:///C:/repo/a%20b.ts");
+        assert!(!uri.contains("%3F"));
     }
 
     use super::*;

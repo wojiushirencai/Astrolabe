@@ -94,7 +94,10 @@ async fn main() -> anyhow::Result<()> {
             // Interactive MCP client setup ships with the npm package (Node).
             // Prefer re-exec via npx so cargo-only installs still work when
             // network/npm is available; otherwise print the install hint.
-            let status = std::process::Command::new("npx")
+            // npm installs `npx.cmd` on Windows; bare `npx` resolves to
+            // `npx.exe`, which does not exist.
+            let npx = if cfg!(windows) { "npx.cmd" } else { "npx" };
+            let status = std::process::Command::new(npx)
                 .arg("-y")
                 .arg("@zlnap/astrolabe")
                 .arg("setup")

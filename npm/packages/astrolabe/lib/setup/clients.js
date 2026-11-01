@@ -171,6 +171,45 @@ function backupFile(filePath) {
   return backup;
 }
 
+/**
+ * Windows-only: renameSync error codes that mean another process (a running
+ * IDE such as Cursor/VS Code/Claude Desktop, or an antivirus scanner) holds
+ * the destination open so it cannot be replaced right now.
+ */
+const WINDOWS_BUSY_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY', 'EEXIST']);
+const WINDOWS_RENAME_RETRIES = 2;
+const WINDOWS_RENAME_RETRY_DELAY_MS = 20;
+
+function isWindowsBusyRenameError(error) {
+  return process.platform === 'win32' && WINDOWS_BUSY_RENAME_CODES.has(error && error.code);
+}
+
+/** Synchronous sleep; writeTextAtomic is a fully sync code path. */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Replace `dest` with `tmp` via POSIX-atomic rename. On Windows a busy
+ * destination fails with EPERM/EACCES/EBUSY/EEXIST; retry briefly, then
+ * degrade to copyFileSync (never delete the destination first, mirroring
+ * scripts/setup-cursor-permissions.mjs). Unrelated errors — and every error
+ * on macOS/Linux — propagate after the first attempt, keeping standard
+ * POSIX atomic-rename semantics unchanged there.
+ */
+function renameAtomic(tmp, dest) {
+  for (let attempt = 0; attempt <= WINDOWS_RENAME_RETRIES; attempt += 1) {
+    try {
+      fs.renameSync(tmp, dest);
+      return;
+    } catch (error) {
+      if (!isWindowsBusyRenameError(error)) throw error;
+      if (attempt < WINDOWS_RENAME_RETRIES) sleepSync(WINDOWS_RENAME_RETRY_DELAY_MS);
+    }
+  }
+  fs.copyFileSync(tmp, dest);
+}
+
 function writeTextAtomic(filePath, contents) {
   let dest = filePath;
   let mode = null;
@@ -181,18 +220,26 @@ function writeTextAtomic(filePath, contents) {
   const dir = path.dirname(dest);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.${path.basename(dest)}.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, contents.endsWith('\n') ? contents : `${contents}\n`, {
-    encoding: 'utf8',
-    mode: mode ?? 0o600,
-  });
-  if (mode !== null) {
+  try {
+    fs.writeFileSync(tmp, contents.endsWith('\n') ? contents : `${contents}\n`, {
+      encoding: 'utf8',
+      mode: mode ?? 0o600,
+    });
+    if (mode !== null) {
+      try {
+        fs.chmodSync(tmp, mode);
+      } catch {
+        // best effort
+      }
+    }
+    renameAtomic(tmp, dest);
+  } finally {
     try {
-      fs.chmodSync(tmp, mode);
+      fs.rmSync(tmp, { force: true });
     } catch {
-      // best effort
+      // ignore cleanup failure; never mask the original error
     }
   }
-  fs.renameSync(tmp, dest);
 }
 
 function writeJsonAtomic(filePath, value) {

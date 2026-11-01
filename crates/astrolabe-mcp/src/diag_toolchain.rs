@@ -207,6 +207,11 @@ enum RunError {
     Other(String),
 }
 
+/// `CREATE_NO_WINDOW`: keep toolchain runs from flashing a console window
+/// when the MCP server is hosted by a GUI process (VS Code). Windows only.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Run `cmd` with a wall-clock limit; the whole process group is killed on
 /// timeout (go / cargo / tsc spawn children).
 fn run(mut cmd: Command, timeout: Duration) -> Result<Output, RunError> {
@@ -217,6 +222,11 @@ fn run(mut cmd: Command, timeout: Duration) -> Result<Output, RunError> {
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RunError::Missing,
@@ -268,6 +278,21 @@ fn kill_group(child: &mut std::process::Child) {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .status();
+    }
+    // Windows: `.cmd` wrappers spawn grandchildren (`tsc.cmd` -> cmd.exe ->
+    // node.exe) that `Child::kill` never reaches, leaking `node.exe`.
+    // `taskkill /T` walks and kills the whole tree; the `kill` below then
+    // reaps the direct child.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
             .status();
     }
     let _ = child.kill();
@@ -869,7 +894,10 @@ fn ts_check(root: &Path, rel: &RelPath) -> Outcome {
         }
         found
     };
-    let mut cmd = Command::new(local.as_deref().unwrap_or(Path::new("tsc")));
+    // A global `tsc` install is `tsc.cmd` on Windows; bare `tsc` resolves to
+    // `tsc.exe`, which npm never installs, and spawn fails with NotFound.
+    let global_tsc = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
+    let mut cmd = Command::new(local.as_deref().unwrap_or(Path::new(global_tsc)));
     cmd.args(["--noEmit", "--pretty", "false", "-p", "tsconfig.json"])
         .current_dir(&project);
     let out = match run(cmd, timeout_for(45)) {

@@ -773,9 +773,10 @@ impl Watcher {
         let extra = &self.scan.extra_excludes;
         let mut work: BTreeSet<RelPath> = BTreeSet::new();
         for abs in &unique {
-            if abs == &self.root
-                || (relativize(&self.root, abs).is_none() && abs.starts_with(&self.root))
-            {
+            // Root event. Compare normalized: a canonicalized (`\\?\`-prefixed)
+            // root must still match the plain event path, or the event is
+            // dropped instead of expanding into a bounded tree walk.
+            if crate::paths::paths_eq_normalized(abs, &self.root) {
                 // Root-directory event: treat as a bounded walk of the whole
                 // tree. Hitting `cap` degrades to a full check.
                 if expand_dir_bounded(&self.root, abs, extra, cap, &mut work).is_err() {
@@ -854,6 +855,12 @@ impl Watcher {
                         }
                         self.snapshot.insert(rel, stamp);
                     }
+                    // Locked by an exclusive holder (Windows: editor save in
+                    // flight, antivirus scan): the file exists, we just
+                    // cannot read it this instant. Keep the recorded verdict
+                    // untouched; the next event or full check retries.
+                    // Dropping it here would delete a just-saved file.
+                    (Admit::Locked, _) => {}
                     // Gone, or no longer passes the scan gates (gitignored,
                     // grew past the size cap, turned binary): a full scan
                     // would drop it, so the directed path must too.
@@ -870,7 +877,9 @@ impl Watcher {
                             added.push(rel);
                         }
                     }
-                    Admit::Missing | Admit::Skip => {}
+                    // Locked and unseen in the snapshot: nothing to keep yet,
+                    // and nothing safe to add while the read fails.
+                    Admit::Missing | Admit::Skip | Admit::Locked => {}
                 },
             }
         }
@@ -1047,6 +1056,12 @@ trait EventFeed {
 struct NotifyFeed {
     rx: Receiver<Result<notify::Event, notify::Error>>,
     overflow: Arc<AtomicBool>,
+    /// Keeps the non-selective (whole-tree) watcher alive. notify tears down
+    /// the OS watch (ReadDirectoryChangesW handle / FSEvents stream) when the
+    /// watcher is dropped, which instantly disconnects `rx` and degrades the
+    /// event loop to polling. `None` in selective mode, where `selective`
+    /// owns the watcher instead.
+    _watcher: Option<notify::RecommendedWatcher>,
     /// Present only in selective (per-directory) mode; owns the watcher so
     /// new directories can be registered from the consumer thread.
     selective: Option<Selective>,
@@ -1200,6 +1215,7 @@ fn init_notify(root: &Path, scan: &ScanOptions, selective: bool) -> Option<(Noti
             NotifyFeed {
                 rx,
                 overflow,
+                _watcher: Some(watcher),
                 selective: None,
             },
             (),
@@ -1225,6 +1241,7 @@ fn init_notify(root: &Path, scan: &ScanOptions, selective: bool) -> Option<(Noti
         NotifyFeed {
             rx,
             overflow,
+            _watcher: None,
             selective: Some(sel),
         },
         (),
@@ -1904,10 +1921,13 @@ fn hash_file(path: &Path) -> Option<u64> {
 
 /// Whether `abs` is, or lies below, a symlink that points at a directory
 /// (checked for every component between `root` and `abs`, using `lstat`).
+/// Comparisons are normalized so a canonicalized (`\\?\`-prefixed) `root`
+/// still matches the plain component walk; otherwise the loop bails at the
+/// first parent and symlinked dirs / junctions go unnoticed.
 fn crosses_symlink_dir(root: &Path, abs: &Path) -> bool {
     let mut cur = abs;
     loop {
-        if cur == root {
+        if crate::paths::paths_eq_normalized(cur, root) {
             return false;
         }
         if let Ok(md) = fs::symlink_metadata(cur) {
@@ -1916,7 +1936,7 @@ fn crosses_symlink_dir(root: &Path, abs: &Path) -> bool {
             }
         }
         match cur.parent() {
-            Some(p) if p.starts_with(root) => cur = p,
+            Some(p) if crate::paths::is_under_normalized(root, p) => cur = p,
             _ => return false,
         }
     }
@@ -2057,6 +2077,10 @@ enum Admit {
     Indexed,
     Missing,
     Skip,
+    /// Exists but locked right now (Windows sharing violation while an
+    /// editor save or antivirus scan holds the file): keep the recorded
+    /// verdict as-is and let a later event retry the read.
+    Locked,
 }
 
 /// Admission of a newly observed path into the watched set.
@@ -2067,6 +2091,7 @@ fn admit_new(root: &Path, rel: &RelPath, opts: &ScanOptions) -> Admit {
     match scan::path_admission(root, rel, opts) {
         scan::PathAdmission::Indexed => Admit::Indexed,
         scan::PathAdmission::Missing => Admit::Missing,
+        scan::PathAdmission::Locked => Admit::Locked,
         scan::PathAdmission::Ignored
         | scan::PathAdmission::TooLarge
         | scan::PathAdmission::Binary => Admit::Skip,
@@ -2429,6 +2454,31 @@ mod tests {
         dir.write("a.rs", vec![b'x'; 1_600_000]);
         let ch = w.check_paths(&[dir.abs("a.rs")]);
         assert_eq!(ch.removed, vec![RelPath::new("a.rs")], "{ch:?}");
+        assert!(w.check().is_empty(), "full scan agrees");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directed_check_keeps_exclusively_locked_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let mut w = default_scan_watcher(&dir);
+        w.check();
+        // Hold the file the way an editor mid-save or an antivirus scan
+        // does (share_mode 0): every other open fails with a sharing
+        // violation. The directed check must keep the file, not remove it.
+        let _guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(dir.abs("a.rs"))
+            .expect("open exclusive guard");
+        let ch = w.check_paths(&[dir.abs("a.rs")]);
+        assert!(ch.is_empty(), "locked file must be kept: {ch:?}");
+        drop(_guard);
+        let ch = w.check_paths(&[dir.abs("a.rs")]);
+        assert!(ch.is_empty(), "unchanged content after unlock: {ch:?}");
         assert!(w.check().is_empty(), "full scan agrees");
     }
 
@@ -3093,6 +3143,65 @@ mod tests {
             let full = w.check();
             assert!(full.is_empty(), "{full:?}");
         }
+    }
+
+    #[test]
+    fn non_selective_watch_survives_init_notify() {
+        let dir = TestDir::new();
+        dir.write("src/a.rs", "fn a() {}");
+        let scan = test_scan();
+        // The non-selective branch registers one recursive watcher and must
+        // keep it alive inside the feed; dropping it disconnects the channel
+        // and the loop silently degrades to polling.
+        let (mut feed, ()) = init_notify(dir.path(), &scan, false).expect("init notify");
+        dir.write("src/b.rs", "fn b() {}");
+        let mut got = false;
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end && !got {
+            if let Ok(FeedWake::Events { paths, .. }) =
+                feed.recv_timeout(Duration::from_millis(100))
+            {
+                got = paths.iter().any(|p| p.ends_with("b.rs"));
+            }
+        }
+        assert!(
+            got,
+            "recursive watcher must deliver events after init_notify returns"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn crosses_symlink_dir_walks_junction_despite_verbatim_prefix() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        let target = TestDir::new();
+        target.write("ext.rs", "fn e() {}");
+        // Junctions need no privilege on Windows and std reports them as
+        // symlinks (reparse points). mklink expects plain, non-verbatim paths.
+        let plain_root = crate::paths::without_verbatim_prefix(dir.path());
+        let link_s = plain_root.join("linkdir").to_string_lossy().into_owned();
+        let target_s = crate::paths::without_verbatim_prefix(target.path())
+            .to_string_lossy()
+            .into_owned();
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", &link_s, &target_s])
+            .output()
+            .expect("spawn cmd for mklink /J");
+        assert!(
+            out.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Canonicalized roots carry a `\\?\` prefix while event paths do not;
+        // the walk must survive that mismatch in both directions.
+        assert!(crosses_symlink_dir(dir.path(), &plain_root.join("linkdir")));
+        assert!(crosses_symlink_dir(
+            dir.path(),
+            &plain_root.join("linkdir").join("ext.rs")
+        ));
+        assert!(crosses_symlink_dir(&plain_root, &dir.abs("linkdir")));
+        assert!(!crosses_symlink_dir(&plain_root, &dir.abs("a.rs")));
     }
 
     #[cfg(target_os = "linux")]

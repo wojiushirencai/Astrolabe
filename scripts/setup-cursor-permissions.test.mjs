@@ -10,6 +10,7 @@ import {
   CATALOG_TOOL_NAMES,
   CLI_ALLOW_ENTRIES,
   IDE_ALLOW_ENTRIES,
+  writeJsonAtomic,
 } from './setup-cursor-permissions.mjs';
 
 const SCRIPT = fileURLToPath(new URL('./setup-cursor-permissions.mjs', import.meta.url));
@@ -221,6 +222,77 @@ test('symlinked permissions.json stays a symlink and the target is updated', { s
     assert.equal(doc.mcpAllowlist[0], 'other:foo');
     assert.equal(doc.mcpAllowlist.includes('astrolabe:search_code'), true);
   } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+function fakeRenameError(code) {
+  return Object.assign(new Error(`fake rename failure: ${code}`), {
+    code,
+    syscall: 'rename',
+  });
+}
+
+test('writeJsonAtomic degrades to copyFileSync when Windows rename fails with EACCES', { skip: process.platform !== 'win32' }, () => {
+  const home = tmpHome();
+  const originalRenameSync = fs.renameSync;
+  const originalCopyFileSync = fs.copyFileSync;
+  let copyCalls = 0;
+  fs.renameSync = () => {
+    throw fakeRenameError('EACCES');
+  };
+  fs.copyFileSync = (...args) => {
+    copyCalls += 1;
+    return originalCopyFileSync(...args);
+  };
+  try {
+    const filePath = path.join(home, '.cursor', 'permissions.json');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, `${JSON.stringify({ mcpAllowlist: [] }, null, 2)}\n`);
+    writeJsonAtomic(filePath, { mcpAllowlist: ['astrolabe:search_code'] });
+    assert.equal(copyCalls, 1);
+    assert.deepEqual(readJson(filePath).mcpAllowlist, ['astrolabe:search_code']);
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(filePath)).filter((name) => name.endsWith('.tmp')),
+      [],
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
+    fs.copyFileSync = originalCopyFileSync;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('writeJsonAtomic keeps rethrowing EACCES rename errors on POSIX (no copy fallback)', { skip: process.platform === 'win32' }, () => {
+  const home = tmpHome();
+  const originalRenameSync = fs.renameSync;
+  const originalCopyFileSync = fs.copyFileSync;
+  let copyCalls = 0;
+  fs.renameSync = () => {
+    throw fakeRenameError('EACCES');
+  };
+  fs.copyFileSync = (...args) => {
+    copyCalls += 1;
+    return originalCopyFileSync(...args);
+  };
+  try {
+    const filePath = path.join(home, '.cursor', 'permissions.json');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const original = `${JSON.stringify({ mcpAllowlist: ['other:foo'] }, null, 2)}\n`;
+    fs.writeFileSync(filePath, original);
+    assert.throws(
+      () => writeJsonAtomic(filePath, { mcpAllowlist: ['astrolabe:search_code'] }),
+      (error) => error.code === 'EACCES',
+    );
+    assert.equal(copyCalls, 0);
+    assert.equal(fs.readFileSync(filePath, 'utf8'), original);
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(filePath)).filter((name) => name.endsWith('.tmp')),
+      [],
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
+    fs.copyFileSync = originalCopyFileSync;
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

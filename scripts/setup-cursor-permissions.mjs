@@ -182,7 +182,10 @@ export function writeJsonAtomic(filePath, value) {
   try {
     fs.renameSync(tmp, dest);
   } catch (error) {
-    if (process.platform === 'win32' && (error.code === 'EPERM' || error.code === 'EEXIST')) {
+    if (
+      process.platform === 'win32' &&
+      (error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'EEXIST')
+    ) {
       // Never delete the destination first: copy over it so there is no window
       // in which the file is missing.
       try {

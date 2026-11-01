@@ -96,6 +96,13 @@ fn check(command: &Path, cwd: Option<&Path>) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // GUI hosts would otherwise flash a console for the version probe.
+    // No effect on Unix.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     if let Some(dir) = cwd.filter(|d| d.is_dir()) {
         cmd.current_dir(dir);
     }

@@ -815,3 +815,155 @@ test('ZCode --with-hooks replaces wrong remind client and scrubs Stop cleanup', 
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// --- writeTextAtomic: Windows destination contention handling ---
+
+function fakeRenameError(code) {
+  return Object.assign(new Error(`fake rename failure: ${code}`), {
+    code,
+    syscall: 'rename',
+  });
+}
+
+function patchFsMethod(name, fake) {
+  const original = fs[name];
+  fs[name] = fake;
+  return () => {
+    fs[name] = original;
+  };
+}
+
+function tmpFilesIn(dir) {
+  return fs.readdirSync(dir).filter((name) => name.endsWith('.tmp'));
+}
+
+test('writeTextAtomic retries a busy Windows rename before giving up atomicity', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const home = tmpHome();
+  const restores = [];
+  try {
+    const filePath = path.join(home, 'mcp.json');
+    fs.writeFileSync(filePath, '{"old":true}\n');
+    const realRenameSync = fs.renameSync;
+    let renameCalls = 0;
+    restores.push(
+      patchFsMethod('renameSync', (...args) => {
+        renameCalls += 1;
+        if (renameCalls < 3) throw fakeRenameError('EACCES');
+        return realRenameSync(...args);
+      }),
+    );
+    clientsMod.writeTextAtomic(filePath, '{"new":true}');
+    assert.equal(renameCalls, 3); // 1 initial attempt + 2 retries
+    assert.equal(JSON.parse(fs.readFileSync(filePath, 'utf8')).new, true);
+    assert.deepEqual(tmpFilesIn(home), []);
+  } finally {
+    for (const restore of restores) restore();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('writeTextAtomic degrades to copyFileSync when Windows rename stays busy', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const home = tmpHome();
+  const restores = [];
+  try {
+    const filePath = path.join(home, 'mcp.json');
+    fs.writeFileSync(filePath, '{"old":true}\n');
+    const realCopyFileSync = fs.copyFileSync;
+    let renameCalls = 0;
+    let copyCalls = 0;
+    restores.push(
+      patchFsMethod('renameSync', () => {
+        renameCalls += 1;
+        throw fakeRenameError('EPERM');
+      }),
+    );
+    restores.push(
+      patchFsMethod('copyFileSync', (...args) => {
+        copyCalls += 1;
+        return realCopyFileSync(...args);
+      }),
+    );
+    clientsMod.writeTextAtomic(filePath, '{"new":true}');
+    assert.equal(renameCalls, 3); // 1 initial attempt + 2 retries
+    assert.equal(copyCalls, 1);
+    assert.equal(JSON.parse(fs.readFileSync(filePath, 'utf8')).new, true);
+    assert.deepEqual(tmpFilesIn(home), []);
+  } finally {
+    for (const restore of restores) restore();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('writeTextAtomic does not retry or fall back to copy on POSIX rename failures', {
+  skip: process.platform === 'win32',
+}, () => {
+  const home = tmpHome();
+  const restores = [];
+  try {
+    const filePath = path.join(home, 'mcp.json');
+    fs.writeFileSync(filePath, '{"old":true}\n');
+    let renameCalls = 0;
+    let copyCalls = 0;
+    restores.push(
+      patchFsMethod('renameSync', () => {
+        renameCalls += 1;
+        throw fakeRenameError('EPERM');
+      }),
+    );
+    restores.push(
+      patchFsMethod('copyFileSync', () => {
+        copyCalls += 1;
+        throw new Error('copyFileSync must not be called on POSIX');
+      }),
+    );
+    assert.throws(
+      () => clientsMod.writeTextAtomic(filePath, '{"new":true}'),
+      (error) => error.code === 'EPERM',
+    );
+    assert.equal(renameCalls, 1);
+    assert.equal(copyCalls, 0);
+    assert.equal(fs.readFileSync(filePath, 'utf8'), '{"old":true}\n');
+    assert.deepEqual(tmpFilesIn(home), []);
+  } finally {
+    for (const restore of restores) restore();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('writeTextAtomic propagates unrelated rename errors after one attempt', () => {
+  const home = tmpHome();
+  const restores = [];
+  try {
+    const filePath = path.join(home, 'mcp.json');
+    fs.writeFileSync(filePath, '{"old":true}\n');
+    let renameCalls = 0;
+    let copyCalls = 0;
+    restores.push(
+      patchFsMethod('renameSync', () => {
+        renameCalls += 1;
+        throw fakeRenameError('ENOSPC');
+      }),
+    );
+    restores.push(
+      patchFsMethod('copyFileSync', () => {
+        copyCalls += 1;
+        throw new Error('copyFileSync must not be called for unrelated errors');
+      }),
+    );
+    assert.throws(
+      () => clientsMod.writeTextAtomic(filePath, '{"new":true}'),
+      (error) => error.code === 'ENOSPC',
+    );
+    assert.equal(renameCalls, 1);
+    assert.equal(copyCalls, 0);
+    assert.equal(fs.readFileSync(filePath, 'utf8'), '{"old":true}\n');
+    assert.deepEqual(tmpFilesIn(home), []);
+  } finally {
+    for (const restore of restores) restore();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -34,7 +34,9 @@
 //! including negation), the default excluded-directory names /
 //! [`ScanOptions::extra_excludes`],
 //! [`ScanOptions::max_file_bytes`], and the cached binary sniff. A racing
-//! delete is [`PathAdmission::Missing`].
+//! delete is [`PathAdmission::Missing`]. A Windows exclusive lock (editor
+//! save in flight, antivirus scan) is [`PathAdmission::Locked`]: the file
+//! exists and must be kept for a later retry, never removed.
 //!
 //! ## Quick file count
 //!
@@ -74,6 +76,11 @@ const BINARY_SNIFF_CACHE_CAP: usize = 100_000;
 /// cached: two same-size writes can share an mtime, so `(mtime, len)` is not
 /// a content identity.
 const MTIME_UNTRUSTED_WINDOW: Duration = Duration::from_secs(2);
+/// Windows `ERROR_SHARING_VIOLATION`: another handle holds the file without
+/// sharing (editor save in flight, antivirus scan). The file exists.
+const WINDOWS_SHARING_VIOLATION: i32 = 32;
+/// Windows `ERROR_LOCK_VIOLATION`, the rarer sibling of 32.
+const WINDOWS_LOCK_VIOLATION: i32 = 33;
 const EXCLUDED_DIRS: &[&str] = &[
     ".git",
     "node_modules",
@@ -190,6 +197,12 @@ pub enum PathAdmission {
     Binary,
     /// Path does not exist, or raced away while we were looking.
     Missing,
+    /// Exists but is unreadable right now: Windows reports a sharing or lock
+    /// violation (`os error 32` / `33`) while an editor save or antivirus
+    /// scan holds the file. Callers must keep the path indexed and retry
+    /// later — treating it as [`PathAdmission::Missing`] would delete a
+    /// just-saved file from the index and the symbol graph.
+    Locked,
 }
 
 /// Early-stop file count from [`count_files`].
@@ -258,6 +271,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> ScanResult {
         Some(
             collect_paths(&root, true, Arc::clone(&excludes))
                 .into_iter()
+                .map(|(path, _)| path)
                 .collect::<BTreeSet<_>>(),
         )
     } else {
@@ -267,10 +281,20 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> ScanResult {
     // Stat + binary sniff are independent per file and dominate on cold disks,
     // network mounts and Windows. `par_iter().collect()` on an indexed source
     // keeps candidate order, and the sorts below make the result independent
-    // of scheduling regardless.
+    // of scheduling regardless. On Windows the stat usually comes free: the
+    // walker's metadata travels with the candidate (see [`collect_paths`]).
     let outcomes: Vec<ScanOutcome> = candidates
         .par_iter()
-        .map(|path| classify_candidate(&root, path, opts, &excludes, admitted.as_ref()))
+        .map(|(path, metadata)| {
+            classify_candidate(
+                &root,
+                path,
+                metadata.as_ref(),
+                opts,
+                &excludes,
+                admitted.as_ref(),
+            )
+        })
         .collect();
     let mut result = ScanResult::default();
     for outcome in outcomes {
@@ -295,6 +319,7 @@ enum ScanOutcome {
 fn classify_candidate(
     root: &Path,
     path: &Path,
+    carried: Option<&Metadata>,
     opts: &ScanOptions,
     excludes: &ExcludeMatcher,
     admitted: Option<&BTreeSet<PathBuf>>,
@@ -304,10 +329,20 @@ fn classify_candidate(
     if gitignored || excludes.matches_file(root, path) {
         return ScanOutcome::Skip(rel, SkipReason::Ignored);
     }
-    let metadata = match path.metadata() {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => return ScanOutcome::Drop,
-        Err(_) => return ScanOutcome::Skip(rel, SkipReason::ReadError),
+    // Metadata carried from the walk (Windows regular files) spares this
+    // phase a second stat; anything else re-stats, so symlink-following and
+    // error behavior are identical on every platform.
+    let fresh;
+    let metadata = match carried.filter(|carried| carried.is_file()) {
+        Some(carried) => carried,
+        None => {
+            fresh = match path.metadata() {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => return ScanOutcome::Drop,
+                Err(_) => return ScanOutcome::Skip(rel, SkipReason::ReadError),
+            };
+            &fresh
+        }
     };
     if metadata.len() > opts.max_file_bytes {
         return ScanOutcome::Skip(rel, SkipReason::TooLarge);
@@ -327,13 +362,16 @@ fn classify_candidate(
 /// `!important` can un-ignore a parent `*`. Directory excludes, size, and
 /// the cached binary sniff then apply in the same order as [`scan`]. A path
 /// that is gone (or not a regular file we can stat) is [`PathAdmission::Missing`].
+/// A stat or read that fails with a Windows sharing violation is
+/// [`PathAdmission::Locked`] — the file exists, it is just held by an
+/// exclusive lock right now, so callers keep it and retry instead of
+/// deleting it from the index.
 pub fn path_admission(root: &Path, rel: &RelPath, opts: &ScanOptions) -> PathAdmission {
     let path = rel_to_abs(root, rel);
     let metadata = match path.metadata() {
         Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => return PathAdmission::Ignored,
-        Err(err) if err.kind() == ErrorKind::NotFound => return PathAdmission::Missing,
-        Err(_) => return PathAdmission::Missing,
+        Err(err) => return admission_for_stat_error(&err),
     };
 
     let excludes = ExcludeMatcher::new(&opts.extra_excludes);
@@ -349,8 +387,78 @@ pub fn path_admission(root: &Path, rel: &RelPath, opts: &ScanOptions) -> PathAdm
     match looks_binary_cached(&path, &metadata, Language::from_path(rel).is_some()) {
         Ok(true) => PathAdmission::Binary,
         Ok(false) => PathAdmission::Indexed,
-        Err(err) if err.kind() == ErrorKind::NotFound => PathAdmission::Missing,
-        Err(_) => PathAdmission::Missing,
+        Err(err) => admission_for_read_error(&err),
+    }
+}
+
+/// A failed stat is `Missing` unless Windows reports a sharing or lock
+/// violation: the path exists, it just cannot be inspected this instant.
+fn admission_for_stat_error(err: &io::Error) -> PathAdmission {
+    if is_windows_lock_violation(err) {
+        PathAdmission::Locked
+    } else {
+        PathAdmission::Missing
+    }
+}
+
+/// A failed content read is `Missing` (deleted while we looked, or gone for
+/// any other reason) unless Windows reports a sharing or lock violation:
+/// the file is alive and merely locked, so keep it and retry later.
+fn admission_for_read_error(err: &io::Error) -> PathAdmission {
+    if err.kind() == ErrorKind::NotFound {
+        return PathAdmission::Missing;
+    }
+    if is_windows_lock_violation(err) {
+        return PathAdmission::Locked;
+    }
+    PathAdmission::Missing
+}
+
+/// Windows sharing / lock violations (`os error 32` / `33`): the file exists
+/// but another handle holds it without sharing. Constant-folds to `false` on
+/// other platforms, so error classification there is unchanged.
+fn is_windows_lock_violation(err: &io::Error) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    matches!(
+        err.raw_os_error(),
+        Some(WINDOWS_SHARING_VIOLATION) | Some(WINDOWS_LOCK_VIOLATION)
+    )
+}
+
+/// Open a file for the binary sniff, riding out transient Windows locks.
+///
+/// An editor writing a save or an antivirus scanning a fresh file briefly
+/// holds it with no sharing, so `CreateFileW` fails with `os error 32`/`33`
+/// even though the file is right there. A short bounded backoff (4 attempts,
+/// 5→10→20 ms) usually outlives the lock; a violation that persists is
+/// propagated to the caller, which classifies it as
+/// [`PathAdmission::Locked`]. On other platforms this is a plain
+/// [`File::open`] — one attempt, no sleeps, behavior unchanged.
+fn open_for_sniff(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        const MAX_ATTEMPTS: u32 = 4;
+        const FIRST_BACKOFF: Duration = Duration::from_millis(5);
+        const MAX_BACKOFF: Duration = Duration::from_millis(20);
+        let mut backoff = FIRST_BACKOFF;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match File::open(path) {
+                Ok(file) => return Ok(file),
+                Err(err) if attempts < MAX_ATTEMPTS && is_windows_lock_violation(&err) => {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
     }
 }
 
@@ -534,23 +642,40 @@ impl ExcludeMatcher {
     }
 }
 
+/// Collect candidate paths from a parallel walk, carrying the metadata the
+/// walker already holds.
+///
+/// On Windows the directory read (`FindFirstFileExW`) hands back length and
+/// timestamps for free, so each candidate carries its [`Metadata`] and the
+/// classification phase skips a second `stat`. Only regular files are
+/// carried: a symlink or anything unusual falls back to a fresh
+/// `path.metadata()` in [`classify_candidate`], keeping the stat-follows-
+/// symlinks gate semantics identical on every platform. On Unix the walker
+/// holds no metadata (reading it there would *add* an `lstat` per file), so
+/// candidates carry `None` and classification stats exactly as before.
 fn collect_paths(
     root: &Path,
     respect_gitignore: bool,
     excludes: Arc<ExcludeMatcher>,
-) -> Vec<PathBuf> {
+) -> Vec<(PathBuf, Option<Metadata>)> {
     let builder = configured_walker(root, respect_gitignore, excludes);
-    let paths = Arc::new(Mutex::new(Vec::new()));
+    let paths: Arc<Mutex<Vec<(PathBuf, Option<Metadata>)>>> = Arc::new(Mutex::new(Vec::new()));
     let output = Arc::clone(&paths);
     builder.build_parallel().run(|| {
         let output = Arc::clone(&output);
         Box::new(move |entry| {
             if let Ok(entry) = entry {
                 if entry.depth() > 0 && !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    // Windows walkers cache the find-data metadata on the
+                    // entry; clone it out before the entry is consumed.
+                    #[cfg(windows)]
+                    let metadata = entry.metadata().ok().filter(|meta| meta.is_file());
+                    #[cfg(not(windows))]
+                    let metadata: Option<Metadata> = None;
                     output
                         .lock()
                         .expect("scan result mutex poisoned")
-                        .push(entry.into_path());
+                        .push((entry.into_path(), metadata));
                 }
             }
             WalkState::Continue
@@ -562,7 +687,9 @@ fn collect_paths(
         .expect("all parallel walker references must be dropped")
         .into_inner()
         .expect("scan result mutex poisoned");
-    paths.sort();
+    // Tuples compare by path only (Metadata is not Ord); stable sort, same
+    // ordering as the previous `Vec<PathBuf>::sort`.
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
     paths
 }
 
@@ -825,7 +952,7 @@ fn binary_sniff_key(path: &Path, metadata: &Metadata) -> Option<BinarySniffKey> 
 /// meaningful density of NULs; everything else keeps the strict rule, which is
 /// what actually protects us from images and object files.
 fn sniff_binary(path: &Path, known_source: bool) -> io::Result<bool> {
-    let file = File::open(path)?;
+    let file = open_for_sniff(path)?;
     let mut reader: Take<File> = file.take(BINARY_SNIFF_BYTES);
     let mut header = Vec::with_capacity(BINARY_SNIFF_BYTES as usize);
     reader.read_to_end(&mut header)?;
@@ -938,6 +1065,72 @@ mod tests {
         assert_eq!(
             path_admission(dir.path(), &RelPath::new("web/dist/bundle.js"), &opts),
             PathAdmission::Ignored
+        );
+    }
+
+    #[test]
+    fn admission_errors_separate_missing_from_windows_lock() {
+        // errno 2 is ENOENT on Unix and ERROR_FILE_NOT_FOUND on Windows.
+        assert_eq!(
+            admission_for_read_error(&io::Error::from_raw_os_error(2)),
+            PathAdmission::Missing
+        );
+        assert_eq!(
+            admission_for_stat_error(&io::Error::from_raw_os_error(5)),
+            PathAdmission::Missing
+        );
+        if cfg!(windows) {
+            // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION: the file is
+            // alive, just held by an exclusive lock right now.
+            for code in [WINDOWS_SHARING_VIOLATION, WINDOWS_LOCK_VIOLATION] {
+                assert_eq!(
+                    admission_for_read_error(&io::Error::from_raw_os_error(code)),
+                    PathAdmission::Locked
+                );
+                assert_eq!(
+                    admission_for_stat_error(&io::Error::from_raw_os_error(code)),
+                    PathAdmission::Locked
+                );
+            }
+        } else {
+            // Off Windows the codes are inert (32 is EPIPE on Linux) and
+            // must never classify as a lock.
+            for code in [32, 33] {
+                assert_eq!(
+                    admission_for_read_error(&io::Error::from_raw_os_error(code)),
+                    PathAdmission::Missing
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_admission_keeps_exclusively_locked_file_as_locked_not_missing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TestDir::new();
+        dir.write("locked.rs", "fn main() {}\n");
+        let opts = ScanOptions::default();
+        assert_eq!(
+            path_admission(dir.path(), &RelPath::new("locked.rs"), &opts),
+            PathAdmission::Indexed
+        );
+        // Hold the file the way an editor mid-save or an antivirus scan
+        // does: every other open fails with ERROR_SHARING_VIOLATION.
+        let _guard = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(dir.path().join("locked.rs"))
+            .expect("open exclusive guard");
+        assert_eq!(
+            path_admission(dir.path(), &RelPath::new("locked.rs"), &opts),
+            PathAdmission::Locked
+        );
+        drop(_guard);
+        assert_eq!(
+            path_admission(dir.path(), &RelPath::new("locked.rs"), &opts),
+            PathAdmission::Indexed
         );
     }
 
@@ -1480,7 +1673,11 @@ mod tests {
         dir.write("blob.dat", b"text\0more");
         let path = dir.path().join("blob.dat");
         let aged = SystemTime::now() - Duration::from_secs(10);
-        File::open(&path)
+        // A write handle: a read-only handle cannot `set_modified` on this
+        // platform (`ERROR_ACCESS_DENIED`), same as the gitignore test above.
+        File::options()
+            .write(true)
+            .open(&path)
             .expect("open blob")
             .set_modified(aged)
             .expect("age mtime past the untrusted window");
@@ -1498,7 +1695,9 @@ mod tests {
         );
 
         fs::write(&path, b"just text").expect("overwrite blob with text");
-        File::open(&path)
+        File::options()
+            .write(true)
+            .open(&path)
             .expect("reopen blob")
             .set_modified(aged + Duration::from_secs(5))
             .expect("bump mtime");
