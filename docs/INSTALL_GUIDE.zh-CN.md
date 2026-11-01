@@ -45,7 +45,12 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 
 ### 方式 3：Windows
 
-下载 `astrolabe-<版本>-x86_64-pc-windows-msvc.zip`，用 `Get-FileHash -Algorithm SHA256` 对照 `SHA256SUMS`，解压出 `astrolabe.exe` 放到固定目录并加入 `PATH`。（Windows 路径未在本次改动中实机验证。）
+下载 `astrolabe-<版本>-x86_64-pc-windows-msvc.zip`，解压出 `astrolabe.exe` 放入系统 `PATH` 路径即可。支持完整的 Windows 反斜杠（`\`）与绝对路径，原生后台静默运行。
+
+> **Windows 建议**：
+> 1. **服务名推荐**：在 Claude Code 配置中，建议将服务名简写为 `ast`（如 `mcp__ast__find_refs`），精炼短名可有效防止模型拼错或超出长度限制；
+> 2. **无需配置 Hook**：Windows 平台无需配置 Shell Hook，避免调用批处理引发控制台黑框闪烁；
+> 3. **轻量源码编译**：若从源码编译，可通过 `winget install BrechtSanders.WinLibs.POSIX.UCRT` 安装轻量 MinGW/LLVM，选用 `x86_64-pc-windows-gnu` 工具链即可一键编译，无需安装庞大的完整 Visual Studio。
 
 ### 方式 4：npm
 

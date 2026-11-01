@@ -256,6 +256,11 @@ function run(argv = process.argv.slice(2)) {
   process.stdout.write('  2. Verify: npx -y @zlnap/astrolabe --version\n');
   if (selectedIds.includes('claude-code')) {
     process.stdout.write('  3. Claude Code: claude mcp get astrolabe\n');
+    if (process.platform === 'win32' && opts.withHooks) {
+      process.stdout.write(
+        '     (Windows: Claude Code runs silently via stdio; shell hooks are omitted to prevent console popups)\n',
+      );
+    }
   }
   if (selectedIds.includes('cursor')) {
     process.stdout.write(

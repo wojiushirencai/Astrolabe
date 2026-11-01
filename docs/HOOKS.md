@@ -8,6 +8,9 @@
 
 ## 2. Claude Code 配方
 
+> **Windows 用户注意**：
+> 在 Windows 下，Claude Code 执行 Shell 类型的 Hook 会调用系统控制台导致黑框闪烁。**Windows 平台强烈建议不配置此 Hook**，Astrolabe 本身作为原生 Stdio MCP 服务即可提供全部代码索引与符号能力，且完全静默无弹窗。
+
 可选：将以下配置**合并进**（不要覆盖已有的 `hooks` 条目）项目 `.claude/settings.json`（或全局 `~/.claude/settings.json`）：
 ```json
 {
