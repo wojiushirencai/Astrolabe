@@ -201,23 +201,25 @@ claude mcp add --scope project astrolabe -- astrolabe . --context=claude-code # 
 
 - `search_code`
 - `find_symbol`
-- `resolve_contx`（别名 `resolve_context`）
-- `get_diag`（别名 `get_diagnostics`）
-- `find_refs`（别名 `find_references`）
-- `goto_def`（别名 `goto_definition`）
-- `get_lang`（别名 `get_languages`）
+- `resolve_contx`
+- `get_diag`
+- `find_refs`
+- `goto_def`
+- `get_lang`
+
+allowlist **只写短名**。旧长名（`resolve_context` / `get_diagnostics` / `find_references` / `goto_definition` / `get_languages` 等）留在服务端 `tools/call` 别名里；`astrolabe setup` / `setup-cursor-permissions.mjs` 重跑时会检查并把 allowlist 里残留的旧长名改成短名。
 
 不要写 `astrolabe:*` 或 `*:*`。
 
 定义 `mcpAllowlist` 会**整表覆盖** IDE 里的 MCP allowlist，因此必须合并、不能覆盖已有条目；其它 MCP server 的工具也请写进同一文件。该 allowlist 需要开启 Cursor **Run Mode**（Auto-review / Allowlist / Run Everything）才生效。
 
-推荐在仓库根目录运行安装脚本（会 merge 写入，已存在的条目不会被删除；支持 `--dry-run` 预览、`--home` 覆盖 HOME）：
+推荐在仓库根目录运行安装脚本（会 merge 短名、迁移旧长名；非 Astrolabe 条目保留；支持 `--dry-run` 预览、`--home` 覆盖 HOME）：
 
 ```bash
 node scripts/setup-cursor-permissions.mjs
 ```
 
-示例（脚本会在文件不存在时创建，已存在时只 union 进 `mcpAllowlist`，不修改 `terminalAllowlist` / `autoRun`）：
+示例（脚本会在文件不存在时创建；已存在时写入短名并迁移旧长名，不修改 `terminalAllowlist` / `autoRun`）：
 
 ```json
 {

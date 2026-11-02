@@ -3,7 +3,8 @@
  * Merge Astrolabe's 7 catalog MCP tools into Cursor allowlists.
  *
  * Names must stay in sync with `CATALOG_TOOL_NAMES` in
- * crates/astrolabe-mcp/src/lib.rs.
+ * crates/astrolabe-mcp/src/lib.rs. Legacy long names already present in an
+ * allowlist are rewritten to short names; tools/call aliases stay server-side.
  *
  * Usage:
  *   node scripts/setup-cursor-permissions.mjs
@@ -29,6 +30,34 @@ export const CATALOG_TOOL_NAMES = [
   'goto_def',
   'get_lang',
 ];
+
+/**
+ * Keep in sync with crates/astrolabe-mcp/src/compat.rs TOOL_ALIASES.
+ * Allowlists advertise short names only; these rewrite stale long / ast_*
+ * entries during setup. Server tools/call aliases are unchanged.
+ */
+export const LEGACY_TOOL_ALIASES = {
+  resolve_context: 'resolve_contx',
+  ast_resolve_contx: 'resolve_contx',
+  ast_context: 'resolve_contx',
+  get_diagnostics: 'get_diag',
+  ast_get_diag: 'get_diag',
+  ast_diag: 'get_diag',
+  get_languages: 'get_lang',
+  ast_get_lang: 'get_lang',
+  ast_langs: 'get_lang',
+  ast_lang: 'get_lang',
+  find_references: 'find_refs',
+  ast_find_ref: 'find_refs',
+  ast_find_refs: 'find_refs',
+  goto_definition: 'goto_def',
+  ast_goto_def: 'goto_def',
+  ast_def: 'goto_def',
+  ast_search_code: 'search_code',
+  ast_search: 'search_code',
+  ast_find_symbol: 'find_symbol',
+  ast_symbol: 'find_symbol',
+};
 
 export const IDE_ALLOW_ENTRIES = CATALOG_TOOL_NAMES.map((name) => `${SERVER_NAME}:${name}`);
 export const CLI_ALLOW_ENTRIES = CATALOG_TOOL_NAMES.map((name) => `Mcp(${SERVER_NAME}:${name})`);
@@ -84,6 +113,104 @@ export function unionPreserve(existing, extras) {
   return { list: out, added };
 }
 
+/**
+ * Migrate Astrolabe IDE allowlist entries (`server:tool`) from legacy long /
+ * ast_* names to short catalog names, then union in missing short entries.
+ */
+export function migrateIdeAllowlist(existing, extras = IDE_ALLOW_ENTRIES) {
+  const seen = new Set();
+  const out = [];
+  const legacyNames = [];
+  let migrated = 0;
+
+  for (const item of existing) {
+    if (typeof item !== 'string') {
+      out.push(item);
+      continue;
+    }
+    const colon = item.indexOf(':');
+    if (colon <= 0) {
+      if (!seen.has(item)) {
+        seen.add(item);
+        out.push(item);
+      }
+      continue;
+    }
+    const server = item.slice(0, colon);
+    let tool = item.slice(colon + 1);
+    if (server !== SERVER_NAME) {
+      if (!seen.has(item)) {
+        seen.add(item);
+        out.push(item);
+      }
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(LEGACY_TOOL_ALIASES, tool)) {
+      legacyNames.push(tool);
+      tool = LEGACY_TOOL_ALIASES[tool];
+      migrated += 1;
+    }
+    const next = `${SERVER_NAME}:${tool}`;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    out.push(next);
+  }
+
+  let added = 0;
+  for (const item of extras) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+    added += 1;
+  }
+  return { list: out, added, migrated, legacyNames: [...new Set(legacyNames)] };
+}
+
+/**
+ * Migrate Cursor CLI allow entries `Mcp(server:tool)` the same way.
+ */
+export function migrateCliAllowlist(existing, extras = CLI_ALLOW_ENTRIES) {
+  const seen = new Set();
+  const out = [];
+  const legacyNames = [];
+  let migrated = 0;
+  const prefix = `Mcp(${SERVER_NAME}:`;
+  const suffix = ')';
+
+  for (const item of existing) {
+    if (typeof item !== 'string') {
+      out.push(item);
+      continue;
+    }
+    if (!item.startsWith(prefix) || !item.endsWith(suffix)) {
+      if (!seen.has(item)) {
+        seen.add(item);
+        out.push(item);
+      }
+      continue;
+    }
+    let tool = item.slice(prefix.length, item.length - suffix.length);
+    if (Object.prototype.hasOwnProperty.call(LEGACY_TOOL_ALIASES, tool)) {
+      legacyNames.push(tool);
+      tool = LEGACY_TOOL_ALIASES[tool];
+      migrated += 1;
+    }
+    const next = `${prefix}${tool}${suffix}`;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    out.push(next);
+  }
+
+  let added = 0;
+  for (const item of extras) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+    added += 1;
+  }
+  return { list: out, added, migrated, legacyNames: [...new Set(legacyNames)] };
+}
+
 function assertObject(value, label) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} 的根必须是 JSON 对象`);
@@ -112,9 +239,9 @@ export function mergePermissionsDoc(doc, extras = IDE_ALLOW_ENTRIES) {
   if (!Array.isArray(existing)) {
     throw new Error('permissions.json 的 mcpAllowlist 必须是数组');
   }
-  const { list, added } = unionPreserve(existing, extras);
+  const { list, added, migrated, legacyNames } = migrateIdeAllowlist(existing, extras);
   doc.mcpAllowlist = list;
-  return { doc, added, total: list.length };
+  return { doc, added, migrated, legacyNames, total: list.length };
 }
 
 export function mergeCliConfigDoc(doc, extras = CLI_ALLOW_ENTRIES) {
@@ -130,9 +257,9 @@ export function mergeCliConfigDoc(doc, extras = CLI_ALLOW_ENTRIES) {
   if (!Array.isArray(existing)) {
     throw new Error('cli-config.json 的 permissions.allow 必须是数组');
   }
-  const { list, added } = unionPreserve(existing, extras);
+  const { list, added, migrated, legacyNames } = migrateCliAllowlist(existing, extras);
   doc.permissions.allow = list;
-  return { doc, added, total: list.length };
+  return { doc, added, migrated, legacyNames, total: list.length };
 }
 
 function formatJson(value) {
@@ -301,9 +428,19 @@ export function run(argv = process.argv.slice(2)) {
     process.stdout.write(`已备份原文件到 ${permissionsBackup}\n`);
   }
   writeJsonAtomic(permissionsPath, permissionsPlan.doc);
+  const migratedNote =
+    permissionsPlan.migrated > 0
+      ? `，迁移旧长名 ${permissionsPlan.migrated} 条→短名`
+      : '';
   process.stdout.write(
-    `已合并 ${permissionsPath}（新增 ${permissionsPlan.added} 条，现共 ${permissionsPlan.total} 条）。\n`,
+    `已合并 ${permissionsPath}（新增 ${permissionsPlan.added} 条${migratedNote}，现共 ${permissionsPlan.total} 条）。\n`,
   );
+  if (permissionsPlan.migrated > 0) {
+    process.stdout.write(
+      `已将 allowlist 中的旧工具名改为短名（${permissionsPlan.legacyNames.join(', ')}）；` +
+        '服务端 tools/call 仍接受旧名别名。\n',
+    );
+  }
 
   if (opts.cli && cliSkipped) {
     process.stdout.write(
@@ -315,8 +452,10 @@ export function run(argv = process.argv.slice(2)) {
       process.stdout.write(`已备份原文件到 ${cliBackup}\n`);
     }
     writeJsonAtomic(cliConfigPath, cliPlan.doc);
+    const cliMigratedNote =
+      cliPlan.migrated > 0 ? `，迁移旧长名 ${cliPlan.migrated} 条→短名` : '';
     process.stdout.write(
-      `已合并 ${cliConfigPath} 的 permissions.allow（新增 ${cliPlan.added} 条，现共 ${cliPlan.total} 条）。未改 approvalMode 和其它字段。\n`,
+      `已合并 ${cliConfigPath} 的 permissions.allow（新增 ${cliPlan.added} 条${cliMigratedNote}，现共 ${cliPlan.total} 条）。未改 approvalMode 和其它字段。\n`,
     );
   }
   return 0;

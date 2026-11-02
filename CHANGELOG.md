@@ -6,6 +6,18 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+### 中文
+
+#### 安装 / Setup
+
+- `astrolabe setup` 与 `scripts/setup-cursor-permissions.mjs`：Cursor `mcpAllowlist` **默认只写短名**；重跑时检查并迁移残留旧长名（`resolve_context` 等）为短名。服务端 `TOOL_ALIASES` / `tools/call` 旧名兼容不变。
+
+### English
+
+#### Install / setup
+
+- `astrolabe setup` and `scripts/setup-cursor-permissions.mjs` write **short** Cursor `mcpAllowlist` names by default and migrate leftover legacy long names on re-run. Server `TOOL_ALIASES` / `tools/call` compat is unchanged.
+
 ## [0.17.6] - 2026-11-01
 
 自 v0.17.5 以来的 PR：#121（文档：Windows 稳定性着重说明、MCP 短名、安装路径强制 `setup --with-hooks`）。完整说明见 GitHub Release。
