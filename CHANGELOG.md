@@ -6,6 +6,10 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-11-02
+
+自 v0.17.6 以来的 PR：#123（setup 默认短名 allowlist + 迁移旧长名）、#116（Dependabot zip 9.0.4→9.0.5）。完整说明见 GitHub Release。
+
 ### 中文
 
 #### 安装 / Setup
