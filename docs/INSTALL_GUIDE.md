@@ -132,7 +132,7 @@ Equivalent JSON (`~/.claude.json` or project `.mcp.json`):
 { "mcpServers": { "astrolabe": { "command": "astrolabe", "args": [".", "--context=cursor"] } } }
 ```
 
-To skip Cursor's per-tool MCP approval for the seven read-only tools, merge entries `astrolabe:<tool>` into `~/.cursor/permissions.json` → `mcpAllowlist` (do not write `astrolabe:*`; Cursor Run Mode must be enabled). `node scripts/setup-cursor-permissions.mjs` does the merge safely (`--dry-run` to preview, `--cli` for `~/.cursor/cli-config.json`). Tools (short names + legacy aliases): `search_code`, `find_symbol`, `resolve_contx`/`resolve_context`, `get_diag`/`get_diagnostics`, `find_refs`/`find_references`, `goto_def`/`goto_definition`, `get_lang`/`get_languages`.
+To skip Cursor's per-tool MCP approval for the seven read-only tools, merge **short** entries `astrolabe:<tool>` into `~/.cursor/permissions.json` → `mcpAllowlist` (do not write `astrolabe:*`; Cursor Run Mode must be enabled). `astrolabe setup` and `node scripts/setup-cursor-permissions.mjs` write short catalog names only and **migrate** any leftover legacy long names in the allowlist to short ones (`--dry-run` to preview, `--cli` for `~/.cursor/cli-config.json`). Allowlist tools: `search_code`, `find_symbol`, `resolve_contx`, `get_diag`, `find_refs`, `goto_def`, `get_lang`. Legacy long names remain **call-time** aliases on `tools/call` only (forgotten client configs still work).
 
 ### Codex
 

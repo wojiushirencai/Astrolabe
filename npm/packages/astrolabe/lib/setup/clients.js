@@ -24,6 +24,34 @@ const CATALOG_TOOL_NAMES = [
   'get_lang',
 ];
 
+/**
+ * Call-time aliases from crates/astrolabe-mcp/src/compat.rs TOOL_ALIASES.
+ * Setup / allowlists advertise short catalog names only; these map legacy
+ * allowlist entries onto short names. Server-side tools/call aliases stay.
+ */
+const LEGACY_TOOL_ALIASES = {
+  resolve_context: 'resolve_contx',
+  ast_resolve_contx: 'resolve_contx',
+  ast_context: 'resolve_contx',
+  get_diagnostics: 'get_diag',
+  ast_get_diag: 'get_diag',
+  ast_diag: 'get_diag',
+  get_languages: 'get_lang',
+  ast_get_lang: 'get_lang',
+  ast_langs: 'get_lang',
+  ast_lang: 'get_lang',
+  find_references: 'find_refs',
+  ast_find_ref: 'find_refs',
+  ast_find_refs: 'find_refs',
+  goto_definition: 'goto_def',
+  ast_goto_def: 'goto_def',
+  ast_def: 'goto_def',
+  ast_search_code: 'search_code',
+  ast_search: 'search_code',
+  ast_find_symbol: 'find_symbol',
+  ast_symbol: 'find_symbol',
+};
+
 function which(cmd, env = process.env) {
   const pathVar = env.PATH || env.Path || '';
   const parts = pathVar.split(path.delimiter).filter(Boolean);
@@ -199,6 +227,122 @@ function writeJsonAtomic(filePath, value) {
   writeTextAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+/**
+ * Rewrite Cursor IDE allowlist entries so Astrolabe tools use short catalog
+ * names only. Legacy long / ast_* names are migrated in place; non-Astrolabe
+ * entries are preserved. Then ensure every catalog short name is present.
+ */
+function migrateIdeAllowlist(existing, extras) {
+  const seen = new Set();
+  const list = [];
+  const legacyNames = [];
+  let migrated = 0;
+
+  for (const item of existing) {
+    if (typeof item !== 'string') {
+      list.push(item);
+      continue;
+    }
+    const colon = item.indexOf(':');
+    if (colon <= 0) {
+      if (!seen.has(item)) {
+        seen.add(item);
+        list.push(item);
+      }
+      continue;
+    }
+    const server = item.slice(0, colon);
+    let tool = item.slice(colon + 1);
+    if (server !== SERVER_NAME) {
+      if (!seen.has(item)) {
+        seen.add(item);
+        list.push(item);
+      }
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(LEGACY_TOOL_ALIASES, tool)) {
+      legacyNames.push(tool);
+      tool = LEGACY_TOOL_ALIASES[tool];
+      migrated += 1;
+    }
+    const next = `${SERVER_NAME}:${tool}`;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    list.push(next);
+  }
+
+  let added = 0;
+  for (const item of extras) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    list.push(item);
+    added += 1;
+  }
+  return {
+    list,
+    added,
+    migrated,
+    legacyNames: [...new Set(legacyNames)],
+  };
+}
+
+/**
+ * Inspect an existing Cursor mcpAllowlist without writing.
+ * status: missing | short-ok | needs-migrate | empty
+ */
+function checkCursorAllowlist(home) {
+  const permissionsPath = path.join(home, '.cursor', 'permissions.json');
+  if (!exists(permissionsPath)) {
+    return {
+      filePath: permissionsPath,
+      status: 'missing',
+      legacyNames: [],
+      shortPresent: 0,
+      message: 'no permissions.json yet; setup will write short catalog names only',
+    };
+  }
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(permissionsPath, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
+    return {
+      filePath: permissionsPath,
+      status: 'error',
+      legacyNames: [],
+      shortPresent: 0,
+      message: `cannot parse permissions.json: ${error.message}`,
+    };
+  }
+  const existing = Array.isArray(doc && doc.mcpAllowlist) ? doc.mcpAllowlist : [];
+  const legacyNames = [];
+  let shortPresent = 0;
+  for (const item of existing) {
+    if (typeof item !== 'string' || !item.startsWith(`${SERVER_NAME}:`)) continue;
+    const tool = item.slice(SERVER_NAME.length + 1);
+    if (Object.prototype.hasOwnProperty.call(LEGACY_TOOL_ALIASES, tool)) {
+      legacyNames.push(tool);
+    } else if (CATALOG_TOOL_NAMES.includes(tool)) {
+      shortPresent += 1;
+    }
+  }
+  const uniqueLegacy = [...new Set(legacyNames)];
+  let status = 'short-ok';
+  let message = `allowlist already uses short names (${shortPresent}/${CATALOG_TOOL_NAMES.length} catalog entries)`;
+  if (uniqueLegacy.length > 0) {
+    status = 'needs-migrate';
+    message =
+      `allowlist still lists legacy long names (${uniqueLegacy.join(', ')}); ` +
+      'setup will rewrite them to short catalog names (server tools/call aliases stay)';
+  } else if (shortPresent === 0 && existing.length === 0) {
+    status = 'empty';
+    message = 'mcpAllowlist is empty; setup will add short catalog names';
+  } else if (shortPresent === 0) {
+    status = 'empty';
+    message = 'no Astrolabe short names in mcpAllowlist; setup will add them';
+  }
+  return { filePath: permissionsPath, status, legacyNames: uniqueLegacy, shortPresent, message };
+}
+
 function mergeCursorPermissions(home, { dryRun = false, yes = false } = {}) {
   const permissionsPath = path.join(home, '.cursor', 'permissions.json');
   const extras = CATALOG_TOOL_NAMES.map((name) => `${SERVER_NAME}:${name}`);
@@ -213,21 +357,15 @@ function mergeCursorPermissions(home, { dryRun = false, yes = false } = {}) {
     created = true;
   }
   const existing = Array.isArray(doc.mcpAllowlist) ? doc.mcpAllowlist : [];
-  const seen = new Set(existing.filter((x) => typeof x === 'string'));
-  const list = existing.slice();
-  let added = 0;
-  for (const item of extras) {
-    if (seen.has(item)) continue;
-    seen.add(item);
-    list.push(item);
-    added += 1;
-  }
+  const { list, added, migrated, legacyNames } = migrateIdeAllowlist(existing, extras);
   doc.mcpAllowlist = list;
   return {
     filePath: permissionsPath,
     doc,
     created,
     added,
+    migrated,
+    legacyNames,
     total: list.length,
     dryRun,
     yes,
@@ -919,8 +1057,11 @@ function canonicalClientId(id) {
 module.exports = {
   CLIENTS,
   CATALOG_TOOL_NAMES,
+  LEGACY_TOOL_ALIASES,
   PACKAGE_NAME,
   SERVER_NAME,
+  migrateIdeAllowlist,
+  checkCursorAllowlist,
   which,
   resolveLaunch,
   jsonServerEntry,

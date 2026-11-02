@@ -10,6 +10,8 @@ import {
   CATALOG_TOOL_NAMES,
   CLI_ALLOW_ENTRIES,
   IDE_ALLOW_ENTRIES,
+  migrateIdeAllowlist,
+  migrateCliAllowlist,
 } from './setup-cursor-permissions.mjs';
 
 const SCRIPT = fileURLToPath(new URL('./setup-cursor-permissions.mjs', import.meta.url));
@@ -223,4 +225,66 @@ test('symlinked permissions.json stays a symlink and the target is updated', { s
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('migrates legacy long allowlist names to short catalog names', () => {
+  const home = tmpHome();
+  try {
+    const filePath = path.join(home, '.cursor', 'permissions.json');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      `${JSON.stringify({
+        mcpAllowlist: [
+          'other:foo',
+          'astrolabe:resolve_context',
+          'astrolabe:get_diagnostics',
+          'astrolabe:find_references',
+          'astrolabe:goto_definition',
+          'astrolabe:get_languages',
+          'astrolabe:search_code',
+          'astrolabe:find_symbol',
+        ],
+      }, null, 2)}\n`,
+    );
+    const result = run(home);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /迁移旧长名/);
+    const doc = readJson(filePath);
+    assert.equal(doc.mcpAllowlist[0], 'other:foo');
+    assert.deepEqual(
+      doc.mcpAllowlist.filter((x) => String(x).startsWith('astrolabe:')).sort(),
+      [...IDE_ALLOW_ENTRIES].sort(),
+    );
+    for (const legacy of [
+      'astrolabe:resolve_context',
+      'astrolabe:get_diagnostics',
+      'astrolabe:find_references',
+      'astrolabe:goto_definition',
+      'astrolabe:get_languages',
+    ]) {
+      assert.equal(doc.mcpAllowlist.includes(legacy), false, legacy);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('migrateIdeAllowlist / migrateCliAllowlist helpers rewrite aliases', () => {
+  const ide = migrateIdeAllowlist(
+    ['other:x', 'astrolabe:resolve_context', 'astrolabe:resolve_contx'],
+    IDE_ALLOW_ENTRIES,
+  );
+  assert.equal(ide.migrated, 1);
+  assert.deepEqual(ide.legacyNames, ['resolve_context']);
+  assert.equal(ide.list.includes('astrolabe:resolve_context'), false);
+  assert.equal(ide.list.includes('astrolabe:resolve_contx'), true);
+
+  const cli = migrateCliAllowlist(
+    ['Mcp(other:x)', 'Mcp(astrolabe:get_diagnostics)'],
+    CLI_ALLOW_ENTRIES,
+  );
+  assert.equal(cli.migrated, 1);
+  assert.equal(cli.list.includes('Mcp(astrolabe:get_diagnostics)'), false);
+  assert.equal(cli.list.includes('Mcp(astrolabe:get_diag)'), true);
 });

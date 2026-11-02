@@ -815,3 +815,48 @@ test('ZCode --with-hooks replaces wrong remind client and scrubs Stop cleanup', 
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('mergeCursorPermissions migrates legacy long names and check reports it', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.cursor', 'permissions.json'),
+      JSON.stringify(
+        {
+          mcpAllowlist: [
+            'other:keep',
+            'astrolabe:resolve_context',
+            'astrolabe:find_references',
+            'astrolabe:search_code',
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    const check = clientsMod.checkCursorAllowlist(home);
+    assert.equal(check.status, 'needs-migrate');
+    assert.ok(check.legacyNames.includes('resolve_context'));
+
+    const plan = clientsMod.mergeCursorPermissions(home, { yes: true });
+    assert.ok(plan.migrated >= 2);
+    assert.equal(plan.doc.mcpAllowlist.includes('other:keep'), true);
+    assert.equal(plan.doc.mcpAllowlist.includes('astrolabe:resolve_context'), false);
+    assert.equal(plan.doc.mcpAllowlist.includes('astrolabe:resolve_contx'), true);
+    assert.equal(plan.doc.mcpAllowlist.includes('astrolabe:find_refs'), true);
+    assert.equal(plan.doc.mcpAllowlist.length, 1 + CATALOG_TOOL_NAMES.length);
+
+    const result = spawnSync(
+      process.execPath,
+      [BIN, 'setup', '--yes', '--clients=cursor', '--home', home, '--dry-run'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /Cursor MCP allowlist check/);
+    assert.match(result.stdout, /legacy long names/);
+    assert.match(result.stdout, /short catalog names only/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

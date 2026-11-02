@@ -8,6 +8,7 @@ const {
   canonicalClientId,
   resolveLaunch,
   mergeCursorPermissions,
+  checkCursorAllowlist,
   backupFile,
   writeJsonAtomic,
 } = require('./clients');
@@ -143,7 +144,10 @@ function run(argv = process.argv.slice(2)) {
   }
 
   let permissionsPlan = null;
+  let allowlistCheck = null;
   if (opts.cursorPermissions && selectedIds.includes('cursor')) {
+    allowlistCheck = checkCursorAllowlist(home);
+    process.stdout.write(`\nCursor MCP allowlist check: ${allowlistCheck.message}\n`);
     permissionsPlan = mergeCursorPermissions(home, {
       dryRun: opts.dryRun,
       yes: opts.yes,
@@ -183,9 +187,16 @@ function run(argv = process.argv.slice(2)) {
     }
   }
   if (permissionsPlan) {
+    const migrateBit =
+      permissionsPlan.migrated > 0
+        ? `, migrate ${permissionsPlan.migrated} legacy name(s)→short`
+        : '';
     process.stdout.write(
-      `  - Cursor permissions: merge ${permissionsPlan.added} allowlist entries into ${permissionsPlan.filePath}` +
+      `  - Cursor permissions: merge ${permissionsPlan.added} allowlist entries${migrateBit} into ${permissionsPlan.filePath}` +
         `${permissionsPlan.created ? ' (new file)' : ''}\n`,
+    );
+    process.stdout.write(
+      '      default: short catalog names only; tools/call still accepts legacy aliases\n',
     );
   }
 
@@ -237,11 +248,21 @@ function run(argv = process.argv.slice(2)) {
     if (permissionsPlan) {
       const backup = backupFile(permissionsPlan.filePath);
       writeJsonAtomic(permissionsPlan.filePath, permissionsPlan.doc);
+      const migrateNote =
+        permissionsPlan.migrated > 0
+          ? `, migrated ${permissionsPlan.migrated} legacy→short`
+          : '';
       process.stdout.write(
         `Merged Cursor allowlist ${permissionsPlan.filePath} ` +
-          `(+${permissionsPlan.added}, total ${permissionsPlan.total})` +
+          `(+${permissionsPlan.added}${migrateNote}, total ${permissionsPlan.total})` +
           `${backup ? `; backup ${backup}` : ''}\n`,
       );
+      if (permissionsPlan.migrated > 0) {
+        process.stdout.write(
+          `  Rewrote legacy allowlist names (${permissionsPlan.legacyNames.join(', ')}) ` +
+            'to short catalog names; server tools/call aliases remain.\n',
+        );
+      }
       summary.push({
         id: 'cursor-permissions',
         status: 'written',
