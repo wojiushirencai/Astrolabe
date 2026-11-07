@@ -46,6 +46,11 @@ Install only drops the binary. `setup` writes each detected client's MCP config.
 ## Does Windows work?
 Yes. v0.17.4–v0.17.5 fixed real Windows path issues (`\\?\` normalize + watcher membership, subdirectory `index_root` reuse, `path_filter` backslash/absolute normalize). Prefer repo-root indexing; then `npm i -g @zlnap/astrolabe` and `npx -y @zlnap/astrolabe setup --with-hooks`.
 
+## What are paths relative to when I override `index_root`?
+`index_root` accepts any existing directory, either absolute or relative to the server process's working directory. With `index_root=/repo/ai-proxy`, pass `path_filter="relay/channel/antigravity"`, not `"ai-proxy/relay/channel/antigravity"`. The same rule applies to precise-tool `path` arguments. An absolute path within that directory is also accepted; outside paths and `..` components are rejected.
+
+A subdirectory may reuse an active parent index without a second cold build. This does not change the input base: missing-path correction suggestions stay relative to the requested directory and can be retried with the same `index_root`. Suggestions exclude sibling directories. Result file paths remain relative to the active index root reported in the response header/note; use that root when passing those result paths to a subsequent call. No repeated-prefix guessing is performed, since `/repo/ai-proxy/ai-proxy` can be a legitimate nested directory.
+
 ## What are the anti-drift hooks? Should I use them?
 PreToolUse hooks that deny repeated grep/whole-file reads and remind the model to use Astrolabe. Their effect on cost/latency has **not** been benchmarked (our A/B runs did not use them). For day-to-day use we still recommend `setup --with-hooks`. See [HOOKS.md](HOOKS.md).
 

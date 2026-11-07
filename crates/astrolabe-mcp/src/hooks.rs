@@ -707,6 +707,123 @@ pub(crate) fn is_code_file_path(path: &str) -> bool {
     }
 }
 
+/// Only positively identified resources/documents are neutral. Unknown extensions and
+/// unsupported programming languages must retain the existing mixed-read guard.
+fn is_non_code_resource(path: &str) -> bool {
+    let path = path.trim().trim_matches(['\'', '"']);
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "md" | "rst" | "txt" | "log"
+    ) && !Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(is_code_file_path)
+        .unwrap_or(false)
+}
+
+/// A deliberately small, lexical exception for explicit temporary diagnostic text.
+/// No globs, substitutions, traversal, directories, source files or implicit cwd searches.
+fn is_temporary_diagnostic_path(path: &str) -> bool {
+    (path.starts_with("/tmp/")
+        || path.starts_with("/private/tmp/")
+        || path.starts_with("/var/tmp/"))
+        && !path.contains(['$', '`', '*', '?', '[', ']', '<', '>', '\n'])
+        && !path.split('/').any(|part| part == ".." || part == ".")
+        && matches!(
+            Path::new(path).extension().and_then(|s| s.to_str()),
+            Some("txt" | "log")
+        )
+        && is_non_code_resource(path)
+}
+
+fn is_diagnostic_text_search(inv: &ShellInvocation) -> bool {
+    if !matches!(inv.command.as_str(), "grep" | "egrep" | "fgrep" | "rg") {
+        return false;
+    }
+    let segments = split_shell_segments(&inv.args);
+    if segments.len() != 1 {
+        return false;
+    }
+    let mut pattern_seen = false;
+    let mut explicit_pattern = false;
+    let mut paths = 0;
+    let mut options = true;
+    for token in &segments[0].tokens {
+        let t = token.text.as_str();
+        if explicit_pattern {
+            explicit_pattern = false;
+            pattern_seen = true;
+        } else if options && t == "--" {
+            options = false;
+        } else if options && (t == "-e" || t == "--regexp") {
+            explicit_pattern = true;
+        } else if options && t.starts_with('-') {
+            // Unknown options (especially recursive, file/type/glob and pattern-file
+            // options) are never assumed safe. Common output/matching flags only.
+            if !t.starts_with("--")
+                && t.len() > 1
+                && t[1..].chars().all(|c| "oEinivchHslqFwxa".contains(c))
+            {
+                continue;
+            }
+            return false;
+        } else if !pattern_seen {
+            pattern_seen = true;
+        } else if is_temporary_diagnostic_path(t) {
+            paths += 1;
+        } else {
+            return false;
+        }
+    }
+    pattern_seen && !explicit_pattern && (paths > 0 || inv.after_pipe)
+}
+
+/// All primary searches must qualify: a harmless diagnostic earlier in a compound
+/// command must not hide source discovery later. Unknown companion commands remain
+/// conservative rather than being treated as diagnostics by association.
+fn diagnostic_search_only(cmd: &str) -> bool {
+    if cmd.contains(['$', '`']) {
+        return false;
+    }
+    let invocations = shell_invocations(cmd);
+    let mut found = false;
+    for inv in &invocations {
+        if is_text_search_command(&inv.command) || is_git_grep(inv) {
+            if !is_diagnostic_text_search(inv) {
+                return false;
+            }
+            found |= !inv.after_pipe;
+        } else if !matches!(
+            inv.command.as_str(),
+            "ps" | "echo"
+                | "printf"
+                | "wc"
+                | "tail"
+                | "head"
+                | "cat"
+                | "sort"
+                | "strings"
+                | "file"
+                | "stat"
+                | "du"
+                | "pwd"
+                | "date"
+        ) || (READ_SHELL_COMMANDS.contains(&inv.command.as_str())
+            || matches!(inv.command.as_str(), "sort" | "strings"))
+            && iter_shell_path_arguments(&inv.args)
+                .iter()
+                .any(|p| !p.chars().all(|c| c.is_ascii_digit()) && !is_temporary_diagnostic_path(p))
+        {
+            return false;
+        }
+    }
+    found
+}
+
 /// 从 shell 命令行参数中提取非选项路径参数
 pub(crate) fn iter_shell_path_arguments(args_str: &str) -> Vec<String> {
     args_str
@@ -1380,6 +1497,12 @@ pub(crate) fn classify_tool_ex(
         }
     }
 
+    // Explicit runtime/temporary-text diagnostics cannot be answered by a code
+    // index. Keep the hard text-search policy unchanged, including pipelines.
+    if !deny_text_search && full_command.map(diagnostic_search_only).unwrap_or(false) {
+        return ToolKind::Neutral;
+    }
+
     // 1.8 Soft primary code-search: non-piped `rg`/`grep -rn`/`git grep` (and wrappers
     // like `cd x && rg …`) count as Grep so Bash cannot bypass the host Grep deny.
     // Pipe-only greps stay Neutral here (`go test | grep FAIL`); hard mode still
@@ -1457,6 +1580,12 @@ pub(crate) fn classify_tool_ex(
     };
 
     if is_read {
+        // Resource reads must not inherit an unrelated code-discovery burst.
+        // Shell commands are excluded here: their representative command can hide
+        // another read/search in a compound command.
+        if full_command.is_none() && file_path.map(is_non_code_resource).unwrap_or(false) {
+            return ToolKind::Neutral;
+        }
         // 切片精读（slice read）：Read 工具带合法 limit 的局部读取计入连续切片额度；
         // 非代码文件（未索引语言/markdown 等）的切片保持中立——与全量读口径一致
         // （Read{is_code_file:false} 不计 n_read），把它们推向 search_code 没有意义；
@@ -1722,42 +1851,42 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
     let slice_threshold = config().slice_read_threshold;
     let readonly_note = format!(" Note: all Astrolabe tools are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
     let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_lang tool), grep is the correct tool for them — ignore this reminder.";
-    // Prefer symbolic tools: they reset n_grep/n_read/n_non_symbolic. search_code only
-    // clears n_slice — following a search_code-only hint can still hit Read/Grep deny.
+    // Prefer relevant symbolic tools for discovery; every recognized Astrolabe
+    // tool, including search_code, resets the complete discovery burst.
     let switch_instruction =
-        "Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset grep/read burst counters); mcp__astrolabe__search_code is for literal/regex text search but only clears the slice-read counter, not n_grep/n_read. Call a symbolic Astrolabe tool now (read-only, safe).";
+        "Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset grep/read burst counters); mcp__astrolabe__search_code is for literal/regex text search and also resets the full grep/read/slice burst. Call a symbolic Astrolabe tool now (read-only, safe).";
     let (reason, ctx) = match deny_kind {
         DenyKind::Grep => (
-            "Too many consecutive grep/rg calls without using symbolic tools. Stop using Grep/grep/rg (including Bash rg/grep -rn) for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
+            "Too many consecutive grep/rg calls without using symbolic tools. Stop using Grep/grep/rg (including Bash rg/grep -rn) for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code also resets the full burst. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were using many Grep/grep/rg calls recently (host Grep or Bash text-search). Prefer Astrolabe symbolic tools: find_symbol / resolve_contx reset the grep/read burst counters; find_refs returns path:line anchors. search_code is fine for literal/regex but only clears the slice-read counter — it will not clear n_grep/n_read, so you may still hit Read deny afterward. {switch_instruction}{unindexed_lang_note}"
+                "You were using many Grep/grep/rg calls recently (host Grep or Bash text-search). Prefer Astrolabe symbolic tools: find_symbol / resolve_contx reset the grep/read burst counters; find_refs returns path:line anchors. search_code is for literal/regex and also resets the full grep/read/slice burst. {switch_instruction}{unindexed_lang_note}"
             ),
         ),
         DenyKind::TextSearch => (
-            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code for literal/regex (slice counter only); also find_refs / goto_def. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
+            "Text search with Grep/grep/rg/ag/ack/git grep is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code for literal/regex (full burst reset); also find_refs / goto_def. Reading known files with Read/cat, ls, and build/test commands are still allowed.",
             format!(
-                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset burst counters); use mcp__astrolabe__search_code for literal/regex enclosing bodies (clears slice-read counter only); also find_refs / goto_def (read-only, safe).{unindexed_lang_note}"
+                "Host text-search tools (Grep, grep, rg, ag, ack, git grep, zgrep) are hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset burst counters); use mcp__astrolabe__search_code for literal/regex enclosing bodies (resets the full grep/read/slice burst); also find_refs / goto_def (read-only, safe).{unindexed_lang_note}"
             ),
         ),
         DenyKind::Glob => (
             "Glob / file_search is disabled (ASTROLABE_DENY_TEXT_SEARCH). Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first; also search_code / find_refs / goto_def.",
-            "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx to locate symbols and paths (full burst reset); mcp__astrolabe__search_code is an alternative for text/path discovery (slice counter only).".to_string(),
+            "Host Glob / file_search is hard-disabled for this Astrolabe process. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx to locate symbols and paths (full burst reset); mcp__astrolabe__search_code is an alternative for text/path discovery (full burst reset).".to_string(),
         ),
         DenyKind::Read => (
-            "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
+            "Too many consecutive read calls of files without using symbolic tools. Stop using read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code also resets the full burst. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were using many read calls on files recently. Prefer Astrolabe symbolic tools for targeted reads: find_symbol / resolve_contx return exact bodies and path:line anchors and reset grep/read burst counters; search_code helps locate text but only clears the slice-read counter. {switch_instruction}"
+                "You were using many read calls on files recently. Prefer Astrolabe symbolic tools for targeted reads: find_symbol / resolve_contx return exact bodies and path:line anchors and reset grep/read burst counters; search_code helps locate text and also resets the full grep/read/slice burst. {switch_instruction}"
             ),
         ),
         DenyKind::Mixed => (
-            "Too many consecutive non-symbolic tool calls (mixed grep and read). Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code only clears the slice-read counter. Call a symbolic Astrolabe tool now (read-only, safe).",
+            "Too many consecutive non-symbolic tool calls (mixed grep and read). Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code also resets the full burst. Call a symbolic Astrolabe tool now (read-only, safe).",
             format!(
-                "You were alternating between grep/rg and read file calls recently without using Astrolabe's symbolic mcp tools. Prefer find_symbol / resolve_contx (reset burst counters); search_code is for literal/regex and only clears the slice-read counter. {switch_instruction}{unindexed_lang_note}"
+                "You were alternating between grep/rg and read file calls recently without using Astrolabe's symbolic mcp tools. Prefer find_symbol / resolve_contx (reset burst counters); search_code is for literal/regex and also resets the full grep/read/slice burst. {switch_instruction}{unindexed_lang_note}"
             ),
         ),
         DenyKind::Slice => (
             "Too many consecutive file-slice reads without using any Astrolabe tool. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first; mcp__astrolabe__search_code also clears the slice-read counter — they are read-only and return exact bodies with path:line anchors.",
-            "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx; mcp__astrolabe__search_code also clears this slice-read counter (unlike grep/read counters). Call an Astrolabe tool now (read-only, safe).".to_string(),
+            "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx; mcp__astrolabe__search_code also resets the full grep/read/slice burst. Call an Astrolabe tool now (read-only, safe).".to_string(),
         ),
     };
     let ctx = format!("{ctx}{readonly_note}");
@@ -2373,6 +2502,244 @@ pub fn run_cleanup() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FORENSICS_COMMAND: &str = r#"ps aux | grep -c '[s]trings'; echo '--- lines ---'; wc -l /tmp/agcli-151-strings.txt; echo '--- tail ---'; tail -c 300 /tmp/agcli-151-strings.txt | cat -v | tail -5; echo; echo '--- version strings ---'; grep -oE '1\.5\.[0-9]' /tmp/agcli-151-strings.txt | sort -u | head"#;
+
+    fn classify_session_bash(command: &str, hard: bool) -> ToolKind {
+        let (name, args) = effective_shell_command(command).unwrap();
+        classify_tool_ex(
+            "bash",
+            Client::ClaudeCode,
+            None,
+            Some(&name),
+            args.as_deref(),
+            Some(command),
+            None,
+            None,
+            hard,
+        )
+    }
+
+    #[test]
+    fn session_diagnostics_classification_is_narrow() {
+        for command in [
+            FORENSICS_COMMAND,
+            "grep -n error /tmp/build.log",
+            "rg -e 'error words' '/private/tmp/build output.txt'",
+            "grep error /tmp/build.log | grep -v debug",
+        ] {
+            assert_eq!(
+                classify_session_bash(command, false),
+                ToolKind::Neutral,
+                "{command}"
+            );
+            assert_eq!(
+                classify_session_bash(command, true),
+                ToolKind::Grep,
+                "hard: {command}"
+            );
+        }
+        for command in [
+            "grep error /tmp/source.rs",
+            "rg error /tmp/source.rs.txt",
+            "grep error /tmp/build.log src/lib.rs",
+            "grep error /tmp/../repo/build.log",
+            "grep error /tmp/*.txt",
+            "grep error /tmp/$FILE.txt",
+            "grep error",
+            "grep -r error /tmp/build.log",
+            "grep -f /tmp/pattern.txt /tmp/build.log",
+            "grep --include=*.rs error /tmp/build.log",
+            "grep error /tmp/build.log; rg Handler src",
+            "grep error /tmp/build.log && cat src/lib.rs",
+            "grep error /tmp/build.log && cat src/Unknown.scala",
+            "grep error /tmp/build.log | cat src/lib.rs",
+            "grep error /tmp/build.log; sort src/lib.rs",
+            "grep '$(cat src/lib.rs)' /tmp/build.log",
+            "echo `rg Handler src`; grep error /tmp/build.log",
+            "grep error /tmp/build.log | grep Handler src/lib.rs",
+            "grep error /tmp/build.log; python inspect.py",
+            "bash -lc 'grep error /tmp/build.log; rg Handler src'",
+            "grep error /tmp/build.log; git grep Handler",
+        ] {
+            assert_eq!(
+                classify_session_bash(command, false),
+                ToolKind::Grep,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_resource_reads_do_not_clear_or_increment_code_burst() {
+        let mut counter = CounterState {
+            n_grep: 2,
+            n_non_symbolic: 3,
+            last_grep_ts: Some(1000.0),
+            last_non_symbolic_ts: Some(1000.0),
+            ..CounterState::default()
+        };
+        let before = counter.clone();
+        for path in [
+            "/repo/src/app/assets/agents/codex.svg",
+            "README.md",
+            "/tmp/build.log",
+        ] {
+            let kind = classify_tool(
+                "read",
+                Client::ClaudeCode,
+                Some(path),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(kind, ToolKind::Neutral, "{path}");
+            assert_eq!(
+                decide_with(&mut counter, kind, 1001.0, &HooksConfig::default()),
+                Decision::NeutralAllow
+            );
+            assert_eq!(counter, before);
+        }
+        for path in [
+            "/tmp/source.rs",
+            "src/widget.tsx",
+            "src/Unknown.scala",
+            "src/Makefile",
+            "src/code.rs.txt",
+        ] {
+            let kind = classify_tool(
+                "read",
+                Client::ClaudeCode,
+                Some(path),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_ne!(kind, ToolKind::Neutral, "{path}");
+        }
+        assert_eq!(
+            decide_with(
+                &mut counter,
+                ToolKind::Grep,
+                1002.0,
+                &HooksConfig::default()
+            ),
+            Decision::Deny(DenyKind::Grep)
+        );
+        let symbolic = classify_tool(
+            "mcp__astrolabe__find_symbol",
+            Client::ClaudeCode,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            decide_with(&mut counter, symbolic, 1003.0, &HooksConfig::default()),
+            Decision::ResetSymbolic
+        );
+        assert_eq!(counter.last_deny_ts, None);
+        assert_eq!(
+            decide_with(
+                &mut counter,
+                ToolKind::Grep,
+                1004.0,
+                &HooksConfig::default()
+            ),
+            Decision::Allow
+        );
+        assert_eq!(counter.n_grep, 1);
+        let mut reads = CounterState {
+            n_read: 2,
+            n_non_symbolic: 2,
+            last_read_ts: Some(1000.0),
+            last_non_symbolic_ts: Some(1000.0),
+            ..CounterState::default()
+        };
+        let source = classify_tool(
+            "read",
+            Client::ClaudeCode,
+            Some("src/widget.tsx"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(source, ToolKind::Read { is_code_file: true });
+        assert_eq!(
+            decide_with(&mut reads, source, 1001.0, &HooksConfig::default()),
+            Decision::Deny(DenyKind::Read)
+        );
+    }
+
+    #[test]
+    fn session_forensics_and_svg_payloads_isolated_hook_regression() {
+        let home = std::env::temp_dir().join(format!(
+            "astrolabe_diagnostics_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = "session-diagnostic-regression";
+        let path = get_hook_data_dir(&home, session, None)
+            .unwrap()
+            .join("counter.json");
+        let seed = CounterState {
+            n_grep: 2,
+            n_non_symbolic: 3,
+            last_grep_ts: Some(1000.0),
+            last_non_symbolic_ts: Some(1000.0),
+            ..CounterState::default()
+        };
+        let cfg = HooksConfig::default();
+        for (tool, input) in [
+            ("Bash", serde_json::json!({"command": FORENSICS_COMMAND})),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/repo/src/app/assets/agents/codex.svg"}),
+            ),
+        ] {
+            save_counter(&path, &seed);
+            let payload =
+                serde_json::json!({"session_id": session, "tool_name": tool, "tool_input": input})
+                    .to_string();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run_remind_impl_with(
+                    "claude-code",
+                    payload.as_bytes(),
+                    &mut out,
+                    &mut err,
+                    Some(1001.0),
+                    Some(&home),
+                    &cfg
+                ),
+                0
+            );
+            assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+            assert!(err.is_empty());
+            assert_eq!(load_counter(&path), seed);
+        }
+        let payload = serde_json::json!({"session_id": session, "tool_name": "Bash",
+            "tool_input": {"command": "grep Handler src/lib.rs"}})
+        .to_string();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run_remind_impl_with(
+            "claude-code",
+            payload.as_bytes(),
+            &mut out,
+            &mut err,
+            Some(1001.0),
+            Some(&home),
+            &cfg,
+        );
+        assert!(String::from_utf8_lossy(&out).contains("deny"));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn test_1_consecutive_grep_deny_and_burst_reset() {
@@ -4060,9 +4427,28 @@ mod tests {
     }
 
     #[test]
+    fn all_deny_guidance_avoids_obsolete_partial_reset_claims() {
+        for kind in [
+            DenyKind::Grep,
+            DenyKind::Glob,
+            DenyKind::TextSearch,
+            DenyKind::Read,
+            DenyKind::Mixed,
+            DenyKind::Slice,
+        ] {
+            let output = build_output(Client::ClaudeCode, kind);
+            assert!(!output.contains("slice counter only"), "{kind:?}: {output}");
+            assert!(
+                !output.contains("only clears the slice"),
+                "{kind:?}: {output}"
+            );
+        }
+    }
+
+    #[test]
     fn test_deny_texts_direct_switch_instruction() {
         // Grep/Read/Mixed：优先推 find_symbol / resolve_contx（清零 burst），
-        // 诚实说明 search_code 只清 n_slice；不得残留软口径
+        // Every Astrolabe tool resets the full burst; keep guidance consistent.
         for kind in [DenyKind::Grep, DenyKind::Read, DenyKind::Mixed] {
             let out = build_output(Client::ClaudeCode, kind);
             assert!(
@@ -4078,8 +4464,8 @@ mod tests {
                 "{kind:?} deny output should still mention search_code: {out}"
             );
             assert!(
-                out.contains("slice-read counter") || out.contains("slice counter"),
-                "{kind:?} deny should honestly say search_code only clears the slice counter: {out}"
+                out.contains("full grep/read/slice burst"),
+                "{kind:?} deny should describe the actual full reset: {out}"
             );
             assert!(
                 out.contains("Stop using"),

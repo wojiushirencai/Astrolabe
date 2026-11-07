@@ -44,9 +44,7 @@ fn looks_windows_path(s: &str) -> bool {
 /// Stable comparison key: no verbatim prefix, `/` separators, Windows paths
 /// lowercased.
 pub fn path_norm_key(path: &Path) -> String {
-    let s = without_verbatim_prefix(path)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let s = slashes_preserving_root(&path.to_string_lossy());
     if looks_windows_path(&s) {
         s.to_ascii_lowercase()
     } else {
@@ -85,8 +83,10 @@ pub fn strip_prefix_normalized(root: &Path, path: &Path) -> Option<PathBuf> {
         format!("{root_s}/")
     };
     let rest = path_s.strip_prefix(&prefix)?;
-    // Reject `/proj` matching `/proj-other` (prefix without boundary).
-    Some(PathBuf::from(rest))
+    // Comparison is case-insensitive for Windows roots, but returned relative
+    // paths must retain the caller's case for case-sensitive index matching.
+    let original = slashes_preserving_root(&path.to_string_lossy());
+    Some(PathBuf::from(&original[original.len() - rest.len()..]))
 }
 
 /// `/`-separated form of a caller-supplied path: backslashes become `/` and a
@@ -95,7 +95,7 @@ pub fn strip_prefix_normalized(root: &Path, path: &Path) -> Option<PathBuf> {
 /// Leading `./` and `/` are preserved: an absolute path must stay absolute for
 /// [`normalize_path_filter_under`] to be able to trim it.
 fn slashes_preserving_root(path: &str) -> String {
-    let raw = path.trim().replace('\\', "/");
+    let raw = path.replace('\\', "/");
     // `\\?\C:\…` / `\\?\UNC\server\share\…` arrive as `//?/C:/…` /
     // `//?/UNC/server/share/…` once the separators are unified.
     if let Some(rest) = raw.strip_prefix("//?/UNC/") {
@@ -133,22 +133,12 @@ fn strip_leading_dot_slash(s: &str) -> &str {
 /// An absolute path outside `root` is only slash-normalised (it cannot be
 /// read as repo-relative). Case is preserved: matching stays case-sensitive.
 pub fn normalize_path_filter_under(root: &Path, filter: &str) -> String {
-    let slashed = slashes_preserving_root(filter);
+    let slashed = slashes_preserving_root(filter.trim());
     // Platform-independent absolute test: unit tests feed `C:\…` on Unix too.
     if slashed.starts_with('/') || looks_windows_path(&slashed) {
         if let Some(rel) = strip_prefix_normalized(root, Path::new(&slashed)) {
             let rel = rel.to_string_lossy();
-            // `path_norm_key` lowercases Windows paths; recover the caller's
-            // spelling from the same-length tail of the slashed input. ASCII
-            // lowercasing preserves byte length, so the tail lines up.
-            let n = slashed.len();
-            let k = rel.len();
-            let tail = if k <= n && slashed.is_char_boundary(n - k) {
-                &slashed[n - k..]
-            } else {
-                rel.as_ref()
-            };
-            return strip_leading_dot_slash(tail).to_string();
+            return strip_leading_dot_slash(&rel).to_string();
         }
     }
     strip_leading_dot_slash(&slashed).to_string()
@@ -157,7 +147,7 @@ pub fn normalize_path_filter_under(root: &Path, filter: &str) -> String {
 /// [`normalize_path_filter_under`] without an index root: `\` → `/` plus the
 /// leading `./` / `/` strip; absolute paths cannot be made repo-relative.
 pub fn normalize_path_filter(filter: &str) -> String {
-    strip_leading_dot_slash(&slashes_preserving_root(filter)).to_string()
+    strip_leading_dot_slash(&slashes_preserving_root(filter.trim())).to_string()
 }
 
 #[cfg(test)]
@@ -214,6 +204,29 @@ mod tests {
             "src/daemon/main.go"
         );
         assert!(strip_prefix_normalized(&root, &outside).is_none());
+    }
+
+    #[test]
+    fn windows_relative_tail_preserves_index_path_case() {
+        for (root, child) in [
+            (r"C:\repo", r"\\?\C:\repo\Src\Daemon"),
+            (r"\\?\C:\repo", "c:/REPO/Src/Daemon"),
+            ("//?/C:/repo", r"C:\repo\Src\Daemon"),
+            (
+                r"\\?\UNC\server\share\repo",
+                r"\\SERVER\SHARE\repo\Src\Daemon",
+            ),
+            (
+                "//?/UNC/server/share/repo",
+                "//server/share/repo/Src/Daemon",
+            ),
+        ] {
+            assert_eq!(
+                strip_prefix_normalized(Path::new(root), Path::new(child)).unwrap(),
+                PathBuf::from("Src/Daemon")
+            );
+        }
+        assert!(strip_prefix_normalized(Path::new("/repo"), Path::new("/Repo/Src")).is_none());
     }
 
     #[test]
