@@ -1777,7 +1777,7 @@ pub(crate) struct ResolveContextParams {
     #[schemars(description = "Next-page offset.")]
     pub offset: usize,
     #[serde(default)]
-    #[schemars(description = "Repo-relative path substring.")]
+    #[schemars(description = "index_root-relative path substring.")]
     pub path_filter: Option<String>,
 }
 
@@ -1816,7 +1816,7 @@ pub(crate) struct QueryParams {
     pub kind: Option<String>,
     /// 仓库相对路径子串过滤（与 search_code 相同语义）。
     #[serde(default)]
-    #[schemars(description = "Repo-relative path substring (not a substitute for query).")]
+    #[schemars(description = "index_root-relative path substring, not query.")]
     pub path_filter: Option<String>,
     /// 展开成员的层数（0=不展开）；`query="*"` + path_filter 时输出文件大纲。
     #[serde(default)]
@@ -1890,7 +1890,7 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Default false. Set true to treat query as a regular expression.")]
     pub regex: bool,
     #[serde(default)]
-    #[schemars(description = "Repo-relative path substring (case-sensitive, not glob).")]
+    #[schemars(description = "index_root-relative substring (case-sensitive, not glob).")]
     pub path_filter: Option<String>,
     #[serde(default)]
     #[schemars(description = "Override case (default: sensitive iff query has uppercase).")]
@@ -2331,15 +2331,18 @@ confidence: unknown"
                 }
             };
             if let Some((session, rel_under)) = self.find_covering_session(&resolved) {
-                let keep_path = nest_path_under_rel(path, &rel_under);
+                let caller_path = match path_relative_to_index_root(&resolved, path) {
+                    Ok(path) => path,
+                    Err(message) => return Err(self.finish(text_error(message))),
+                };
+                let keep_path = nest_path_under_rel(caller_path.as_deref(), &rel_under);
                 let note = if rel_under.as_os_str().is_empty() {
                     None
                 } else {
-                    let filter = keep_path.as_deref().unwrap_or(".");
                     Some(format!(
-                        "note: index_root is under active root {}; reusing that index and scoping to path_filter=\"{}\"",
+                        "note: reusing active index at {}; input path/path_filter and missing-path corrections remain relative to requested index_root={}. Result file paths are relative to the active index root.",
                         astrolabe_core::paths::display_path(&session.root),
-                        filter
+                        astrolabe_core::paths::display_path(&resolved)
                     ))
                 };
                 // Touch residency when the covering session lives in a dispatcher.
@@ -2350,8 +2353,11 @@ confidence: unknown"
                     note,
                 });
             }
+            let keep_path = match path_relative_to_index_root(&resolved, path) {
+                Ok(path) => path,
+                Err(message) => return Err(self.finish(text_error(message))),
+            };
             let session = self.ensure_index_root_session(&resolved)?;
-            let keep_path = path.map(str::to_string).filter(|p| !p.is_empty());
             return Ok(RouteOutcome {
                 hint: session.root.to_string_lossy().into_owned(),
                 path: keep_path,
@@ -3369,6 +3375,31 @@ fn relativize_to_child(child: &Path, path: &str) -> String {
     path.to_string()
 }
 
+/// Validate and normalize in the requested root BEFORE translating into a
+/// reused index. An absolute filter cannot override the requested scope, and
+/// parent components must never become an accidental wider search.
+fn path_relative_to_index_root(root: &Path, path: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = path.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let slashed = raw.replace('\\', "/");
+    let absolute = slashed.starts_with('/') || slashed.as_bytes().get(1) == Some(&b':');
+    if absolute && !astrolabe_core::paths::is_under_normalized(root, Path::new(raw)) {
+        return Err(format!(
+            "path/path_filter '{raw}' is outside index_root={}; keep index_root unchanged and use a path within it.",
+            astrolabe_core::paths::display_path(root)
+        ));
+    }
+    let relative = astrolabe_core::paths::normalize_path_filter_under(root, raw);
+    if relative.split('/').any(|component| component == "..") {
+        return Err(
+            "path/path_filter must not contain '..' components; use a path within index_root."
+                .into(),
+        );
+    }
+    Ok((!relative.is_empty() && relative != ".").then_some(relative))
+}
+
 /// Fold a caller `path` / `path_filter` (relative to an override `index_root`)
 /// under the relative path of that override inside a reused parent session.
 ///
@@ -3824,7 +3855,11 @@ impl AstrolabeServer {
             // path): match against `/`-separated index paths.
             params.path_filter =
                 normalize_filter_for_root(&session.root, params.path_filter.as_deref());
-            if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
+            if let Some(message) = path_filter_error(
+                index,
+                params.path_filter.as_deref(),
+                params.index_root.as_deref(),
+            ) {
                 return self.finish_at(&session.root, text_error(message));
             }
             let kind = match params.kind.as_deref() {
@@ -4141,7 +4176,11 @@ impl AstrolabeServer {
                     })
                     .collect();
                 if filter_text_paths.is_empty() {
-                    if let Some(message) = path_filter_error(index, params.path_filter.as_deref()) {
+                    if let Some(message) = path_filter_error(
+                        index,
+                        params.path_filter.as_deref(),
+                        params.index_root.as_deref(),
+                    ) {
                         return text_error(message);
                     }
                 }
@@ -5916,7 +5955,22 @@ fn symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
 
 /// path_filter 不匹配任何已索引路径（也不匹配未入索引的代码文件）时返回
 /// 显式错误，列出最接近的已索引路径，而不是静默返回 0 条。
-fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> {
+fn path_filter_error(
+    index: &RepoIndex,
+    filter: Option<&str>,
+    index_root: Option<&str>,
+) -> Option<String> {
+    // The matcher sees paths in the reused index, but the caller still supplies
+    // filters relative to its requested directory. Never suggest sibling paths.
+    let requested = index_root.and_then(|raw| resolve_call_index_root(raw).ok());
+    path_filter_error_at_root(index, filter, requested.as_deref())
+}
+
+fn path_filter_error_at_root(
+    index: &RepoIndex,
+    filter: Option<&str>,
+    requested: Option<&Path>,
+) -> Option<String> {
     let raw = filter.filter(|f| !f.is_empty())?;
     // Match the repo's `/`-separated spelling so a Windows client sending
     // `crates\astrolabe-mcp` is diagnosed as a hit, not as a missing path.
@@ -5929,7 +5983,17 @@ fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> 
     if !index.unindexed_code_exts(Some(filter)).is_empty() {
         return None;
     }
-    let cleaned = filter.trim_start_matches("./").trim_start_matches('/');
+    let scope = requested
+        .and_then(|root| astrolabe_core::paths::strip_prefix_normalized(&index.root, root))
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(|rel| format!("{}/", rel.to_string_lossy().replace('\\', "/")));
+    let caller_filter = scope
+        .as_deref()
+        .and_then(|prefix| filter.strip_prefix(prefix))
+        .unwrap_or(filter);
+    let cleaned = caller_filter
+        .trim_start_matches("./")
+        .trim_start_matches('/');
     let segments: Vec<String> = cleaned
         .split('/')
         .filter(|seg| !seg.is_empty())
@@ -5938,6 +6002,13 @@ fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> 
     let mut candidates: BTreeMap<String, ()> = BTreeMap::new();
     for file in files {
         let path = file.path.as_str();
+        let path = match scope.as_deref() {
+            Some(prefix) => match path.strip_prefix(prefix) {
+                Some(relative) => relative,
+                None => continue,
+            },
+            None => path,
+        };
         candidates.insert(path.to_string(), ());
         let mut dir = path;
         while let Some((parent, _)) = dir.rsplit_once('/') {
@@ -5968,12 +6039,13 @@ fn path_filter_error(index: &RepoIndex, filter: Option<&str>) -> Option<String> 
     scored.sort();
     let closest: Vec<String> = scored.into_iter().take(5).map(|entry| entry.3).collect();
     let mut message = format!(
-        "path_filter '{filter}' matches no indexed path (case-sensitive repo-relative path substring, not a glob; no absolute path or ./ prefix)."
+        "path_filter '{caller_filter}' matches no indexed path (case-sensitive path substring, not a glob; relative to index_root={}). ",
+        astrolabe_core::paths::display_path(requested.unwrap_or(&index.root))
     );
     if !closest.is_empty() {
-        message.push_str(&format!("Closest indexed paths: {}.", closest.join(", ")));
+        message.push_str(&format!("Closest indexed paths: {}. ", closest.join(", ")));
         message.push_str(&format!(
-            "Next: use one of the paths above as path_filter (e.g. \"{}\"), or drop path_filter and retry.",
+            "Next: keep index_root unchanged and use one of the paths above as path_filter (e.g. \"{}\"), or drop path_filter and retry within that index_root.",
             closest[0]
         ));
     } else {
@@ -11663,6 +11735,168 @@ mod mcp_routing_tests {
     }
 
     #[test]
+    fn subroot_path_suggestions_round_trip_without_repeated_prefixes() {
+        let parent = tmp("subroot_suggestion_roundtrip");
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for scope in ["ai-proxy", "src/daemon"] {
+            let dir = repo.join(scope).join("relay/channel/antigravity");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("convert.rs"), "pub fn roundtrip_marker() {}\n").unwrap();
+        }
+        // A tempting suggestion outside either requested scope must not leak in.
+        std::fs::write(repo.join("convert.rs"), "pub fn outside_marker() {}\n").unwrap();
+        let knobs = crate::knobs::McpKnobs {
+            watch_mode: None,
+            loop_guard: crate::loop_guard::LoopGuardConfig {
+                repeat_max: 0,
+                rate_max: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut server = AstrolabeServer::new_with_knobs(repo.clone(), knobs, 8 << 20);
+        server.structured_output = false;
+        server.start_indexing();
+        let ready =
+            until_ready(|| server.find_symbol(Parameters(sym("outside_marker", None, None))));
+        assert!(ready.contains("outside_marker"), "{ready}");
+        for scope in ["ai-proxy", "src/daemon"] {
+            let root = repo.join(scope).to_string_lossy().into_owned();
+            let call = |filter: &str| {
+                server.search_code(Parameters(
+                    serde_json::from_value(json!({
+                        "index_root": root, "query": "roundtrip_marker", "path_filter": filter,
+                        "dedup": false
+                    }))
+                    .unwrap(),
+                ))
+            };
+            let error = until_ready(|| call("antigravity/convert.rs"));
+            let suggestion = error
+                .split("e.g. \"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .expect(&error);
+            assert!(
+                !suggestion.starts_with(scope),
+                "suggestion must be relative to unchanged index_root: {error}"
+            );
+            let result = text(&call(suggestion));
+            assert!(
+                !result.contains("matches no indexed path"),
+                "suggestion failed to round-trip: {result}"
+            );
+            assert!(result.contains("roundtrip_marker"), "{result}");
+            assert!(!error.contains("outside_marker"), "{error}");
+        }
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn windows_subroot_correction_suggestions_round_trip() {
+        let repo = tmp("windows-scoped-correction");
+        std::fs::create_dir_all(repo.join("AI-proxy/Relay/Antigravity")).unwrap();
+        std::fs::write(
+            repo.join("AI-proxy/Relay/Antigravity/convert.rs"),
+            "pub fn convert() {}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("outside.rs"), "pub fn outside() {}\n").unwrap();
+        let mut index = crate::index::build(&repo).unwrap();
+        for (active, requested) in [
+            (r"C:\repo", r"C:\repo\AI-proxy"),
+            (r"\\?\C:\repo", r"c:\REPO\AI-proxy"),
+            (r"C:\repo", "//?/C:/repo/AI-proxy"),
+            (
+                r"\\?\UNC\server\share\repo",
+                r"\\SERVER\SHARE\repo\AI-proxy",
+            ),
+        ] {
+            index.root = PathBuf::from(active);
+            let requested = Path::new(requested);
+            let relative =
+                astrolabe_core::paths::strip_prefix_normalized(&index.root, requested).unwrap();
+            let bad_filter =
+                nest_path_under_rel(Some("Antigravity/convert.rs"), &relative).unwrap();
+            let error =
+                path_filter_error_at_root(&index, Some(&bad_filter), Some(requested)).unwrap();
+            let suggested = error
+                .split("e.g. \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            assert_eq!(suggested, "Relay/Antigravity/convert.rs", "{error}");
+            let normalized = path_relative_to_index_root(requested, Some(suggested)).unwrap();
+            let translated = nest_path_under_rel(normalized.as_deref(), &relative);
+            assert!(
+                path_filter_error_at_root(&index, translated.as_deref(), Some(requested)).is_none(),
+                "{error}"
+            );
+            let candidates = error
+                .split("Closest indexed paths: ")
+                .nth(1)
+                .unwrap()
+                .split(". Next:")
+                .next()
+                .unwrap();
+            assert!(!candidates.contains("outside.rs"), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn scoped_path_translation_preserves_contract_on_unix_and_windows() {
+        for (root, absolute) in [
+            ("/repo/ai-proxy", "/repo/ai-proxy/Relay/convert.rs"),
+            (r"C:\repo\ai-proxy", r"C:\repo\ai-proxy\Relay\convert.rs"),
+            (
+                r"\\?\C:\repo\ai-proxy",
+                r"c:/REPO/ai-proxy/Relay/convert.rs",
+            ),
+            (
+                r"C:\repo\ai-proxy",
+                r"\\?\C:\repo\ai-proxy\Relay\convert.rs",
+            ),
+            (r"C:\repo\ai-proxy", "//?/C:/repo/ai-proxy/Relay/convert.rs"),
+            (
+                r"\\?\UNC\server\share\repo\ai-proxy",
+                r"\\SERVER\SHARE\repo\ai-proxy\Relay\convert.rs",
+            ),
+        ] {
+            let root = Path::new(root);
+            for input in [r".\Relay\convert.rs", "Relay/convert.rs", absolute] {
+                let caller = path_relative_to_index_root(root, Some(input)).unwrap();
+                assert_eq!(caller.as_deref(), Some("Relay/convert.rs"), "{input}");
+                assert_eq!(
+                    nest_path_under_rel(caller.as_deref(), Path::new("ai-proxy")).as_deref(),
+                    Some("ai-proxy/Relay/convert.rs"),
+                    "{input}"
+                );
+            }
+            assert!(path_relative_to_index_root(root, Some("../outside.rs")).is_err());
+            assert!(path_relative_to_index_root(root, Some("Relay/../../outside.rs")).is_err());
+            assert!(path_relative_to_index_root(root, Some("/outside/convert.rs")).is_err());
+            assert!(path_relative_to_index_root(root, Some(r"D:\outside\convert.rs")).is_err());
+            assert!(path_relative_to_index_root(root, Some("."))
+                .unwrap()
+                .is_none());
+        }
+        // Never guess that an already-prefixed relative path should be stripped:
+        // a same-named directory INSIDE the requested root is legitimate.
+        let caller =
+            path_relative_to_index_root(Path::new("/repo/ai-proxy"), Some("ai-proxy/convert.rs"))
+                .unwrap();
+        assert_eq!(
+            nest_path_under_rel(caller.as_deref(), Path::new("ai-proxy")).as_deref(),
+            Some("ai-proxy/ai-proxy/convert.rs")
+        );
+    }
+
+    #[test]
     fn nest_path_under_rel_joins_caller_filter() {
         assert_eq!(nest_path_under_rel(None, Path::new("")), None);
         assert_eq!(
@@ -11780,10 +12014,10 @@ mod mcp_routing_tests {
             };
             Arc::clone(index)
         };
-        let message = path_filter_error(&index, Some(r"no-such\dir"))
+        let message = path_filter_error(&index, Some(r"no-such\dir"), None)
             .expect("an unmatched filter must produce an explicit error");
         assert!(message.contains("matches no indexed path"), "{message}");
-        assert!(path_filter_error(&index, Some("no-such/dir")).is_some());
+        assert!(path_filter_error(&index, Some("no-such/dir"), None).is_some());
         server.stop_watching();
     }
 

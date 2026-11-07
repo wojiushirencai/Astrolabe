@@ -94,7 +94,7 @@ pub(crate) struct FindRefsParams {
     // among many).
     #[serde(default)]
     #[schemars(
-        description = "Repo-relative file of the definition or a use site. Strongly preferred for ambiguous names (Init, Run, …). If omitted: this session's last find_symbol/goto_def hit for the same symbol, else unique index definition, else ranked candidates."
+        description = "index_root-relative definition/use-site file. Strongly preferred for ambiguous names (Init, Run, …). If omitted: this session's last find_symbol/goto_def hit for the same symbol, else unique index definition, else ranked candidates."
     )]
     pub path: Option<String>,
     #[serde(default)]
@@ -124,7 +124,7 @@ pub(crate) struct GotoDefParams {
         description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
     )]
     pub index_root: Option<String>,
-    #[schemars(description = "File containing the use site.")]
+    #[schemars(description = "Use-site file relative to index_root.")]
     pub path: String,
     #[serde(default)]
     #[schemars(description = "Symbol name.")]
@@ -153,7 +153,7 @@ pub(crate) struct GetDiagParams {
         description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
     )]
     pub index_root: Option<String>,
-    #[schemars(description = "Repo-relative file.")]
+    #[schemars(description = "index_root-relative file.")]
     pub path: String,
     #[serde(default)]
     #[schemars(description = "Minimum severity: error, warning, information, or hint.")]
