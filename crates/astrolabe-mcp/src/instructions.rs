@@ -9,10 +9,28 @@
 
 use std::path::Path;
 
+/// Shared Cursor L1 guidance. `astrolabe setup --scope=project` renders the
+/// same file into the project's `.cursor/rules/astrolabe.mdc`, so the MCP
+/// instructions and the Cursor rule never drift into two hand-maintained copies.
+const CURSOR_L1_TEMPLATE: &str = include_str!("../contexts/cursor-l1.md");
+
 /// L1: the MCP `instructions` field. CRITICAL bootstrap + the factual
 /// index-root header (中文事实段原样保留).
 pub fn connection_instructions(context_name: &str, root: &Path) -> String {
-    let _ = context_name;
+    // Cursor's built-in tools outrank MCP instructions, so Cursor gets the
+    // shared L1 file (setup --scope=project renders it into .cursor/rules).
+    // Every other context keeps the original text.
+    if context_name == "cursor" {
+        let mut text = CURSOR_L1_TEMPLATE
+            .replace("{{INDEX_ROOT}}", &astrolabe_core::paths::display_path(root))
+            .trim_end()
+            .to_string();
+        if let Some(hint) = go_layout_hint(root) {
+            text.push('\n');
+            text.push_str(&hint);
+        }
+        return text;
+    }
     format!(
         "CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_contx, search_code, find_symbol, find_refs, goto_def, get_diag, get_lang. All are read-only: batch independent calls in parallel in one turn.\n\n\
          Current index root index_root: {}. The index_root in results is that path;\
@@ -516,6 +534,19 @@ mod tests {
             !instructions.contains("call resolve_contx first"),
             "{instructions}"
         );
+    }
+
+    #[test]
+    fn cursor_connection_instructions_use_shared_l1_template() {
+        let root = Path::new("/workspace/cursor_repo");
+        let l1 = connection_instructions("cursor", root);
+        assert!(l1.contains("CRITICAL"), "{l1}");
+        assert!(l1.contains("/workspace/cursor_repo"), "{l1}");
+        assert!(l1.contains("astrolabe-find_symbol"), "{l1}");
+        assert!(!l1.contains("{{INDEX_ROOT}}"), "{l1}");
+        // Non-cursor contexts still use the original L1 wording.
+        let claude = connection_instructions("claude-code", root);
+        assert!(!claude.contains("astrolabe-find_symbol"), "{claude}");
     }
 
     fn tmp_repo(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {

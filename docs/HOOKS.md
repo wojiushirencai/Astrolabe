@@ -114,7 +114,7 @@ Astrolabe 防漂移 Hook 层已内置对 **Codebuddy** 与 **Grok** 客户端的
 Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容能力：
 - **配置文件**：放置于 `~/.cursor/hooks.json`（全局）或当前项目根目录 `.cursor/hooks.json`。事件名使用小驼峰（`preToolUse`、`sessionEnd`）。另外，Cursor 也会自动加载 `.claude/settings.json`（第三方兼容模式，PreToolUse 自动映射，但注意该模式不映射 `additionalContext`）。
 - **工具识别与输出格式**：内置工具名包括 `Shell`、`Read`、`Write`、`Grep`、`Task`；Astrolabe `--client=cursor`（别名：`cursor-agent`、`cursor_agent`、`cursor-cli`）输出 Cursor 原生扁平格式 `{"permission":"deny","user_message":...,"agent_message":...}`，长引导文案直接注入 `agent_message` 送达模型。
-- **matcher 必须包含 Astrolabe 的 MCP 工具**：remind 要看到 `mcp__astrolabe__*` 调用才能在你用了符号工具后清零 grep/read 计数；matcher 只写 `Shell|Read|Grep` 会让计数只增不清，已在正确使用 Astrolabe 的会话里仍可能被拦。`mcp__astrolabe__.*` 这一写法（Cursor 与 Grok 的 MCP 工具名格式）**未在真实宿主上验证**，若你的宿主不识别，请改用 `*`（ZCode 一节同理），非相关工具由 Astrolabe 自行放行。
+- **matcher 必须包含 Astrolabe 的 MCP 工具**：remind 要看到 Astrolabe 工具调用才能在你用了符号工具后清零 grep/read 计数；matcher 只写 `Shell|Read|Grep` 会让计数只增不清，已在正确使用 Astrolabe 的会话里仍可能被拦。Cursor CLI 内部把 MCP 工具命名为 `astrolabe-find_symbol` 这种形式，因此 matcher 用 `astrolabe-.*`；同时保留 `mcp__astrolabe__.*` 以兼容旧版 Cursor（Grok / Kimi 等仍使用后者）。若你的宿主不识别，可改用 `*`（ZCode 一节同理），非相关工具由 Astrolabe 自行放行。
 - **会话识别兼容**：Cursor 原生 preToolUse 事件仅传递 `conversation_id`，Astrolabe 内部会话提取逻辑已原生兼容 `conversation_id` / `conversationId` fallback。
 
 **完整配方（`.cursor/hooks.json`）**：
@@ -124,13 +124,13 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
   "hooks": {
     "preToolUse": [
       {
-        "command": "astrolabe hooks remind --client=cursor",
-        "matcher": "Shell|Read|Grep|mcp__astrolabe__.*"
+        "command": "/abs/path/to/astrolabe hooks remind --client=cursor",
+        "matcher": "Shell|Read|Grep|astrolabe-.*|mcp__astrolabe__.*"
       }
     ],
     "sessionEnd": [
       {
-        "command": "astrolabe hooks cleanup"
+        "command": "/abs/path/to/astrolabe hooks cleanup"
       }
     ]
   }

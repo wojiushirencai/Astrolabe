@@ -20,6 +20,11 @@ Options:
   --no-cursor-permissions
                          Skip merging Cursor mcpAllowlist
   --cursor-permissions   Force Cursor allowlist merge when Cursor is selected (default on)
+  --project <dir>        Project root for Cursor's best-effort approval and, with
+                         --scope=project, for .cursor/mcp.json + rules
+  --scope=global|project Cursor config scope (default: global ~/.cursor/mcp.json).
+                         project writes <project>/.cursor/mcp.json (cwd pinned),
+                         <project>/.cursor/rules/astrolabe.mdc and approves that directory
   --home <dir>           Override HOME (tests)
   -h, --help             Show this help
 
@@ -37,6 +42,8 @@ function parseArgs(argv) {
     native: false,
     help: false,
     home: null,
+    project: null,
+    scope: 'global',
     clients: null,
     command: null,
     cursorPermissions: true,
@@ -60,6 +67,27 @@ function parseArgs(argv) {
     } else if (arg.startsWith('--home=')) {
       opts.home = arg.slice('--home='.length);
       if (!opts.home) throw new Error('--home needs a directory');
+    } else if (arg === '--project') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('-')) throw new Error('--project needs a directory');
+      opts.project = value;
+      i += 1;
+    } else if (arg.startsWith('--project=')) {
+      opts.project = arg.slice('--project='.length);
+      if (!opts.project) throw new Error('--project needs a directory');
+    } else if (arg === '--scope') {
+      const value = argv[i + 1];
+      if (value !== 'global' && value !== 'project') {
+        throw new Error('--scope must be global or project');
+      }
+      opts.scope = value;
+      i += 1;
+    } else if (arg.startsWith('--scope=')) {
+      const value = arg.slice('--scope='.length);
+      if (value !== 'global' && value !== 'project') {
+        throw new Error('--scope must be global or project');
+      }
+      opts.scope = value;
     } else if (arg.startsWith('--clients=')) {
       const raw = arg.slice('--clients='.length).trim();
       if (!raw) throw new Error('--clients needs a comma-separated list');

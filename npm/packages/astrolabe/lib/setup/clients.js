@@ -499,43 +499,134 @@ const CLIENTS = [
       }
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch, withHooks = false }) {
-      const filePath = path.join(home, '.cursor', 'mcp.json');
+    plan({ home, launch, withHooks = false, projectRoot = null, cursorBinPath = null, env = process.env, pyrightPath = null, detected = true, scope = 'global', cursorCommandExplicit = false }) {
+      const globalMcpPath = path.join(home, '.cursor', 'mcp.json');
       const hooksPath = cursorMod.resolveCursorHooksPath(home);
-      const entry = jsonServerEntry(launch);
-      const steps = [];
-      steps.push({
-        kind: 'json-mcp',
-        filePath,
-        summary: `merge mcpServers.astrolabe into ${filePath}`,
-        apply() {
-          const result = mergeJsonMcpFile(filePath, entry, { create: true });
-          return { ...result, entry, write: () => writeJsonAtomic(filePath, result.doc) };
-        },
+      const projectScope = scope === 'project';
+      if (!detected) {
+        return {
+          kind: 'cursor',
+          filePath: globalMcpPath,
+          summary: 'Cursor not detected; skipping Cursor config, rules and approvals',
+          apply() {
+            return {
+              skipped: true,
+              reason: 'Cursor not detected (install Cursor or cursor-agent, then re-run setup)',
+            };
+          },
+        };
+      }
+      const root = projectRoot
+        ? cursorMod.canonicalizePath(projectRoot)
+        : cursorMod.resolveProjectRoot(process.cwd());
+      // Absolute native binary: a bare `astrolabe`/`npx` command depends on the
+      // client's PATH and silently fails on hooks and on stdio spawn.
+      const binPath =
+        cursorBinPath || (cursorCommandExplicit ? null : which('astrolabe', env));
+      if (!binPath) {
+        return {
+          kind: 'cursor',
+          filePath: globalMcpPath,
+          summary: 'Cursor skipped: could not resolve an absolute astrolabe binary',
+          apply() {
+            return {
+              skipped: true,
+              reason: 'could not resolve an absolute astrolabe binary (pass --command=/abs/path/astrolabe)',
+            };
+          },
+        };
+      }
+      const projectMcpPath = path.join(root, '.cursor', 'mcp.json');
+      const rulesPath = path.join(root, '.cursor', 'rules', 'astrolabe.mdc');
+      const projectEntry = cursorMod.cursorServerEntry({
+        binPath,
+        projectRoot: root,
+        env,
+        pyrightPath,
+        includeCwd: true,
       });
+      const globalEntry = cursorMod.cursorServerEntry({
+        binPath,
+        env,
+        pyrightPath,
+        includeCwd: false,
+      });
+      const steps = [];
+      if (projectScope) {
+        steps.push({
+          kind: 'json-mcp',
+          filePath: projectMcpPath,
+          summary: `merge mcpServers.astrolabe into ${projectMcpPath} (absolute binary, cwd ${root}, env PATH/ASTROLABE_LSP_TIMEOUT)`,
+          apply() {
+            const result = mergeJsonMcpFile(projectMcpPath, projectEntry, { create: true });
+            return {
+              ...result,
+              entry: projectEntry,
+              write: () => writeJsonAtomic(projectMcpPath, result.doc),
+            };
+          },
+        });
+        steps.push({
+          kind: 'cursor-rules',
+          filePath: rulesPath,
+          summary: `write ${rulesPath} (frontmatter alwaysApply: true; body from the shared MCP L1 source)`,
+          apply() {
+            const text = cursorMod.renderCursorRules({
+              template: cursorMod.loadL1Template(),
+              projectRoot: root,
+            });
+            const result = cursorMod.mergeRulesFile(rulesPath, text, { existsFn: exists });
+            return { ...result, write: () => writeTextAtomic(rulesPath, result.text) };
+          },
+        });
+      } else {
+        steps.push({
+          kind: 'json-mcp',
+          filePath: globalMcpPath,
+          summary: `merge mcpServers.astrolabe into ${globalMcpPath} (absolute binary, env PATH/ASTROLABE_LSP_TIMEOUT)`,
+          apply() {
+            const result = mergeJsonMcpFile(globalMcpPath, globalEntry, { create: true });
+            return {
+              ...result,
+              entry: globalEntry,
+              write: () => writeJsonAtomic(globalMcpPath, result.doc),
+            };
+          },
+        });
+      }
       if (withHooks) {
         steps.push({
           kind: 'cursor-hooks',
           filePath: hooksPath,
-          summary: `merge preToolUse/sessionEnd into ${hooksPath} (--client=cursor)`,
+          summary: `merge preToolUse/sessionEnd into ${hooksPath} (--client=cursor, absolute hook command)`,
           apply() {
             const create = exists(path.join(home, '.cursor')) || exists(hooksPath);
             const result = cursorMod.mergeCursorHooksFile(hooksPath, {
               create,
               existsFn: exists,
+              binPath,
             });
             if (result.skipped) return result;
             return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
           },
         });
       }
+      const primaryPath = projectScope ? projectMcpPath : globalMcpPath;
+      const primaryEntry = projectScope ? projectEntry : globalEntry;
       return {
         kind: 'cursor',
-        filePath,
-        entry,
-        summary:
-          steps[0].summary +
-          (withHooks ? `; hooks → ${hooksPath} (--client=cursor, matcher incl. mcp__astrolabe__.*)` : ''),
+        filePath: primaryPath,
+        entry: primaryEntry,
+        summary: projectScope
+          ? `project ${projectMcpPath} (absolute binary, cwd=project root, env)` +
+            `; rules ${rulesPath} (explicit --scope=project)` +
+            (withHooks
+              ? `; hooks → ${hooksPath} (--client=cursor, matcher incl. astrolabe-.*)`
+              : '')
+          : `global ${globalMcpPath} (absolute binary, env)` +
+            (withHooks
+              ? `; hooks → ${hooksPath} (--client=cursor, matcher incl. astrolabe-.*)`
+              : ''),
         steps,
         apply() {
           const results = [];
@@ -545,7 +636,7 @@ const CLIENTS = [
           const primary = results.find((r) => !r.skipped) || results[0];
           return {
             ...primary,
-            entry,
+            entry: primaryEntry,
             results,
             write: () => {
               for (const r of results) {
@@ -1097,4 +1188,18 @@ module.exports = {
   resolveCursorHooksPath: cursorMod.resolveCursorHooksPath,
   mergeCursorHooksFile: cursorMod.mergeCursorHooksFile,
   CURSOR_REMIND_MATCHER: cursorMod.REMIND_MATCHER,
+  resolveCursorProjectRoot: cursorMod.resolveProjectRoot,
+  canonicalizePath: cursorMod.canonicalizePath,
+  cursorProjectSlug: cursorMod.projectSlug,
+  resolveCursorApprovalPath: cursorMod.resolveApprovalPath,
+  resolveCursorDisabledPath: cursorMod.resolveDisabledPath,
+  detectPyright: cursorMod.detectPyright,
+  cursorServerEntry: cursorMod.cursorServerEntry,
+  buildCursorEnv: cursorMod.buildCursorEnv,
+  renderCursorRules: cursorMod.renderCursorRules,
+  loadCursorL1Template: cursorMod.loadL1Template,
+  mergeCursorRulesFile: cursorMod.mergeRulesFile,
+  checkCursorApprovalFile: cursorMod.checkApprovalFile,
+  removeAstrolabeFromCursorDisabled: cursorMod.removeAstrolabeFromDisabled,
+  enableCursorApproval: cursorMod.enableCursorApproval,
 };

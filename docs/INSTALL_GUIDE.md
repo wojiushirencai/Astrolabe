@@ -88,11 +88,12 @@ npx -y @zlnap/astrolabe setup --yes --with-hooks
 
 **Install without `setup` leaves you with a binary that clients do not call.** Hooks (`--with-hooks`) nudge agents away from Grep/Read toward Astrolabe; skip them only if you intentionally want MCP-only wiring.
 
-The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin plus Cursor / Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`.
+The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin plus Cursor / Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`, `--scope=global|project` (Cursor; default global), `--project <dir>` (Cursor project root; default: cwd's git root).
 
 **MCP tool short names** (what `tools/list` shows): `resolve_contx`, `search_code`, `find_symbol`, `find_refs`, `goto_def`, `get_diag`, `get_lang`. Legacy long names remain aliases on `tools/call`.
 
-- **Cursor:** MCP into `~/.cursor/mcp.json` with `--context=cursor`; optional `--with-hooks` writes `~/.cursor/hooks.json` (`preToolUse` → `astrolabe hooks remind --client=cursor` with matcher `Shell|Read|Grep|mcp__astrolabe__.*`, plus `sessionEnd` cleanup).
+- **Cursor (default `--scope=global`):** writes `~/.cursor/mcp.json` with the absolute native binary, `type: stdio`, and `env` containing `PATH`, `ASTROLABE_LSP_TIMEOUT=300`, plus `ASTROLABE_LSP_PYTHON` when `pyright-langserver` is found. Also runs `cursor-agent mcp enable astrolabe` in the current project directory as a best-effort step and removes a stale `astrolabe` entry from `mcp-disabled.json`. Cursor has no file-based global rules directory, so L1 guidance comes from the MCP instructions plus the global `~/.cursor/hooks.json` remind hook (enable with `--with-hooks`, absolute hook command, matcher `Shell|Read|Grep|astrolabe-.*`). Existing other `mcpServers` entries are preserved; re-running is idempotent.
+- **Cursor project scope (`--scope=project`):** writes the three-piece setup for the git root / `--project`: `<project>/.cursor/mcp.json` (absolute binary, `cwd` = project root, same `env`), `<project>/.cursor/rules/astrolabe.mdc` (`alwaysApply: true`, generated from the same L1 source as the MCP instructions), and approves that directory with `cursor-agent mcp enable astrolabe`.
 - **OpenCode:** merges into `~/.config/opencode/opencode.jsonc` (or `.json` / older `config.json`, or `~/.opencode/…` if that is what exists). Auto-detects V1 (`mcp.<name>` + `enabled`), V2 (`mcp.servers`), or Claude-like `mcpServers`. JSONC comments are preserved when the parent object already exists. Optional `--with-hooks` writes `~/.config/opencode/plugins/astrolabe-guard.ts`.
 - **DeepSeek Harness:** installs vendored `astrolabe-dsh-guard` into `~/.dsh/profiles/**/node_modules` and merges a managed block into `~/.dsh/cordis.patch.yml` without touching the `orca-managed-dsh-hooks` block. DSH MCP servers are per-repo in the UI — setup does not write them.
 - **Codebuddy:** MCP into `~/.codebuddy/.mcp.json` (or existing `mcp.json` / `~/.codebuddy.json`); optional `--with-hooks` merges CC-compatible hooks into `~/.codebuddy/settings.json` (PreToolUse + SessionEnd).
@@ -126,11 +127,29 @@ Equivalent JSON (`~/.claude.json` or project `.mcp.json`):
 
 ### Cursor
 
-`~/.cursor/mcp.json` or `.cursor/mcp.json`:
+`astrolabe setup` defaults to the global `~/.cursor/mcp.json`. Add `--scope=project` (and optionally `--project <dir>`) to write the project-level `.cursor/mcp.json` and `.cursor/rules/astrolabe.mdc` instead. Both keep other servers and use the absolute native binary:
 
 ```json
-{ "mcpServers": { "astrolabe": { "command": "astrolabe", "args": [".", "--context=cursor"] } } }
+{
+  "mcpServers": {
+    "astrolabe": {
+      "type": "stdio",
+      "command": "/abs/path/to/node_modules/@zlnap/darwin-arm64/astrolabe",
+      "args": [".", "--context=cursor"],
+      "cwd": "/abs/path/to/project",
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "ASTROLABE_LSP_TIMEOUT": "300",
+        "ASTROLABE_LSP_PYTHON": "/abs/path/to/pyright-langserver"
+      }
+    }
+  }
+}
 ```
+
+`cwd` and the `.cursor/rules` file are project-scope only. Cursor CLI approval is recorded per project in `~/.cursor/projects/<slug>/mcp-approvals.json`; a global MCP entry cannot pre-approve future projects. Default setup runs `cursor-agent mcp enable astrolabe` in the current project as a best-effort step, then tells you that new projects prompt for approval on first use (`--approve-mcps` for headless runs, or run the command manually in that project). `--scope=project` runs the same command for the target directory and verifies the approvals file. Editing the server entry changes the config hash and requires re-approval, so re-run setup after config changes. `setup` also removes `astrolabe` from `mcp-disabled.json`.
+
+Cursor has no file-based global rules directory (User Rules live in the UI). Global L1 guidance therefore comes from the MCP `instructions` field plus the global `~/.cursor/hooks.json` remind hook, which `--with-hooks` registers with an absolute binary path and the Cursor-native `astrolabe-.*` matcher.
 
 To skip Cursor's per-tool MCP approval for the seven read-only tools, merge **short** entries `astrolabe:<tool>` into `~/.cursor/permissions.json` → `mcpAllowlist` (do not write `astrolabe:*`; Cursor Run Mode must be enabled). `astrolabe setup` and `node scripts/setup-cursor-permissions.mjs` write short catalog names only and **migrate** any leftover legacy long names in the allowlist to short ones (`--dry-run` to preview, `--cli` for `~/.cursor/cli-config.json`). Allowlist tools: `search_code`, `find_symbol`, `resolve_contx`, `get_diag`, `find_refs`, `goto_def`, `get_lang`. Legacy long names remain **call-time** aliases on `tools/call` only (forgotten client configs still work).
 

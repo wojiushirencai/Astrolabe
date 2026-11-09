@@ -17,6 +17,12 @@ function tmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'astrolabe-setup-'));
 }
 
+function tmpProject(home) {
+  const project = path.join(home, 'project');
+  fs.mkdirSync(project, { recursive: true });
+  return project;
+}
+
 test('parseArgs accepts yes/clients/dry-run/native', () => {
   const opts = argsMod.parseArgs([
     '--yes',
@@ -31,6 +37,9 @@ test('parseArgs accepts yes/clients/dry-run/native', () => {
   assert.equal(opts.dryRun, true);
   assert.equal(opts.native, true);
   assert.equal(opts.home, '/tmp/h');
+  assert.equal(opts.scope, 'global');
+  assert.equal(argsMod.parseArgs(['--scope=project']).scope, 'project');
+  assert.throws(() => argsMod.parseArgs(['--scope=bogus']), /--scope must be global or project/);
 });
 
 test('resolveLaunch defaults to npx @zlnap/astrolabe', () => {
@@ -129,7 +138,20 @@ test('setup --list and --dry-run via bin shim', () => {
 
     const dry = spawnSync(
       process.execPath,
-      [BIN, 'setup', '--yes', '--clients=cursor', '--dry-run', '--home', home, '--no-cursor-permissions'],
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--dry-run',
+        '--home',
+        home,
+        '--project',
+        tmpProject(home),
+        '--command',
+        path.join(home, 'bin', 'astrolabe'),
+        '--no-cursor-permissions',
+      ],
       { encoding: 'utf8' },
     );
     assert.equal(dry.status, 0, dry.stderr + dry.stdout);
@@ -142,7 +164,7 @@ test('setup --list and --dry-run via bin shim', () => {
   }
 });
 
-test('setup --yes writes cursor mcp.json and merges allowlist', () => {
+test('setup --yes defaults to global cursor mcp.json and leaves the project untouched', () => {
   const home = tmpHome();
   try {
     fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
@@ -150,26 +172,102 @@ test('setup --yes writes cursor mcp.json and merges allowlist', () => {
       path.join(home, '.cursor', 'mcp.json'),
       JSON.stringify({ mcpServers: { keep: { command: 'keep' } } }, null, 2),
     );
+    const project = tmpProject(home);
+    const emptyPath = path.join(home, 'empty-path');
+    fs.mkdirSync(emptyPath, { recursive: true });
+    const bin = path.join(home, 'bin', 'astrolabe');
     const result = spawnSync(
       process.execPath,
-      [BIN, 'setup', '--yes', '--clients=cursor', '--home', home],
-      { encoding: 'utf8' },
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--home',
+        home,
+        '--project',
+        project,
+        '--command',
+        bin,
+      ],
+      { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: emptyPath } },
     );
     assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /global config/);
+    assert.match(result.stdout, /no file-based global rules directory/);
+
     const mcp = JSON.parse(fs.readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8'));
     assert.equal(mcp.mcpServers.keep.command, 'keep');
-    assert.equal(mcp.mcpServers.astrolabe.command, 'npx');
-    assert.deepEqual(mcp.mcpServers.astrolabe.args, [
-      '-y',
-      '@zlnap/astrolabe',
-      '.',
-      '--context=cursor',
-    ]);
+    assert.equal(mcp.mcpServers.astrolabe.command, bin);
+    assert.deepEqual(mcp.mcpServers.astrolabe.args, ['.', '--context=cursor']);
+    assert.equal(mcp.mcpServers.astrolabe.cwd, undefined);
+    assert.equal(mcp.mcpServers.astrolabe.env.ASTROLABE_LSP_TIMEOUT, '300');
+    assert.equal(typeof mcp.mcpServers.astrolabe.env.PATH, 'string');
+
+    // Default scope must not create project-level config or rules.
+    assert.equal(fs.existsSync(path.join(project, '.cursor', 'mcp.json')), false);
+    assert.equal(fs.existsSync(path.join(project, '.cursor', 'rules', 'astrolabe.mdc')), false);
+
     const perms = JSON.parse(
       fs.readFileSync(path.join(home, '.cursor', 'permissions.json'), 'utf8'),
     );
     assert.ok(perms.mcpAllowlist.includes('astrolabe:search_code'));
     assert.equal(perms.mcpAllowlist.length, 7);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('setup --scope=project writes project config, rules and approves that directory', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    const project = tmpProject(home);
+    const emptyPath = path.join(home, 'empty-path');
+    fs.mkdirSync(emptyPath, { recursive: true });
+    const bin = path.join(home, 'bin', 'astrolabe');
+    const result = spawnSync(
+      process.execPath,
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--scope=project',
+        '--home',
+        home,
+        '--project',
+        project,
+        '--command',
+        bin,
+        '--no-cursor-permissions',
+      ],
+      { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: emptyPath } },
+    );
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+
+    const realProject = clientsMod.canonicalizePath(project);
+    const projectMcp = JSON.parse(
+      fs.readFileSync(path.join(project, '.cursor', 'mcp.json'), 'utf8'),
+    );
+    assert.equal(projectMcp.mcpServers.astrolabe.command, bin);
+    assert.deepEqual(projectMcp.mcpServers.astrolabe.args, ['.', '--context=cursor']);
+    assert.equal(projectMcp.mcpServers.astrolabe.cwd, realProject);
+    assert.equal(projectMcp.mcpServers.astrolabe.env.ASTROLABE_LSP_TIMEOUT, '300');
+    assert.equal(typeof projectMcp.mcpServers.astrolabe.env.PATH, 'string');
+
+    const rules = fs.readFileSync(
+      path.join(project, '.cursor', 'rules', 'astrolabe.mdc'),
+      'utf8',
+    );
+    assert.match(rules, /^---\n/);
+    assert.match(rules, /alwaysApply: true/);
+    assert.match(rules, /astrolabe-find_symbol/);
+    assert.ok(rules.includes(realProject), rules);
+
+    // Project scope does not create the global fallback.
+    assert.equal(fs.existsSync(path.join(home, '.cursor', 'mcp.json')), false);
+    assert.match(result.stdout, /cursor-agent not found on PATH/);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -649,6 +747,10 @@ test('Cursor --with-hooks writes hooks.json with --client=cursor and mcp matcher
         2,
       ),
     );
+    const project = tmpProject(home);
+    const emptyPath = path.join(home, 'empty-path');
+    fs.mkdirSync(emptyPath, { recursive: true });
+    const bin = path.join(home, 'bin', 'astrolabe');
     const result = spawnSync(
       process.execPath,
       [
@@ -659,19 +761,21 @@ test('Cursor --with-hooks writes hooks.json with --client=cursor and mcp matcher
         '--with-hooks',
         '--home',
         home,
+        '--project',
+        project,
+        '--command',
+        bin,
         '--no-cursor-permissions',
       ],
-      { encoding: 'utf8' },
+      { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: emptyPath } },
     );
     assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.equal(fs.existsSync(path.join(project, '.cursor', 'mcp.json')), false);
+    assert.equal(fs.existsSync(path.join(project, '.cursor', 'rules', 'astrolabe.mdc')), false);
 
     const mcp = JSON.parse(fs.readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8'));
-    assert.deepEqual(mcp.mcpServers.astrolabe.args, [
-      '-y',
-      '@zlnap/astrolabe',
-      '.',
-      '--context=cursor',
-    ]);
+    assert.equal(mcp.mcpServers.astrolabe.command, bin);
+    assert.deepEqual(mcp.mcpServers.astrolabe.args, ['.', '--context=cursor']);
     assert.ok(!JSON.stringify(mcp).includes('claude-code'));
 
     const hooks = JSON.parse(fs.readFileSync(path.join(home, '.cursor', 'hooks.json'), 'utf8'));
@@ -680,8 +784,9 @@ test('Cursor --with-hooks writes hooks.json with --client=cursor and mcp matcher
       String(e.command || '').includes('astrolabe hooks remind'),
     );
     assert.ok(remind, 'preToolUse remind missing');
-    assert.equal(remind.command, 'astrolabe hooks remind --client=cursor');
+    assert.equal(remind.command, `${bin} hooks remind --client=cursor`);
     assert.equal(remind.matcher, clientsMod.CURSOR_REMIND_MATCHER);
+    assert.match(remind.matcher, /astrolabe-\.\*/);
     assert.match(remind.matcher, /mcp__astrolabe__\.\*/);
     assert.ok(!remind.command.includes('claude-code'));
     const cleanup = hooks.hooks.sessionEnd.find((e) =>
@@ -849,7 +954,19 @@ test('mergeCursorPermissions migrates legacy long names and check reports it', (
 
     const result = spawnSync(
       process.execPath,
-      [BIN, 'setup', '--yes', '--clients=cursor', '--home', home, '--dry-run'],
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--home',
+        home,
+        '--project',
+        tmpProject(home),
+        '--command',
+        path.join(home, 'bin', 'astrolabe'),
+        '--dry-run',
+      ],
       { encoding: 'utf8' },
     );
     assert.equal(result.status, 0, result.stderr + result.stdout);
@@ -859,4 +976,544 @@ test('mergeCursorPermissions migrates legacy long names and check reports it', (
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('Cursor project root/slug matches cursor-agent project dirs', () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    const realProject = clientsMod.canonicalizePath(project);
+    assert.equal(clientsMod.cursorProjectSlug('/Users/a/Project/serena+visio'), 'Users-a-Project-serena-visio');
+    assert.equal(clientsMod.cursorProjectSlug('C:\\Users\\a\\repo'), 'C-Users-a-repo');
+    assert.equal(
+      clientsMod.resolveCursorApprovalPath(home, project),
+      path.join(
+        home,
+        '.cursor',
+        'projects',
+        clientsMod.cursorProjectSlug(realProject),
+        'mcp-approvals.json',
+      ),
+    );
+    assert.equal(
+      clientsMod.resolveCursorProjectRoot(project, {
+        spawnFn: () => ({ status: 1, stdout: '' }),
+      }),
+      realProject,
+    );
+    const gitTop = clientsMod.resolveCursorProjectRoot('/ignored', {
+      spawnFn: () => ({ status: 0, stdout: `${project}\n` }),
+    });
+    assert.equal(gitTop, realProject);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Cursor server entry injects PATH/timeout and probes pyright', () => {
+  const noPyright = clientsMod.detectPyright(
+    { PATH: '', HOME: '/none' },
+    { whichFn: () => null, existsFn: () => false, home: '/none', platform: 'linux' },
+  );
+  assert.equal(noPyright, null);
+
+  const found = clientsMod.detectPyright(
+    { PATH: '/x' },
+    {
+      whichFn: (cmd) => (cmd === 'pyright-langserver' ? '/x/pyright-langserver' : null),
+      existsFn: () => false,
+      home: '/h',
+      platform: 'linux',
+    },
+  );
+  assert.equal(found, '/x/pyright-langserver');
+
+  const entry = clientsMod.cursorServerEntry({
+    binPath: '/abs/astrolabe',
+    projectRoot: '/proj',
+    env: { PATH: '/bin:/usr/bin' },
+    pyrightPath: found,
+    includeCwd: true,
+  });
+  assert.equal(entry.command, '/abs/astrolabe');
+  assert.deepEqual(entry.args, ['.', '--context=cursor']);
+  assert.equal(entry.cwd, path.resolve('/proj'));
+  assert.equal(entry.env.PATH, '/bin:/usr/bin');
+  assert.equal(entry.env.ASTROLABE_LSP_TIMEOUT, '300');
+  assert.equal(entry.env.ASTROLABE_LSP_PYTHON, '/x/pyright-langserver');
+
+  const fallback = clientsMod.cursorServerEntry({
+    binPath: '/abs/astrolabe',
+    env: { PATH: '/bin' },
+    pyrightPath: null,
+    includeCwd: false,
+  });
+  assert.equal(fallback.cwd, undefined);
+  assert.equal(fallback.env.ASTROLABE_LSP_PYTHON, undefined);
+});
+
+test('Cursor rules render from the shared MCP L1 template', () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    const template = clientsMod.loadCursorL1Template();
+    assert.match(template, /\{\{INDEX_ROOT\}\}/);
+    const text = clientsMod.renderCursorRules({ template, projectRoot: project });
+    assert.match(text, /^---\n/);
+    assert.match(text, /description: .*Astrolabe/);
+    assert.match(text, /alwaysApply: true/);
+    assert.match(text, /astrolabe-find_symbol/);
+    assert.ok(text.includes(clientsMod.canonicalizePath(project)), text);
+    assert.ok(!text.includes('{{INDEX_ROOT}}'), text);
+
+    const rulesPath = path.join(project, '.cursor', 'rules', 'astrolabe.mdc');
+    const first = clientsMod.mergeCursorRulesFile(rulesPath, text, { existsFn: () => false });
+    assert.equal(first.created, true);
+    fs.mkdirSync(path.dirname(rulesPath), { recursive: true });
+    fs.writeFileSync(rulesPath, text);
+    const second = clientsMod.mergeCursorRulesFile(rulesPath, text, { existsFn: fs.existsSync });
+    assert.equal(second.created, false);
+    assert.equal(second.unchanged, true);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Cursor approvals and disabled lists are read/merged idempotently', () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    const approvalPath = clientsMod.resolveCursorApprovalPath(home, project);
+    fs.mkdirSync(path.dirname(approvalPath), { recursive: true });
+    fs.writeFileSync(approvalPath, JSON.stringify(['other-1', 'astrolabe-abc123']));
+    const approval = clientsMod.checkCursorApprovalFile(approvalPath);
+    assert.equal(approval.exists, true);
+    assert.equal(approval.approved, true);
+
+    fs.writeFileSync(approvalPath, JSON.stringify(['other-1']));
+    assert.equal(clientsMod.checkCursorApprovalFile(approvalPath).approved, false);
+
+    const disabledPath = clientsMod.resolveCursorDisabledPath(home, project);
+    fs.mkdirSync(path.dirname(disabledPath), { recursive: true });
+    fs.writeFileSync(disabledPath, JSON.stringify(['astrolabe', 'other']));
+    const first = clientsMod.removeAstrolabeFromCursorDisabled(disabledPath);
+    assert.equal(first.changed, true);
+    assert.deepEqual(first.doc, ['other']);
+    fs.writeFileSync(disabledPath, JSON.stringify(first.doc));
+    const second = clientsMod.removeAstrolabeFromCursorDisabled(disabledPath);
+    assert.equal(second.changed, false);
+    assert.deepEqual(second.doc, ['other']);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Cursor hooks use absolute command and astrolabe-* matcher idempotently', () => {
+  const home = tmpHome();
+  try {
+    const hooksPath = clientsMod.resolveCursorHooksPath(home);
+    fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+    fs.writeFileSync(
+      hooksPath,
+      JSON.stringify(
+        {
+          version: 1,
+          hooks: {
+            preToolUse: [
+              { command: 'astrolabe hooks remind --client=cursor', matcher: 'Shell|Read|Grep' },
+              { command: 'echo keep', matcher: 'Read' },
+            ],
+            sessionEnd: [{ command: 'astrolabe hooks cleanup' }],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const bin = path.join(home, 'bin', 'astrolabe');
+    const first = clientsMod.mergeCursorHooksFile(hooksPath, {
+      create: true,
+      existsFn: fs.existsSync,
+      binPath: bin,
+    });
+    assert.equal(first.replaced, true);
+    assert.equal(first.doc.hooks.preToolUse[0].command, `${bin} hooks remind --client=cursor`);
+    assert.equal(first.doc.hooks.preToolUse[0].matcher, clientsMod.CURSOR_REMIND_MATCHER);
+    assert.match(first.doc.hooks.preToolUse[0].matcher, /astrolabe-\.\*/);
+    assert.equal(first.doc.hooks.preToolUse.length, 2);
+    assert.equal(first.doc.hooks.preToolUse[1].command, 'echo keep');
+    assert.equal(first.doc.hooks.sessionEnd[0].command, `${bin} hooks cleanup`);
+
+    fs.writeFileSync(hooksPath, JSON.stringify(first.doc, null, 2));
+    const second = clientsMod.mergeCursorHooksFile(hooksPath, {
+      create: true,
+      existsFn: fs.existsSync,
+      binPath: bin,
+    });
+    assert.equal(
+      second.doc.hooks.preToolUse.filter((e) =>
+        String(e.command || '').includes('astrolabe hooks remind'),
+      ).length,
+      1,
+    );
+    assert.equal(
+      second.doc.hooks.sessionEnd.filter((e) =>
+        String(e.command || '').includes('astrolabe hooks cleanup'),
+      ).length,
+      1,
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test(
+  'setup approves cursor-agent MCP and preserves other servers (idempotent)',
+  { skip: process.platform === 'win32' },
+  () => {
+    const home = tmpHome();
+    try {
+      fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+      fs.writeFileSync(
+        path.join(home, '.cursor', 'mcp.json'),
+        JSON.stringify({ mcpServers: { keep: { command: 'keep' } } }, null, 2),
+      );
+      const project = tmpProject(home);
+      const fakeBin = path.join(home, 'fakebin');
+      fs.mkdirSync(fakeBin, { recursive: true });
+      const fakeAgent = path.join(fakeBin, 'cursor-agent');
+      fs.writeFileSync(
+        fakeAgent,
+        [
+          '#!/usr/bin/env node',
+          "'use strict';",
+          "const fs = require('fs');",
+          "const path = require('path');",
+          "const slug = process.cwd().replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');",
+          "const dir = path.join(process.env.HOME, '.cursor', 'projects', slug);",
+          "fs.mkdirSync(dir, { recursive: true });",
+          "fs.writeFileSync(path.join(dir, 'mcp-approvals.json'), JSON.stringify(['astrolabe-testhash']));",
+          "process.exit(0);",
+          '',
+        ].join('\n'),
+      );
+      fs.chmodSync(fakeAgent, 0o755);
+      const bin = path.join(home, 'bin', 'astrolabe');
+      const env = {
+        ...process.env,
+        HOME: home,
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+      };
+      const args = [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--scope=project',
+        '--with-hooks',
+        '--home',
+        home,
+        '--project',
+        project,
+        '--command',
+        bin,
+        '--no-cursor-permissions',
+      ];
+      const result = spawnSync(process.execPath, args, { encoding: 'utf8', env });
+      assert.equal(result.status, 0, result.stderr + result.stdout);
+      assert.match(result.stdout, /Cursor CLI approval: approved astrolabe/);
+
+      const approvalPath = clientsMod.resolveCursorApprovalPath(home, project);
+      const approval = clientsMod.checkCursorApprovalFile(approvalPath);
+      assert.equal(approval.approved, true);
+      assert.ok(approval.entries.includes('astrolabe-testhash'));
+
+      const globalDoc = JSON.parse(
+        fs.readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8'),
+      );
+      assert.equal(globalDoc.mcpServers.keep.command, 'keep');
+      assert.equal(globalDoc.mcpServers.astrolabe, undefined);
+
+      const projectDoc = JSON.parse(
+        fs.readFileSync(path.join(project, '.cursor', 'mcp.json'), 'utf8'),
+      );
+      assert.equal(projectDoc.mcpServers.astrolabe.cwd, clientsMod.canonicalizePath(project));
+
+      const rerun = spawnSync(process.execPath, args, { encoding: 'utf8', env });
+      assert.equal(rerun.status, 0, rerun.stderr + rerun.stdout);
+      const hooks = JSON.parse(
+        fs.readFileSync(path.join(home, '.cursor', 'hooks.json'), 'utf8'),
+      );
+      assert.equal(
+        hooks.hooks.preToolUse.filter((e) =>
+          String(e.command || '').includes('astrolabe hooks remind'),
+        ).length,
+        1,
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'setup without cursor-agent removes astrolabe from mcp-disabled and prints guidance',
+  { skip: process.platform === 'win32' },
+  () => {
+    const home = tmpHome();
+    try {
+      fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+      const project = tmpProject(home);
+      const disabledPath = clientsMod.resolveCursorDisabledPath(home, project);
+      fs.mkdirSync(path.dirname(disabledPath), { recursive: true });
+      fs.writeFileSync(disabledPath, JSON.stringify(['astrolabe', 'other']));
+      const emptyPath = path.join(home, 'empty-path');
+      fs.mkdirSync(emptyPath, { recursive: true });
+      const env = { ...process.env, HOME: home, PATH: emptyPath };
+      const result = spawnSync(
+        process.execPath,
+        [
+          BIN,
+          'setup',
+          '--yes',
+          '--clients=cursor',
+          '--home',
+          home,
+          '--project',
+          project,
+          '--command',
+          path.join(home, 'bin', 'astrolabe'),
+          '--no-cursor-permissions',
+        ],
+        { encoding: 'utf8', env },
+      );
+      assert.equal(result.status, 0, result.stderr + result.stdout);
+      assert.match(result.stdout, /cursor-agent not found on PATH/);
+      assert.match(result.stdout, /cursor-agent mcp enable astrolabe/);
+      assert.deepEqual(JSON.parse(fs.readFileSync(disabledPath, 'utf8')), ['other']);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test('Cursor hooks dedupe .exe/space/custom-binary commands on re-run', () => {
+  const home = tmpHome();
+  try {
+    const hooksPath = clientsMod.resolveCursorHooksPath(home);
+    fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+    fs.writeFileSync(
+      hooksPath,
+      JSON.stringify(
+        {
+          version: 1,
+          hooks: {
+            preToolUse: [
+              {
+                command:
+                  '"C:\\Program Files\\Astrolabe\\astrolabe.exe" hooks remind --client=cursor',
+                matcher: 'Shell|Read|Grep',
+              },
+              { command: 'echo keep', matcher: 'Read' },
+            ],
+            sessionEnd: [{ command: 'C:\\Tools\\my-astrolabe.exe hooks cleanup' }],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    const bin = 'C:\\Program Files\\Astrolabe\\astrolabe.exe';
+    const first = clientsMod.mergeCursorHooksFile(hooksPath, {
+      create: true,
+      existsFn: fs.existsSync,
+      binPath: bin,
+    });
+    assert.equal(first.replaced, true);
+    assert.equal(
+      first.doc.hooks.preToolUse.filter((e) =>
+        /hooks\s+remind/.test(String(e.command || '')),
+      ).length,
+      1,
+    );
+    assert.equal(
+      first.doc.hooks.sessionEnd.filter((e) =>
+        /hooks\s+cleanup/.test(String(e.command || '')),
+      ).length,
+      1,
+    );
+    assert.equal(first.doc.hooks.preToolUse[0].matcher, clientsMod.CURSOR_REMIND_MATCHER);
+    assert.ok(first.doc.hooks.preToolUse[0].command.includes(bin));
+
+    fs.writeFileSync(hooksPath, JSON.stringify(first.doc, null, 2));
+    const second = clientsMod.mergeCursorHooksFile(hooksPath, {
+      create: true,
+      existsFn: fs.existsSync,
+      binPath: 'C:\\Tools\\custom-name.exe',
+    });
+    assert.equal(
+      second.doc.hooks.preToolUse.filter((e) =>
+        /hooks\s+remind/.test(String(e.command || '')),
+      ).length,
+      1,
+      'second run must replace, not append',
+    );
+    assert.ok(second.doc.hooks.preToolUse[0].command.includes('custom-name.exe'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('--command bare name resolves through PATH instead of cwd', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    const project = tmpProject(home);
+    const fakeBin = path.join(home, 'fakebin');
+    fs.mkdirSync(fakeBin, { recursive: true });
+    const fakeAstrolabe = path.join(fakeBin, 'astrolabe');
+    fs.writeFileSync(fakeAstrolabe, '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(fakeAstrolabe, 0o755);
+    const env = { ...process.env, HOME: home, PATH: fakeBin };
+    const result = spawnSync(
+      process.execPath,
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--home',
+        home,
+        '--project',
+        project,
+        '--command',
+        'astrolabe',
+        '--no-cursor-permissions',
+      ],
+      { encoding: 'utf8', env },
+    );
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const mcp = JSON.parse(fs.readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8'));
+    assert.equal(mcp.mcpServers.astrolabe.command, fakeAstrolabe);
+    assert.ok(path.isAbsolute(mcp.mcpServers.astrolabe.command));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('skipped cursor action does not run approval or permissions merge', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    const project = tmpProject(home);
+    const emptyPath = path.join(home, 'empty-path');
+    fs.mkdirSync(emptyPath, { recursive: true });
+    const env = { ...process.env, HOME: home, PATH: emptyPath };
+    const result = spawnSync(
+      process.execPath,
+      [
+        BIN,
+        'setup',
+        '--yes',
+        '--clients=cursor',
+        '--home',
+        home,
+        '--project',
+        project,
+        '--command',
+        'definitely-not-on-path',
+      ],
+      { encoding: 'utf8', env },
+    );
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /SKIP/);
+    assert.doesNotMatch(result.stdout, /Cursor CLI approval/);
+    assert.doesNotMatch(result.stdout, /Cursor MCP allowlist check/);
+    assert.equal(fs.existsSync(path.join(home, '.cursor', 'permissions.json')), false);
+    assert.equal(
+      fs.existsSync(clientsMod.resolveCursorApprovalPath(home, project)),
+      false,
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('setup backs up hooks.json on a re-run with --with-hooks', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    const project = tmpProject(home);
+    const emptyPath = path.join(home, 'empty-path');
+    fs.mkdirSync(emptyPath, { recursive: true });
+    const env = { ...process.env, HOME: home, PATH: emptyPath };
+    const args = [
+      BIN,
+      'setup',
+      '--yes',
+      '--clients=cursor',
+      '--with-hooks',
+      '--home',
+      home,
+      '--project',
+      project,
+      '--command',
+      path.join(home, 'bin', 'astrolabe'),
+      '--no-cursor-permissions',
+    ];
+    const first = spawnSync(process.execPath, args, { encoding: 'utf8', env });
+    assert.equal(first.status, 0, first.stderr + first.stdout);
+    const second = spawnSync(process.execPath, args, { encoding: 'utf8', env });
+    assert.equal(second.status, 0, second.stderr + second.stdout);
+    const backups = fs
+      .readdirSync(path.join(home, '.cursor'))
+      .filter((name) => name.startsWith('hooks.json.bak-'));
+    assert.ok(backups.length >= 1, `expected hooks.json backup, got ${backups.join(', ')}`);
+    const hooks = JSON.parse(
+      fs.readFileSync(path.join(home, '.cursor', 'hooks.json'), 'utf8'),
+    );
+    assert.equal(
+      hooks.hooks.preToolUse.filter((e) =>
+        /hooks\s+remind/.test(String(e.command || '')),
+      ).length,
+      1,
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('enableCursorApproval sets timeout/stdio and shells Windows .cmd', () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    let captured = null;
+    const spawnFn = (cmd, args, opts) => {
+      captured = { cmd, args, opts };
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    };
+    const result = clientsMod.enableCursorApproval({
+      home,
+      projectRoot: project,
+      env: { PATH: 'C:\\tools' },
+      whichFn: () => 'C:\\Program Files\\Cursor\\cursor-agent.cmd',
+      spawnFn,
+      platform: 'win32',
+    });
+    assert.equal(result.available, true);
+    assert.equal(captured.opts.timeout, 15000);
+    assert.deepEqual(captured.opts.stdio, ['ignore', 'pipe', 'pipe']);
+    assert.equal(captured.opts.shell, true);
+    assert.deepEqual(captured.args, []);
+    assert.match(captured.cmd, /^"C:\\Program Files\\Cursor\\cursor-agent\.cmd" mcp enable astrolabe$/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('loadL1Template falls back when the packaged template is absent', () => {
+  const template = clientsMod.loadCursorL1Template({ existsFn: () => false });
+  assert.match(template, /CRITICAL/);
+  assert.match(template, /astrolabe-find_symbol/);
+  assert.match(template, /\{\{INDEX_ROOT\}\}/);
 });
