@@ -317,3 +317,21 @@ DSH 可为每个仓库注册一个 MCP server，工具名形如 `mcp__astrolabe-
 - 命令识别按 shell 分词后只看"命令位置"的 token：支持 `cd x && grep`、`sudo grep`、`FOO=1 rg`、`bash -c "grep …"`、`grep.exe`/`rg.exe`、`findstr`、`Select-String`、`git [opts] grep`；`echo grep is great`、`git commit -m "fix grep bug"` 不会被当成搜索。软模式不把管道后段（`cat a | grep x`）当 grep，硬模式会拦。
 - Windows 原生环境没有 `HOME` 时，状态目录回退到 `USERPROFILE`（再回退 `HOMEDRIVE`+`HOMEPATH`）。这一点只通过单元测试覆盖，**未在真实 Windows 上验证**。
 - 计数文件锁使用操作系统文件锁（flock / LockFileEx），进程崩溃后自动释放，不会遗留需要手动清理的锁。
+
+### Runtime diagnostics and resource reads
+
+Soft-mode code-discovery counters do not count direct reads of recognized resources
+(e.g. SVG/images, Markdown and diagnostic text/log files). These reads neither clear
+nor increment an existing source-discovery burst. Unknown file types and unsupported
+source-language reads retain the existing mixed-read guard.
+
+A narrow soft-mode exception also permits grep/rg of explicit `.txt`/`.log` files
+under `/tmp`, `/private/tmp` or `/var/tmp` for runtime diagnostics. It does not cover
+source files, implicit/current-directory searches, recursive searches, wildcards,
+substitutions, unknown options or unknown companion commands. Every search/read in
+a compound command is checked; adding a source search or source read removes the
+exception. Hard text-search mode remains unchanged, including pipeline filters.
+
+For code discovery, use a relevant `find_symbol` or `resolve_contx` query; use
+`search_code` for literal/regex searches. Every recognized Astrolabe tool resets the
+full grep/read/slice burst before invocation; a resource read is not a reset token.

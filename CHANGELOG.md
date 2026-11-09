@@ -6,6 +6,58 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.8] - 2026-11-07
+
+### 中文
+
+本版本相对 v0.17.7 仅包含 #125 的会话复现修复与本次版本更新。
+
+#### 路径纠错与子目录索引
+- 修复子目录 `index_root` 复用父索引时的纠错建议往返：保持原 `index_root` 重试建议的 `path_filter`，不再出现 `ai-proxy/ai-proxy/...` 或 `src/daemon/src/daemon/...` 的重复前缀失败。建议仅来自所请求目录，不再列出兄弟目录。
+- 绝对路径先按所请求目录归一化再折叠到父索引；拒绝目录外路径与 `..` 分量，不通过猜测删除重复前缀，以免破坏合法同名嵌套目录。保留 Windows 相对路径大小写，覆盖盘符、verbatim、UNC 与斜杠写法。
+- 工具参数说明、索引复用提示与 FAQ 明确输入基准：`path` / `path_filter` 相对所请求 `index_root`；结果文件路径仍相对响应中标明的活动索引根。
+
+#### Hook 误拦与提示
+- 软模式中，明确识别的资源/文档读取，以及 `/tmp`、`/private/tmp`、`/var/tmp` 下显式 `.txt` / `.log` 诊断搜索，不再误计为代码发现调用；这些操作**既不增加也不清零**已有 burst 计数。
+- 豁免保持保守：源码搜索/读取、复合命令中的源码操作、未知类型/未支持语言的原有 guard，以及硬文本搜索模式均保持保护。
+- 纠正拒绝提示：识别到的 Astrolabe 工具（包括 `search_code`）会清零完整 grep/read/slice burst，无需先做无关的符号查询。
+
+#### 验证与已知限制
+- 原生 stdio 回归复现 Go 文件的“错误路径 → 建议 → 相同子根重试”序列；新增路径、Hook 与隔离临时目录测试。Windows 路径仅为模拟回归覆盖，**未进行 Windows 真机验证**。
+- 本次未修改 watcher 调度/新鲜度行为；Mac 上已有的三个 watcher/barrier/快速回退测试失败及两个严格 lint 的未使用测试 helper 问题不声称已修复，详见 #125。
+
+#### 安装后必须 setup（含 hooks）
+```bash
+npm i -g @zlnap/astrolabe@0.17.8
+npx -y @zlnap/astrolabe@0.17.8 setup --with-hooks
+```
+只安装二进制不会配置 MCP 或 hooks；已有会话需由用户自行按客户端要求重新加载配置。
+
+### English
+
+Compared with v0.17.7, this release contains only the session-reproduced fixes in #125 and the version update.
+
+#### Path corrections and subdirectory indexing
+- Missing-path suggestions now round-trip with an unchanged subdirectory `index_root` when reusing a parent index, preventing `ai-proxy/ai-proxy/...` and `src/daemon/src/daemon/...` correction loops. Suggestions stay inside the requested directory, excluding siblings.
+- Normalize absolute inputs against the requested root before parent-index translation; reject outside-root inputs and `..` components instead of guessing away repeated prefixes in legitimate nested directories. Preserve Windows relative-path case across drive, verbatim, UNC and slash spellings.
+- Tool schemas, reuse notes and FAQ clarify that input `path` / `path_filter` remain relative to the requested `index_root`; result file paths remain relative to the active index root reported in the response.
+
+#### Hook false positives and guidance
+- In soft mode, recognized resource/document reads and explicit `.txt` / `.log` diagnostics under `/tmp`, `/private/tmp` or `/var/tmp` no longer count as code discovery. They **neither increment nor reset** an existing burst.
+- Exemptions remain narrow: source searches/reads, source operations inside compound commands, existing guards for unknown types/unsupported languages, and hard text-search mode remain protected.
+- Correct denial guidance: every recognized Astrolabe tool, including `search_code`, resets the full grep/read/slice burst; an unrelated symbolic query is unnecessary.
+
+#### Verification and known limitations
+- A native stdio regression reproduces the Go-file miss/suggest/retry sequence with unchanged subroots; path, hook and isolated temporary-repository regressions are included. Windows paths have **simulated regression coverage only, not real-machine verification**.
+- Watcher scheduling/freshness is unchanged. This release does not claim to fix the three pre-existing Mac watcher/barrier/quick-revert test failures or the two strict-lint unused test-helper warnings documented in #125.
+
+#### Setup is required after installation (with hooks)
+```bash
+npm i -g @zlnap/astrolabe@0.17.8
+npx -y @zlnap/astrolabe@0.17.8 setup --with-hooks
+```
+A binary-only installation configures neither MCP nor hooks. Existing sessions must be reloaded by the user as required by their client.
+
 ## [0.17.7] - 2026-11-02
 
 自 v0.17.6 以来的 PR：#123（setup 默认短名 allowlist + 迁移旧长名）、#116（Dependabot zip 9.0.4→9.0.5）。完整说明见 GitHub Release。
