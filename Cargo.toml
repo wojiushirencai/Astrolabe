@@ -74,6 +74,14 @@ schemars = "1.2"
 regex = "1.13"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
 
+# Global allocator for astrolabe-mcp (src/main.rs). mimalloc keeps far less
+# free memory in per-thread arenas than the system allocator after a large
+# index build, and `mi_collect(true)` can hand the pages back to the OS.
+# `libmimalloc-sys` is listed explicitly so alloc.rs can call `mi_collect`;
+# its `extended` feature exposes the binding.
+mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = "0.1"
+
 # LSP installer (download / checksum / extract). Pinned for parallel tasks.
 sha2 = "0.10"
 hex = "0.4"

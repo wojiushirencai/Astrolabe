@@ -111,7 +111,8 @@ struct FileTree {
 impl FileTree {
     fn new(index: &RepoIndex, file: FileId) -> Self {
         let symbols = &index.graph().symbols;
-        let members = index.names().name_path.file_symbols(file);
+        let names = index.names();
+        let members = names.name_path.file_symbols(file);
         let (order, parent) = nest(symbols, members);
         let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
         for &idx in &order {

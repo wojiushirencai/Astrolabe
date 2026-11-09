@@ -71,7 +71,13 @@ pub(crate) fn with_file_cache<R>(cache: Option<&Arc<FileCache>>, f: impl FnOnce(
 
 pub(crate) fn read_lines(root: &Path, path: &str) -> Option<Arc<Vec<String>>> {
     if let Some(cache) = FILE_CACHE.with(|c| c.borrow().clone()) {
-        return crate::index::load_source_lines(&cache, root, path).map(|(lines, _)| lines);
+        // The cache stores the compact `CachedLines` (one String plus one
+        // offset table). The remaining callers of `read_lines` in
+        // `live_backend` / `py_refs` still take `Arc<Vec<String>>`, so this
+        // compatibility boundary materializes owned lines once per read;
+        // new call sites should use `index::load_source_lines` directly.
+        return crate::index::load_source_lines(&cache, root, path)
+            .map(|(lines, _)| Arc::new(lines.to_vec()));
     }
     let source = astrolabe_core::text::read_source(&root.join(path)).ok()?;
     Some(Arc::new(source.lines().map(str::to_owned).collect()))

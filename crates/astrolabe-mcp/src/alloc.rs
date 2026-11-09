@@ -1,13 +1,23 @@
 //! Hand freed heap back to the OS after big index swaps.
 //!
 //! On a 4.35M-line repo about 45% of RSS after an index build is free memory
-//! that glibc keeps in its per-thread arenas (rayon parses on every core, so
-//! every core gets an arena full of parse temporaries). `malloc_trim(0)` walks
-//! every arena and `madvise`s the free pages away; the live data (graph,
-//! NameIndex) is untouched.
+//! kept in allocator arenas (rayon parses on every core, so every core gets an
+//! arena full of parse temporaries). Two layers are purged:
 //!
-//! Only Linux glibc has `malloc_trim`. musl, macOS and Windows compile this to
-//! a no-op. `ASTROLABE_MALLOC_TRIM=0` turns it off (A/B and escape hatch).
+//! 1. `mi_collect(true)` asks mimalloc (the process's global allocator) to
+//!    collect every heap and release its free pages immediately.
+//! 2. The platform allocator is trimmed too, for memory the C libraries
+//!    (tree-sitter, sqlite, system frameworks) allocated through the system
+//!    `malloc` rather than through Rust's global allocator:
+//!    - Linux glibc: `malloc_trim(0)` walks every arena and `madvise`s the
+//!      free pages away.
+//!    - macOS: `malloc_zone_pressure_relief(NULL, 0)` relieves pressure on
+//!      all registered malloc zones.
+//!    - Windows: `_heapmin()` returns free CRT heap pages to the OS.
+//!
+//! The live data (graph, NameIndex) is untouched. Linux musl and other targets
+//! compile this to a no-op. `ASTROLABE_MALLOC_TRIM=0` turns it off (A/B and
+//! escape hatch).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -32,7 +42,11 @@ fn parse_enabled(raw: Option<&str>) -> bool {
     )
 }
 
-const SUPPORTED: bool = cfg!(all(target_os = "linux", target_env = "gnu"));
+const SUPPORTED: bool = cfg!(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    target_os = "windows",
+));
 
 /// Return free heap pages to the OS, on the calling thread. If another
 /// thread is already trimming, this only marks the heap dirty and returns at
@@ -56,21 +70,62 @@ pub(crate) fn release_free_memory() -> bool {
     true
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    target_os = "windows",
+))]
 fn trim_now() {
     let started = std::time::Instant::now();
-    // SAFETY: malloc_trim takes no pointers and is thread-safe (it locks
-    // each arena while trimming it).
-    let released = unsafe { libc::malloc_trim(0) };
+    // SAFETY: mi_collect(true) only walks mimalloc's own heaps and takes no
+    // pointers from this crate; it is safe to call from any thread.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+    let native_released = trim_platform_allocator();
     tracing::debug!(
-        released = released != 0,
+        native_released,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "malloc_trim"
+        "mimalloc trim"
     );
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    target_os = "windows",
+)))]
 fn trim_now() {}
+
+/// Trim the system allocator used by C libraries that do not go through
+/// Rust's global allocator. Returns whether the platform reported releasing
+/// anything.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_platform_allocator() -> bool {
+    // SAFETY: malloc_trim takes no pointers and is thread-safe (it locks
+    // each arena while trimming it).
+    unsafe { libc::malloc_trim(0) != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn trim_platform_allocator() -> bool {
+    // libmalloc is part of libSystem; the symbol has shipped since 10.7.
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    // SAFETY: a null zone asks libmalloc to relieve every registered zone.
+    // The call takes no pointer we own and is safe to run concurrently.
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) != 0 }
+}
+
+#[cfg(target_os = "windows")]
+fn trim_platform_allocator() -> bool {
+    // `_heapmin` lives in the CRT that Rust links against.
+    unsafe extern "C" {
+        fn _heapmin() -> std::ffi::c_int;
+    }
+    // SAFETY: _heapmin operates on the CRT heap and is thread-safe. It
+    // returns 0 on success (whether or not pages were actually released).
+    unsafe { _heapmin() == 0 }
+}
 
 /// How long applies must stay quiet before [`release_free_memory_when_quiet`]
 /// trims. Each apply reassembles the whole graph, so trimming between two
@@ -136,6 +191,29 @@ mod tests {
         for off in ["0", "off", "OFF", " false ", "no"] {
             assert!(!parse_enabled(Some(off)), "{off:?} should disable");
         }
+    }
+
+    #[test]
+    fn trim_is_supported_and_returns_true_on_supported_targets() {
+        if !SUPPORTED {
+            // musl and other targets compile the trim to a no-op.
+            assert!(!release_free_memory(), "unsupported targets must not trim");
+            return;
+        }
+        if !enabled() {
+            // ASTROLABE_MALLOC_TRIM opted out of trims for this process.
+            return;
+        }
+        // A concurrent test may hold RUNNING; retry rather than racing it.
+        let mut released = false;
+        for _ in 0..50 {
+            released = release_free_memory();
+            if released {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(released, "release_free_memory should run a trim");
     }
 
     #[test]

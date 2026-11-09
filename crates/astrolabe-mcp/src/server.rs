@@ -10,7 +10,7 @@ use std::{
 
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
-    cache::{FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
+    cache::{CachedLines, FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
     graph::{cached_centrality, rank_and_match},
     render::symbol_line,
     types::RelPath,
@@ -1215,9 +1215,11 @@ fn render_grouped_hits(
         }
         let file_is_test = crate::explain::is_test_caller(path, "");
         let wanted: Vec<usize> = rows.iter().map(|r| r.line.saturating_sub(1)).collect();
+        // `role_views` feeds `code_mask`, which still takes `&[String]`:
+        // materialize the compact buffer once per file with hits.
         let views = index
             .cached_lines(cache, path)
-            .and_then(|(lines, _)| role_views(path, &lines, &wanted));
+            .and_then(|(lines, _)| role_views(path, &lines.to_vec(), &wanted));
         for r in &mut rows {
             let test = file_is_test || crate::explain::is_test_caller(path, &r.sym);
             r.role = match views
@@ -1400,7 +1402,7 @@ fn render_symbol_hits(
     limit: usize,
     fallback: usize,
     enclosing: &dyn Fn(&SearchHit) -> Option<CodeSymbol>,
-    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<CachedLines>>,
     seen: &mut dyn FnMut(&str, u32, u32) -> Option<u64>,
 ) -> Option<(String, bool)> {
     let mut out = String::new();
@@ -1517,11 +1519,11 @@ fn render_search_hits(
     hits: &[SearchHit],
     context: usize,
     limit: usize,
-    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<CachedLines>>,
 ) -> (String, usize) {
     let mut budget = TokenBudget::new(limit);
     let mut out = String::new();
-    let mut current: Option<(String, Option<Arc<Vec<String>>>)> = None;
+    let mut current: Option<(String, Option<Arc<CachedLines>>)> = None;
     // Last line (1-based) already printed for the current file.
     let mut printed = 0usize;
     for (i, hit) in hits.iter().enumerate() {
@@ -2210,9 +2212,21 @@ impl AstrolabeServer {
 
     pub fn start_indexing(&self) {
         if let Some(dispatch) = &self.dispatch {
-            start_idle_ticker(Arc::clone(dispatch), Arc::clone(&self.ticker_stop));
+            start_idle_ticker(
+                Some(Arc::clone(&self.primary)),
+                Some(Arc::clone(dispatch)),
+                Arc::clone(&self.ticker_stop),
+            );
             return;
         }
+        // Single-root mode: patrol the primary for two-stage idle eviction.
+        // The primary is not indexed here when a dispatch exists (multi-project
+        // children activate on first use), and `assemble` never begins a ticker.
+        start_idle_ticker(
+            Some(Arc::clone(&self.primary)),
+            None,
+            Arc::clone(&self.ticker_stop),
+        );
         start_root_indexing(Arc::clone(&self.primary));
     }
 
@@ -2273,7 +2287,16 @@ impl AstrolabeServer {
         })
     }
 
+    /// Route a tool call to its session, stamping the idle clock.
     fn session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
+        let session = self.route_session_for(hint)?;
+        session.touch();
+        Ok(session)
+    }
+
+    /// Route without stamping: pre-call state probes (`building_session`) use
+    /// this, so deciding how to answer does not count as activity.
+    fn route_session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
         if hint.is_empty() {
             return Ok(Arc::clone(&self.primary));
         }
@@ -2302,6 +2325,19 @@ impl AstrolabeServer {
             };
         }
         Ok(Arc::clone(&self.primary))
+    }
+
+    /// Wake a hard-hibernated index and wait briefly (bounded) for its warm
+    /// start, so every indexed tool path gets a served snapshot instead of a
+    /// "building" answer. No-op for every other state.
+    fn wake_if_hibernated(&self, session: &Arc<RootSession>) {
+        let hibernated = matches!(
+            &*session.state.read().unwrap_or_else(|e| e.into_inner()),
+            IndexState::Hibernated
+        );
+        if hibernated {
+            session.ensure_awake();
+        }
     }
 
     /// Resolve optional per-call `index_root`, then fall back to multi-project
@@ -2423,7 +2459,11 @@ confidence: unknown"
                 self.primary.knobs.clone(),
                 self.cache_budget_bytes,
             );
-            start_idle_ticker(Arc::clone(&dispatch), Arc::clone(&self.ticker_stop));
+            start_idle_ticker(
+                None,
+                Some(Arc::clone(&dispatch)),
+                Arc::clone(&self.ticker_stop),
+            );
             *slot = Some(dispatch);
         }
         let dispatch = Arc::clone(slot.as_ref().expect("just inserted"));
@@ -2542,12 +2582,23 @@ confidence: unknown"
         }
     }
 
-    /// The routed session, when its index is still in the cold build.
+    /// The routed session, when its index is not serving yet (cold build, or
+    /// a hard-hibernated index that has to warm-start). A hibernated index is
+    /// woken here (bounded) so `search_code` can answer from the restored
+    /// index; if the warm start does not finish in time, the on-disk scan
+    /// fallback still answers instead of a "retry shortly" error.
     fn building_session(&self, hint: &str) -> Option<Arc<RootSession>> {
         let session = self.session_for(hint).ok()?;
+        let hibernated = matches!(
+            &*session.state.read().unwrap_or_else(|e| e.into_inner()),
+            IndexState::Hibernated
+        );
+        if hibernated {
+            session.ensure_awake();
+        }
         let building = matches!(
             &*session.state.read().unwrap_or_else(|e| e.into_inner()),
-            IndexState::Building
+            IndexState::Building | IndexState::Hibernated
         );
         building.then_some(session)
     }
@@ -2697,6 +2748,9 @@ confidence: unknown"
             Ok(s) => s,
             Err(err) => return err,
         };
+        // A hibernated index has no snapshot to serve: warm-start it first
+        // (bounded), then run the ordinary freshness barrier on the result.
+        self.wake_if_hibernated(&session);
         let effect = if barrier {
             run_barrier(&session)
         } else {
@@ -2714,6 +2768,9 @@ confidence: unknown"
             IndexState::Building => Snap::Building,
             IndexState::Failed(error) => Snap::Failed(error.clone()),
             IndexState::Ready(index) => Snap::Ready(Arc::clone(index)),
+            // Still hibernated: the wake either did not start (cooldown) or
+            // did not finish inside `WAKE_WAIT`. Answer like a cold build.
+            IndexState::Hibernated => Snap::Building,
         };
         let result = match snap {
             Snap::Building => {
@@ -2763,6 +2820,7 @@ confidence: unknown"
             Ok(s) => s,
             Err(err) => return err,
         };
+        self.wake_if_hibernated(&session);
         let effect = if barrier {
             run_barrier(&session)
         } else {
@@ -2861,6 +2919,7 @@ confidence: unknown"
         let Ok(session) = self.session_for(hint) else {
             return run();
         };
+        self.wake_if_hibernated(&session);
         let _ = run_barrier(&session);
         let Some(stamp) = Self::stamp_of(&session) else {
             return run();
@@ -4281,6 +4340,9 @@ impl AstrolabeServer {
                         return None;
                     }
                     let (lines, cache_hit) = index.cached_lines(&session.file_cache, path)?;
+                    // `LineScanner` and `code_mask` still take `&[String]`;
+                    // materialize the compact buffer once per scanned file.
+                    let lines = lines.to_vec();
                     let mut out = FileScan {
                         hits: Vec::new(),
                         cache_hit,
@@ -4617,11 +4679,11 @@ impl AstrolabeServer {
                     );
                 }
                 let context = search_context_lines(params.context_lines, total);
-                let mut file_lines = |hit: &SearchHit| -> Option<Arc<Vec<String>>> {
+                let mut file_lines = |hit: &SearchHit| -> Option<Arc<CachedLines>> {
                     if hit.text_only {
                         let text =
                             std::fs::read_to_string(session.root.join(&hit.path)).ok()?;
-                        Some(Arc::new(text.lines().map(str::to_string).collect()))
+                        Some(Arc::new(CachedLines::from_text(text)))
                     } else {
                         index
                             .cached_lines(&session.file_cache, &hit.path)
@@ -5032,7 +5094,8 @@ impl AstrolabeServer {
                 let mut impl_sources = std::collections::HashMap::new();
                 // Equal ignoring ASCII case implies equal lowercase names, so
                 // the name table's group is a superset (in symbol order).
-                let candidates = index.names().by_lower(&last.to_lowercase());
+                let names = index.names();
+                let candidates = names.by_lower(&last.to_lowercase());
                 for symbol in candidates.iter().map(|&i| &symbols[i as usize]) {
                     if !symbol.name.eq_ignore_ascii_case(last)
                         || kind.is_some_and(|k| symbol.kind != k)
@@ -9300,8 +9363,10 @@ mod tests {
         }
     }
 
-    fn numbered(n: usize) -> Arc<Vec<String>> {
-        Arc::new((1..=n).map(|i| format!("line{i}")).collect())
+    fn numbered(n: usize) -> Arc<CachedLines> {
+        Arc::new(CachedLines::from_lines(
+            (1..=n).map(|i| format!("line{i}")).collect(),
+        ))
     }
 
     #[test]
@@ -10039,7 +10104,7 @@ mod tests {
             match &*server.primary.state.read().unwrap() {
                 IndexState::Ready(_) => return,
                 IndexState::Failed(e) => panic!("index failed: {e}"),
-                IndexState::Building => {}
+                IndexState::Building | IndexState::Hibernated => {}
             }
             if start.elapsed() > timeout {
                 panic!("timeout waiting for Ready");
@@ -10054,7 +10119,7 @@ mod tests {
             match &*session.state.read().unwrap() {
                 IndexState::Ready(_) => return,
                 IndexState::Failed(e) => panic!("index failed: {e}"),
-                IndexState::Building => {}
+                IndexState::Building | IndexState::Hibernated => {}
             }
             if start.elapsed() > timeout {
                 panic!("timeout waiting for child Ready");
@@ -10065,6 +10130,49 @@ mod tests {
 
     fn git_marker(dir: &Path) {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
+    }
+
+    /// End-to-end two-stage idle wake: a hard-hibernated primary must
+    /// warm-start on the next routed tool call and serve real results, not
+    /// a "retry shortly" answer.
+    #[test]
+    fn hibernated_primary_wakes_on_the_next_tool_call() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server =
+            AstrolabeServer::new_with_knobs(dir.clone(), test_knobs(), 8 * 1024 * 1024);
+        server.structured_output = false;
+        server.start_indexing();
+        wait_ready(&server, Duration::from_secs(20));
+
+        // Simulate the hard stage: unload the index and leave it hibernated.
+        *server.primary.state.write().unwrap() = IndexState::Hibernated;
+        assert!(server.primary.snapshot_ready().is_none());
+
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            root: None,
+            index_root: None,
+            query: "alpha".into(),
+            include_body: false,
+            substring: None,
+            path_filter: None,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+            offset: 0,
+            dedup: None,
+            agent_id: None,
+        })));
+        assert!(
+            text.contains("alpha"),
+            "a hibernated index must wake and serve, got {text}"
+        );
+        assert!(
+            matches!(&*server.primary.state.read().unwrap(), IndexState::Ready(_)),
+            "the wake must leave a Ready index behind"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_knobs() -> crate::knobs::McpKnobs {
