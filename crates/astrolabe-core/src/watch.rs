@@ -1047,8 +1047,10 @@ trait EventFeed {
 struct NotifyFeed {
     rx: Receiver<Result<notify::Event, notify::Error>>,
     overflow: Arc<AtomicBool>,
-    /// Present only in selective (per-directory) mode; owns the watcher so
-    /// new directories can be registered from the consumer thread.
+    /// Keep the native backend alive in both recursive and selective modes.
+    /// Dropping it disconnects `rx` and silently degrades to polling.
+    watcher: notify::RecommendedWatcher,
+    /// Per-directory registration state, used only in selective mode.
     selective: Option<Selective>,
 }
 
@@ -1056,7 +1058,6 @@ struct NotifyFeed {
 /// trees (node_modules, target, ...), so their files cost no kernel watches
 /// or events.
 struct Selective {
-    watcher: notify::RecommendedWatcher,
     root: PathBuf,
     extra: Vec<String>,
     dirs: HashSet<PathBuf>,
@@ -1067,6 +1068,7 @@ impl Selective {
     /// it. Files seen are appended to `found`. Err on registration failure.
     fn register_tree(
         &mut self,
+        watcher: &mut notify::RecommendedWatcher,
         start: &Path,
         found: &mut Vec<PathBuf>,
     ) -> Result<(), notify::Error> {
@@ -1083,7 +1085,7 @@ impl Selective {
             if self.dirs.contains(&d) {
                 continue;
             }
-            self.watcher.watch(&d, RecursiveMode::NonRecursive)?;
+            watcher.watch(&d, RecursiveMode::NonRecursive)?;
             self.dirs.insert(d.clone());
             let Ok(rd) = fs::read_dir(&d) else { continue };
             for ent in rd.flatten() {
@@ -1100,14 +1102,19 @@ impl Selective {
 
     /// Register directories newly appearing among `paths`; returns the files
     /// found inside them (they may have been created before the watch).
-    fn adopt(&mut self, paths: &[PathBuf], overflow: &AtomicBool) -> Vec<PathBuf> {
+    fn adopt(
+        &mut self,
+        watcher: &mut notify::RecommendedWatcher,
+        paths: &[PathBuf],
+        overflow: &AtomicBool,
+    ) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for p in paths {
             let is_new_dir = fs::symlink_metadata(p)
                 .map(|m| m.file_type().is_dir())
                 .unwrap_or(false);
             if is_new_dir && !self.dirs.contains(p) && p.starts_with(&self.root) {
-                if let Err(e) = self.register_tree(p, &mut found) {
+                if let Err(e) = self.register_tree(watcher, p, &mut found) {
                     tracing::warn!(%e, dir = %p.display(), "failed to watch new directory");
                     overflow.store(true, Ordering::SeqCst);
                 }
@@ -1132,7 +1139,7 @@ impl EventFeed for NotifyFeed {
                     Vec::new()
                 };
                 if let Some(sel) = self.selective.as_mut() {
-                    let found = sel.adopt(&paths, &self.overflow);
+                    let found = sel.adopt(&mut self.watcher, &paths, &self.overflow);
                     paths.extend(found);
                 }
                 Ok(FeedWake::Events { paths, overflow })
@@ -1200,31 +1207,32 @@ fn init_notify(root: &Path, scan: &ScanOptions, selective: bool) -> Option<(Noti
             NotifyFeed {
                 rx,
                 overflow,
+                watcher,
                 selective: None,
             },
             (),
         ));
     }
     let mut sel = Selective {
-        watcher,
         root: root.to_path_buf(),
         extra: scan.extra_excludes.clone(),
         dirs: HashSet::new(),
     };
     let mut ignored = Vec::new();
-    if let Err(e) = sel.register_tree(root, &mut ignored) {
+    if let Err(e) = sel.register_tree(&mut watcher, root, &mut ignored) {
         tracing::warn!(%e, root = %root.display(), "failed to register notify watches");
         return None;
     }
     // `.git/info/exclude` changes the admitted set; `.git` itself is excluded.
     let info = root.join(".git").join("info");
     if info.is_dir() {
-        let _ = sel.watcher.watch(&info, RecursiveMode::NonRecursive);
+        let _ = watcher.watch(&info, RecursiveMode::NonRecursive);
     }
     Some((
         NotifyFeed {
             rx,
             overflow,
+            watcher,
             selective: Some(sel),
         },
         (),
@@ -2157,6 +2165,32 @@ mod tests {
             audit_ignored: false,
             ..ScanOptions::default()
         }
+    }
+
+    #[test]
+    fn recursive_notify_feed_keeps_native_watcher_alive() {
+        let dir = TestDir::new();
+        // Force the recursive path even on Linux, where production normally
+        // uses selective watches. No event loop or polling can satisfy this.
+        let (mut feed, ()) =
+            init_notify(dir.path(), &test_scan(), false).expect("initialize native watcher");
+        let path = dir.abs("native-watch-lifetime.rs");
+        dir.write("native-watch-lifetime.rs", "fn native_event() {}\n");
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "native event did not arrive within 2s"
+            );
+            match feed.recv_timeout(remaining) {
+                Ok(FeedWake::Events { paths, .. }) if paths.contains(&path) => break,
+                Ok(FeedWake::Events { .. }) => continue,
+                wake => panic!("native watcher stopped before delivering the write: {wake:?}"),
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     fn watcher(dir: &TestDir) -> Watcher {
