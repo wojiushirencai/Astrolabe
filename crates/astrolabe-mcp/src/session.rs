@@ -182,6 +182,8 @@ pub(crate) struct RootSession {
     /// Full builds (cold or background rebuild) currently running for this
     /// session; [`RootSession::wait_builds_idle`] waits for it to reach 0.
     pub builds_active: Arc<std::sync::atomic::AtomicUsize>,
+    /// Serializes shutdown with ownership acquisition and publication.
+    lifecycle: Mutex<()>,
     /// Last coverage note ("N 个文件有语法错误…") shown in full in this
     /// session. The note is repeated only when it changes, a result is
     /// empty, or a hit lands in an error file.
@@ -205,6 +207,11 @@ pub(crate) struct RootSession {
     /// panicked.
     #[cfg(test)]
     pub fail_applies: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) wake_before_publish:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    pub(crate) wake_wait_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl fmt::Debug for RootSession {
@@ -261,6 +268,7 @@ impl RootSession {
             rebuild_journal: Arc::new(Mutex::new(ChangeSet::default())),
             closed: Arc::new(AtomicBool::new(false)),
             builds_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            lifecycle: Mutex::new(()),
             coverage_note_shown: Arc::new(Mutex::new(None)),
             apply_health: Arc::new(Mutex::new(ApplyHealth::default())),
             last_active: Arc::new(AtomicU64::new(current_time_secs())),
@@ -270,6 +278,10 @@ impl RootSession {
             knobs,
             #[cfg(test)]
             fail_applies: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            wake_before_publish: Mutex::new(None),
+            #[cfg(test)]
+            wake_wait_started: Mutex::new(None),
         })
     }
 
@@ -291,6 +303,7 @@ impl RootSession {
 
     /// Stop the watcher and drop the indexer lock. Store files stay on disk.
     pub(crate) fn teardown(&self) {
+        let _lifecycle = self.lifecycle.lock_or_recover();
         self.closed.store(true, Ordering::SeqCst);
         if let Some(handle) = self.watch.lock_or_recover().take() {
             handle.stop();
@@ -301,6 +314,9 @@ impl RootSession {
 
     /// Record that a tool call routed to this session (idle-policy clock).
     pub(crate) fn touch(&self) {
+        // Serialize activity with the hard-idle check and state swap. A call
+        // either keeps Ready resident or observes Hibernated and wakes it.
+        let _state = self.state.read().unwrap_or_else(|e| e.into_inner());
         let now = current_time_secs();
         self.last_active.store(now, Ordering::Relaxed);
         // A query means the session is in use again: the next idle spell may
@@ -345,14 +361,25 @@ impl RootSession {
     /// on a helper thread, then hand every free page back to the OS. The repo
     /// must not be dropped on the ticker thread: tearing down a large graph
     /// takes tens of milliseconds.
-    fn hibernate(&self, idle_secs: u64) -> bool {
+    fn hibernate(&self, now_secs: u64, observed_activity: u64) -> bool {
+        let idle_secs = now_secs.saturating_sub(observed_activity);
         // Take the state write lock first, then re-check the rebuild flag:
         // a rebuild publishes `Ready` and would resurrect the memory we just
         // freed, so refusing while it is in flight is what keeps the swap
         // win. The flag is atomic, so this lock order cannot deadlock.
         let old = {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-            if self.rebuild_inflight.load(Ordering::SeqCst) {
+            if self.closed.load(Ordering::SeqCst)
+                || self.rebuild_inflight.load(Ordering::SeqCst)
+                || self.last_active.load(Ordering::Relaxed) != observed_activity
+                || self.idle_secs(now_secs) < self.idle_policy.hibernate.as_secs()
+            {
+                return false;
+            }
+            let last_wake = self.last_wake.load(Ordering::Relaxed);
+            if last_wake != 0
+                && now_secs.saturating_sub(last_wake) < self.idle_policy.wakeup_cooldown.as_secs()
+            {
                 return false;
             }
             match std::mem::replace(&mut *state, IndexState::Hibernated) {
@@ -406,24 +433,19 @@ impl RootSession {
             return false;
         }
         let now = current_time_secs();
-        {
-            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            if !matches!(*state, IndexState::Hibernated) {
-                return false;
-            }
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        // A concurrent winner may have moved Hibernated to Building (or
+        // already published Ready). Join that wake rather than refusing it.
+        match &*state {
+            IndexState::Ready(_) => return true,
+            IndexState::Building => return self.last_wake.load(Ordering::Relaxed) != 0,
+            IndexState::Failed(_) => return false,
+            IndexState::Hibernated => {}
         }
         let last_wake = self.last_wake.load(Ordering::Relaxed);
         if last_wake != 0
             && now.saturating_sub(last_wake) < self.idle_policy.wakeup_cooldown.as_secs()
         {
-            return false;
-        }
-        // Claim the rebuild slot and flip the state atomically: the state
-        // write lock is the same one every publisher takes, so no wake can
-        // race a publish, and `rebuild_inflight` stays owned by one loser /
-        // winner pair only.
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        if !matches!(*state, IndexState::Hibernated) {
             return false;
         }
         // A background rebuild already in flight publishes `Ready` by itself;
@@ -435,10 +457,10 @@ impl RootSession {
         {
             return true;
         }
+        self.last_wake.store(now, Ordering::Relaxed);
         *state = IndexState::Building;
         drop(state);
         self.touch();
-        self.last_wake.store(now, Ordering::Relaxed);
         tracing::info!(root = %self.root.display(), "waking hibernated primary index");
         self.spawn_wake();
         true
@@ -450,10 +472,17 @@ impl RootSession {
     /// back to `Hibernated` (retryable after the cooldown); a failed one is
     /// reported as `Failed`, like a failed cold build.
     fn spawn_wake(self: &Arc<Self>) {
+        // Register before spawning, and retain the guard through replay and
+        // publication, not merely through parsing inside build_session_index.
+        let Some(active) = BuildActive::enter_if_open(self) else {
+            self.rebuild_inflight.store(false, Ordering::SeqCst);
+            return;
+        };
         let session = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("astrolabe-wake".into())
             .spawn(move || {
+                let _active = active;
                 // Reset the rebuild slot even if publishing panics: a stuck
                 // `true` would wedge every later barrier-triggered rebuild.
                 struct RebuildSlot(Arc<AtomicBool>);
@@ -463,8 +492,21 @@ impl RootSession {
                     }
                 }
                 let _slot = RebuildSlot(Arc::clone(&session.rebuild_inflight));
-                let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
+                let persist = {
+                    let _lifecycle = session.lifecycle.lock_or_recover();
+                    if session.closed.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    crate::reindex::refresh_leader(&session.indexer_lock, &session.root)
+                };
                 let outcome = build_session_index(&session, persist);
+                #[cfg(test)]
+                if let Some((entered, resume)) =
+                    session.wake_before_publish.lock_or_recover().take()
+                {
+                    entered.wait();
+                    resume.wait();
+                }
                 match outcome {
                     Some(outcome @ IndexState::Ready(_)) => {
                         if session.closed.load(Ordering::SeqCst) {
@@ -505,8 +547,15 @@ impl RootSession {
 
     /// Wait (bounded) for a just-woken index to become `Ready`.
     fn wait_wake(&self, timeout: Duration) -> bool {
+        #[cfg(test)]
+        if let Some(started) = self.wake_wait_started.lock_or_recover().take() {
+            let _ = started.send(());
+        }
         let deadline = Instant::now() + timeout;
         loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return false;
+            }
             match &*self.state.read().unwrap_or_else(|e| e.into_inner()) {
                 IndexState::Ready(_) => return true,
                 // A failed wake is terminal for this call. `Hibernated` can
@@ -527,26 +576,19 @@ impl RootSession {
     /// hibernated"), `false` when the index is still building after the
     /// bounded wait or the wake was refused (cooldown).
     pub(crate) fn ensure_awake(self: &Arc<Self>) -> bool {
-        let is_hibernated = matches!(
-            &*self.state.read().unwrap_or_else(|e| e.into_inner()),
-            IndexState::Hibernated
-        );
-        if is_hibernated {
-            if !self.wake_if_hibernated() {
-                return false;
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let needs_wake = {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            match &*state {
+                IndexState::Ready(_) => return true,
+                IndexState::Failed(_) => return false,
+                IndexState::Building => self.last_wake.load(Ordering::Relaxed) != 0,
+                IndexState::Hibernated => true,
             }
-            return self.wait_wake(WAKE_WAIT);
-        }
-        // If another concurrent request already initiated the wake and transitioned
-        // state to Building, wait up to WAKE_WAIT as well instead of failing fast.
-        let is_waking = matches!(
-            &*self.state.read().unwrap_or_else(|e| e.into_inner()),
-            IndexState::Building
-        ) && self.last_wake.load(std::sync::atomic::Ordering::Relaxed) != 0;
-        if is_waking {
-            return self.wait_wake(WAKE_WAIT);
-        }
-        true
+        };
+        needs_wake && self.wake_if_hibernated() && self.wait_wake(WAKE_WAIT)
     }
 }
 
@@ -584,6 +626,15 @@ impl DispatchState {
 struct BuildActive(Arc<std::sync::atomic::AtomicUsize>);
 
 impl BuildActive {
+    fn enter_if_open(session: &RootSession) -> Option<Self> {
+        let _lifecycle = session.lifecycle.lock_or_recover();
+        if session.closed.load(Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self::enter(session))
+        }
+    }
+
     fn enter(session: &RootSession) -> Self {
         session.builds_active.fetch_add(1, Ordering::SeqCst);
         BuildActive(Arc::clone(&session.builds_active))
@@ -1141,6 +1192,9 @@ fn inline_repair(session: &RootSession, paths: Vec<RelPath>) {
 
 /// Kick a full `IncrementalIndex::build` without dropping to `Building`.
 pub(crate) fn trigger_background_rebuild_arc(session: &Arc<RootSession>) {
+    let Some(active) = BuildActive::enter_if_open(session) else {
+        return;
+    };
     if session
         .rebuild_inflight
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1163,8 +1217,16 @@ pub(crate) fn trigger_background_rebuild_arc(session: &Arc<RootSession>) {
     std::thread::Builder::new()
         .name("astrolabe-rebuild".into())
         .spawn(move || {
+            let _active = active;
             let started = Instant::now();
-            let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
+            let persist = {
+                let _lifecycle = session.lifecycle.lock_or_recover();
+                if session.closed.load(Ordering::SeqCst) {
+                    session.rebuild_inflight.store(false, Ordering::SeqCst);
+                    return;
+                }
+                crate::reindex::refresh_leader(&session.indexer_lock, &session.root)
+            };
             let outcome = build_session_index(&session, persist);
             let rebuilt = matches!(outcome, Some(IndexState::Ready(_)));
             {
@@ -1196,9 +1258,17 @@ pub(crate) fn trigger_background_rebuild_arc(session: &Arc<RootSession>) {
 /// Publish a background rebuild without losing changes that were applied to
 /// the old index (journal) or buffered (pending) while it was building.
 fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
+    // Preserve pending-before-state lock ordering, and acquire the lifecycle
+    // gate only after pending: an older publisher may tear down on cancel.
+    // Closing and replay/publication are mutually exclusive, so ownership
+    // cannot be reacquired (or Ready published) after the session closes.
+    let mut pending = session.pending.lock_or_recover();
+    let _lifecycle = session.lifecycle.lock_or_recover();
+    if session.closed.load(Ordering::SeqCst) {
+        return;
+    }
     let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
     let opts = crate::reindex::mcp_index_options(persist, session.knobs.parse_cache_bytes);
-    let mut pending = session.pending.lock_or_recover();
     let mut replay = std::mem::take(&mut *session.rebuild_journal.lock_or_recover());
     replay.merge(std::mem::take(&mut *pending));
     if let IndexState::Ready(index) = &outcome {
@@ -1222,7 +1292,10 @@ fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
             .last_active
             .store(current_time_secs(), Ordering::Relaxed);
     }
-    *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
+    let mut state = session.state.write().unwrap_or_else(|e| e.into_inner());
+    if !session.closed.load(Ordering::SeqCst) {
+        *state = outcome;
+    }
 }
 
 /// Append a staleness note to the first text block of an already-finished result.
@@ -1351,7 +1424,12 @@ fn patrol_primary(primary: &Arc<RootSession>, now_secs: u64) {
     if primary.closed.load(Ordering::SeqCst) {
         return;
     }
-    let idle = primary.idle_secs(now_secs);
+    let observed_activity = primary.last_active.load(Ordering::Relaxed);
+    let idle = if observed_activity == 0 {
+        0
+    } else {
+        now_secs.saturating_sub(observed_activity)
+    };
     let policy = primary.idle_policy;
     if idle >= policy.hibernate.as_secs() {
         // A just-woken index stays up for the cooldown even if it was never
@@ -1361,7 +1439,7 @@ fn patrol_primary(primary: &Arc<RootSession>, now_secs: u64) {
         if last_wake != 0 && now_secs.saturating_sub(last_wake) < policy.wakeup_cooldown.as_secs() {
             return;
         }
-        primary.hibernate(idle);
+        primary.hibernate(now_secs, observed_activity);
     } else if idle >= policy.soft_evict.as_secs() {
         // Only consume the per-spell trip when there is a snapshot to shed;
         // a session still building would otherwise burn the trip and never
@@ -2371,5 +2449,128 @@ mod tests {
             IndexState::Hibernated
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn hard_patrol_rechecks_activity_before_swapping_ready() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        let session = ready_session_with_policy(
+            &dir,
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            idle_policy(0, 60, 0),
+        );
+        // Model the patrol's observation, followed by a routed request before
+        // hibernate acquires the write lock. No wall-clock delay is required.
+        let observed = current_time_secs() + 10;
+        session.last_active.store(observed, Ordering::Relaxed);
+        let patrol_now = observed + 120;
+        assert!(session.idle_secs(patrol_now) >= 60);
+        session.touch();
+        assert!(session.ensure_awake());
+        assert!(!session.hibernate(patrol_now, observed));
+        assert!(session.snapshot_ready().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_wake_callers_join_the_building_winner() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let session = ready_session_with_policy(
+            &dir,
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            idle_policy(0, 1, 0),
+        );
+        *session.state.write().unwrap() = IndexState::Hibernated;
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *session.wake_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        assert!(session.wake_if_hibernated());
+        entered.wait();
+        assert!(matches!(
+            *session.state.read().unwrap(),
+            IndexState::Building
+        ));
+        // This is the loser path: it must report an existing wake even though
+        // Hibernated was replaced before this request reached the claim lock.
+        assert!(session.wake_if_hibernated());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        *session.wake_wait_started.lock().unwrap() = Some(started_tx);
+        let waiter_session = Arc::clone(&session);
+        let waiter = std::thread::spawn(move || waiter_session.ensure_awake());
+        let started = started_rx.recv_timeout(Duration::from_secs(2));
+        resume.wait();
+        assert!(
+            started.is_ok(),
+            "concurrent request must join the wake wait"
+        );
+        assert!(waiter.join().unwrap());
+        assert!(session.snapshot_ready().is_some());
+        assert!(session.wait_builds_idle(Duration::from_secs(5)));
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shutdown_waits_for_wake_after_parsing_before_publish() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        let session = ready_session_with_policy(
+            &dir,
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            idle_policy(0, 1, 0),
+        );
+        *session.state.write().unwrap() = IndexState::Hibernated;
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *session.wake_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        assert!(session.wake_if_hibernated());
+        entered.wait();
+        session.teardown();
+        assert!(
+            !session.wait_builds_idle(Duration::ZERO),
+            "publication phase must still count as active"
+        );
+        assert!(
+            !session.ensure_awake(),
+            "closed waiters must not wait for the deadline"
+        );
+        resume.wait();
+        assert!(session.wait_builds_idle(Duration::from_secs(5)));
+        assert!(session.snapshot_ready().is_none());
+        assert!(session.indexer_lock.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn closed_rebuild_cannot_reacquire_ownership_or_publish() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        let session = ready_session_with_policy(
+            &dir,
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            idle_policy(0, 1, 0),
+        );
+        let outcome = build_index(&dir, false, session.knobs.parse_cache_bytes);
+        *session.state.write().unwrap() = IndexState::Hibernated;
+        session.teardown();
+        publish_rebuilt(&session, outcome);
+        assert!(session.snapshot_ready().is_none());
+        assert!(session.indexer_lock.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -633,13 +633,27 @@ pub(crate) fn process_matches_cursor_astrolabe(
     workspace_root: Option<&Path>,
 ) -> bool {
     let lower = cmdline.to_ascii_lowercase();
-    if !lower.contains("astrolabe") || !cmdline_has_cursor_context(&lower) {
+    // A hook may carry the same context and cwd as its MCP server. It is not
+    // evidence that the server is available (including a concurrent hook).
+    let is_hook = lower
+        .split_whitespace()
+        .any(|token| token.trim_matches(['\'', '"']) == "hooks");
+    if !lower.contains("astrolabe") || !cmdline_has_cursor_context(&lower) || is_hook {
         return false;
     }
     match workspace_root {
         None => true,
         Some(root) => proc_cwd.is_some_and(|cwd| paths_equivalent(cwd, root)),
     }
+}
+
+fn process_is_cursor_astrolabe_server(
+    pid: u32,
+    cmdline: &str,
+    proc_cwd: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> bool {
+    pid != std::process::id() && process_matches_cursor_astrolabe(cmdline, proc_cwd, workspace_root)
 }
 
 // ---- 进程存活探测 ----------------------------------------------------------
@@ -674,13 +688,19 @@ fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
     else {
         return false;
     };
+    if !out.status.success() {
+        return false;
+    }
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let line = line.trim_start();
         let Some((pid, cmdline)) = line.split_once(char::is_whitespace) else {
             continue;
         };
+        let Ok(process_id) = pid.parse::<u32>() else {
+            continue;
+        };
         let cmdline = cmdline.trim_start();
-        if !process_matches_cursor_astrolabe(cmdline, None, None) {
+        if !process_is_cursor_astrolabe_server(process_id, cmdline, None, None) {
             continue;
         }
         let cwd = process_cwd_for_pid(pid);
@@ -709,7 +729,10 @@ fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
             continue;
         };
         let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
-        if !process_matches_cursor_astrolabe(&cmdline, None, None) {
+        let Ok(process_id) = pid.parse::<u32>() else {
+            continue;
+        };
+        if !process_is_cursor_astrolabe_server(process_id, &cmdline, None, None) {
             continue;
         }
         let cwd = std::fs::read_link(proc_dir.join("cwd")).ok();
@@ -722,8 +745,10 @@ fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn astrolabe_cursor_process_alive(_workspace_root: Option<&Path>) -> bool {
-    // 其它平台无法可靠读取进程 cwd：保持旧的强制行为，避免误降级。
-    true
+    // No reliable project-scoped probe is available on these platforms (including
+    // Windows). Unknown availability must not strand auto mode in a hard deny;
+    // users who require unconditional blocking can explicitly select enforce.
+    false
 }
 
 /// 结合批准状态与进程存活状态决定是否维持强制拦截。
@@ -6101,6 +6126,60 @@ mod tests {
     }
 
     #[test]
+    fn cursor_approved_without_server_allows_hard_auto_but_not_enforce() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("astrolabe_cursor_no_server_{rand_id}"));
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        std::fs::write(
+            home.join(".cursor/mcp.json"),
+            r#"{"mcpServers":{"astrolabe":{"command":"astrolabe"}}}"#,
+        )
+        .unwrap();
+        assert!(cursor_mcp_approved(&home, &workspace));
+        assert!(!astrolabe_cursor_process_alive(Some(&workspace)));
+        let payload = serde_json::json!({
+            "conversation_id": "cursor_approved_no_server",
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "foo"},
+            "workspace_roots": [workspace],
+        })
+        .to_string();
+        for (mode, permission) in [
+            (CursorMode::Auto, "allow"),
+            (CursorMode::Advisory, "allow"),
+            (CursorMode::Enforce, "deny"),
+        ] {
+            let cfg = HooksConfig {
+                cursor_mode: mode,
+                deny_text_search: true,
+                ..Default::default()
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                run_remind_impl_with(
+                    "cursor",
+                    payload.as_bytes(),
+                    &mut out,
+                    &mut err,
+                    Some(100.0),
+                    Some(&home),
+                    &cfg,
+                ),
+                0
+            );
+            let output: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(output["permission"], permission);
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn cursor_advisory_mode_never_blocks() {
         let rand_id = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -6508,6 +6587,47 @@ mod tests {
             None,
             None
         ));
+    }
+
+    #[test]
+    fn process_match_excludes_hooks_and_current_pid() {
+        let ws = Path::new("/test/project");
+        for command in [
+            "astrolabe hooks remind --client=cursor --context=cursor",
+            "astrolabe --context=cursor hooks remind --client=cursor",
+            "node /x/astrolabe hooks cleanup --context cursor",
+            "astrolabe 'hooks' remind --context=cursor",
+        ] {
+            assert!(!process_matches_cursor_astrolabe(
+                command,
+                Some(ws),
+                Some(ws)
+            ));
+            // An approved project with only hooks must remain advisory in auto.
+            assert!(!cursor_should_enforce(
+                CursorMode::Auto,
+                true,
+                process_matches_cursor_astrolabe(command, Some(ws), Some(ws)),
+            ));
+        }
+        assert!(!process_is_cursor_astrolabe_server(
+            std::process::id(),
+            "astrolabe . --context=cursor",
+            Some(ws),
+            Some(ws),
+        ));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn unavailable_platform_probe_allows_auto_but_preserves_enforce() {
+        let alive = astrolabe_cursor_process_alive(Some(Path::new("C:/test/project")));
+        assert!(
+            !alive,
+            "an unsupported probe must not claim the MCP is alive"
+        );
+        assert!(!cursor_should_enforce(CursorMode::Auto, true, alive));
+        assert!(cursor_should_enforce(CursorMode::Enforce, true, alive));
     }
 
     #[test]

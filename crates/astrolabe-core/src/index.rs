@@ -202,12 +202,7 @@ struct CachedProduct {
 }
 
 impl CachedProduct {
-    fn from_parsed(
-        language: Language,
-        sha: String,
-        loc: u32,
-        parsed: &ParsedFile,
-    ) -> Option<Self> {
+    fn from_parsed(language: Language, sha: String, loc: u32, parsed: &ParsedFile) -> Option<Self> {
         let bytes = store::encode_parsed(parsed).ok()?;
         Some(Self {
             language,
@@ -1132,21 +1127,18 @@ fn insert_product(cache: &mut ParseProductCache, row: &ParsedRow) {
         },
         // No store encoding exists (persistence off, or the write failed):
         // encode here so the in-memory cache still holds the compact form.
-        None => match CachedProduct::from_parsed(
-            row.language,
-            row.sha.clone(),
-            row.loc,
-            &row.parsed,
-        ) {
-            Some(product) => product,
-            None => {
-                tracing::warn!(
-                    path = %row.path.as_str(),
-                    "parse product encode failed; not cached"
-                );
-                return;
+        None => {
+            match CachedProduct::from_parsed(row.language, row.sha.clone(), row.loc, &row.parsed) {
+                Some(product) => product,
+                None => {
+                    tracing::warn!(
+                        path = %row.path.as_str(),
+                        "parse product encode failed; not cached"
+                    );
+                    return;
+                }
             }
-        },
+        }
     };
     cache.insert(row.path.clone(), product);
 }

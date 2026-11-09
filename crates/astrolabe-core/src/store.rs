@@ -44,8 +44,8 @@ pub enum StoreError {
 
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// A `.bad-*` copy older than this is deleted on the next heal/open. The copy
-/// a heal has just produced is younger, so it survives for inspection.
+/// A `.bad-*` copy quarantined longer ago than this is deleted on the next open.
+/// A copy a heal has just produced is younger, so it survives for inspection.
 const BAD_STORE_STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
 /// Any `.bad-*` copy larger than this is deleted even when recent: the store
 /// is a rebuildable cache, and a 258 MB corpse is never worth keeping.
@@ -162,10 +162,18 @@ fn prune_old_bad_stores(db_path: &Path) {
         let Ok(metadata) = std::fs::metadata(&path) else {
             continue;
         };
-        let too_old = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
+        // Renaming preserves the source mtime, which may long predate the
+        // corruption. Numeric suffixes record when the copy was quarantined.
+        // Older/non-numeric names retain the historical mtime fallback.
+        let quarantined_at = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit_once(".bad-"))
+            .and_then(|(_, stamp)| stamp.parse::<u64>().ok())
+            .and_then(|stamp| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(stamp)))
+            .or_else(|| metadata.modified().ok());
+        let too_old = quarantined_at
+            .and_then(|quarantined| now.duration_since(quarantined).ok())
             .is_some_and(|age| age > BAD_STORE_STALE_AFTER);
         if !too_old && metadata.len() <= BAD_STORE_STALE_BYTES {
             continue;
@@ -1726,6 +1734,19 @@ mod tests {
             .set_modified(old_time)
             .unwrap();
 
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let fresh_quarantine = sibling(&stamp.to_string());
+        std::fs::write(&fresh_quarantine, b"old source, fresh quarantine").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fresh_quarantine)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
         let big = sibling("big");
         // Sparse on purpose: only the logical size matters to the pruner.
         std::fs::File::create(&big)
@@ -1739,9 +1760,44 @@ mod tests {
         prune_old_bad_stores(&db);
 
         assert!(fresh.exists(), "recent small copy is kept for inspection");
+        assert!(
+            fresh_quarantine.exists(),
+            "numeric quarantine time takes precedence over old source mtime"
+        );
         assert!(!old.exists(), "copy older than 24h is pruned");
         assert!(!big.exists(), "copy larger than 32MB is pruned");
         assert!(unrelated.exists(), "unrelated siblings are untouched");
+    }
+
+    #[test]
+    fn newly_quarantined_old_corrupt_store_survives_reopen() {
+        let dir = TestDir::new("bad-old-source");
+        let db = dir.db();
+        std::fs::write(&db, vec![0xABu8; 4096]).unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(25 * 3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        drop(Store::open_or_heal(&db).expect("heals an old corrupt cache"));
+        let copies = bad_store_siblings(&db);
+        assert_eq!(copies.len(), 1);
+        let fresh = &copies[0];
+        assert!(fresh.exists(), "new quarantine is kept for inspection");
+
+        // A genuinely old quarantine is removed even if its mtime is fresh.
+        let old_stamp = old_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stale = dir.0.join(format!("index.redb.bad-{old_stamp}"));
+        std::fs::write(&stale, b"old diagnostic copy").unwrap();
+        drop(Store::open_or_heal(&db).expect("reopens healed cache"));
+        assert!(fresh.exists(), "source mtime must not age a new quarantine");
+        assert!(!stale.exists(), "quarantines older than 24h are removed");
     }
 
     #[test]

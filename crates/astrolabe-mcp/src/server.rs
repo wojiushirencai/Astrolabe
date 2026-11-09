@@ -618,7 +618,7 @@ struct RoleView {
 /// Role of hit lines using the file's `code_mask`: trailing comments no longer
 /// leak words into the label, and lines inside multi-line / raw strings (Go
 /// backticks, Python triple quotes) are tagged `字符串` instead of `定义`/`加载`.
-fn role_views(path: &str, lines: &[String], wanted: &[usize]) -> Option<HashMap<usize, RoleView>> {
+fn role_views(path: &str, lines: &[&str], wanted: &[usize]) -> Option<HashMap<usize, RoleView>> {
     let comments_only = crate::code_mask::code_mask(path, lines, true)?;
     let bare_mask = crate::code_mask::code_mask(path, lines, false)?;
     let pick = |line: &str, mask: &[bool]| -> String {
@@ -1215,11 +1215,10 @@ fn render_grouped_hits(
         }
         let file_is_test = crate::explain::is_test_caller(path, "");
         let wanted: Vec<usize> = rows.iter().map(|r| r.line.saturating_sub(1)).collect();
-        // `role_views` feeds `code_mask`, which still takes `&[String]`:
-        // materialize the compact buffer once per file with hits.
+        // Borrow source text for role classification; only the reference table is allocated.
         let views = index
             .cached_lines(cache, path)
-            .and_then(|(lines, _)| role_views(path, &lines.to_vec(), &wanted));
+            .and_then(|(lines, _)| role_views(path, &lines.borrowed_lines(), &wanted));
         for r in &mut rows {
             let test = file_is_test || crate::explain::is_test_caller(path, &r.sym);
             r.role = match views
@@ -2329,15 +2328,9 @@ impl AstrolabeServer {
 
     /// Wake a hard-hibernated index and wait briefly (bounded) for its warm
     /// start, so every indexed tool path gets a served snapshot instead of a
-    /// "building" answer. No-op for every other state.
+    /// "building" answer. Also joins an in-flight warm wake.
     fn wake_if_hibernated(&self, session: &Arc<RootSession>) {
-        let hibernated = matches!(
-            &*session.state.read().unwrap_or_else(|e| e.into_inner()),
-            IndexState::Hibernated
-        );
-        if hibernated {
-            session.ensure_awake();
-        }
+        session.ensure_awake();
     }
 
     /// Resolve optional per-call `index_root`, then fall back to multi-project
@@ -2589,13 +2582,7 @@ confidence: unknown"
     /// fallback still answers instead of a "retry shortly" error.
     fn building_session(&self, hint: &str) -> Option<Arc<RootSession>> {
         let session = self.session_for(hint).ok()?;
-        let hibernated = matches!(
-            &*session.state.read().unwrap_or_else(|e| e.into_inner()),
-            IndexState::Hibernated
-        );
-        if hibernated {
-            session.ensure_awake();
-        }
+        session.ensure_awake();
         let building = matches!(
             &*session.state.read().unwrap_or_else(|e| e.into_inner()),
             IndexState::Building | IndexState::Hibernated
@@ -4228,16 +4215,6 @@ impl AstrolabeServer {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(invalid_regex_message(error)),
                 };
-                // Whole-buffer candidate lines (a superset of the lines the
-                // per-line matchers accept; see `line_scan`). With smart case
-                // the case-insensitive variant covers both matchers.
-                let line_scanner = if variant_matcher.is_some() {
-                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), true)
-                } else if params.regex {
-                    crate::line_scan::LineScanner::new(&params.query, !sensitive)
-                } else {
-                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), !sensitive)
-                };
                 if let Some(mode) = params.aggregate.as_deref() {
                     if mode != "top" && mode != "dir" && mode != "file" {
                         return text_error(format!(
@@ -4340,9 +4317,7 @@ impl AstrolabeServer {
                         return None;
                     }
                     let (lines, cache_hit) = index.cached_lines(&session.file_cache, path)?;
-                    // `LineScanner` and `code_mask` still take `&[String]`;
-                    // materialize the compact buffer once per scanned file.
-                    let lines = lines.to_vec();
+                    // Search and comment filtering both borrow the cached source text.
                     let mut out = FileScan {
                         hits: Vec::new(),
                         cache_hit,
@@ -4352,8 +4327,25 @@ impl AstrolabeServer {
                     };
                     // Lazy: the mask is only computed once a line matches.
                     let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
-                    for line_no in line_scanner.candidates(&lines) {
-                        let line = &lines[line_no];
+                    // Literal matches cannot span lines (newline queries were
+                    // rejected above). Prefilter against the shared text once,
+                    // avoiding regex startup/pool contention on every line.
+                    // Regex queries retain exact per-line anchor semantics.
+                    let candidate_matcher = variant_matcher.as_ref().unwrap_or(&matcher);
+                    let mut buffer_matches = (!params.regex)
+                        .then(|| candidate_matcher.find_iter(lines.as_text()).peekable());
+                    let base = lines.as_text().as_ptr() as usize;
+                    for (line_no, line) in lines.iter().enumerate() {
+                        if let Some(candidates) = &mut buffer_matches {
+                            let start = line.as_ptr() as usize - base;
+                            let end = start + line.len();
+                            while candidates.peek().is_some_and(|hit| hit.end() <= start) {
+                                candidates.next();
+                            }
+                            if candidates.peek().is_none_or(|hit| hit.start() >= end) {
+                                continue;
+                            }
+                        }
                         if !matcher.is_match(line) {
                             if variant_matcher.as_ref().is_some_and(|v| v.is_match(line)) {
                                 let text = if out.variants.is_empty() {
@@ -4372,7 +4364,11 @@ impl AstrolabeServer {
                         }
                         if params.skip_comments {
                             let mask = mask.get_or_insert_with(|| {
-                                crate::code_mask::code_mask(path, &lines, strings_are_code)
+                                if crate::code_mask::has_lexer(path) {
+                                    crate::code_mask::code_mask(path, &lines.borrowed_lines(), strings_are_code)
+                                } else {
+                                    None
+                                }
                             });
                             if let Some(mask) = mask {
                                 let real = matcher
@@ -4460,8 +4456,7 @@ impl AstrolabeServer {
                                 let text = std::fs::read(session.root.join(rels[idx]))
                                     .map(|raw| String::from_utf8_lossy(&raw).into_owned())
                                     .unwrap_or_default();
-                                let lines: Vec<String> =
-                                    text.lines().map(str::to_string).collect();
+                                let lines: Vec<&str> = text.lines().collect();
                                 if let Some(mask) = crate::code_mask::code_mask(
                                     rels[idx],
                                     &lines,
@@ -7787,7 +7782,7 @@ mod tests {
 
     #[test]
     fn hit_roles_use_lexer_for_trailing_comments_and_raw_strings() {
-        let go: Vec<String> = [
+        let go: Vec<&str> = [
             "package p",
             "func f() {",
             "\ts := `",
@@ -7796,22 +7791,20 @@ mod tests {
             "\treturn s // a := b",
             "}",
         ]
-        .iter()
-        .map(|l| l.to_string())
+        .into_iter()
         .collect();
         let v = role_views("a.go", &go, &[3, 5]).unwrap();
         // inside a Go raw string: not a definition
         assert_eq!(hit_role_view(false, &go[3], &v[&3]), "string");
         // trailing comment words do not leak into the label
         assert_eq!(hit_role_view(false, &go[5], &v[&5]), "use");
-        let py: Vec<String> = [
+        let py: Vec<&str> = [
             "def g(thread):",
             "    return thread  # read SysLog(x)",
             "    # SysLog(x)",
             "    x = 1  # note",
         ]
-        .iter()
-        .map(|l| l.to_string())
+        .into_iter()
         .collect();
         let v = role_views("b.py", &py, &[1, 2]).unwrap();
         assert_eq!(hit_role_view(false, &py[1], &v[&1]), "use");
@@ -7819,7 +7812,7 @@ mod tests {
         // no lexer: falls back to text heuristic
         assert!(role_views("a.txt", &py, &[0]).is_none());
         // string literal keys still see strings
-        let rs: Vec<String> = vec!["let k = \"v\"; // read".into()];
+        let rs: Vec<&str> = vec!["let k = \"v\"; // read"];
         let v = role_views("a.rs", &rs, &[0]).unwrap();
         assert_eq!(hit_role_view(false, &rs[0], &v[&0]), "def");
     }
@@ -8756,6 +8749,81 @@ mod tests {
         );
         assert!(!hit.contains(&note), "{hit}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_code_borrowed_cache_keeps_crlf_unicode_and_bare_cr_lines() {
+        let (server, dir) = smart_server(&[(
+            "hello.py",
+            "# Needle 雪\r\n# needle\r\n\r\n# Needle 雪\r".into(),
+        )]);
+        let repo = server.primary.snapshot_ready().unwrap();
+        let (cached, _) = repo
+            .cached_lines(&server.primary.file_cache, "hello.py")
+            .unwrap();
+        let base = cached.as_text().as_ptr() as usize;
+        for line in cached.iter() {
+            let start = line.as_ptr() as usize;
+            assert!(start >= base && start + line.len() <= base + cached.as_text().len());
+        }
+        for (query, regex) in [("Needle 雪", false), ("^# Needle 雪", true)] {
+            let mut params = search(query);
+            params.regex = regex;
+            params.case_sensitive = Some(true);
+            params.context_lines = Some(0);
+            params.group = Some(false);
+            params.dedup = Some(false);
+            for _ in 0..2 {
+                let text = first_text(server.search_code(Parameters(params.clone())));
+                assert!(text.contains("hello.py:1"), "{text}");
+                assert!(text.contains("hello.py:4"), "{text}");
+                assert!(!text.contains("hello.py:2"), "{text}");
+            }
+        }
+        assert!(server.primary.cache_hits.load(Ordering::Relaxed) >= 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_code_skip_comments_borrows_warm_cache_for_literal_and_regex() {
+        let (server, dir) = smart_server(&[(
+            "hello.go",
+            "package p\r\n// Needle 雪\r\n/* Needle 雪\r\nNeedle 雪 */\r\nfunc f() { call(Needle) }\r\nvar s = `Needle`\r\n// Needle\r".into(),
+        )]);
+        let repo = server.primary.snapshot_ready().unwrap();
+        let (cached, _) = repo
+            .cached_lines(&server.primary.file_cache, "hello.go")
+            .unwrap();
+        for (query, regex) in [
+            ("Needle", false),
+            (r"\bNeedle\b", true),
+            (r"^func .*Needle", true),
+        ] {
+            let mut params = search(query);
+            params.regex = regex;
+            params.skip_comments = true;
+            params.case_sensitive = Some(true);
+            params.context_lines = Some(0);
+            params.group = Some(false);
+            params.dedup = Some(false);
+            for _ in 0..2 {
+                let text = first_text(server.search_code(Parameters(params.clone())));
+                assert!(text.contains("hello.go:5"), "{query}: {text}");
+                for excluded in [2, 3, 4, 6, 7] {
+                    assert!(
+                        !text.contains(&format!("hello.go:{excluded}")),
+                        "{query}: {text}"
+                    );
+                }
+            }
+        }
+        let (after, hit) = repo
+            .cached_lines(&server.primary.file_cache, "hello.go")
+            .unwrap();
+        assert!(hit);
+        assert!(Arc::ptr_eq(&cached, &after));
+        assert!(server.primary.cache_hits.load(Ordering::Relaxed) >= 6);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -10130,6 +10198,50 @@ mod tests {
 
     fn git_marker(dir: &Path) {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
+    }
+
+    #[test]
+    fn concurrent_tool_gates_wait_for_wake_instead_of_building_fallback() {
+        for search_gate in [false, true] {
+            let dir = unique_temp_dir();
+            std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+            let server = Arc::new(AstrolabeServer::new_with_knobs(
+                dir.clone(),
+                test_knobs(),
+                8 * 1024 * 1024,
+            ));
+            server.start_indexing();
+            wait_ready(&server, Duration::from_secs(20));
+            *server.primary.state.write().unwrap() = IndexState::Hibernated;
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            *server.primary.wake_before_publish.lock().unwrap() =
+                Some((Arc::clone(&entered), Arc::clone(&resume)));
+            assert!(server.primary.wake_if_hibernated());
+            entered.wait();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            *server.primary.wake_wait_started.lock().unwrap() = Some(started_tx);
+            let request_server = Arc::clone(&server);
+            let request = std::thread::spawn(move || {
+                if search_gate {
+                    request_server.building_session("").is_none()
+                } else {
+                    request_server.wake_if_hibernated(&request_server.primary);
+                    request_server.primary.snapshot_ready().is_some()
+                }
+            });
+            let started = started_rx.recv_timeout(Duration::from_secs(2));
+            resume.wait();
+            let served = request.join().unwrap();
+            assert!(started.is_ok(), "tool gate must enter the warm-wake wait");
+            assert!(
+                served,
+                "restored index must be served rather than building fallback"
+            );
+            assert!(server.primary.wait_builds_idle(Duration::from_secs(5)));
+            server.stop_watching();
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// End-to-end two-stage idle wake: a hard-hibernated primary must

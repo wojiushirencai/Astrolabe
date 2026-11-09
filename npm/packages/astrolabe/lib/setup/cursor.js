@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { createHash } = require('crypto');
 
 const SERVER_NAME = 'astrolabe';
 const DEFAULT_LSP_TIMEOUT = '300';
@@ -73,17 +74,21 @@ function entryCommand(entry) {
   return '';
 }
 
-function isAstrolabeRemind(entry) {
+function isAstrolabeHook(entry, subcommand, binPath) {
+  // Never replace a legacy group containing unrelated hooks as a whole.
+  if (entry && !entry.command && Array.isArray(entry.hooks) && entry.hooks.length !== 1) {
+    return false;
+  }
   const command = entryCommand(entry);
-  // Match the subcommand shape, not a hard-coded binary name: Windows paths
-  // carry `.exe`, quoted paths contain spaces, and --command may point at an
-  // arbitrary binary name. Do not filter on --client=cursor here: an existing
-  // entry with the wrong client must be replaced in place, not duplicated.
-  return /\bhooks\s+remind(?:\s|$)/.test(command);
-}
-
-function isAstrolabeCleanup(entry) {
-  return /\bhooks\s+cleanup(?:\s|$)/.test(entryCommand(entry));
+  const match = command.match(/^\s*(.*?)\s+hooks\s+(remind|cleanup)(?:\s|$)/);
+  if (!match || match[2] !== subcommand) return false;
+  const executable = match[1];
+  // Explicit --command paths may have arbitrary names. Otherwise only claim
+  // the actual Astrolabe executable, not another program with similar args.
+  if (binPath && executable === quoteCommandPath(binPath)) return true;
+  if (!/^(?:"[^"]*"|'[^']*'|[^\s"';&|<>`]+)$/.test(executable)) return false;
+  const unquoted = executable.replace(/^(?:"([^"]*)"|'([^']*)')$/, (_, a, b) => a || b);
+  return /^(?:.*[/\\])?astrolabe(?:\.(?:exe|cmd|bat))?$/i.test(unquoted);
 }
 
 /**
@@ -118,7 +123,7 @@ function mergeCursorHooksFile(
   let replaced = false;
 
   if (!Array.isArray(hooks.preToolUse)) hooks.preToolUse = [];
-  const remindIdx = hooks.preToolUse.findIndex(isAstrolabeRemind);
+  const remindIdx = hooks.preToolUse.findIndex((entry) => isAstrolabeHook(entry, 'remind', binPath));
   const nextRemind = remindEntry(binPath);
   if (remindIdx >= 0) {
     hooks.preToolUse[remindIdx] = nextRemind;
@@ -128,7 +133,7 @@ function mergeCursorHooksFile(
   }
 
   if (!Array.isArray(hooks.sessionEnd)) hooks.sessionEnd = [];
-  const cleanupIdx = hooks.sessionEnd.findIndex(isAstrolabeCleanup);
+  const cleanupIdx = hooks.sessionEnd.findIndex((entry) => isAstrolabeHook(entry, 'cleanup', binPath));
   const nextCleanup = cleanupEntry(binPath);
   if (cleanupIdx >= 0) {
     hooks.sessionEnd[cleanupIdx] = nextCleanup;
@@ -373,19 +378,41 @@ function readJsonArray(filePath) {
   }
 }
 
-/**
- * Cursor stores approvals as `astrolabe-<config-hash>`; any change to the
- * mcp.json entry changes the hash and invalidates the old approval.
- */
-function checkApprovalFile(filePath, serverName = SERVER_NAME) {
+/** Cursor hashes the project root and its normalized stdio server config. */
+function approvalKey(projectRoot, server, serverName = SERVER_NAME) {
+  if (!projectRoot || !server || typeof server.command !== 'string') return null;
+  // Cursor's stdio schema strips fields such as type/cwd before hashing.
+  const normalized = { command: server.command, args: server.args || [], env: server.env || {} };
+  const hash = createHash('sha256')
+    .update(JSON.stringify({ path: canonicalizePath(projectRoot), server: normalized }))
+    .digest('hex').slice(0, 16);
+  return `${serverName}-${hash}`;
+}
+
+function checkApprovalFile(filePath, { projectRoot, server, serverName = SERVER_NAME } = {}) {
   const entries = readJsonArray(filePath);
-  const approved = Boolean(
-    entries &&
-      entries.some(
-        (entry) => entry === serverName || entry.startsWith(`${serverName}-`),
-      ),
-  );
-  return { filePath, exists: entries !== null, approved, entries: entries || [] };
+  const expectedKey = approvalKey(projectRoot, server, serverName);
+  const approved = Boolean(expectedKey && entries && entries.includes(expectedKey));
+  return { filePath, exists: entries !== null, approved, expectedKey, entries: entries || [] };
+}
+
+function currentServer(home, projectRoot) {
+  // Project entries override global entries, as in Cursor. Invalid project
+  // configuration must not turn a global approval into a successful check.
+  for (const filePath of [
+    path.join(projectRoot, '.cursor', 'mcp.json'),
+    path.join(home, '.cursor', 'mcp.json'),
+  ]) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
+      if (doc.mcpServers && Object.hasOwn(doc.mcpServers, SERVER_NAME)) {
+        return doc.mcpServers[SERVER_NAME];
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') return null;
+    }
+  }
+  return null;
 }
 
 function removeAstrolabeFromDisabled(
@@ -400,7 +427,10 @@ function removeAstrolabeFromDisabled(
   if (!Array.isArray(parsed)) {
     throw new Error(`${filePath} must contain a JSON array`);
   }
-  const doc = parsed.filter((item) => item !== serverName);
+  const doc = parsed.filter((item) =>
+    !(typeof item === 'string' && (item === serverName ||
+      (item.startsWith(`${serverName}-`) && /^[a-f0-9]+$/i.test(item.slice(serverName.length + 1))))),
+  );
   return { filePath, skipped: false, changed: doc.length !== parsed.length, doc };
 }
 
@@ -474,7 +504,7 @@ function enableCursorApproval({
   if (!agent) {
     return {
       available: false,
-      approval: checkApprovalFile(approvalPath),
+      approval: checkApprovalFile(approvalPath, { projectRoot: root, server: currentServer(home, root) }),
       disabled,
       root,
       approvalPath,
@@ -488,12 +518,16 @@ function enableCursorApproval({
     { cwd: root, env: approvalEnv(env, home) },
     platform,
   );
+  const approval = checkApprovalFile(approvalPath, {
+    projectRoot: root, server: currentServer(home, root),
+  });
+  if (result.status !== 0 || result.error || result.signal) approval.approved = false;
   return {
     available: true,
     agent,
     root,
     approvalPath,
-    approval: checkApprovalFile(approvalPath),
+    approval,
     disabled,
     status: result.status,
     signal: result.signal || null,
@@ -531,6 +565,7 @@ module.exports = {
   loadL1Template,
   renderCursorRules,
   mergeRulesFile,
+  approvalKey,
   checkApprovalFile,
   removeAstrolabeFromDisabled,
   enableCursorApproval,

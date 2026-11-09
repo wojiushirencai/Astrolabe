@@ -378,7 +378,8 @@ async function runAsync(argv = process.argv.slice(2)) {
           approvalHint,
       );
     } else if (opts.scope === 'project') {
-      if (!cursorApproval.approval.approved) {
+      if (cursorApproval.status !== 0 || cursorApproval.error || cursorApproval.signal ||
+          !cursorApproval.approval.approved) {
         process.stdout.write(
           `\nCursor CLI approval: \`cursor-agent mcp enable astrolabe\` exited ${cursorApproval.status}` +
             `${cursorApproval.stderr ? `: ${cursorApproval.stderr}` : ''}\n` +
@@ -454,8 +455,8 @@ async function runAsync(argv = process.argv.slice(2)) {
       if (opts.scope === 'project') {
         process.stdout.write(
           `  3. Cursor: project config ${path.join(projectRoot, '.cursor', 'mcp.json')} + ` +
-            `${path.join(projectRoot, '.cursor', 'rules', 'astrolabe.mdc')}; this directory was ` +
-            'approved with `cursor-agent mcp enable astrolabe` when the CLI is available.\n',
+            `${path.join(projectRoot, '.cursor', 'rules', 'astrolabe.mdc')}; this directory ` +
+            'requires successful `cursor-agent mcp enable astrolabe` approval before use.\n',
         );
       } else {
         process.stdout.write(

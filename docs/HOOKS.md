@@ -117,6 +117,10 @@ Cursor CLI 支持原生 hooks 配置，亦具备对 Claude Code 配置的兼容�
 - **matcher 必须包含 Astrolabe 的 MCP 工具**：remind 要看到 Astrolabe 工具调用才能在你用了符号工具后清零 grep/read 计数；matcher 只写 `Shell|Read|Grep` 会让计数只增不清，已在正确使用 Astrolabe 的会话里仍可能被拦。Cursor CLI 内部把 MCP 工具命名为 `astrolabe-find_symbol` 这种形式，因此 matcher 用 `astrolabe-.*`；同时保留 `mcp__astrolabe__.*` 以兼容旧版 Cursor（Grok / Kimi 等仍使用后者）。若你的宿主不识别，可改用 `*`（ZCode 一节同理），非相关工具由 Astrolabe 自行放行。
 - **会话识别兼容**：Cursor 原生 preToolUse 事件仅传递 `conversation_id`，Astrolabe 内部会话提取逻辑已原生兼容 `conversation_id` / `conversationId` fallback。
 
+**Cursor 拦截策略**：`ASTROLABE_HOOK_CURSOR_MODE=auto`（默认）只有在项目已批准 Astrolabe MCP、且探测到同项目的 Cursor MCP 服务进程时才维持 deny；hook 进程自身或其它 `hooks` 子命令不算服务。服务未启动、未获批准或无法可靠探测时，deny 会降级为 `permission: allow` 加提醒。Windows 等暂不支持可靠项目级探测的平台在 auto 下同样放行，不假定服务存活。`advisory` 始终只提醒，`enforce` 则强制保留 deny，不依赖服务可用性。
+
+上述降级也适用于 `--deny-text-search` / `ASTROLABE_DENY_TEXT_SEARCH=true` 产生的硬模式 deny（含首次 Grep / Glob / shell 文本搜索），并非仅针对软阈值。若需要在 MCP 不可用时仍硬拦截，须在 **hooks 进程**设置 `ASTROLABE_HOOK_CURSOR_MODE=enforce`。其它客户端不受此 Cursor 策略影响。
+
 **完整配方（`.cursor/hooks.json`）**：
 ```json
 {
@@ -309,7 +313,7 @@ DSH 可为每个仓库注册一个 MCP server，工具名形如 `mcp__astrolabe-
 
 ## 硬禁用与命令识别说明
 
-- `ASTROLABE_DENY_TEXT_SEARCH=true`（或 `--deny-text-search`）下 Grep/Glob 每次都拦，不受 `min_deny_interval_seconds` 静默窗约束；静默窗只作用于软模式。
+- `ASTROLABE_DENY_TEXT_SEARCH=true`（或 `--deny-text-search`）下 Grep/Glob 每次都触发硬模式 deny 判定，不受 `min_deny_interval_seconds` 静默窗约束；静默窗只作用于软模式。但 Cursor 的 auto / advisory 策略仍可将该 deny 降级为放行加提醒；要求无条件硬拦截时使用 `ASTROLABE_HOOK_CURSOR_MODE=enforce`。
 - 命令识别按 shell 分词后只看"命令位置"的 token：支持 `cd x && grep`、`sudo grep`、`FOO=1 rg`、`bash -c "grep …"`、`grep.exe`/`rg.exe`、`findstr`、`Select-String`、`git [opts] grep`；`echo grep is great`、`git commit -m "fix grep bug"` 不会被当成搜索。软模式不把管道后段（`cat a | grep x`）当 grep，硬模式会拦。
 - Windows 原生环境没有 `HOME` 时，状态目录回退到 `USERPROFILE`（再回退 `HOMEDRIVE`+`HOMEPATH`）。这一点只通过单元测试覆盖，**未在真实 Windows 上验证**。
 - 计数文件锁使用操作系统文件锁（flock / LockFileEx），进程崩溃后自动释放，不会遗留需要手动清理的锁。

@@ -9,6 +9,7 @@ const { spawnSync } = require('node:child_process');
 
 const argsMod = require('./setup/args');
 const clientsMod = require('./setup/clients');
+const cursorMod = require('./setup/cursor');
 const { CLIENTS, CATALOG_TOOL_NAMES } = clientsMod;
 
 const BIN = path.join(__dirname, '..', 'bin', 'astrolabe.js');
@@ -1085,8 +1086,10 @@ test('Cursor approvals and disabled lists are read/merged idempotently', () => {
     const project = tmpProject(home);
     const approvalPath = clientsMod.resolveCursorApprovalPath(home, project);
     fs.mkdirSync(path.dirname(approvalPath), { recursive: true });
-    fs.writeFileSync(approvalPath, JSON.stringify(['other-1', 'astrolabe-abc123']));
-    const approval = clientsMod.checkCursorApprovalFile(approvalPath);
+    const server = { command: '/bin/astrolabe', args: ['.'], env: {} };
+    const key = cursorMod.approvalKey(project, server);
+    fs.writeFileSync(approvalPath, JSON.stringify(['other-1', key]));
+    const approval = clientsMod.checkCursorApprovalFile(approvalPath, { projectRoot: project, server });
     assert.equal(approval.exists, true);
     assert.equal(approval.approved, true);
 
@@ -1095,7 +1098,7 @@ test('Cursor approvals and disabled lists are read/merged idempotently', () => {
 
     const disabledPath = clientsMod.resolveCursorDisabledPath(home, project);
     fs.mkdirSync(path.dirname(disabledPath), { recursive: true });
-    fs.writeFileSync(disabledPath, JSON.stringify(['astrolabe', 'other']));
+    fs.writeFileSync(disabledPath, JSON.stringify(['astrolabe', 'astrolabe-abc123', 'astrolabe-deadbeef', 'other']));
     const first = clientsMod.removeAstrolabeFromCursorDisabled(disabledPath);
     assert.equal(first.changed, true);
     assert.deepEqual(first.doc, ['other']);
@@ -1192,7 +1195,10 @@ test(
           "const slug = process.cwd().replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');",
           "const dir = path.join(process.env.HOME, '.cursor', 'projects', slug);",
           "fs.mkdirSync(dir, { recursive: true });",
-          "fs.writeFileSync(path.join(dir, 'mcp-approvals.json'), JSON.stringify(['astrolabe-testhash']));",
+          "const server = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.cursor', 'mcp.json'), 'utf8')).mcpServers.astrolabe;",
+          "const normalized = { command: server.command, args: server.args || [], env: server.env || {} };",
+          "const key = 'astrolabe-' + require('crypto').createHash('sha256').update(JSON.stringify({ path: process.cwd(), server: normalized })).digest('hex').slice(0, 16);",
+          "fs.writeFileSync(path.join(dir, 'mcp-approvals.json'), JSON.stringify([key]));",
           "process.exit(0);",
           '',
         ].join('\n'),
@@ -1224,9 +1230,10 @@ test(
       assert.match(result.stdout, /Cursor CLI approval: approved astrolabe/);
 
       const approvalPath = clientsMod.resolveCursorApprovalPath(home, project);
-      const approval = clientsMod.checkCursorApprovalFile(approvalPath);
+      const server = JSON.parse(fs.readFileSync(path.join(project, '.cursor', 'mcp.json'), 'utf8')).mcpServers.astrolabe;
+      const approval = clientsMod.checkCursorApprovalFile(approvalPath, { projectRoot: project, server });
       assert.equal(approval.approved, true);
-      assert.ok(approval.entries.includes('astrolabe-testhash'));
+      assert.ok(approval.entries.includes(cursorMod.approvalKey(project, server)));
 
       const globalDoc = JSON.parse(
         fs.readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8'),
@@ -1266,7 +1273,7 @@ test(
       const project = tmpProject(home);
       const disabledPath = clientsMod.resolveCursorDisabledPath(home, project);
       fs.mkdirSync(path.dirname(disabledPath), { recursive: true });
-      fs.writeFileSync(disabledPath, JSON.stringify(['astrolabe', 'other']));
+      fs.writeFileSync(disabledPath, JSON.stringify(['astrolabe', 'astrolabe-abc123', 'astrolabe-deadbeef', 'other']));
       const emptyPath = path.join(home, 'empty-path');
       fs.mkdirSync(emptyPath, { recursive: true });
       const env = { ...process.env, HOME: home, PATH: emptyPath };
@@ -1316,7 +1323,7 @@ test('Cursor hooks dedupe .exe/space/custom-binary commands on re-run', () => {
               },
               { command: 'echo keep', matcher: 'Read' },
             ],
-            sessionEnd: [{ command: 'C:\\Tools\\my-astrolabe.exe hooks cleanup' }],
+            sessionEnd: [{ command: 'C:\\Tools\\astrolabe.exe hooks cleanup' }],
           },
         },
         null,
@@ -1516,4 +1523,127 @@ test('loadL1Template falls back when the packaged template is absent', () => {
   assert.match(template, /CRITICAL/);
   assert.match(template, /astrolabe-find_symbol/);
   assert.match(template, /\{\{INDEX_ROOT\}\}/);
+});
+
+
+test('Cursor approval requires the current hash, not a stale or bare server entry', () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    const file = path.join(home, 'approvals.json');
+    const server = { type: 'stdio', command: '/bin/astrolabe', args: ['.'], env: { PATH: '/bin' } };
+    const options = { projectRoot: project, server };
+    const key = cursorMod.approvalKey(project, server);
+    fs.writeFileSync(file, JSON.stringify(['astrolabe', 'astrolabe-old', 'other-1']));
+    assert.equal(cursorMod.checkApprovalFile(file, options).approved, false);
+    fs.writeFileSync(file, JSON.stringify([key]));
+    assert.equal(cursorMod.checkApprovalFile(file, options).approved, true);
+    assert.equal(cursorMod.checkApprovalFile(file).approved, false);
+    for (const changed of [
+      { ...server, command: '/new/astrolabe' },
+      { ...server, args: ['.', '--context=cursor'] },
+      { ...server, env: { PATH: '/new/bin' } },
+    ]) {
+      assert.equal(cursorMod.checkApprovalFile(file, { ...options, server: changed }).approved, false);
+    }
+    assert.equal(cursorMod.checkApprovalFile(file, {
+      ...options, projectRoot: path.join(project, 'other'),
+    }).approved, false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('failed or timed out enable never reports approval, even with a matching hash', () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    const server = { command: '/bin/astrolabe', args: ['.'], env: {} };
+    fs.mkdirSync(path.join(project, '.cursor'));
+    fs.writeFileSync(path.join(project, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { astrolabe: server } }));
+    const file = cursorMod.resolveApprovalPath(home, project);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify([cursorMod.approvalKey(project, server)]));
+    for (const result of [
+      { status: 1 },
+      { status: null, error: new Error('ETIMEDOUT'), signal: 'SIGTERM' },
+      { status: 0, error: new Error('spawn failed') },
+    ]) {
+      const approval = cursorMod.enableCursorApproval({
+        home, projectRoot: project, whichFn: () => '/fake/cursor-agent', spawnFn: () => result,
+      });
+      assert.equal(approval.approval.approved, false);
+    }
+    assert.equal(cursorMod.enableCursorApproval({
+      home, projectRoot: project, whichFn: () => '/fake/cursor-agent', spawnFn: () => ({ status: 0 }),
+    }).approval.approved, true);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Cursor hook migration preserves third-party subcommands and recognizes explicit custom binaries', () => {
+  const home = tmpHome();
+  try {
+    const file = path.join(home, 'hooks.json');
+    const thirdParty = [
+      { command: '/opt/other-agent hooks remind --client=cursor' },
+      { command: 'echo astrolabe hooks remind' },
+      { command: 'echo /path/astrolabe hooks remind' },
+      { command: '/opt/other-astrolabe hooks remind' },
+      { hooks: [{ command: 'astrolabe hooks remind' }, { command: 'echo keep' }] },
+    ];
+    const cleanup = { command: '/opt/other-agent hooks cleanup' };
+    fs.writeFileSync(file, JSON.stringify({ hooks: {
+      preToolUse: [...thirdParty, { command: "'/old path/astrolabe' hooks remind --client=claude-code" }],
+      sessionEnd: [cleanup, { command: 'astrolabe hooks cleanup' }],
+    } }));
+    const binPath = '/custom path/my-agent';
+    const first = cursorMod.mergeCursorHooksFile(file, { binPath });
+    assert.deepEqual(first.doc.hooks.preToolUse.slice(0, thirdParty.length), thirdParty);
+    assert.deepEqual(first.doc.hooks.sessionEnd[0], cleanup);
+    assert.equal(first.doc.hooks.preToolUse.length, thirdParty.length + 1);
+    assert.equal(first.doc.hooks.sessionEnd.length, 2);
+    fs.writeFileSync(file, JSON.stringify(first.doc));
+    const second = cursorMod.mergeCursorHooksFile(file, { binPath });
+    assert.deepEqual(second.doc, first.doc);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('project setup does not print approved after a failed enable with a stale hash', { skip: process.platform === 'win32' }, () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, '.cursor'));
+    const project = tmpProject(home);
+    const approvalPath = cursorMod.resolveApprovalPath(home, project);
+    fs.mkdirSync(path.dirname(approvalPath), { recursive: true });
+    fs.writeFileSync(approvalPath, JSON.stringify(['astrolabe-stale']));
+    const fakeBin = path.join(home, 'fakebin');
+    fs.mkdirSync(fakeBin);
+    fs.writeFileSync(path.join(fakeBin, 'cursor-agent'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const result = spawnSync(process.execPath, [
+      BIN, 'setup', '--yes', '--clients=cursor', '--scope=project', '--home', home,
+      '--project', project, '--command', path.join(home, 'astrolabe'), '--no-cursor-permissions',
+    ], { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: fakeBin } });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /exited 1/);
+    assert.doesNotMatch(result.stdout, /approval: approved|was approved/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+test('disabled cleanup preserves other server names and non-string values', () => {
+  const home = tmpHome();
+  try {
+    const file = path.join(home, 'disabled.json');
+    fs.writeFileSync(file, JSON.stringify(['astrolabe', 'astrolabe-a1b2c3', 'astrolabe-helper', 'other-abc123', 3]));
+    assert.deepEqual(cursorMod.removeAstrolabeFromDisabled(file).doc,
+      ['astrolabe-helper', 'other-abc123', 3]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

@@ -45,7 +45,7 @@ impl Default for CacheConfig {
 /// The whole file lives in one [`String`] and each line is addressed by a
 /// single `u32` start offset, so caching a million-line file costs two heap
 /// allocations instead of one `String` allocation per line. Line text is
-/// sliced on demand and follows [`str::lines`] semantics exactly: a trailing
+/// sliced on demand. Text input follows [`str::lines`] semantics: a trailing
 /// `\n` is removed, and a `\r` is removed only when it preceded that `\n`
 /// (a bare `\r` is content); a final line ending produces no extra empty line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,6 +55,8 @@ pub struct CachedLines {
     /// Length is `line_count + 1`; an empty file has zero lines and so an
     /// empty vector, matching `str::lines`.
     line_starts: Vec<u32>,
+    /// Explicit line arrays retain their boundaries and all line content.
+    owned_lines: bool,
 }
 
 impl CachedLines {
@@ -72,15 +74,37 @@ impl CachedLines {
             }
             line_starts.push(offset_u32(len));
         }
-        Self { text, line_starts }
+        Self {
+            text,
+            line_starts,
+            owned_lines: false,
+        }
     }
 
-    /// Build from owned lines, joining with `\n`.
+    /// Build from owned lines, joining with `\n` for [`Self::as_text`].
     ///
-    /// This is the inverse of `text.lines().map(str::to_owned).collect()`:
-    /// an empty vector yields zero lines, and lines must not contain `\n`.
+    /// Unlike text input, explicit line arrays preserve trailing empty lines
+    /// and bare carriage returns. An empty vector yields zero lines.
     pub fn from_lines(lines: Vec<String>) -> Self {
-        Self::from_text(lines.join("\n"))
+        if lines.is_empty() {
+            return Self::default();
+        }
+        let mut text =
+            String::with_capacity(lines.iter().map(String::len).sum::<usize>() + lines.len() - 1);
+        let mut line_starts = Vec::with_capacity(lines.len() + 1);
+        for (index, line) in lines.into_iter().enumerate() {
+            if index != 0 {
+                text.push('\n');
+            }
+            line_starts.push(offset_u32(text.len()));
+            text.push_str(&line);
+        }
+        line_starts.push(offset_u32(text.len()));
+        Self {
+            text,
+            line_starts,
+            owned_lines: true,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -94,7 +118,15 @@ impl CachedLines {
     /// The line at `index` without its line ending, or `None` past the end.
     pub fn get(&self, index: usize) -> Option<&str> {
         let start = *self.line_starts.get(index)? as usize;
-        let end = *self.line_starts.get(index + 1)? as usize;
+        let mut end = *self.line_starts.get(index + 1)? as usize;
+        if self.owned_lines {
+            // Only the separator we inserted belongs to neither line. Do not
+            // interpret a line's own trailing CR (or other content) as an EOL.
+            if index + 1 < self.len() {
+                end -= 1;
+            }
+            return Some(&self.text[start..end]);
+        }
         let raw = &self.text[start..end];
         Some(match raw.strip_suffix('\n') {
             Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
@@ -107,7 +139,17 @@ impl CachedLines {
         (0..self.len()).map(move |index| self.get(index).unwrap_or_default())
     }
 
+    /// Borrowed slice-compatible line view, without copying source text.
+    ///
+    /// This allocates only the reference table. Prefer [`Self::iter`] when a
+    /// consumer does not require a slice.
+    pub fn borrowed_lines(&self) -> Vec<&str> {
+        self.iter().collect()
+    }
+
     /// The full file text, line endings included.
+    /// Explicit line arrays are joined with `\n`; their boundaries may not
+    /// be recoverable by parsing this text with [`str::lines`].
     pub fn as_text(&self) -> &str {
         &self.text
     }
@@ -326,11 +368,53 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines.get(0), Some("first"));
         assert_eq!(lines.get(1), Some("second"));
-        assert_eq!(lines, CachedLines::from("first\nsecond"));
+        assert_eq!(lines.to_vec(), CachedLines::from("first\nsecond").to_vec());
         assert!(CachedLines::from(Vec::new()).is_empty());
         // A `Vec<String>` is accepted wherever `Into<CachedLines>` is expected.
         let lines: CachedLines = vec!["x".to_string()].into();
         assert_eq!(lines.get(0), Some("x"));
+    }
+
+    #[test]
+    fn explicit_line_arrays_preserve_empty_lines_and_carriage_returns() {
+        let cache = FileCache::new(CacheConfig::default());
+        for expected in [
+            vec![],
+            vec![""],
+            vec!["", ""],
+            vec!["a", ""],
+            vec!["a", "", ""],
+            vec!["\r", ""],
+            vec!["a\r", "b\r", ""],
+            vec!["a\rb", "日本語\r", "Été", ""],
+        ] {
+            let owned: Vec<String> = expected.iter().map(|s| (*s).to_owned()).collect();
+            let lines = CachedLines::from_lines(owned.clone());
+            assert_eq!(lines.len(), expected.len());
+            assert_eq!(lines.to_vec(), owned);
+            assert_eq!(lines.borrowed_lines(), expected);
+            assert_eq!(
+                lines.iter().rev().collect::<Vec<_>>(),
+                expected.iter().rev().copied().collect::<Vec<_>>()
+            );
+            assert_eq!(lines.as_text(), expected.join("\n"));
+            for (index, line) in expected.iter().enumerate() {
+                assert_eq!(lines.get(index), Some(*line));
+                assert_eq!(&lines[index], *line);
+            }
+            assert_eq!(lines.get(expected.len()), None);
+            cache.insert("roundtrip", owned.clone(), 1);
+            assert_eq!(cache.get("roundtrip", 1).unwrap().to_vec(), owned);
+        }
+    }
+
+    #[test]
+    fn borrowed_lines_point_into_the_text_buffer() {
+        let lines = CachedLines::from_text("first\r\nsecond\n");
+        let view = lines.borrowed_lines();
+        assert_eq!(view, ["first", "second"]);
+        assert_eq!(view[0].as_ptr(), lines.as_text().as_ptr());
+        assert_eq!(view[1].as_ptr(), lines.as_text()[7..].as_ptr());
     }
 
     #[test]
