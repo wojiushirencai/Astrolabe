@@ -6,6 +6,44 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.9] - 2026-11-10
+
+### 中文
+
+#### 内存生命周期与紧凑缓存
+- 空闲时分阶段清理派生索引与缓存，再进入索引休眠；请求到来时按需唤醒。修复休眠、并发唤醒和关闭过程中的竞态，避免活动请求被休眠或关闭时发布未完成。
+- 引入 mimalloc，并在 Rayon 工作线程上回收空闲堆；结合各平台的页面回收接口。损坏索引备份按隔离时间清理，保留最近的诊断副本。
+- 采用紧凑行缓存、序列化解析缓存、名称表与倒排表；搜索、注释过滤和引用扫描借用缓存行，减少重复文本复制，保留末尾空行和裸 CR 的往返语义。
+
+#### Setup、Hook 与原生文件监视器
+- 修正 Hook 自探测和 Windows auto 模式探测失败处理；审批须匹配当前配置哈希，清理禁用列表时保留其他条目，迁移 Hook 时保留第三方命令。
+- 修复 macOS/Windows 原生 watcher 生命周期：由 NotifyFeed 持有监视器，避免初始化后立即释放并退回 10 秒轮询。三个 watcher/barrier/快速回退回归通过，不靠延长等待时间；新增直接验证原生事件的生命周期测试。
+
+#### 安装后必须 setup（含 hooks）
+```bash
+npm i -g @zlnap/astrolabe@0.17.9
+astrolabe setup --with-hooks
+```
+只安装二进制不会配置 MCP 或 hooks；请按客户端要求重新加载已有会话。内存和唤醒收益取决于仓库与工作负载，本版不承诺固定内存占用或加速倍数。
+
+### English
+
+#### Memory lifecycle and compact caches
+- Evict derived indexes and caches in idle stages before hibernating the primary index; wake on demand. Close hibernation, concurrent-wake, and shutdown races so active requests and index publication are coordinated.
+- Adopt mimalloc and collect idle heaps on Rayon workers alongside platform page-reclaim APIs. Prune corrupted-index backups by quarantine time while retaining recent diagnostic copies.
+- Compact line/serialized parse caches, name tables, and postings. Borrow cached lines across search, comment filtering, and reference scans; preserve trailing empty lines and bare CR round-trips.
+
+#### Setup, hooks, and native file watching
+- Correct hook self-probing and Windows auto detection failure handling. Require current configuration hashes for approval, preserve unrelated disabled entries, and retain third-party hook commands during migration.
+- Keep the native watcher owned by NotifyFeed on macOS/Windows instead of dropping it after initialization and falling back to 10-second polling. The three watcher/barrier/quick-revert regressions pass without longer sleeps; add a direct native-event lifetime regression.
+
+#### Required setup after installation (including hooks)
+```bash
+npm i -g @zlnap/astrolabe@0.17.9
+astrolabe setup --with-hooks
+```
+Installing the binary alone does not configure MCP or hooks. Reload existing sessions as required by the client. Memory and wake-up behavior depend on the repository and workload; no fixed footprint or speedup is promised.
+
 ## [0.17.8] - 2026-11-07
 
 ### 中文
