@@ -7867,9 +7867,9 @@ mod tests {
         .collect();
         let v = role_views("a.go", &go, &[3, 5]).unwrap();
         // inside a Go raw string: not a definition
-        assert_eq!(hit_role_view(false, &go[3], &v[&3]), "string");
+        assert_eq!(hit_role_view(false, go[3], &v[&3]), "string");
         // trailing comment words do not leak into the label
-        assert_eq!(hit_role_view(false, &go[5], &v[&5]), "use");
+        assert_eq!(hit_role_view(false, go[5], &v[&5]), "use");
         let py: Vec<&str> = [
             "def g(thread):",
             "    return thread  # read SysLog(x)",
@@ -7879,14 +7879,14 @@ mod tests {
         .into_iter()
         .collect();
         let v = role_views("b.py", &py, &[1, 2]).unwrap();
-        assert_eq!(hit_role_view(false, &py[1], &v[&1]), "use");
-        assert_eq!(hit_role_view(false, &py[2], &v[&2]), "comment");
+        assert_eq!(hit_role_view(false, py[1], &v[&1]), "use");
+        assert_eq!(hit_role_view(false, py[2], &v[&2]), "comment");
         // no lexer: falls back to text heuristic
         assert!(role_views("a.txt", &py, &[0]).is_none());
         // string literal keys still see strings
         let rs: Vec<&str> = vec!["let k = \"v\"; // read"];
         let v = role_views("a.rs", &rs, &[0]).unwrap();
-        assert_eq!(hit_role_view(false, &rs[0], &v[&0]), "def");
+        assert_eq!(hit_role_view(false, rs[0], &v[&0]), "def");
     }
 
     #[test]

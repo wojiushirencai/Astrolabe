@@ -67,9 +67,9 @@ tree-sitter-lua = "0.5"
 # Protobuf IDL (LanguageFn / tree-sitter-language, host tree-sitter 0.27).
 tree-sitter-proto = "0.6.0"
 # astrolabe-mcp. Caret (not `=`) so patch releases still apply.
-# rmcp 3.4.0 is the floor because it implements MCP spec 2026-07-28
-# (initialize is optional; per-request `_meta` is the new lifecycle).
-rmcp = { version = "3.4.0", features = ["server", "transport-io", "schemars"] }
+# rmcp 3.9.0 includes fixes for RUSTSEC-2026-0457, -0461, and -0462.
+# It retains MCP spec 2026-07-28 support and the per-request `_meta` lifecycle.
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "schemars"] }
 schemars = "1.2"
 regex = "1.13"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }

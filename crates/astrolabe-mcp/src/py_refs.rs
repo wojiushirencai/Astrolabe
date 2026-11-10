@@ -55,7 +55,7 @@ fn indent_of(line: &str) -> usize {
 /// Whether the statement at `idx` (indent > 0) sits in module-level
 /// control flow rather than in a `def` / `class` body.
 fn module_level_at(lines: &[&str], idx: usize) -> bool {
-    let mut want = indent_of(&lines[idx]);
+    let mut want = indent_of(lines[idx]);
     if want == 0 {
         return true;
     }
@@ -149,7 +149,7 @@ pub(crate) fn dunder_all(lines: &[&str]) -> HashSet<String> {
     while i < lines.len() {
         let t = lines[i].trim_start();
         i += 1;
-        if !t.starts_with("__all__") || indent_of(&lines[i - 1]) != 0 {
+        if !t.starts_with("__all__") || indent_of(lines[i - 1]) != 0 {
             continue;
         }
         let mut text = t.to_string();
@@ -157,7 +157,7 @@ pub(crate) fn dunder_all(lines: &[&str]) -> HashSet<String> {
             text.matches(['[', '(']).count() as i32 - text.matches([']', ')']).count() as i32;
         while depth > 0 && i < lines.len() {
             text.push(' ');
-            text.push_str(&lines[i]);
+            text.push_str(lines[i]);
             depth += lines[i].matches(['[', '(']).count() as i32
                 - lines[i].matches([']', ')']).count() as i32;
             i += 1;
@@ -857,7 +857,7 @@ fn self_attr_type(lines: &[&str], attr: &str) -> Option<String> {
 fn local_type(lines: &[&str], line: usize, var: &str) -> Option<String> {
     (line.saturating_sub(300)..=line)
         .rev()
-        .find_map(|k| binding_on(&lines[k], var))
+        .find_map(|k| binding_on(lines[k], var))
         .flatten()
 }
 
@@ -873,7 +873,7 @@ fn directly_in_class(lines: &[&str], start0: usize, name: &str) -> bool {
         // An attribute (`name: T = …`): fine.
         return true;
     };
-    let d = indent_of(&lines[def_at]);
+    let d = indent_of(lines[def_at]);
     for l in lines[..def_at].iter().rev() {
         let t = l.trim_start();
         if t.is_empty() || t.starts_with('#') || t.starts_with('@') || indent_of(l) >= d {

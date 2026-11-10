@@ -1377,7 +1377,7 @@ fn go_shadowed(lines: &[&str], line: usize, byte: usize, name: &str, funcs: &[(u
     if !funcs.iter().any(|&(s, e)| s <= line1 && line1 <= e) {
         return false;
     }
-    binding_on_line(&lines[line], name).is_some()
+    binding_on_line(lines[line], name).is_some()
         || go_local_binding(lines, line, byte, name).is_some()
 }
 
@@ -1787,7 +1787,7 @@ fn decl_refs(
             if kind != HitKind::Code {
                 continue;
             }
-            let base = selector_base(&lines[line], byte);
+            let base = selector_base(lines[line], byte);
             if base.is_some_and(|b| foreign.contains(b)) {
                 continue;
             }
@@ -1811,7 +1811,7 @@ fn decl_refs(
             if ts.is_some()
                 && !is_decl
                 && base.is_none()
-                && crate::refs_graph_ts::is_object_key(&lines[line], byte)
+                && crate::refs_graph_ts::is_object_key(lines[line], byte)
             {
                 members += 1;
                 continue;
@@ -1836,7 +1836,7 @@ fn decl_refs(
                     continue;
                 }
             }
-            if go && !is_decl && base.is_none() && go_literal_key(&lines[line], byte, name) {
+            if go && !is_decl && base.is_none() && go_literal_key(lines[line], byte, name) {
                 // `Name: v` in a composite literal is a field key.
                 members += 1;
                 continue;
@@ -1925,7 +1925,7 @@ fn decl_refs(
                     }
                 }
             }
-            let character = utf16_col(&lines[line], byte);
+            let character = utf16_col(lines[line], byte);
             let start = Position {
                 line: line as u32,
                 character,

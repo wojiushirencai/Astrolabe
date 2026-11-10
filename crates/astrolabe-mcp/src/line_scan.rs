@@ -125,7 +125,7 @@ mod tests {
 
     fn per_line(re: &regex::Regex, lines: &[&str]) -> Vec<usize> {
         (0..lines.len())
-            .filter(|&i| re.is_match(&lines[i]))
+            .filter(|&i| re.is_match(lines[i]))
             .collect()
     }
 
@@ -141,7 +141,7 @@ mod tests {
         let got: Vec<usize> = cands
             .iter()
             .copied()
-            .filter(|&i| re.is_match(&lines[i]))
+            .filter(|&i| re.is_match(lines[i]))
             .collect();
         assert_eq!(got, want, "pattern {pattern:?} on {text:?}");
         assert!(cands.windows(2).all(|w| w[0] < w[1]), "{cands:?}");
