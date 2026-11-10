@@ -10,7 +10,7 @@ use std::{
 
 use astrolabe_core::{
     budget::{estimate_tokens, truncate_ranked, TokenBudget},
-    cache::{FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
+    cache::{CachedLines, FileCache, DEFAULT_MEMORY_BUDGET_BYTES},
     graph::{cached_centrality, rank_and_match},
     render::symbol_line,
     types::RelPath,
@@ -618,7 +618,7 @@ struct RoleView {
 /// Role of hit lines using the file's `code_mask`: trailing comments no longer
 /// leak words into the label, and lines inside multi-line / raw strings (Go
 /// backticks, Python triple quotes) are tagged `字符串` instead of `定义`/`加载`.
-fn role_views(path: &str, lines: &[String], wanted: &[usize]) -> Option<HashMap<usize, RoleView>> {
+fn role_views(path: &str, lines: &[&str], wanted: &[usize]) -> Option<HashMap<usize, RoleView>> {
     let comments_only = crate::code_mask::code_mask(path, lines, true)?;
     let bare_mask = crate::code_mask::code_mask(path, lines, false)?;
     let pick = |line: &str, mask: &[bool]| -> String {
@@ -1215,9 +1215,10 @@ fn render_grouped_hits(
         }
         let file_is_test = crate::explain::is_test_caller(path, "");
         let wanted: Vec<usize> = rows.iter().map(|r| r.line.saturating_sub(1)).collect();
+        // Borrow source text for role classification; only the reference table is allocated.
         let views = index
             .cached_lines(cache, path)
-            .and_then(|(lines, _)| role_views(path, &lines, &wanted));
+            .and_then(|(lines, _)| role_views(path, &lines.borrowed_lines(), &wanted));
         for r in &mut rows {
             let test = file_is_test || crate::explain::is_test_caller(path, &r.sym);
             r.role = match views
@@ -1400,7 +1401,7 @@ fn render_symbol_hits(
     limit: usize,
     fallback: usize,
     enclosing: &dyn Fn(&SearchHit) -> Option<CodeSymbol>,
-    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<CachedLines>>,
     seen: &mut dyn FnMut(&str, u32, u32) -> Option<u64>,
 ) -> Option<(String, bool)> {
     let mut out = String::new();
@@ -1517,11 +1518,11 @@ fn render_search_hits(
     hits: &[SearchHit],
     context: usize,
     limit: usize,
-    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<Vec<String>>>,
+    file_lines: &mut dyn FnMut(&SearchHit) -> Option<Arc<CachedLines>>,
 ) -> (String, usize) {
     let mut budget = TokenBudget::new(limit);
     let mut out = String::new();
-    let mut current: Option<(String, Option<Arc<Vec<String>>>)> = None;
+    let mut current: Option<(String, Option<Arc<CachedLines>>)> = None;
     // Last line (1-based) already printed for the current file.
     let mut printed = 0usize;
     for (i, hit) in hits.iter().enumerate() {
@@ -2210,9 +2211,21 @@ impl AstrolabeServer {
 
     pub fn start_indexing(&self) {
         if let Some(dispatch) = &self.dispatch {
-            start_idle_ticker(Arc::clone(dispatch), Arc::clone(&self.ticker_stop));
+            start_idle_ticker(
+                Some(Arc::clone(&self.primary)),
+                Some(Arc::clone(dispatch)),
+                Arc::clone(&self.ticker_stop),
+            );
             return;
         }
+        // Single-root mode: patrol the primary for two-stage idle eviction.
+        // The primary is not indexed here when a dispatch exists (multi-project
+        // children activate on first use), and `assemble` never begins a ticker.
+        start_idle_ticker(
+            Some(Arc::clone(&self.primary)),
+            None,
+            Arc::clone(&self.ticker_stop),
+        );
         start_root_indexing(Arc::clone(&self.primary));
     }
 
@@ -2273,7 +2286,16 @@ impl AstrolabeServer {
         })
     }
 
+    /// Route a tool call to its session, stamping the idle clock.
     fn session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
+        let session = self.route_session_for(hint)?;
+        session.touch();
+        Ok(session)
+    }
+
+    /// Route without stamping: pre-call state probes (`building_session`) use
+    /// this, so deciding how to answer does not count as activity.
+    fn route_session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
         if hint.is_empty() {
             return Ok(Arc::clone(&self.primary));
         }
@@ -2302,6 +2324,13 @@ impl AstrolabeServer {
             };
         }
         Ok(Arc::clone(&self.primary))
+    }
+
+    /// Wake a hard-hibernated index and wait briefly (bounded) for its warm
+    /// start, so every indexed tool path gets a served snapshot instead of a
+    /// "building" answer. Also joins an in-flight warm wake.
+    fn wake_if_hibernated(&self, session: &Arc<RootSession>) {
+        session.ensure_awake();
     }
 
     /// Resolve optional per-call `index_root`, then fall back to multi-project
@@ -2429,7 +2458,11 @@ confidence: unknown"
                 self.primary.knobs.clone(),
                 self.cache_budget_bytes,
             );
-            start_idle_ticker(Arc::clone(&dispatch), Arc::clone(&self.ticker_stop));
+            start_idle_ticker(
+                None,
+                Some(Arc::clone(&dispatch)),
+                Arc::clone(&self.ticker_stop),
+            );
             *slot = Some(dispatch);
         }
         let dispatch = Arc::clone(slot.as_ref().expect("just inserted"));
@@ -2548,12 +2581,17 @@ confidence: unknown"
         }
     }
 
-    /// The routed session, when its index is still in the cold build.
+    /// The routed session, when its index is not serving yet (cold build, or
+    /// a hard-hibernated index that has to warm-start). A hibernated index is
+    /// woken here (bounded) so `search_code` can answer from the restored
+    /// index; if the warm start does not finish in time, the on-disk scan
+    /// fallback still answers instead of a "retry shortly" error.
     fn building_session(&self, hint: &str) -> Option<Arc<RootSession>> {
         let session = self.session_for(hint).ok()?;
+        session.ensure_awake();
         let building = matches!(
             &*session.state.read().unwrap_or_else(|e| e.into_inner()),
-            IndexState::Building
+            IndexState::Building | IndexState::Hibernated
         );
         building.then_some(session)
     }
@@ -2703,6 +2741,9 @@ confidence: unknown"
             Ok(s) => s,
             Err(err) => return err,
         };
+        // A hibernated index has no snapshot to serve: warm-start it first
+        // (bounded), then run the ordinary freshness barrier on the result.
+        self.wake_if_hibernated(&session);
         let effect = if barrier {
             run_barrier(&session)
         } else {
@@ -2720,6 +2761,9 @@ confidence: unknown"
             IndexState::Building => Snap::Building,
             IndexState::Failed(error) => Snap::Failed(error.clone()),
             IndexState::Ready(index) => Snap::Ready(Arc::clone(index)),
+            // Still hibernated: the wake either did not start (cooldown) or
+            // did not finish inside `WAKE_WAIT`. Answer like a cold build.
+            IndexState::Hibernated => Snap::Building,
         };
         let result = match snap {
             Snap::Building => {
@@ -2769,6 +2813,7 @@ confidence: unknown"
             Ok(s) => s,
             Err(err) => return err,
         };
+        self.wake_if_hibernated(&session);
         let effect = if barrier {
             run_barrier(&session)
         } else {
@@ -2867,6 +2912,7 @@ confidence: unknown"
         let Ok(session) = self.session_for(hint) else {
             return run();
         };
+        self.wake_if_hibernated(&session);
         let _ = run_barrier(&session);
         let Some(stamp) = Self::stamp_of(&session) else {
             return run();
@@ -4208,16 +4254,6 @@ impl AstrolabeServer {
                     Ok(matcher) => matcher,
                     Err(error) => return text_error(invalid_regex_message(error)),
                 };
-                // Whole-buffer candidate lines (a superset of the lines the
-                // per-line matchers accept; see `line_scan`). With smart case
-                // the case-insensitive variant covers both matchers.
-                let line_scanner = if variant_matcher.is_some() {
-                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), true)
-                } else if params.regex {
-                    crate::line_scan::LineScanner::new(&params.query, !sensitive)
-                } else {
-                    crate::line_scan::LineScanner::new(&regex::escape(&params.query), !sensitive)
-                };
                 if let Some(mode) = params.aggregate.as_deref() {
                     if mode != "top" && mode != "dir" && mode != "file" {
                         return text_error(format!(
@@ -4320,6 +4356,7 @@ impl AstrolabeServer {
                         return None;
                     }
                     let (lines, cache_hit) = index.cached_lines(&session.file_cache, path)?;
+                    // Search and comment filtering both borrow the cached source text.
                     let mut out = FileScan {
                         hits: Vec::new(),
                         cache_hit,
@@ -4329,8 +4366,25 @@ impl AstrolabeServer {
                     };
                     // Lazy: the mask is only computed once a line matches.
                     let mut mask: Option<Option<Vec<Vec<bool>>>> = None;
-                    for line_no in line_scanner.candidates(&lines) {
-                        let line = &lines[line_no];
+                    // Literal matches cannot span lines (newline queries were
+                    // rejected above). Prefilter against the shared text once,
+                    // avoiding regex startup/pool contention on every line.
+                    // Regex queries retain exact per-line anchor semantics.
+                    let candidate_matcher = variant_matcher.as_ref().unwrap_or(&matcher);
+                    let mut buffer_matches = (!params.regex)
+                        .then(|| candidate_matcher.find_iter(lines.as_text()).peekable());
+                    let base = lines.as_text().as_ptr() as usize;
+                    for (line_no, line) in lines.iter().enumerate() {
+                        if let Some(candidates) = &mut buffer_matches {
+                            let start = line.as_ptr() as usize - base;
+                            let end = start + line.len();
+                            while candidates.peek().is_some_and(|hit| hit.end() <= start) {
+                                candidates.next();
+                            }
+                            if candidates.peek().is_none_or(|hit| hit.start() >= end) {
+                                continue;
+                            }
+                        }
                         if !matcher.is_match(line) {
                             if variant_matcher.as_ref().is_some_and(|v| v.is_match(line)) {
                                 let text = if out.variants.is_empty() {
@@ -4349,7 +4403,11 @@ impl AstrolabeServer {
                         }
                         if params.skip_comments {
                             let mask = mask.get_or_insert_with(|| {
-                                crate::code_mask::code_mask(path, &lines, strings_are_code)
+                                if crate::code_mask::has_lexer(path) {
+                                    crate::code_mask::code_mask(path, &lines.borrowed_lines(), strings_are_code)
+                                } else {
+                                    None
+                                }
                             });
                             if let Some(mask) = mask {
                                 let real = matcher
@@ -4437,8 +4495,7 @@ impl AstrolabeServer {
                                 let text = std::fs::read(session.root.join(rels[idx]))
                                     .map(|raw| String::from_utf8_lossy(&raw).into_owned())
                                     .unwrap_or_default();
-                                let lines: Vec<String> =
-                                    text.lines().map(str::to_string).collect();
+                                let lines: Vec<&str> = text.lines().collect();
                                 if let Some(mask) = crate::code_mask::code_mask(
                                     rels[idx],
                                     &lines,
@@ -4656,11 +4713,11 @@ impl AstrolabeServer {
                     );
                 }
                 let context = search_context_lines(params.context_lines, total);
-                let mut file_lines = |hit: &SearchHit| -> Option<Arc<Vec<String>>> {
+                let mut file_lines = |hit: &SearchHit| -> Option<Arc<CachedLines>> {
                     if hit.text_only {
                         let text =
                             std::fs::read_to_string(session.root.join(&hit.path)).ok()?;
-                        Some(Arc::new(text.lines().map(str::to_string).collect()))
+                        Some(Arc::new(CachedLines::from_text(text)))
                     } else {
                         index
                             .cached_lines(&session.file_cache, &hit.path)
@@ -5071,7 +5128,8 @@ impl AstrolabeServer {
                 let mut impl_sources = std::collections::HashMap::new();
                 // Equal ignoring ASCII case implies equal lowercase names, so
                 // the name table's group is a superset (in symbol order).
-                let candidates = index.names().by_lower(&last.to_lowercase());
+                let names = index.names();
+                let candidates = names.by_lower(&last.to_lowercase());
                 for symbol in candidates.iter().map(|&i| &symbols[i as usize]) {
                     if !symbol.name.eq_ignore_ascii_case(last)
                         || kind.is_some_and(|k| symbol.kind != k)
@@ -7796,7 +7854,7 @@ mod tests {
 
     #[test]
     fn hit_roles_use_lexer_for_trailing_comments_and_raw_strings() {
-        let go: Vec<String> = [
+        let go: Vec<&str> = [
             "package p",
             "func f() {",
             "\ts := `",
@@ -7805,32 +7863,30 @@ mod tests {
             "\treturn s // a := b",
             "}",
         ]
-        .iter()
-        .map(|l| l.to_string())
+        .into_iter()
         .collect();
         let v = role_views("a.go", &go, &[3, 5]).unwrap();
         // inside a Go raw string: not a definition
-        assert_eq!(hit_role_view(false, &go[3], &v[&3]), "string");
+        assert_eq!(hit_role_view(false, go[3], &v[&3]), "string");
         // trailing comment words do not leak into the label
-        assert_eq!(hit_role_view(false, &go[5], &v[&5]), "use");
-        let py: Vec<String> = [
+        assert_eq!(hit_role_view(false, go[5], &v[&5]), "use");
+        let py: Vec<&str> = [
             "def g(thread):",
             "    return thread  # read SysLog(x)",
             "    # SysLog(x)",
             "    x = 1  # note",
         ]
-        .iter()
-        .map(|l| l.to_string())
+        .into_iter()
         .collect();
         let v = role_views("b.py", &py, &[1, 2]).unwrap();
-        assert_eq!(hit_role_view(false, &py[1], &v[&1]), "use");
-        assert_eq!(hit_role_view(false, &py[2], &v[&2]), "comment");
+        assert_eq!(hit_role_view(false, py[1], &v[&1]), "use");
+        assert_eq!(hit_role_view(false, py[2], &v[&2]), "comment");
         // no lexer: falls back to text heuristic
         assert!(role_views("a.txt", &py, &[0]).is_none());
         // string literal keys still see strings
-        let rs: Vec<String> = vec!["let k = \"v\"; // read".into()];
+        let rs: Vec<&str> = vec!["let k = \"v\"; // read"];
         let v = role_views("a.rs", &rs, &[0]).unwrap();
-        assert_eq!(hit_role_view(false, &rs[0], &v[&0]), "def");
+        assert_eq!(hit_role_view(false, rs[0], &v[&0]), "def");
     }
 
     #[test]
@@ -8768,6 +8824,81 @@ mod tests {
     }
 
     #[test]
+    fn search_code_borrowed_cache_keeps_crlf_unicode_and_bare_cr_lines() {
+        let (server, dir) = smart_server(&[(
+            "hello.py",
+            "# Needle 雪\r\n# needle\r\n\r\n# Needle 雪\r".into(),
+        )]);
+        let repo = server.primary.snapshot_ready().unwrap();
+        let (cached, _) = repo
+            .cached_lines(&server.primary.file_cache, "hello.py")
+            .unwrap();
+        let base = cached.as_text().as_ptr() as usize;
+        for line in cached.iter() {
+            let start = line.as_ptr() as usize;
+            assert!(start >= base && start + line.len() <= base + cached.as_text().len());
+        }
+        for (query, regex) in [("Needle 雪", false), ("^# Needle 雪", true)] {
+            let mut params = search(query);
+            params.regex = regex;
+            params.case_sensitive = Some(true);
+            params.context_lines = Some(0);
+            params.group = Some(false);
+            params.dedup = Some(false);
+            for _ in 0..2 {
+                let text = first_text(server.search_code(Parameters(params.clone())));
+                assert!(text.contains("hello.py:1"), "{text}");
+                assert!(text.contains("hello.py:4"), "{text}");
+                assert!(!text.contains("hello.py:2"), "{text}");
+            }
+        }
+        assert!(server.primary.cache_hits.load(Ordering::Relaxed) >= 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_code_skip_comments_borrows_warm_cache_for_literal_and_regex() {
+        let (server, dir) = smart_server(&[(
+            "hello.go",
+            "package p\r\n// Needle 雪\r\n/* Needle 雪\r\nNeedle 雪 */\r\nfunc f() { call(Needle) }\r\nvar s = `Needle`\r\n// Needle\r".into(),
+        )]);
+        let repo = server.primary.snapshot_ready().unwrap();
+        let (cached, _) = repo
+            .cached_lines(&server.primary.file_cache, "hello.go")
+            .unwrap();
+        for (query, regex) in [
+            ("Needle", false),
+            (r"\bNeedle\b", true),
+            (r"^func .*Needle", true),
+        ] {
+            let mut params = search(query);
+            params.regex = regex;
+            params.skip_comments = true;
+            params.case_sensitive = Some(true);
+            params.context_lines = Some(0);
+            params.group = Some(false);
+            params.dedup = Some(false);
+            for _ in 0..2 {
+                let text = first_text(server.search_code(Parameters(params.clone())));
+                assert!(text.contains("hello.go:5"), "{query}: {text}");
+                for excluded in [2, 3, 4, 6, 7] {
+                    assert!(
+                        !text.contains(&format!("hello.go:{excluded}")),
+                        "{query}: {text}"
+                    );
+                }
+            }
+        }
+        let (after, hit) = repo
+            .cached_lines(&server.primary.file_cache, "hello.go")
+            .unwrap();
+        assert!(hit);
+        assert!(Arc::ptr_eq(&cached, &after));
+        assert!(server.primary.cache_hits.load(Ordering::Relaxed) >= 6);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn search_code_uses_file_cache_and_records_hits() {
         let (server, dir) = ready_server_with_disk();
         let params = SearchParams {
@@ -9372,8 +9503,10 @@ mod tests {
         }
     }
 
-    fn numbered(n: usize) -> Arc<Vec<String>> {
-        Arc::new((1..=n).map(|i| format!("line{i}")).collect())
+    fn numbered(n: usize) -> Arc<CachedLines> {
+        Arc::new(CachedLines::from_lines(
+            (1..=n).map(|i| format!("line{i}")).collect(),
+        ))
     }
 
     #[test]
@@ -10111,7 +10244,7 @@ mod tests {
             match &*server.primary.state.read().unwrap() {
                 IndexState::Ready(_) => return,
                 IndexState::Failed(e) => panic!("index failed: {e}"),
-                IndexState::Building => {}
+                IndexState::Building | IndexState::Hibernated => {}
             }
             if start.elapsed() > timeout {
                 panic!("timeout waiting for Ready");
@@ -10126,7 +10259,7 @@ mod tests {
             match &*session.state.read().unwrap() {
                 IndexState::Ready(_) => return,
                 IndexState::Failed(e) => panic!("index failed: {e}"),
-                IndexState::Building => {}
+                IndexState::Building | IndexState::Hibernated => {}
             }
             if start.elapsed() > timeout {
                 panic!("timeout waiting for child Ready");
@@ -10137,6 +10270,93 @@ mod tests {
 
     fn git_marker(dir: &Path) {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
+    }
+
+    #[test]
+    fn concurrent_tool_gates_wait_for_wake_instead_of_building_fallback() {
+        for search_gate in [false, true] {
+            let dir = unique_temp_dir();
+            std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+            let server = Arc::new(AstrolabeServer::new_with_knobs(
+                dir.clone(),
+                test_knobs(),
+                8 * 1024 * 1024,
+            ));
+            server.start_indexing();
+            wait_ready(&server, Duration::from_secs(20));
+            *server.primary.state.write().unwrap() = IndexState::Hibernated;
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            *server.primary.wake_before_publish.lock().unwrap() =
+                Some((Arc::clone(&entered), Arc::clone(&resume)));
+            assert!(server.primary.wake_if_hibernated());
+            entered.wait();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            *server.primary.wake_wait_started.lock().unwrap() = Some(started_tx);
+            let request_server = Arc::clone(&server);
+            let request = std::thread::spawn(move || {
+                if search_gate {
+                    request_server.building_session("").is_none()
+                } else {
+                    request_server.wake_if_hibernated(&request_server.primary);
+                    request_server.primary.snapshot_ready().is_some()
+                }
+            });
+            let started = started_rx.recv_timeout(Duration::from_secs(2));
+            resume.wait();
+            let served = request.join().unwrap();
+            assert!(started.is_ok(), "tool gate must enter the warm-wake wait");
+            assert!(
+                served,
+                "restored index must be served rather than building fallback"
+            );
+            assert!(server.primary.wait_builds_idle(Duration::from_secs(5)));
+            server.stop_watching();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// End-to-end two-stage idle wake: a hard-hibernated primary must
+    /// warm-start on the next routed tool call and serve real results, not
+    /// a "retry shortly" answer.
+    #[test]
+    fn hibernated_primary_wakes_on_the_next_tool_call() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server =
+            AstrolabeServer::new_with_knobs(dir.clone(), test_knobs(), 8 * 1024 * 1024);
+        server.structured_output = false;
+        server.start_indexing();
+        wait_ready(&server, Duration::from_secs(20));
+
+        // Simulate the hard stage: unload the index and leave it hibernated.
+        *server.primary.state.write().unwrap() = IndexState::Hibernated;
+        assert!(server.primary.snapshot_ready().is_none());
+
+        let text = first_text(server.find_symbol(Parameters(QueryParams {
+            root: None,
+            index_root: None,
+            query: "alpha".into(),
+            include_body: false,
+            substring: None,
+            path_filter: None,
+            kind: None,
+            depth: 0,
+            budget_tokens: 500,
+            offset: 0,
+            dedup: None,
+            agent_id: None,
+        })));
+        assert!(
+            text.contains("alpha"),
+            "a hibernated index must wake and serve, got {text}"
+        );
+        assert!(
+            matches!(&*server.primary.state.read().unwrap(), IndexState::Ready(_)),
+            "the wake must leave a Ready index behind"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_knobs() -> crate::knobs::McpKnobs {

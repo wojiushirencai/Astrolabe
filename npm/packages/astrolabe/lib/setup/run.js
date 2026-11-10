@@ -2,6 +2,7 @@
 
 const path = require('path');
 const os = require('os');
+const clientsMod = require('./clients');
 const {
   CLIENTS,
   getClient,
@@ -11,7 +12,7 @@ const {
   checkCursorAllowlist,
   backupFile,
   writeJsonAtomic,
-} = require('./clients');
+} = clientsMod;
 const { parseArgs, USAGE } = require('./args');
 const { isTTY, confirm, selectClients } = require('./prompt');
 
@@ -97,7 +98,49 @@ function formatEntryPreview(planResult) {
   return '';
 }
 
+function resolveCommandBinary(command, env = process.env) {
+  if (!command) return null;
+  // Absolute path or an explicit relative path: resolve against cwd.
+  if (path.isAbsolute(command)) return path.resolve(command);
+  if (command.includes('/') || command.includes('\\')) return path.resolve(command);
+  // Bare command name: resolve through PATH, otherwise `--command=astrolabe`
+  // would become <cwd>/astrolabe, which is not absolute and has no separator.
+  const found = clientsMod.which(command, env);
+  return found ? path.resolve(found) : null;
+}
+
+/**
+ * Back up every existing target a multi-step plan will rewrite (project/global
+ * mcp.json, rules, hooks.json), not just the primary file. New files have
+ * nothing to back up.
+ */
+function backupAppliedFiles(applied) {
+  const targets = [
+    { filePath: applied.filePath, created: applied.created, skipped: applied.skipped },
+    ...(Array.isArray(applied.results) ? applied.results : []).map((step) => ({
+      filePath: step.filePath,
+      created: step.created,
+      skipped: step.skipped,
+    })),
+  ];
+  const seen = new Set();
+  const backups = [];
+  for (const target of targets) {
+    if (!target.filePath || target.skipped || target.created || seen.has(target.filePath)) {
+      continue;
+    }
+    seen.add(target.filePath);
+    const backup = backupFile(target.filePath);
+    if (backup) backups.push(backup);
+  }
+  return backups;
+}
+
 function run(argv = process.argv.slice(2)) {
+  return runAsync(argv);
+}
+
+async function runAsync(argv = process.argv.slice(2)) {
   const opts = parseArgs(argv);
   if (opts.help) {
     process.stdout.write(USAGE);
@@ -106,6 +149,7 @@ function run(argv = process.argv.slice(2)) {
 
   const home = resolveHome(opts.home);
   const rows = detectAll(home);
+  const detectedById = new Map(rows.map((row) => [row.id, row.detected]));
 
   if (opts.list) {
     printList(rows);
@@ -124,6 +168,58 @@ function run(argv = process.argv.slice(2)) {
     return 0;
   }
 
+  const cursorSelected = selectedIds.includes('cursor');
+  const cursorDetected = cursorSelected && detectedById.get('cursor');
+  let projectRoot = null;
+  let cursorBinPath = null;
+  let cursorBinError = null;
+  let pyrightPath = null;
+  if (cursorDetected) {
+    projectRoot = clientsMod.resolveCursorProjectRoot(
+      opts.project ? path.resolve(opts.project) : process.cwd(),
+    );
+    pyrightPath = clientsMod.detectPyright(process.env, {
+      whichFn: clientsMod.which,
+      home,
+    });
+    if (opts.command) {
+      cursorBinPath = resolveCommandBinary(opts.command, process.env);
+      if (!cursorBinPath) {
+        cursorBinError =
+          `--command ${opts.command} not found (absolute path or PATH lookup failed)`;
+      }
+    } else if (opts.native) {
+      // --native promises "astrolabe on PATH"; prefer that over downloading.
+      cursorBinPath = resolveCommandBinary('astrolabe', process.env);
+      if (!cursorBinPath) {
+        try {
+          const { resolveBinary } = require('../resolve');
+          cursorBinPath = path.resolve(await resolveBinary());
+        } catch (error) {
+          cursorBinError = error.message || String(error);
+        }
+      }
+    } else {
+      try {
+        const { resolveBinary } = require('../resolve');
+        cursorBinPath = path.resolve(await resolveBinary());
+      } catch (error) {
+        cursorBinError = error.message || String(error);
+      }
+    }
+    if (!cursorBinPath && !opts.command) {
+      cursorBinPath = resolveCommandBinary('astrolabe', process.env);
+    }
+    if (!cursorBinPath) {
+      process.stderr.write(
+        `[astrolabe setup] could not resolve the native astrolabe binary: ` +
+          `${cursorBinError || 'not found'}\n` +
+          '  Cursor needs an absolute binary path; skipping Cursor setup.\n' +
+          '  Fix: npm i -g @zlnap/astrolabe (or pass --command=/abs/path/astrolabe)\n',
+      );
+    }
+  }
+
   const actions = [];
   for (const id of selectedIds) {
     const client = getClient(id);
@@ -132,7 +228,18 @@ function run(argv = process.argv.slice(2)) {
       native: opts.native,
       commandOverride: opts.command,
     });
-    const plan = client.plan({ home, launch, withHooks: opts.withHooks });
+    const plan = client.plan({
+      home,
+      launch,
+      withHooks: opts.withHooks,
+      projectRoot,
+      cursorBinPath,
+      pyrightPath,
+      env: process.env,
+      detected: detectedById.get(id),
+      scope: opts.scope,
+      cursorCommandExplicit: Boolean(opts.command),
+    });
     const applied = plan.apply();
     actions.push({
       id,
@@ -143,9 +250,12 @@ function run(argv = process.argv.slice(2)) {
     });
   }
 
+  const cursorAction = actions.find((action) => action.id === 'cursor');
+  const cursorApplied = Boolean(cursorAction && !cursorAction.applied.skipped);
+
   let permissionsPlan = null;
   let allowlistCheck = null;
-  if (opts.cursorPermissions && selectedIds.includes('cursor')) {
+  if (opts.cursorPermissions && cursorApplied) {
     allowlistCheck = checkCursorAllowlist(home);
     process.stdout.write(`\nCursor MCP allowlist check: ${allowlistCheck.message}\n`);
     permissionsPlan = mergeCursorPermissions(home, {
@@ -177,7 +287,13 @@ function run(argv = process.argv.slice(2)) {
       }
     }
     if (action.id !== 'deepseek-harness') {
-      process.stdout.write(`      command: ${action.launch.command} ${action.launch.args.join(' ')}\n`);
+      const launchCommand =
+        action.id === 'cursor' && action.applied.entry
+          ? action.applied.entry
+          : action.launch;
+      process.stdout.write(
+        `      command: ${launchCommand.command} ${(launchCommand.args || []).join(' ')}\n`,
+      );
     }
     const preview = formatEntryPreview(action.applied);
     if (preview) {
@@ -221,17 +337,73 @@ function run(argv = process.argv.slice(2)) {
       summary.push({ id: action.id, status: 'skipped', reason: action.applied.reason });
       continue;
     }
-    const backup = backupFile(action.applied.filePath);
+    const backups = backupAppliedFiles(action.applied);
     action.applied.write();
     summary.push({
       id: action.id,
       status: 'written',
       file: action.applied.filePath,
-      backup,
+      backup: backups[0] || null,
+      backups,
     });
     process.stdout.write(
-      `Wrote ${action.applied.filePath}${backup ? ` (backup ${backup})` : ''}\n`,
+      `Wrote ${action.applied.filePath}${backups.length ? ` (backup ${backups.join(', ')})` : ''}\n`,
     );
+  }
+
+  let cursorApproval = null;
+  if (cursorDetected && projectRoot && cursorApplied) {
+    cursorApproval = clientsMod.enableCursorApproval({
+      home,
+      projectRoot,
+      env: process.env,
+      whichFn: clientsMod.which,
+    });
+    if (cursorApproval.disabled && cursorApproval.disabled.changed && cursorApproval.disabled.doc) {
+      const backup = backupFile(cursorApproval.disabled.filePath);
+      writeJsonAtomic(cursorApproval.disabled.filePath, cursorApproval.disabled.doc);
+      process.stdout.write(
+        `Removed astrolabe from ${cursorApproval.disabled.filePath}` +
+          `${backup ? ` (backup ${backup})` : ''}\n`,
+      );
+    }
+    const approvalHint =
+      '  Global MCP registration cannot pre-approve future projects: Cursor asks on the ' +
+      'first use of each project name. Headless runs can pass --approve-mcps; otherwise ' +
+      'run `cursor-agent mcp enable astrolabe` in that project.\n';
+    if (!cursorApproval.available) {
+      process.stdout.write(
+        '\nCursor CLI approval: cursor-agent not found on PATH.\n' +
+          `  Run: cursor-agent mcp enable astrolabe   (cwd ${projectRoot})\n` +
+          approvalHint,
+      );
+    } else if (opts.scope === 'project') {
+      if (cursorApproval.status !== 0 || cursorApproval.error || cursorApproval.signal ||
+          !cursorApproval.approval.approved) {
+        process.stdout.write(
+          `\nCursor CLI approval: \`cursor-agent mcp enable astrolabe\` exited ${cursorApproval.status}` +
+            `${cursorApproval.stderr ? `: ${cursorApproval.stderr}` : ''}\n` +
+            `  Run it manually in ${projectRoot}.\n` +
+            '  Cursor CLI silently hides unapproved project MCP servers from the model.\n',
+        );
+      } else {
+        process.stdout.write(
+          `\nCursor CLI approval: approved astrolabe for ${projectRoot} (${cursorApproval.approvalPath})\n`,
+        );
+        summary.push({
+          id: 'cursor-approval',
+          status: 'written',
+          file: cursorApproval.approvalPath,
+          backup: null,
+        });
+      }
+    } else {
+      process.stdout.write(
+        `\nCursor CLI: ran \`cursor-agent mcp enable astrolabe\` in ${projectRoot} ` +
+          `(best effort, exit ${cursorApproval.status}).\n` +
+          approvalHint,
+      );
+    }
   }
 
   if (permissionsPlan) {
@@ -279,16 +451,34 @@ function run(argv = process.argv.slice(2)) {
     process.stdout.write('  3. Claude Code: claude mcp get astrolabe\n');
   }
   if (selectedIds.includes('cursor')) {
-    process.stdout.write(
-      '  3. Cursor: open Settings → MCP and confirm astrolabe is listed; enable Run Mode for allowlist.\n',
-    );
+    if (cursorDetected) {
+      if (opts.scope === 'project') {
+        process.stdout.write(
+          `  3. Cursor: project config ${path.join(projectRoot, '.cursor', 'mcp.json')} + ` +
+            `${path.join(projectRoot, '.cursor', 'rules', 'astrolabe.mdc')}; this directory ` +
+            'requires successful `cursor-agent mcp enable astrolabe` approval before use.\n',
+        );
+      } else {
+        process.stdout.write(
+          `  3. Cursor: global config ${path.join(home, '.cursor', 'mcp.json')}. Cursor has no ` +
+            'file-based global rules directory; the L1 guidance comes from the MCP instructions ' +
+            'and the global ~/.cursor/hooks.json remind hook (enable with --with-hooks). ' +
+            'New projects still prompt for MCP approval on first use.\n',
+        );
+      }
+    } else {
+      process.stdout.write(
+        '  3. Cursor: not detected; skipped config, rules and MCP approval.\n',
+      );
+    }
     if (opts.withHooks) {
       process.stdout.write(
-        '     Hooks: ~/.cursor/hooks.json uses --client=cursor (matcher includes mcp__astrolabe__.*).\n',
+        '     Hooks: ~/.cursor/hooks.json uses an absolute binary path and --client=cursor ' +
+          '(matcher includes astrolabe-.*).\n',
       );
     } else {
       process.stdout.write(
-        '     Tip: re-run with --with-hooks to write ~/.cursor/hooks.json (--client=cursor).\n',
+        '     Tip: re-run with --with-hooks to write ~/.cursor/hooks.json (absolute path, --client=cursor).\n',
       );
     }
   }

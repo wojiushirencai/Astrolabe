@@ -36,6 +36,10 @@
     "lib",
     "README.md"
   ],
+  "scripts": {
+    "prepack": "node ../../scripts/sync-setup-assets.js",
+    "postpack": "node ../../scripts/sync-setup-assets.js --clean"
+  },
   "engines": {
     "node": ">=18"
   },
