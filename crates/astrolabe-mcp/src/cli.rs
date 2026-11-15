@@ -13,7 +13,10 @@ Astrolabe MCP server (stdio)
 Usage: astrolabe [options] [ROOT]
 
 ROOT priority: positional → ASTROLABE_ROOT → . (detect from cwd)
-  . / omitted   walk up for nearest .git or .serena/project.yml
+  . / omitted   nearest .git upward; else direct child git repos
+                (one → that repo, several → multi-project); else nearest
+                .astrolabe/project.yml upward (.serena/project.yml is
+                accepted for Serena compatibility)
   other path    canonicalize only; do not walk up
 
 Options:

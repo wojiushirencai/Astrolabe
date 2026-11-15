@@ -6,6 +6,15 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+### 中文
+
+#### 项目根判定：git 优先，新增 `.astrolabe/project.yml`
+- 新增项目标记 `.astrolabe/project.yml`，用于在没有 git 的目录声明项目根（目前只看文件是否存在）。只认这个文件：Astrolabe 会在每个建过索引的目录下自动创建 `.astrolabe/`（索引、锁、memories），只有这个目录不算项目标记。
+- `.serena/project.yml` 继续兼容；通过它命中项目根时，日志会建议改用 `.astrolabe/project.yml`。
+- 从 cwd（`.`）判定项目根改为 git 优先：① 向上找最近的 `.git`，找到即为仓库根，仓库内子目录里更近的项目文件不再把仓库拆开；② 否则看 cwd 的直接子目录，恰好 1 个 git 仓库就直接索引它，2 个及以上进入多项目调度模式——cwd 自身有 `.astrolabe/project.yml` 或 `.serena/project.yml` 也一样；③ 周围都没有 git 时，向上找最近的项目文件（同一目录两种都有即同一个根）；④ 仍未找到则按文件数判定，行为不变。祖先目录上的标记（用户主目录或文件数超限）照旧忽略并告警。
+- 行为变化：newapi 这类“非 git 根目录 + `.serena/project.yml` + 多个子 git 仓库”的目录，此前会被当成一个仓库整体索引（一次实际启动约 9 万文件，内存峰值约 6.2 GB），现在进入多项目模式，只按需索引用到的子仓库。git 仓库内部带 `.serena/project.yml` 的子目录也不再单独成根，而是归入外层仓库。
+- 显式指定的根（位置参数 / `ASTROLABE_ROOT`）仍不向上查找；启动日志里的 repo / single 标签同样认 `.astrolabe/project.yml`。
+
 ## [0.17.9] - 2026-11-10
 
 ### 中文

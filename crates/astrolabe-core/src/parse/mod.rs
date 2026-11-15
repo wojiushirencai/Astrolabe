@@ -2583,6 +2583,7 @@ function f(opts: { inlineParam: string }) { return (opts as { castOnly: 1 }); }\
                 | ".next"
                 | ".openvisio"
                 | ".serena"
+                | ".astrolabe"
         )
     }
 
