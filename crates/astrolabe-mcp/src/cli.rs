@@ -15,6 +15,8 @@ Usage: astrolabe [options] [ROOT]
 ROOT priority: positional → ASTROLABE_ROOT → . (detect from cwd)
   . / omitted   walk up for nearest .git or .serena/project.yml
   other path    canonicalize only; do not walk up
+  only git repositories are indexed: a non-git ROOT serves its child repos
+  or is refused (ASTROLABE_ALLOW_NON_GIT_ROOT=1 indexes it as given)
 
 Options:
   --context NAME   client context (default, claude-code, cursor, codex, readonly)

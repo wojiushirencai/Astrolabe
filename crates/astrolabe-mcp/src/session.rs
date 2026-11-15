@@ -203,6 +203,9 @@ pub(crate) struct RootSession {
     /// thread is not re-queued) on every tick.
     pub soft_evicted: Arc<AtomicBool>,
     pub knobs: McpKnobs,
+    /// Set on the non-git parent of a multi-project dispatcher
+    /// ([`Self::mark_dormant`]): it is never indexed, woken or rebuilt.
+    dormant: AtomicBool,
     /// Test hook: the next N incremental applies fail as if the engine
     /// panicked.
     #[cfg(test)]
@@ -276,6 +279,7 @@ impl RootSession {
             idle_policy,
             soft_evicted: Arc::new(AtomicBool::new(false)),
             knobs,
+            dormant: AtomicBool::new(false),
             #[cfg(test)]
             fail_applies: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -299,6 +303,16 @@ impl RootSession {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Never index this session: cold builds, wakes and background rebuilds
+    /// all refuse from now on. For the non-git parent of a dispatcher.
+    pub(crate) fn mark_dormant(&self) {
+        self.dormant.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_dormant(&self) -> bool {
+        self.dormant.load(Ordering::SeqCst)
     }
 
     /// Stop the watcher and drop the indexer lock. Store files stay on disk.
@@ -429,7 +443,7 @@ impl RootSession {
     /// query. Also refuses while a background rebuild is already running —
     /// that rebuild publishes `Ready` by itself.
     pub(crate) fn wake_if_hibernated(self: &Arc<Self>) -> bool {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::SeqCst) || self.is_dormant() {
             return false;
         }
         let now = current_time_secs();
@@ -576,7 +590,7 @@ impl RootSession {
     /// hibernated"), `false` when the index is still building after the
     /// bounded wait or the wake was refused (cooldown).
     pub(crate) fn ensure_awake(self: &Arc<Self>) -> bool {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::SeqCst) || self.is_dormant() {
             return false;
         }
         let needs_wake = {
@@ -649,7 +663,12 @@ impl Drop for BuildActive {
 
 /// Full build for `session` that stops early once the session is closed
 /// (teardown on eviction / shutdown). `None` = cancelled; nothing to publish.
+/// A dormant session is never built.
 pub(crate) fn build_session_index(session: &RootSession, persist: bool) -> Option<IndexState> {
+    if session.is_dormant() {
+        tracing::warn!(root = %session.root.display(), "refusing to index a dormant non-git root");
+        return None;
+    }
     let _active = BuildActive::enter(session);
     let started = Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -694,6 +713,10 @@ pub(crate) fn build_index(root: &Path, persist: bool, parse_cache_bytes: u64) ->
 /// Spawn the cold-build thread. Watcher is started *inside* that thread
 /// before `IncrementalIndex::build`.
 pub(crate) fn start_root_indexing(session: Arc<RootSession>) {
+    if session.is_dormant() {
+        tracing::warn!(root = %session.root.display(), "refusing to index a dormant non-git root");
+        return;
+    }
     std::thread::Builder::new()
         .name("astrolabe-index".into())
         .spawn(move || bootstrap_root(session))

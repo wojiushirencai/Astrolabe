@@ -42,7 +42,7 @@ use crate::{
     index::RepoIndex,
     knobs::McpKnobs,
     openai_schema::sanitize_for_openai_tools,
-    root::resolve_call_index_root,
+    root::{is_in_git_project, non_git_index_root_message, resolve_call_index_root},
     session::{
         self, activate_absolute_root, append_stale_note, run_barrier, start_idle_ticker,
         start_root_indexing, teardown_all, BarrierEffect, DispatchState, RootSession,
@@ -2165,7 +2165,12 @@ impl AstrolabeServer {
             "configured bounded file cache"
         );
         let loop_guard_config = knobs.loop_guard;
+        let dormant_parent =
+            dispatch.is_some() && !knobs.allow_non_git_root && !is_in_git_project(&root);
         let primary = RootSession::new(root.clone(), knobs, budget_bytes);
+        if dormant_parent {
+            primary.mark_dormant();
+        }
         Self {
             root: primary.root.clone(),
             cache_budget_bytes: budget_bytes,
@@ -2297,14 +2302,14 @@ impl AstrolabeServer {
     /// this, so deciding how to answer does not count as activity.
     fn route_session_for(&self, hint: &str) -> Result<Arc<RootSession>, CallToolResult> {
         if hint.is_empty() {
-            return Ok(Arc::clone(&self.primary));
+            return self.serving_primary();
         }
         let hint_path = Path::new(hint);
         if astrolabe_core::paths::paths_eq_normalized(hint_path, self.primary.root.as_path())
             || self.primary.root.to_string_lossy() == hint
             || astrolabe_core::paths::display_path(&self.primary.root) == hint
         {
-            return Ok(Arc::clone(&self.primary));
+            return self.serving_primary();
         }
         if let Some(dispatch) = &self.dispatch {
             return match session::route_session(dispatch, hint) {
@@ -2323,6 +2328,15 @@ impl AstrolabeServer {
                 Err(msg) => Err(self.finish(text_error(msg))),
             };
         }
+        self.serving_primary()
+    }
+
+    /// The primary session, unless it is the dormant non-git parent of a
+    /// multi-project dispatcher: that one never serves a call.
+    fn serving_primary(&self) -> Result<Arc<RootSession>, CallToolResult> {
+        if self.primary.is_dormant() {
+            return Err(self.finish(text_error(non_git_index_root_message(&self.primary.root))));
+        }
         Ok(Arc::clone(&self.primary))
     }
 
@@ -2340,7 +2354,9 @@ impl AstrolabeServer {
     /// When the override directory sits under an already-active session root
     /// (startup primary or a previously activated root), that parent session is
     /// reused and the override is folded into `path` / `path_filter` so a
-    /// subdirectory argument does not kick off a second cold build.
+    /// subdirectory argument does not kick off a second cold build. An
+    /// override that no active session covers must lie inside a git project;
+    /// otherwise it is refused before any session exists for it.
     fn resolve_call_root(
         &self,
         index_root: Option<&str>,
@@ -2382,6 +2398,9 @@ confidence: unknown"
                     note,
                 });
             }
+            if let Some(refused) = self.refuse_non_git_root(&resolved) {
+                return Err(refused);
+            }
             let keep_path = match path_relative_to_index_root(&resolved, path) {
                 Ok(path) => path,
                 Err(message) => return Err(self.finish(text_error(message))),
@@ -2419,7 +2438,9 @@ confidence: unknown"
                 best = Some((Arc::clone(session), rel));
             }
         };
-        consider(&self.primary);
+        if !self.primary.is_dormant() {
+            consider(&self.primary);
+        }
         let mut scan_dispatch = |dispatch: &DispatchState| {
             let map = dispatch.sessions.lock().unwrap_or_else(|e| e.into_inner());
             for session in map.values() {
@@ -2440,13 +2461,26 @@ confidence: unknown"
         best
     }
 
+    /// Refusal for a per-call `index_root` outside any git project, unless
+    /// `ASTROLABE_ALLOW_NON_GIT_ROOT` is set. Checked before any session is
+    /// created for it.
+    fn refuse_non_git_root(&self, resolved: &Path) -> Option<CallToolResult> {
+        if self.primary.knobs.allow_non_git_root || is_in_git_project(resolved) {
+            return None;
+        }
+        Some(self.finish(text_error(non_git_index_root_message(resolved))))
+    }
+
     /// Open or reuse a [`RootSession`] for an absolute index root.
     fn ensure_index_root_session(
         &self,
         resolved: &Path,
     ) -> Result<Arc<RootSession>, CallToolResult> {
         if astrolabe_core::paths::paths_eq_normalized(resolved, self.primary.root.as_path()) {
-            return Ok(Arc::clone(&self.primary));
+            return self.serving_primary();
+        }
+        if let Some(refused) = self.refuse_non_git_root(resolved) {
+            return Err(refused);
         }
         if let Some(dispatch) = &self.dispatch {
             return Ok(activate_absolute_root(dispatch, resolved));
@@ -11951,6 +11985,247 @@ mod mcp_routing_tests {
         );
 
         server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    fn quiet_knobs() -> crate::knobs::McpKnobs {
+        crate::knobs::McpKnobs {
+            watch_mode: None,
+            loop_guard: crate::loop_guard::LoopGuardConfig {
+                repeat_max: 0,
+                rate_max: 0,
+                ..Default::default()
+            },
+            ..crate::knobs::McpKnobs::default()
+        }
+    }
+
+    fn refusal(route: Result<RouteOutcome, CallToolResult>) -> String {
+        match route {
+            Ok(route) => panic!("expected a refusal, routed to {}", route.hint),
+            Err(refused) => text(&refused),
+        }
+    }
+
+    fn dynamic_session_count(server: &AstrolabeServer) -> usize {
+        server
+            .dynamic_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|d| d.sessions.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn per_call_index_root_outside_git_is_refused_without_a_session() {
+        let parent = tmp("idxroot_nongit");
+        let repo = parent.join("repo_a");
+        let sibling = parent.join("repo_b");
+        for dir in [&repo, &sibling] {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+        }
+        std::fs::write(repo.join("lib.rs"), "pub fn alpha_only() -> u8 { 1 }\n").unwrap();
+        let plain = parent.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("notes.rs"), "pub fn plain_only() {}\n").unwrap();
+
+        let mut server = AstrolabeServer::new_with_knobs(repo.clone(), quiet_knobs(), 8 << 20);
+        server.structured_output = false;
+
+        let msg =
+            refusal(server.resolve_call_root(Some(parent.to_str().unwrap()), None, None, None));
+        assert!(msg.contains("not inside a git repository"), "{msg}");
+        assert!(msg.contains(&repo.display().to_string()), "{msg}");
+        assert!(msg.contains(&sibling.display().to_string()), "{msg}");
+        assert!(msg.contains("confidence: unknown"), "{msg}");
+
+        let out = text(&server.find_symbol(Parameters(QueryParams {
+            index_root: Some(plain.to_string_lossy().into_owned()),
+            ..sym("plain_only", None, None)
+        })));
+        assert!(out.contains("not inside a git repository"), "{out}");
+        assert!(out.contains("no direct child git repositories"), "{out}");
+        assert!(!out.contains("notes.rs"), "{out}");
+
+        assert!(
+            server
+                .dynamic_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "a refused index_root must not open a dispatcher or session"
+        );
+        assert!(!plain.join(".astrolabe").exists());
+        assert!(!parent.join(".astrolabe").exists());
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn allow_non_git_root_knob_restores_per_call_indexing() {
+        let parent = tmp("idxroot_allow");
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let plain = parent.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("lib.rs"), "pub fn plain_only() -> u8 { 1 }\n").unwrap();
+        let knobs = crate::knobs::McpKnobs {
+            allow_non_git_root: true,
+            ..quiet_knobs()
+        };
+        let mut server = AstrolabeServer::new_with_knobs(repo.clone(), knobs, 8 << 20);
+        server.structured_output = false;
+
+        let hit = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                index_root: Some(plain.to_string_lossy().into_owned()),
+                ..sym("plain_only", None, None)
+            }))
+        });
+        assert!(hit.contains("plain_only"), "{hit}");
+        assert!(
+            hit.starts_with(&format!(
+                "index_root: {}",
+                astrolabe_core::paths::display_path(&plain)
+            )),
+            "{hit}"
+        );
+        assert_eq!(dynamic_session_count(&server), 1);
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn multi_project_non_git_parent_is_never_routed_or_indexed() {
+        let parent = tmp("multi_nongit_parent");
+        let alpha = parent.join("alpha");
+        let beta = parent.join("beta");
+        for (dir, name) in [(&alpha, "alpha_only"), (&beta, "beta_only")] {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(
+                dir.join("lib.rs"),
+                format!("pub fn {name}() -> u8 {{ 1 }}\n"),
+            )
+            .unwrap();
+        }
+        // A non-git folder of worktrees next to the child repos.
+        let prep = parent.join("work-prep");
+        let worktree = prep.join("wt1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: /tmp/fake.git\n").unwrap();
+        std::fs::write(prep.join("stray.rs"), "pub fn stray() {}\n").unwrap();
+
+        let mut server = AstrolabeServer::with_multi_project_knobs(
+            parent.clone(),
+            vec![alpha.clone(), beta.clone()],
+            quiet_knobs(),
+            8 << 20,
+        );
+        server.structured_output = false;
+        server.start_indexing();
+        assert!(server.primary.is_dormant());
+
+        for raw in [&parent, &prep] {
+            let msg =
+                refusal(server.resolve_call_root(Some(raw.to_str().unwrap()), None, None, None));
+            assert!(msg.contains("not inside a git repository"), "{msg}");
+            assert!(msg.contains("confidence: unknown"), "{msg}");
+        }
+        let prep_msg =
+            refusal(server.resolve_call_root(Some(prep.to_str().unwrap()), None, None, None));
+        assert!(
+            prep_msg.contains(&worktree.display().to_string()),
+            "{prep_msg}"
+        );
+        for hint in ["", parent.to_str().unwrap()] {
+            let refused = server
+                .route_session_for(hint)
+                .expect_err("the dormant parent must not serve");
+            let msg = text(&refused);
+            assert!(msg.contains("not inside a git repository"), "{msg}");
+        }
+        assert!(
+            server.find_covering_session(&alpha).is_none(),
+            "the dormant parent must not cover its children"
+        );
+
+        let route = server
+            .resolve_call_root(Some(alpha.to_str().unwrap()), None, None, None)
+            .expect("a child repo routes to its own session");
+        assert_eq!(route.hint, alpha.to_string_lossy());
+        let hit = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                index_root: Some(alpha.to_string_lossy().into_owned()),
+                ..sym("alpha_only", None, None)
+            }))
+        });
+        assert!(hit.contains("alpha_only"), "{hit}");
+        assert!(
+            hit.starts_with(&format!(
+                "index_root: {}",
+                astrolabe_core::paths::display_path(&alpha)
+            )),
+            "{hit}"
+        );
+
+        // The session itself refuses every build or wake as well.
+        *server.primary.state.write().unwrap() = IndexState::Hibernated;
+        assert!(!server.primary.wake_if_hibernated());
+        assert!(!server.primary.ensure_awake());
+        start_root_indexing(Arc::clone(&server.primary));
+        assert!(crate::session::build_session_index(&server.primary, false).is_none());
+        assert!(matches!(
+            *server.primary.state.read().unwrap(),
+            IndexState::Hibernated
+        ));
+        assert!(
+            !parent.join(".astrolabe").exists(),
+            "the parent must not grow an index store"
+        );
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn multi_project_parent_is_dormant_only_outside_git() {
+        let parent = tmp("multi_dormancy");
+        let children: Vec<PathBuf> = ["alpha", "beta"].iter().map(|n| parent.join(n)).collect();
+        for dir in &children {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+        }
+        let non_git = AstrolabeServer::with_multi_project_knobs(
+            parent.clone(),
+            children.clone(),
+            quiet_knobs(),
+            8 << 20,
+        );
+        assert!(non_git.primary.is_dormant());
+        let allowed = AstrolabeServer::with_multi_project_knobs(
+            parent.clone(),
+            children.clone(),
+            crate::knobs::McpKnobs {
+                allow_non_git_root: true,
+                ..quiet_knobs()
+            },
+            8 << 20,
+        );
+        assert!(!allowed.primary.is_dormant());
+        assert!(allowed.route_session_for("").is_ok());
+        // Single-root mode never marks its primary dormant.
+        let single = AstrolabeServer::new_with_knobs(parent.clone(), quiet_knobs(), 8 << 20);
+        assert!(!single.primary.is_dormant());
+        std::fs::create_dir_all(parent.join(".git")).unwrap();
+        let in_git = AstrolabeServer::with_multi_project_knobs(
+            parent.clone(),
+            children,
+            quiet_knobs(),
+            8 << 20,
+        );
+        assert!(!in_git.primary.is_dormant());
+        for server in [non_git, allowed, single, in_git] {
+            server.stop_watching();
+        }
         let _ = std::fs::remove_dir_all(&parent);
     }
 

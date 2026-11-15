@@ -38,6 +38,9 @@ pub(crate) struct McpKnobs {
     pub parse_cache_bytes: u64,
     pub reindex_throttle: Duration,
     pub loop_guard: crate::loop_guard::LoopGuardConfig,
+    /// `ASTROLABE_ALLOW_NON_GIT_ROOT`: index directories outside any git
+    /// project (startup root and per-call `index_root`). Off by default.
+    pub allow_non_git_root: bool,
 }
 
 impl Default for McpKnobs {
@@ -52,6 +55,7 @@ impl Default for McpKnobs {
             parse_cache_bytes: DEFAULT_PARSE_CACHE_BYTES,
             reindex_throttle: DEFAULT_REINDEX_THROTTLE,
             loop_guard: crate::loop_guard::LoopGuardConfig::default(),
+            allow_non_git_root: false,
         }
     }
 }
@@ -86,6 +90,35 @@ impl McpKnobs {
             parse_cache_bytes: parse_cache_bytes_from_env(),
             reindex_throttle: reindex_throttle_from_env(),
             loop_guard: crate::loop_guard::LoopGuardConfig::from_env(),
+            allow_non_git_root: allow_non_git_root_from_env(),
+        }
+    }
+}
+
+/// `ASTROLABE_ALLOW_NON_GIT_ROOT` from the process environment.
+pub fn allow_non_git_root_from_env() -> bool {
+    parse_allow_non_git_root(
+        std::env::var("ASTROLABE_ALLOW_NON_GIT_ROOT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// `1` / `true` / `yes` / `on` enable; unset, empty, `0` / `false` / `no` /
+/// `off` disable; anything else warns and stays disabled.
+pub(crate) fn parse_allow_non_git_root(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                "invalid ASTROLABE_ALLOW_NON_GIT_ROOT; non-git roots stay refused"
+            );
+            false
         }
     }
 }
@@ -266,5 +299,17 @@ mod tests {
         assert_eq!(defaults.barrier_max, BARRIER_MAX_INLINE);
         assert_eq!(defaults.idle, Duration::from_secs(DEFAULT_IDLE_SECS));
         assert_eq!(defaults.resident_roots, DEFAULT_RESIDENT_ROOTS);
+        assert!(!defaults.allow_non_git_root);
+    }
+
+    #[test]
+    fn parse_allow_non_git_root_matrix() {
+        assert!(!parse_allow_non_git_root(None));
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_allow_non_git_root(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "no", "off", "2", "maybe"] {
+            assert!(!parse_allow_non_git_root(Some(off)), "{off:?}");
+        }
     }
 }
