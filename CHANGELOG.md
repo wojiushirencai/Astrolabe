@@ -6,6 +6,8 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.10] - 2026-11-15
+
 ### 中文
 
 #### 只索引 git 仓库和 `.astrolabe/project.yml` 项目
@@ -26,6 +28,36 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 #### 验证
 - 新增 root / knobs / server 单元测试，覆盖 `.astrolabe/project.yml` 与 `.serena/project.yml` 的识别和优先级（裸 `.astrolabe/` 不算标记）、git 判定（含 `$HOME` 标记、worktree 指针文件）、启动分类、显式根分类、`index_root` 拒绝文本、分发模式父目录拒绝与逃生开关；以及：带子仓库的项目文件目录不会从其普通子目录被采纳、对“项目文件 + 子仓库”目录的 `index_root` 被拒绝并列出子仓库、只有 `.astrolabe/project.yml` 的非 git 目录可作为 `index_root`、带 `.serena/project.yml` 的分发父目录仍休眠。原有把非 git 临时目录当作 `Single` 的测试改为断言 `NotGit`。
+
+#### 安装后必须 setup（含 hooks）
+```bash
+npm i -g @zlnap/astrolabe@0.17.10
+astrolabe setup --with-hooks
+```
+只安装二进制不会配置 MCP 或 hooks；请按客户端要求重新加载已有会话。
+
+### English
+
+#### Index only git repositories and `.astrolabe/project.yml` projects
+- Add the `.astrolabe/project.yml` project marker for declaring a project in a directory without git. Only the file counts: Astrolabe creates `.astrolabe/` (index, lock, memories) in every indexed directory, so the bare directory is not a marker. `.serena/project.yml` is still accepted for Serena compatibility; when it is the matching marker, the log suggests switching to `.astrolabe/project.yml`.
+- One "indexable root" rule now drives startup `.`, explicit roots, per-call `index_root`, and multi-project parents:
+  1. The directory or an ancestor contains `.git` (directory or file; worktrees and submodules count) outside `$HOME` → indexable.
+  2. Otherwise, if direct children are git repositories → the directory itself is not indexable, even with a project file; its child repositories are served instead.
+  3. Otherwise, the nearest project file (`.astrolabe/project.yml`, or `.serena/project.yml` for compatibility) → indexable, unless the directory holding it contains child git repositories.
+  4. Otherwise → not indexable.
+- Startup from `.` now refuses a non-indexable directory (exit code 2, same startup-failure guidance as the file-count cap) instead of indexing it when it holds at most 20k files. An explicit root that is not indexable serves its single child repository, starts multi-project dispatch for two or more, or is refused.
+- Per-call `index_root` outside any project returns an error listing up to 20 child repositories; no session or index is created. A multi-project parent is never indexed or woken; previously a sub-path `index_root` could land on the parent session, hang in "index building", and scan the whole tree on disk.
+- Behavior change: a non-git workspace such as `newapi` (root `.serena/project.yml`, 6 child repositories, plus a non-git directory holding 25 git worktrees and ~120k source files) was previously indexed as one repository (~90k files, ~6.2 GB peak physical memory). It now starts in multi-project mode and indexes child repositories on demand.
+
+#### Escape hatch
+- `ASTROLABE_ALLOW_NON_GIT_ROOT=1` (also `true` / `yes` / `on`) restores the previous behavior. It is read once at startup; `ASTROLABE_MAX_ROOT_FILES` still applies.
+
+#### Required setup after installation (including hooks)
+```bash
+npm i -g @zlnap/astrolabe@0.17.10
+astrolabe setup --with-hooks
+```
+Installing the binary alone does not configure MCP or hooks. Reload existing sessions as required by the client.
 
 ## [0.17.9] - 2026-11-10
 
