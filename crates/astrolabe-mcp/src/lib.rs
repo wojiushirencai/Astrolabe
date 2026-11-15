@@ -46,9 +46,9 @@ pub use cli::{parse_launch, Launch, USAGE};
 pub use context::{resolve_context_name, ClientContext};
 pub use knobs::allow_non_git_root_from_env;
 pub use root::{
-    child_git_repos, count_root_files, find_project_root, is_cwd_sentinel, is_in_git_project,
-    non_git_index_root_message, resolve_call_index_root, resolve_explicit_root, resolve_index_root,
-    resolve_root, resolve_startup_root, ResolvedRoot, DEFAULT_MAX_ROOT_FILES,
+    child_git_repos, count_root_files, find_project_root, is_cwd_sentinel, is_indexable_root,
+    is_project_dir, non_git_index_root_message, resolve_call_index_root, resolve_explicit_root,
+    resolve_index_root, resolve_root, resolve_startup_root, ResolvedRoot, DEFAULT_MAX_ROOT_FILES,
 };
 pub use server::{AstrolabeServer, StartupFailedServer};
 

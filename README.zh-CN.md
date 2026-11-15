@@ -85,7 +85,7 @@ Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安�
 | `get_diag` | 文件的语法与类型错误。（别名：`get_diagnostics`） |
 | `get_lang` | 语言、文件数、代码行数、语言服务器状态，以及索引覆盖情况（见下）。（别名：`get_languages`） |
 
-`tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发），其中包含每个工具上可选的按次 `index_root`（位于 git 仓库内的绝对路径或相对 cwd 的目录；省略则沿用进程启动时的索引根）。Astrolabe 只索引 git 仓库：非 git 的启动目录或 `index_root` 会被拒绝并列出其下的子仓库，除非设 `ASTROLABE_ALLOW_NON_GIT_ROOT=1`（见[参考手册](docs/REFERENCE.zh-CN.md)）。其余参数——`regex`、`exclude`、`count_only`、`context_lines`、`group`、`dedup`、`kind`、`depth`、`substring`、`dry_run_rename`、`character`、`severity`、`offset`、`page`、`budget_tokens`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
+`tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发），其中包含每个工具上可选的按次 `index_root`（位于 git 仓库或 `.astrolabe/project.yml` 项目内的绝对路径或相对 cwd 的目录；省略则沿用进程启动时的索引根）。Astrolabe 只索引 git 仓库和用 `.astrolabe/project.yml` 声明的目录（兼容 Serena 的 `.serena/project.yml`），装着 git 仓库的目录本身永远不建索引；其他启动目录或 `index_root` 会被拒绝并列出其下的子仓库，除非设 `ASTROLABE_ALLOW_NON_GIT_ROOT=1`（见[参考手册](docs/REFERENCE.zh-CN.md)）。其余参数——`regex`、`exclude`、`count_only`、`context_lines`、`group`、`dedup`、`kind`、`depth`、`substring`、`dry_run_rename`、`character`、`severity`、`offset`、`page`、`budget_tokens`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
 
 工具描述与返回文本为**纯英文**（schema 文案、结果正文、hook 提醒），避免中英双语让模型歧义。
 

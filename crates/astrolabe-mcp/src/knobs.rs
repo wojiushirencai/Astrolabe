@@ -38,8 +38,9 @@ pub(crate) struct McpKnobs {
     pub parse_cache_bytes: u64,
     pub reindex_throttle: Duration,
     pub loop_guard: crate::loop_guard::LoopGuardConfig,
-    /// `ASTROLABE_ALLOW_NON_GIT_ROOT`: index directories outside any git
-    /// project (startup root and per-call `index_root`). Off by default.
+    /// `ASTROLABE_ALLOW_NON_GIT_ROOT`: index directories that are neither in a
+    /// git repository nor marked by `.astrolabe/project.yml` (startup root and
+    /// per-call `index_root`). Off by default.
     pub allow_non_git_root: bool,
 }
 

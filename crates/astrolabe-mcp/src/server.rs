@@ -42,7 +42,7 @@ use crate::{
     index::RepoIndex,
     knobs::McpKnobs,
     openai_schema::sanitize_for_openai_tools,
-    root::{is_in_git_project, non_git_index_root_message, resolve_call_index_root},
+    root::{is_indexable_root, non_git_index_root_message, resolve_call_index_root},
     session::{
         self, activate_absolute_root, append_stale_note, run_barrier, start_idle_ticker,
         start_root_indexing, teardown_all, BarrierEffect, DispatchState, RootSession,
@@ -2166,7 +2166,7 @@ impl AstrolabeServer {
         );
         let loop_guard_config = knobs.loop_guard;
         let dormant_parent =
-            dispatch.is_some() && !knobs.allow_non_git_root && !is_in_git_project(&root);
+            dispatch.is_some() && !knobs.allow_non_git_root && !is_indexable_root(&root);
         let primary = RootSession::new(root.clone(), knobs, budget_bytes);
         if dormant_parent {
             primary.mark_dormant();
@@ -2355,7 +2355,7 @@ impl AstrolabeServer {
     /// (startup primary or a previously activated root), that parent session is
     /// reused and the override is folded into `path` / `path_filter` so a
     /// subdirectory argument does not kick off a second cold build. An
-    /// override that no active session covers must lie inside a git project;
+    /// override that no active session covers must be indexable;
     /// otherwise it is refused before any session exists for it.
     fn resolve_call_root(
         &self,
@@ -2461,11 +2461,11 @@ confidence: unknown"
         best
     }
 
-    /// Refusal for a per-call `index_root` outside any git project, unless
-    /// `ASTROLABE_ALLOW_NON_GIT_ROOT` is set. Checked before any session is
-    /// created for it.
+    /// Refusal for a per-call `index_root` that is not indexable
+    /// ([`is_indexable_root`]), unless `ASTROLABE_ALLOW_NON_GIT_ROOT` is set.
+    /// Checked before any session is created for it.
     fn refuse_non_git_root(&self, resolved: &Path) -> Option<CallToolResult> {
-        if self.primary.knobs.allow_non_git_root || is_in_git_project(resolved) {
+        if self.primary.knobs.allow_non_git_root || is_indexable_root(resolved) {
             return None;
         }
         Some(self.finish(text_error(non_git_index_root_message(resolved))))
@@ -12227,6 +12227,138 @@ mod mcp_routing_tests {
             server.stop_watching();
         }
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    fn write_project_file(dir: &Path, marker_dir: &str) {
+        std::fs::create_dir_all(dir.join(marker_dir)).unwrap();
+        std::fs::write(
+            dir.join(marker_dir).join("project.yml"),
+            "project_name: t\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn per_call_index_root_on_marked_parent_of_repos_is_refused() {
+        for marker in [".astrolabe", ".serena"] {
+            let parent = tmp("idxroot_marked_parent");
+            let alpha = parent.join("alpha");
+            let beta = parent.join("beta");
+            for dir in [&alpha, &beta] {
+                std::fs::create_dir_all(dir.join(".git")).unwrap();
+            }
+            write_project_file(&parent, marker);
+            let docs = parent.join("docs");
+            std::fs::create_dir_all(&docs).unwrap();
+            std::fs::write(docs.join("notes.rs"), "pub fn docs_only() {}\n").unwrap();
+
+            let mut server = AstrolabeServer::new_with_knobs(alpha.clone(), quiet_knobs(), 8 << 20);
+            server.structured_output = false;
+
+            let msg =
+                refusal(server.resolve_call_root(Some(parent.to_str().unwrap()), None, None, None));
+            assert!(
+                msg.contains("not inside a git repository"),
+                "{marker}: {msg}"
+            );
+            assert!(
+                msg.contains("even with .astrolabe/project.yml"),
+                "{marker}: {msg}"
+            );
+            assert!(
+                msg.contains(&alpha.display().to_string()),
+                "{marker}: {msg}"
+            );
+            assert!(msg.contains(&beta.display().to_string()), "{marker}: {msg}");
+
+            let out = text(&server.find_symbol(Parameters(QueryParams {
+                index_root: Some(docs.to_string_lossy().into_owned()),
+                ..sym("docs_only", None, None)
+            })));
+            assert!(
+                out.contains("not inside a git repository"),
+                "{marker}: {out}"
+            );
+            assert!(!out.contains("notes.rs"), "{marker}: {out}");
+
+            assert!(
+                server
+                    .dynamic_roots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none(),
+                "a refused index_root must not open a dispatcher or session"
+            );
+            assert!(!docs.join(".astrolabe").exists());
+            assert!(!parent.join(".astrolabe").join("index.redb").exists());
+            server.stop_watching();
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+    }
+
+    #[test]
+    fn per_call_index_root_on_declared_non_git_project_is_served() {
+        let parent = tmp("idxroot_declared");
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let declared = parent.join("declared");
+        std::fs::create_dir_all(&declared).unwrap();
+        write_project_file(&declared, ".astrolabe");
+        std::fs::write(
+            declared.join("lib.rs"),
+            "pub fn declared_only() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        let mut server = AstrolabeServer::new_with_knobs(repo.clone(), quiet_knobs(), 8 << 20);
+        server.structured_output = false;
+
+        let hit = until_ready(|| {
+            server.find_symbol(Parameters(QueryParams {
+                index_root: Some(declared.to_string_lossy().into_owned()),
+                ..sym("declared_only", None, None)
+            }))
+        });
+        assert!(hit.contains("declared_only"), "{hit}");
+        assert!(
+            hit.starts_with(&format!(
+                "index_root: {}",
+                astrolabe_core::paths::display_path(&declared)
+            )),
+            "{hit}"
+        );
+        assert_eq!(dynamic_session_count(&server), 1);
+        server.stop_watching();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn multi_project_parent_with_project_file_is_still_dormant() {
+        for marker in [".serena", ".astrolabe"] {
+            let parent = tmp("multi_marked_parent");
+            let children: Vec<PathBuf> = ["alpha", "beta"].iter().map(|n| parent.join(n)).collect();
+            for dir in &children {
+                std::fs::create_dir_all(dir.join(".git")).unwrap();
+            }
+            write_project_file(&parent, marker);
+            assert!(!is_indexable_root(&parent), "{marker}");
+            let server = AstrolabeServer::with_multi_project_knobs(
+                parent.clone(),
+                children,
+                quiet_knobs(),
+                8 << 20,
+            );
+            assert!(server.primary.is_dormant(), "{marker}");
+            let refused = server
+                .route_session_for("")
+                .expect_err("the dormant parent must not serve");
+            let msg = text(&refused);
+            assert!(
+                msg.contains("not inside a git repository"),
+                "{marker}: {msg}"
+            );
+            server.stop_watching();
+            let _ = std::fs::remove_dir_all(&parent);
+        }
     }
 
     #[test]

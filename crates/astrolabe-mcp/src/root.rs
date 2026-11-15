@@ -1,50 +1,58 @@
 //! Resolve the directory Astrolabe actually indexes.
 //!
-//! Serena's Claude Code setup does **not** index `args: ["."]` as a literal
-//! relative path. It walks up from the MCP process cwd looking for a project
-//! boundary, then stores the **absolute** path. A nested worktree must win
-//! over an ancestor so a checkout inside another repo is not hijacked.
+//! Like Serena's `--project-from-cwd`, the cwd sentinel `.` (and "no
+//! argument") is **not** indexed as a literal relative path: the MCP process
+//! cwd is classified against project boundaries and the **absolute** path is
+//! stored.
 //!
-//! Markers (nearest wins, same single-pass rule as Serena's
-//! `find_project_root`):
+//! Markers:
 //!
 //! * `.git` — a directory, or a worktree/submodule pointer file
-//! * `.serena/project.yml` — an explicit Serena project (a bare `.serena/`
-//!   directory is **not** enough; Serena requires the YAML file)
+//! * `.astrolabe/project.yml` — an explicit project without git.
+//!   `.serena/project.yml` is accepted for Serena compatibility. Only the
+//!   YAML file counts: Astrolabe creates `.astrolabe/` (index store, lock,
+//!   memories) in every root it indexes, and a bare `.serena/` is not a
+//!   Serena project either.
 //!
 //! Explicit paths (`astrolabe /path/to/repo`, `ASTROLABE_ROOT=/path`) are
 //! not walked up after canonicalization — that is Serena's `--project` flag.
-//! The cwd sentinel `.` (and "no argument") is Serena's `--project-from-cwd`.
 //!
-//! Astrolabe only indexes git projects. A path is *inside a git project*
-//! ([`is_in_git_project`]) when [`find_project_root`] finds a marker at or
-//! above it and that marker is not the home directory (a dotfiles `~/.git`
-//! does not make every folder under `$HOME` a project).
+//! Git wins, and only marked directories are indexed. One rule
+//! ([`is_indexable_root`]) serves startup, explicit roots, per-call
+//! `index_root` and the multi-project parent:
 //!
-//! When no ancestor marker is adopted, [`resolve_root`] classifies the spawn
-//! directory instead of indexing it blindly (that fallback once indexed a
-//! 350k-file parent of many git checkouts, and later a non-git folder of 25
-//! worktrees at 6 GB):
+//! 1. The nearest `.git` at or above the path → indexable. A nested worktree
+//!    wins over its ancestor repo, and a project file inside a repo does not
+//!    split it. A marker at `$HOME` never counts (a dotfiles `~/.git` does
+//!    not make every folder below it a project).
+//! 2. Otherwise, direct children that contain `.git` (hidden names such as
+//!    `.Trash` are skipped) → the path itself is **not** indexable, even with
+//!    a project file; its child repos are served or listed instead.
+//! 3. Otherwise, the nearest project file at or above the path → indexable,
+//!    unless that directory holds child git repos (git wins: a non-git
+//!    parent of checkouts is never indexed whole from a subdirectory).
+//! 4. Otherwise → not indexable.
 //!
-//! 1. Walk **up** first — a nested checkout such as `newapi/web` must still
-//!    resolve to `newapi`. Downward probes must not change that.
-//! 2. Look **down** one level for direct children that contain `.git`
-//!    (hidden names such as `.Trash` are skipped). Exactly one hit is served
-//!    directly as `Repo`; two or more are `MultiProject`.
-//! 3. Count files (capped): over the limit is `TooLarge`. Within it, a
-//!    directory outside any git project is `NotGit`; a subdirectory of a git
-//!    project whose oversized root was skipped is `Single`.
+//! [`resolve_root`] applies the rule to the cwd instead of indexing it
+//! blindly (a blind fallback once indexed a 350k-file parent of many git
+//! checkouts, and later a non-git parent with `.serena/project.yml` above
+//! six checkouts and a folder of 25 worktrees at 6 GB): the marked root is
+//! `Repo`, one child repo is served as `Repo`, several are `MultiProject`,
+//! and an unmarked cwd is `NotGit` (or `TooLarge` over the file limit). A
+//! marked *ancestor* that is over the limit is not adopted: a nearer project
+//! file below a rejected `.git` is tried next, and otherwise the cwd below
+//! it is `Single`.
 //!
 //! The MCP binary starts `MultiProject` in dispatcher mode (lazy per-child
-//! indexing, see `session.rs` / `roots.rs`; the non-git parent itself is
-//! never indexed) and refuses `TooLarge` and `NotGit` on the cwd sentinel
+//! indexing, see `session.rs` / `roots.rs`; the parent itself is never
+//! indexed) and refuses `TooLarge` and `NotGit` on the cwd sentinel
 //! (`exit 2`). An explicit root ([`resolve_explicit_root`]) skips the size
-//! gate and is served as given inside a git project; outside one it is
-//! replaced by its child repos the same way, or refused when it has none.
-//! A per-call `index_root` outside a git project is refused with its child
-//! repos listed ([`non_git_index_root_message`]).
+//! gate and is served as given when indexable; otherwise it is replaced by
+//! its child repos the same way, or refused when it has none. A per-call
+//! `index_root` that is not indexable is refused with its child repos listed
+//! ([`non_git_index_root_message`]).
 //!
-//! `ASTROLABE_ALLOW_NON_GIT_ROOT=1` restores indexing non-git directories
+//! `ASTROLABE_ALLOW_NON_GIT_ROOT=1` restores indexing unmarked directories
 //! as given ([`resolve_startup_root`]).
 
 use std::fmt::Write as _;
@@ -61,13 +69,14 @@ pub const DEFAULT_MAX_ROOT_FILES: u64 = 20_000;
 /// Outcome of [`resolve_root`] / [`resolve_explicit_root`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedRoot {
-    /// A project root: the nearest `.git` / `.serena/project.yml` at or
-    /// above the cwd, an explicit root that carries one, or the only direct
-    /// child repo of a non-git directory.
+    /// A marked root: the nearest `.git` (or, without git, project file) at
+    /// or above the cwd, an explicit root that carries a marker, or the only
+    /// direct child repo of an unindexable directory.
     Repo(PathBuf),
-    /// Indexed as given without being a project root: a subdirectory of a
-    /// git project whose root was not adopted (explicit path, or an ancestor
-    /// over `limit`), or any directory under `ASTROLABE_ALLOW_NON_GIT_ROOT`.
+    /// Indexed as given without being a marked root: a subdirectory of an
+    /// indexable project whose root was not adopted (explicit path, or an
+    /// ancestor over `limit`), or any directory under
+    /// `ASTROLABE_ALLOW_NON_GIT_ROOT`.
     Single(PathBuf),
     /// Two or more direct children contain `.git`. Hidden names are not listed.
     MultiProject {
@@ -80,17 +89,33 @@ pub enum ResolvedRoot {
         files: u64,
         limit: u64,
     },
-    /// Outside any git project and without child git repos (for the cwd:
-    /// within `limit`). Refused unless `ASTROLABE_ALLOW_NON_GIT_ROOT` is set.
+    /// Not indexable (no git or usable project file around) and without child
+    /// git repos (for the cwd: within `limit`). Refused unless
+    /// `ASTROLABE_ALLOW_NON_GIT_ROOT` is set.
     NotGit(PathBuf),
 }
 
-/// Walk `start` and its parents. The nearest directory that contains `.git`
-/// or `.serena/project.yml` wins.
+/// Walk `start` and its parents: the nearest `.git` wins; without one, the
+/// nearest project file whose directory holds no child git repos. Upward
+/// only — [`is_indexable_root`] also probes `start`'s own child repos.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    find_git_root(start).or_else(|| project_file_root(start))
+}
+
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    find_upward(start, has_git_marker)
+}
+
+/// The nearest project file at or above `start`, unless its directory holds
+/// child git repos: those repos are served one by one, never under it.
+fn project_file_root(start: &Path) -> Option<PathBuf> {
+    find_upward(start, has_project_file).filter(|found| child_git_repos(found).is_empty())
+}
+
+fn find_upward(start: &Path, is_marked: fn(&Path) -> bool) -> Option<PathBuf> {
     let mut dir = start.canonicalize().ok()?;
     loop {
-        if is_project_marker(&dir) {
+        if is_marked(&dir) {
             return Some(dir);
         }
         if !dir.pop() {
@@ -99,10 +124,40 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Serena: `.serena/project.yml` is the project file; `.git` may be a dir or
-/// a gitdir pointer. Same-directory both-present is the same root.
-fn is_project_marker(dir: &Path) -> bool {
-    dir.join(".git").exists() || dir.join(".serena").join("project.yml").is_file()
+/// True when `dir` is a project root on its own: it has `.git` or a project
+/// file. Used wherever a directory is labelled repo vs single.
+pub fn is_project_dir(dir: &Path) -> bool {
+    has_git_marker(dir) || has_project_file(dir)
+}
+
+/// `.git` may be a directory or a worktree/submodule gitdir pointer file.
+fn has_git_marker(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// `.astrolabe/project.yml`, or Serena's `.serena/project.yml`. A bare
+/// `.astrolabe/` is not enough: the index store creates it in every root.
+fn has_project_file(dir: &Path) -> bool {
+    has_astrolabe_project_file(dir) || has_serena_project_file(dir)
+}
+
+fn has_astrolabe_project_file(dir: &Path) -> bool {
+    dir.join(".astrolabe").join("project.yml").is_file()
+}
+
+fn has_serena_project_file(dir: &Path) -> bool {
+    dir.join(".serena").join("project.yml").is_file()
+}
+
+/// Nudge Serena-only projects toward the native marker.
+fn note_serena_project_file(root: &Path) {
+    if !has_git_marker(root) && !has_astrolabe_project_file(root) && has_serena_project_file(root) {
+        tracing::info!(
+            root = %root.display(),
+            "project root marked by .serena/project.yml (Serena compatibility); \
+             consider adding .astrolabe/project.yml"
+        );
+    }
 }
 
 /// True when the launch request means "detect from process cwd".
@@ -112,8 +167,10 @@ pub fn is_cwd_sentinel(path: &Path) -> bool {
 
 /// Classify `cwd` for the index-root guardrail.
 ///
-/// Upward detection is first and final: a nested repo is never reclassified
-/// because a parent directory happens to contain sibling checkouts.
+/// Order (see the module docs): nearest `.git` up, git children down,
+/// nearest project file up, then the file count. A git root found upward is
+/// final: a nested repo is never reclassified because a parent directory
+/// happens to contain sibling checkouts.
 ///
 /// A marker found in an *ancestor* of `cwd` is size-checked like an unmarked
 /// directory: a stray `~/.git` (dotfiles) or a repo above the limit must not
@@ -121,38 +178,74 @@ pub fn is_cwd_sentinel(path: &Path) -> bool {
 /// skipped (with a warning) and `cwd` is classified instead; set
 /// `ASTROLABE_ROOT` or raise `ASTROLABE_MAX_ROOT_FILES` to force it.
 pub fn resolve_root(cwd: &Path, limit: u64) -> ResolvedRoot {
-    let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    if let Some(found) = find_project_root(cwd) {
-        if found == cwd_canon {
-            return ResolvedRoot::Repo(found);
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let adopt = |found: PathBuf| {
+        let found = adopt_marked_root(found, &root, limit)?;
+        note_serena_project_file(&found);
+        Some(ResolvedRoot::Repo(found))
+    };
+    let marked = match standing(&root, &home_dirs()) {
+        // A size-rejected git root still yields to a nearer project file.
+        Standing::Git(found) => {
+            let served = adopt(found).or_else(|| project_file_root(&root).and_then(adopt));
+            if let Some(served) = served {
+                return served;
+            }
+            true
         }
-        match ancestor_rejection(&found, limit) {
-            None => return ResolvedRoot::Repo(found),
-            Some(reason) => tracing::warn!(
-                ancestor = %found.display(),
-                cwd = %cwd_canon.display(),
-                "ignoring project marker in ancestor directory ({reason}); \
-                 set ASTROLABE_ROOT or ASTROLABE_MAX_ROOT_FILES to use it"
-            ),
+        Standing::ProjectFile(found) => {
+            if let Some(served) = adopt(found) {
+                return served;
+            }
+            true
         }
-    }
-    let root = cwd_canon;
-    let mut children = child_git_repos(&root);
-    if children.len() == 1 {
-        // A single nested repo needs no routing: serve it directly.
-        return ResolvedRoot::Repo(children.remove(0));
-    }
-    if !children.is_empty() {
-        return ResolvedRoot::MultiProject { root, children };
+        Standing::GitParent(children) => return serve_child_repos(root, children),
+        Standing::Unmarked => false,
+    };
+    if marked {
+        let children = child_git_repos(&root);
+        if !children.is_empty() {
+            return serve_child_repos(root, children);
+        }
     }
     let (files, truncated) = count_root_files(&root, limit);
     if truncated {
         return ResolvedRoot::TooLarge { root, files, limit };
     }
-    if is_in_git_project(&root) {
+    if marked {
         ResolvedRoot::Single(root)
     } else {
         ResolvedRoot::NotGit(root)
+    }
+}
+
+/// `children` is non-empty.
+fn serve_child_repos(root: PathBuf, mut children: Vec<PathBuf>) -> ResolvedRoot {
+    if children.len() == 1 {
+        // A single nested repo needs no routing: serve it directly.
+        ResolvedRoot::Repo(children.remove(0))
+    } else {
+        ResolvedRoot::MultiProject { root, children }
+    }
+}
+
+/// `found` if it may serve as the root for `cwd`; an ancestor that
+/// [`ancestor_rejection`] refuses is skipped with a warning.
+fn adopt_marked_root(found: PathBuf, cwd: &Path, limit: u64) -> Option<PathBuf> {
+    if found == cwd {
+        return Some(found);
+    }
+    match ancestor_rejection(&found, limit) {
+        None => Some(found),
+        Some(reason) => {
+            tracing::warn!(
+                ancestor = %found.display(),
+                cwd = %cwd.display(),
+                "ignoring project marker in ancestor directory ({reason}); \
+                 set ASTROLABE_ROOT or ASTROLABE_MAX_ROOT_FILES to use it"
+            );
+            None
+        }
     }
 }
 
@@ -174,37 +267,73 @@ fn home_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-/// True when `path` lies inside a git project: the nearest `.git` /
-/// `.serena/project.yml` at or above it exists and is not the home
-/// directory. Only such paths are indexed (unless
-/// `ASTROLABE_ALLOW_NON_GIT_ROOT` is set).
-pub fn is_in_git_project(path: &Path) -> bool {
-    in_git_project(path, &home_dirs())
+/// Where a path stands under the git-first rule (module docs, steps 1–4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Standing {
+    /// The nearest `.git` at or above the path.
+    Git(PathBuf),
+    /// No git around; these direct children carry `.git`.
+    GitParent(Vec<PathBuf>),
+    /// No git around: the nearest project file at or above the path.
+    ProjectFile(PathBuf),
+    /// No usable marker.
+    Unmarked,
 }
 
-fn in_git_project(path: &Path, homes: &[PathBuf]) -> bool {
-    find_project_root(path).is_some_and(|found| !homes.contains(&found))
+/// `homes` markers never count.
+fn standing(path: &Path, homes: &[PathBuf]) -> Standing {
+    if let Some(found) = find_git_root(path).filter(|found| !homes.contains(found)) {
+        return Standing::Git(found);
+    }
+    let children = child_git_repos(path);
+    if !children.is_empty() {
+        return Standing::GitParent(children);
+    }
+    match project_file_root(path).filter(|found| !homes.contains(found)) {
+        Some(found) => Standing::ProjectFile(found),
+        None => Standing::Unmarked,
+    }
+}
+
+/// True when `path` may be indexed as given: it lies in a git repo, or —
+/// with no git around and no child repos — under a project file. Every
+/// entry point (startup, explicit root, per-call `index_root`,
+/// multi-project parent) uses this unless `ASTROLABE_ALLOW_NON_GIT_ROOT`
+/// is set.
+pub fn is_indexable_root(path: &Path) -> bool {
+    indexable_root(path, &home_dirs())
+}
+
+fn indexable_root(path: &Path, homes: &[PathBuf]) -> bool {
+    matches!(
+        standing(path, homes),
+        Standing::Git(_) | Standing::ProjectFile(_)
+    )
 }
 
 /// Classify an explicit root (`astrolabe /path`, `ASTROLABE_ROOT`) that
-/// [`resolve_index_root`] already canonicalized. Inside a git project it is
-/// served as given — `Repo` when it carries the marker, else `Single` — and
-/// no size gate applies. Outside one, its direct child repos are served the
-/// way [`resolve_root`] serves them, and a directory without any is `NotGit`.
+/// [`resolve_index_root`] already canonicalized. When indexable it is served
+/// as given (`Repo` when it carries a marker, else `Single`) and no size gate
+/// applies. Otherwise its direct child repos are served the way
+/// [`resolve_root`] serves them, and a directory without any is `NotGit`.
 pub fn resolve_explicit_root(path: &Path) -> ResolvedRoot {
     let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if is_in_git_project(&root) {
-        return if is_project_marker(&root) {
-            ResolvedRoot::Repo(root)
-        } else {
-            ResolvedRoot::Single(root)
-        };
+    match standing(&root, &home_dirs()) {
+        Standing::Git(_) => served_as_given(root),
+        Standing::ProjectFile(found) => {
+            note_serena_project_file(&found);
+            served_as_given(root)
+        }
+        Standing::GitParent(children) => serve_child_repos(root, children),
+        Standing::Unmarked => ResolvedRoot::NotGit(root),
     }
-    let mut children = child_git_repos(&root);
-    match children.len() {
-        0 => ResolvedRoot::NotGit(root),
-        1 => ResolvedRoot::Repo(children.remove(0)),
-        _ => ResolvedRoot::MultiProject { root, children },
+}
+
+fn served_as_given(root: PathBuf) -> ResolvedRoot {
+    if is_project_dir(&root) {
+        ResolvedRoot::Repo(root)
+    } else {
+        ResolvedRoot::Single(root)
     }
 }
 
@@ -236,11 +365,7 @@ fn startup_from_cwd(cwd: &Path, limit: u64, allow_non_git: bool) -> ResolvedRoot
 
 fn startup_from_explicit(path: PathBuf, allow_non_git: bool) -> ResolvedRoot {
     let resolved = if allow_non_git {
-        if is_project_marker(&path) {
-            ResolvedRoot::Repo(path)
-        } else {
-            ResolvedRoot::Single(path)
-        }
+        served_as_given(path)
     } else {
         resolve_explicit_root(&path)
     };
@@ -286,7 +411,7 @@ pub fn child_git_repos(root: &Path) -> Vec<PathBuf> {
         if !path.is_dir() {
             continue;
         }
-        if path.join(".git").exists() {
+        if has_git_marker(&path) {
             children.push(path.canonicalize().unwrap_or(path));
         }
     }
@@ -304,8 +429,10 @@ impl ResolvedRoot {
             }
             Self::NotGit(root) => Some(format!(
                 "Astrolabe refused to index {}: it is not inside a git repository \
-                 (Astrolabe only indexes git repositories).\n\
+                 (Astrolabe only indexes git repositories and directories marked by \
+                 .astrolabe/project.yml).\n\
                  cd into a repository (or pass its path), or run `git init` there; \
+                 a non-git project can be declared with .astrolabe/project.yml; \
                  set ASTROLABE_ALLOW_NON_GIT_ROOT=1 to index it anyway",
                 root.display()
             )),
@@ -351,23 +478,23 @@ fn write_capped_paths(out: &mut String, paths: &[PathBuf]) {
     }
 }
 
-/// Tool error for a per-call `index_root` outside any git project. Nothing
-/// is indexed for it; the direct child repos are listed as the paths to
-/// pass instead.
+/// Tool error for a per-call `index_root` that is not indexable
+/// ([`is_indexable_root`]). Nothing is indexed for it; the direct child repos
+/// are listed as the paths to pass instead.
 pub fn non_git_index_root_message(root: &Path) -> String {
     let children = child_git_repos(root);
     let mut out = format!(
-        "index_root `{}` is not inside a git repository; Astrolabe only indexes git repositories, so nothing was indexed.\n",
+        "index_root `{}` is not inside a git repository, so nothing was indexed.\n",
         root.display()
     );
     match children.first() {
         None => out.push_str(
-            "It has no direct child git repositories: pass a git repository (or a directory inside one) as index_root.\n",
+            "It has no direct child git repositories: pass a git repository (or a directory inside one) as index_root, or declare a non-git project with .astrolabe/project.yml.\n",
         ),
         Some(first) => {
             let _ = writeln!(
                 out,
-                "Pass one of its {} direct child git repositories as index_root instead:",
+                "Pass one of its {} direct child git repositories as index_root instead (a directory holding git repositories is not indexed itself, even with .astrolabe/project.yml):",
                 children.len()
             );
             write_capped_paths(&mut out, &children);
@@ -380,12 +507,13 @@ pub fn non_git_index_root_message(root: &Path) -> String {
 
 /// Turn a user/MCP-supplied path into the directory that will be indexed.
 ///
-/// * `.` / `./` — detect from cwd (walk up for `.git` or `.serena/project.yml`);
-///   if none, canonicalize cwd. Size / multi-project refuse lives in
-///   [`resolve_root`], applied by the binary for this sentinel.
+/// * `.` / `./` — detect from cwd via [`find_project_root`] (nearest `.git`,
+///   else nearest `.astrolabe/project.yml` / `.serena/project.yml`); if
+///   none, canonicalize cwd. The child-repo probe, size gate and refusals
+///   live in [`resolve_root`], applied by the binary for this sentinel.
 /// * any other path — canonicalize that directory and do **not** walk up.
-///   The size gate never applies (explicit user intent); the git-only rule
-///   is [`resolve_explicit_root`].
+///   The size gate never applies (explicit user intent); the indexability
+///   rule is [`resolve_explicit_root`].
 pub fn resolve_index_root(requested: &Path) -> anyhow::Result<PathBuf> {
     let start = if requested.is_absolute() {
         requested.to_path_buf()
@@ -399,13 +527,14 @@ pub fn resolve_index_root(requested: &Path) -> anyhow::Result<PathBuf> {
     if is_cwd_sentinel(requested) {
         if let Some(found) = find_project_root(&start) {
             tracing::info!(root = %found.display(), "detected project root from cwd");
+            note_serena_project_file(&found);
             return Ok(found);
         }
         let cwd = start.canonicalize().unwrap_or(start);
         tracing::warn!(
             cwd = %cwd.display(),
-            "no .git or .serena/project.yml ancestor; indexing cwd as-is \
-             (Serena would leave the project inactive)"
+            "no .git or .astrolabe/project.yml (or Serena's .serena/project.yml) \
+             ancestor; indexing cwd as-is (Serena would leave the project inactive)"
         );
         return Ok(cwd);
     }
@@ -417,10 +546,10 @@ pub fn resolve_index_root(requested: &Path) -> anyhow::Result<PathBuf> {
 ///
 /// Absolute paths are used as-is; relative paths join the process cwd at call
 /// time. The result is canonicalized and must be an existing directory. Unlike
-/// startup [`resolve_index_root`], this never walks up to `.git` /
-/// `.serena/project.yml` and never applies MultiProject / TooLarge refuses;
-/// the server refuses a result outside any git project
-/// ([`is_in_git_project`], [`non_git_index_root_message`]).
+/// startup [`resolve_index_root`], this never walks up to `.git` or a project
+/// file and never applies MultiProject / TooLarge refuses; the server refuses
+/// a result that is not indexable ([`is_indexable_root`],
+/// [`non_git_index_root_message`]).
 pub fn resolve_call_index_root(raw: &str) -> Result<PathBuf, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -472,6 +601,24 @@ mod tests {
     fn write_serena_marker(dir: &Path) {
         std::fs::create_dir_all(dir.join(".serena")).unwrap();
         std::fs::write(dir.join(".serena").join("project.yml"), "project_name: t\n").unwrap();
+    }
+
+    fn write_astrolabe_marker(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".astrolabe")).unwrap();
+        std::fs::write(
+            dir.join(".astrolabe").join("project.yml"),
+            "project_name: t\n",
+        )
+        .unwrap();
+    }
+
+    /// What the index store leaves behind in every indexed root.
+    fn write_astrolabe_store(dir: &Path) {
+        let store = dir.join(".astrolabe");
+        std::fs::create_dir_all(store.join("memories")).unwrap();
+        std::fs::write(store.join("index.redb"), b"redb").unwrap();
+        std::fs::write(store.join("indexer.lock"), b"").unwrap();
+        std::fs::write(store.join(".gitignore"), "*\n").unwrap();
     }
 
     fn git_marker(dir: &Path) {
@@ -549,18 +696,23 @@ mod tests {
     }
 
     #[test]
-    fn nearest_serena_wins_over_ancestor_git() {
+    fn ancestor_git_wins_over_nearer_project_file() {
         let outer = unique_temp_dir();
         std::fs::create_dir_all(outer.join(".git")).unwrap();
-        let inner = outer.join("serena-project");
+        let inner = outer.join("sub");
         std::fs::create_dir_all(&inner).unwrap();
         write_serena_marker(&inner);
-        let found = find_project_root(&inner).expect("inner serena");
+        write_astrolabe_marker(&inner);
+        let found = find_project_root(&inner).expect("ancestor git");
         assert_eq!(
             found,
-            inner.canonicalize().unwrap(),
-            "nearest .serena/project.yml must not be hijacked by an ancestor .git"
+            outer.canonicalize().unwrap(),
+            "a project file inside a repo must not split it"
         );
+        match resolve_root(&inner, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => assert_eq!(found, outer.canonicalize().unwrap()),
+            other => panic!("expected Repo(outer), got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&outer);
     }
 
@@ -611,6 +763,229 @@ mod tests {
             "either marker in the same directory resolves to that directory"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finds_astrolabe_project_yml_from_nested_folder() {
+        let root = unique_temp_dir();
+        write_astrolabe_marker(&root);
+        let nested = root.join("src").join("pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+        let found = find_project_root(&nested).expect("astrolabe root");
+        assert_eq!(found, root.canonicalize().unwrap());
+        match resolve_root(&nested, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => assert_eq!(found, root.canonicalize().unwrap()),
+            other => panic!("expected Repo(root), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn serena_project_yml_still_marks_a_root_without_git() {
+        let root = unique_temp_dir();
+        write_serena_marker(&root);
+        write_n_files(&root, 2);
+        let nested = root.join("pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+        for cwd in [&root, &nested] {
+            match resolve_root(cwd, DEFAULT_MAX_ROOT_FILES) {
+                ResolvedRoot::Repo(found) => assert_eq!(found, root.canonicalize().unwrap()),
+                other => panic!("expected Repo(root) from {}, got {other:?}", cwd.display()),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn astrolabe_dir_without_project_yml_is_not_a_marker() {
+        let bare = unique_temp_dir();
+        std::fs::create_dir_all(bare.join(".astrolabe")).unwrap();
+        assert!(find_project_root(&bare).is_none());
+        let _ = std::fs::remove_dir_all(&bare);
+
+        let root = unique_temp_dir();
+        write_astrolabe_store(&root);
+        write_n_files(&root, 2);
+        assert!(
+            find_project_root(&root).is_none(),
+            "the index store creates .astrolabe/ in every root it indexes"
+        );
+        let nested = root.join("pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+        match resolve_root(&nested, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::NotGit(found) => assert_eq!(found, nested.canonicalize().unwrap()),
+            other => panic!("expected NotGit(nested), got {other:?}"),
+        }
+        assert!(!is_indexable_root(&nested));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_project_dir_requires_git_or_project_file() {
+        let root = unique_temp_dir();
+        let make = |name: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let git_dir = make("git-dir");
+        git_marker(&git_dir);
+        let git_file = make("git-file");
+        std::fs::write(git_file.join(".git"), "gitdir: /tmp/fake.git\n").unwrap();
+        let astrolabe = make("astrolabe");
+        write_astrolabe_marker(&astrolabe);
+        let serena = make("serena");
+        write_serena_marker(&serena);
+        for dir in [&git_dir, &git_file, &astrolabe, &serena] {
+            assert!(is_project_dir(dir), "{}", dir.display());
+        }
+        let store = make("store");
+        write_astrolabe_store(&store);
+        let bare_serena = make("bare-serena");
+        std::fs::create_dir_all(bare_serena.join(".serena")).unwrap();
+        let plain = make("plain");
+        for dir in [&store, &bare_serena, &plain] {
+            assert!(!is_project_dir(dir), "{}", dir.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_file_root_with_child_repos_is_multiproject() {
+        // A non-git parent with a project file above several checkouts (and
+        // a non-git folder of worktrees) must not be indexed whole.
+        for write_marker in [write_serena_marker as fn(&Path), write_astrolabe_marker] {
+            let root = unique_temp_dir();
+            write_marker(&root);
+            git_marker(&root.join("alpha"));
+            git_marker(&root.join("beta"));
+            for name in ["wt1", "wt2"] {
+                let worktree = root.join("worktrees").join(name);
+                std::fs::create_dir_all(&worktree).unwrap();
+                std::fs::write(worktree.join(".git"), "gitdir: /tmp/fake.git\n").unwrap();
+            }
+            match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+                ResolvedRoot::MultiProject {
+                    root: got,
+                    children,
+                } => {
+                    assert_eq!(got, root.canonicalize().unwrap());
+                    let names: Vec<_> = children
+                        .iter()
+                        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                        .collect();
+                    assert_eq!(names, ["alpha", "beta"]);
+                }
+                other => panic!("expected MultiProject, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn project_file_root_with_child_repos_is_not_adopted_from_plain_subdir() {
+        // cwd = newapi/docs: the parent's project file must not pull the
+        // whole workspace (child checkouts included) into one index.
+        for write_marker in [write_serena_marker as fn(&Path), write_astrolabe_marker] {
+            let root = unique_temp_dir();
+            write_marker(&root);
+            git_marker(&root.join("alpha"));
+            git_marker(&root.join("beta"));
+            let docs = root.join("docs");
+            std::fs::create_dir_all(&docs).unwrap();
+            std::fs::write(docs.join("notes.md"), "# notes\n").unwrap();
+            let no_homes: &[PathBuf] = &[];
+            assert!(!indexable_root(&docs, no_homes));
+            assert!(!indexable_root(&root, no_homes));
+            assert_eq!(find_project_root(&docs), None);
+            assert_eq!(
+                resolve_root(&docs, DEFAULT_MAX_ROOT_FILES),
+                ResolvedRoot::NotGit(docs.canonicalize().unwrap())
+            );
+            assert_eq!(
+                resolve_explicit_root(&docs),
+                ResolvedRoot::NotGit(docs.canonicalize().unwrap())
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn project_file_root_with_one_child_repo_serves_the_child() {
+        let root = unique_temp_dir();
+        write_astrolabe_marker(&root);
+        git_marker(&root.join("solo"));
+        match resolve_root(&root, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => {
+                assert_eq!(found, root.join("solo").canonicalize().unwrap());
+            }
+            other => panic!("expected Repo(solo), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nearest_project_file_wins_without_git() {
+        let outer = unique_temp_dir();
+        write_astrolabe_marker(&outer);
+        let inner = outer.join("nested");
+        std::fs::create_dir_all(&inner).unwrap();
+        write_serena_marker(&inner);
+        let deep = inner.join("pkg");
+        std::fs::create_dir_all(&deep).unwrap();
+        match resolve_root(&deep, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => assert_eq!(found, inner.canonicalize().unwrap()),
+            other => panic!("expected Repo(inner), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn same_directory_astrolabe_and_serena_is_that_root() {
+        let root = unique_temp_dir();
+        write_astrolabe_marker(&root);
+        write_serena_marker(&root);
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        match resolve_root(&nested, DEFAULT_MAX_ROOT_FILES) {
+            ResolvedRoot::Repo(found) => assert_eq!(found, root.canonicalize().unwrap()),
+            other => panic!("expected Repo(root), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn oversized_ancestor_project_file_is_not_adopted_as_root() {
+        let ancestor = unique_temp_dir();
+        write_astrolabe_marker(&ancestor);
+        write_n_files(&ancestor, 6);
+        let proj = ancestor.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("a.rs"), b"fn a() {}").unwrap();
+        match resolve_root(&proj, 3) {
+            ResolvedRoot::Single(found) => assert_eq!(found, proj.canonicalize().unwrap()),
+            other => panic!("expected Single(proj), got {other:?}"),
+        }
+        match resolve_root(&proj, 100) {
+            ResolvedRoot::Repo(found) => assert_eq!(found, ancestor.canonicalize().unwrap()),
+            other => panic!("expected Repo(ancestor), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ancestor);
+    }
+
+    #[test]
+    fn rejected_ancestor_git_falls_back_to_project_file() {
+        let ancestor = unique_temp_dir();
+        git_marker(&ancestor);
+        write_n_files(&ancestor, 6);
+        let proj = ancestor.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_astrolabe_marker(&proj);
+        match resolve_root(&proj, 3) {
+            ResolvedRoot::Repo(found) => assert_eq!(found, proj.canonicalize().unwrap()),
+            other => panic!("expected Repo(proj), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ancestor);
     }
 
     #[test]
@@ -918,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn in_git_project_follows_markers_but_not_home() {
+    fn indexable_root_follows_markers_but_not_home() {
         let base = unique_temp_dir();
         let repo = base.join("repo");
         git_marker(&repo);
@@ -930,14 +1305,21 @@ mod tests {
         let serena = base.join("serena");
         std::fs::create_dir_all(&serena).unwrap();
         write_serena_marker(&serena);
+        let declared = base.join("declared");
+        let declared_deep = declared.join("docs");
+        std::fs::create_dir_all(&declared_deep).unwrap();
+        write_astrolabe_marker(&declared);
+        let bare_astrolabe = base.join("bare_astrolabe");
+        std::fs::create_dir_all(bare_astrolabe.join(".astrolabe").join("memories")).unwrap();
         let plain = base.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         let no_homes: &[PathBuf] = &[];
-        for inside in [&repo, &deep, &worktree, &serena] {
-            assert!(in_git_project(inside, no_homes), "{}", inside.display());
+        for inside in [&repo, &deep, &worktree, &serena, &declared, &declared_deep] {
+            assert!(indexable_root(inside, no_homes), "{}", inside.display());
         }
-        assert!(!in_git_project(&plain, no_homes));
-        assert!(!in_git_project(&base, no_homes));
+        assert!(!indexable_root(&bare_astrolabe, no_homes));
+        assert!(!indexable_root(&plain, no_homes));
+        assert!(!indexable_root(&base, no_homes));
 
         // A dotfiles marker at $HOME does not cover the folders below it, but
         // a real repo under $HOME still counts.
@@ -948,10 +1330,10 @@ mod tests {
         let home_repo = home.join("proj");
         git_marker(&home_repo);
         let homes = [home.canonicalize().unwrap()];
-        assert!(!in_git_project(&home, &homes));
-        assert!(!in_git_project(&under_home, &homes));
-        assert!(in_git_project(&home_repo, &homes));
-        assert!(in_git_project(&under_home, no_homes));
+        assert!(!indexable_root(&home, &homes));
+        assert!(!indexable_root(&under_home, &homes));
+        assert!(indexable_root(&home_repo, &homes));
+        assert!(indexable_root(&under_home, no_homes));
         let _ = std::fs::remove_dir_all(&base);
     }
 

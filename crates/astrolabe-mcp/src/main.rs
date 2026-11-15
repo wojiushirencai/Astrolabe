@@ -67,10 +67,13 @@ async fn main() -> anyhow::Result<()> {
     // hint, which is exactly the failure mode this project refuses elsewhere.
     //
     // `.` (what MCP configs pass) is not taken literally. Like Serena's
-    // `--project-from-cwd`, it walks up from the client spawn cwd looking
-    // for `.git` or `.serena/project.yml` and stores the absolute path. An
-    // explicit directory is canonicalized as-is and is not replaced by an
-    // ancestor marker.
+    // `--project-from-cwd`, the client spawn cwd is resolved to a project
+    // root (nearest `.git`, then child repos, then nearest
+    // `.astrolabe/project.yml` or Serena's `.serena/project.yml`; see
+    // `root.rs`) and stored as an absolute path. An explicit directory is
+    // canonicalized as-is and is not replaced by an ancestor marker. Either
+    // way a root that is not indexable is refused unless
+    // ASTROLABE_ALLOW_NON_GIT_ROOT is set.
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let launch = match parse_launch(args.iter().cloned()) {
         Ok(launch) => launch,
