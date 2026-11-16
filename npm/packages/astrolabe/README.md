@@ -2,12 +2,13 @@
 
 Astrolabe AI：面向 AI 编码助手的本地代码检索与导航 MCP server（二进制名 `astrolabe`）。与 npm 上无关的 `astrolabe`、`astrolabe-ai` 包不是同一个项目。本包是**零依赖**的 Node shim：通过 `optionalDependencies` 安装当前平台的原生二进制，再把 stdin/stdout/stderr、退出码和信号原样交给它。
 
+Already installed? Follow the [upgrade steps](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/INSTALL_GUIDE.md#upgrade) ([中文](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/INSTALL_GUIDE.zh-CN.md#upgrade)). Keep your existing global or project configuration, re-run setup, then reload the client; replacing the package does not update a running MCP server.
+
 ## Install + setup (setup is required)
 
 ```bash
 npm i -g @zlnap/astrolabe
-# REQUIRED — without setup there is no MCP wiring and no hooks,
-# so agents usually will not actually use the tools:
+# REQUIRED — register MCP; add hooks where setup supports them:
 npx -y @zlnap/astrolabe setup --with-hooks
 # non-interactive:
 npx -y @zlnap/astrolabe setup --yes --with-hooks
@@ -21,6 +22,8 @@ npx -y @zlnap/astrolabe setup --with-hooks
 ```
 
 `setup` detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo, Continue, OpenCode, DeepSeek Harness, Codebuddy, Grok Build, Kimi Code, and ZCode; **merges** MCP config (never wipes other servers). Cursor defaults to the global `~/.cursor/mcp.json` with the absolute native binary, `type: stdio`, and `env` (`PATH`, `ASTROLABE_LSP_TIMEOUT=300`, `ASTROLABE_LSP_PYTHON` when pyright is found); it also best-effort runs `cursor-agent mcp enable astrolabe` in the current project and removes a stale `astrolabe` entry from `mcp-disabled.json`. Cursor has no file-based global rules directory, so L1 guidance comes from the MCP instructions plus the global `~/.cursor/hooks.json` remind hook. Add `--scope=project` (optionally `--project <dir>`) to write `<project>/.cursor/mcp.json` (pinned `cwd`), `<project>/.cursor/rules/astrolabe.mdc` (`alwaysApply: true`), and approve that directory; global MCP entries cannot pre-approve new projects, so Cursor asks on first use (`--approve-mcps` for headless). `--with-hooks` installs OpenCode's guard plugin and hook recipes for Cursor / Codebuddy / Grok / Kimi / ZCode (Cursor: `~/.cursor/hooks.json` with an absolute command path, `--client=cursor`, matcher `astrolabe-.*`; ZCode: no `SessionEnd`, scrub cleanup off `Stop`). Flags: `--yes`, `--clients=…`, `--dry-run`, `--native`, `--list`, `--with-hooks`, `--no-cursor-permissions`, `--scope=global|project`, `--project <dir>`.
+
+Claude Code is an exception: setup registers MCP only, even with `--with-hooks`. Merge the [Claude Code hook recipe](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/HOOKS.md#2-claude-code-配方) yourself if you want hooks, preserving existing third-party entries.
 
 ## MCP tools (short names)
 

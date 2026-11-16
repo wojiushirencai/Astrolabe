@@ -6,6 +6,8 @@
 npx -y @zlnap/astrolabe /path/to/repo
 ```
 
+首次安装后，还要运行 `npx -y @zlnap/astrolabe@latest setup --with-hooks` 把 MCP 接入客户端；Claude Code 的 Hook 需[手工合并](../docs/HOOKS.md#2-claude-code-配方)。已经装过的用户请按[升级步骤](../docs/INSTALL_GUIDE.zh-CN.md#upgrade)操作，不要只更新包就结束。英文说明见 [upgrade guide](../docs/INSTALL_GUIDE.md#upgrade)。
+
 本目录是独立的 npm workspace。**不要**把 `packages/` 打进主包 tarball。
 
 ## 布局

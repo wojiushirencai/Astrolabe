@@ -32,6 +32,8 @@ Recent releases focused on **Windows reliability** after real machine testing:
 
 Prefer omitting `index_root`, or pass the **repo root**. If a brand-new root is still Building, retry shortly.
 
+Already installed? Follow the [upgrade steps](docs/INSTALL_GUIDE.md#upgrade): update the program, re-run `setup` for your existing configuration location, then reload the client. Updating the binary does not replace a running MCP server.
+
 ## Quick start (3 steps)
 
 **1. Install** the binary (pick one):
@@ -59,6 +61,8 @@ astrolabe setup --with-hooks
 # non-interactive: configure every detected client
 npx -y @zlnap/astrolabe setup --yes --with-hooks
 ```
+
+`--with-hooks` installs hooks or plugins only for supported clients. Claude Code setup registers MCP only; merge its [hook recipe](docs/HOOKS.md#2-claude-code-配方) separately, keeping existing hooks.
 
 Claude Code (manual MCP only, still prefer `setup` above):
 

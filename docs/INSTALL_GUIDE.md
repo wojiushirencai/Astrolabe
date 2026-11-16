@@ -1,6 +1,8 @@
 # Astrolabe AI — install and client setup
 
-Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-11-01 for v0.17.5+ (Windows stability #117/#119, MCP short names, required `setup`).
+Chinese version: [INSTALL_GUIDE.zh-CN.md](INSTALL_GUIDE.zh-CN.md). Last updated 2026-11-16.
+
+New here? Start with the installation options below. Already installed? Follow [Upgrading an existing installation](#upgrade).
 
 > **Name check.** This project is *Astrolabe AI* (GitHub: `wojiushirencai/Astrolabe`, binary: `astrolabe`). It is **not** the npm packages `astrolabe` (a 2014 Protractor page-object library) or `astrolabe-ai` (an unrelated resume tool), nor the other MCP servers that happen to be called "astrolabe". Install only from this repository's GitHub Releases or the `@zlnap/*` npm scope.
 
@@ -59,7 +61,7 @@ The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with 
 
 ```bash
 npm i -g @zlnap/astrolabe          # or: npx -y @zlnap/astrolabe --version
-# REQUIRED after every fresh install / upgrade:
+# After a fresh install, run setup to connect your clients:
 npx -y @zlnap/astrolabe setup --with-hooks
 ```
 
@@ -74,9 +76,82 @@ cargo build --release --bin astrolabe      # target/release/astrolabe
 
 Verify with `astrolabe --version`, then run `npx -y @zlnap/astrolabe setup --with-hooks` (or `astrolabe setup --with-hooks`) and restart your client so it picks up MCP + hooks.
 
+<a id="upgrade"></a>
+
+## Upgrading an existing installation
+
+**Already using Astrolabe? Start here.** Updating the executable does not update every client configuration or replace a running MCP server. Re-running setup refreshes the configuration; it does not mean every patch release needs hand-edited JSON.
+
+### 1. Check how you installed it and where the configuration lives
+
+Back up the MCP and hook files you plan to change, especially if you customized the command or search-blocking settings. Setup also backs up existing files before writing, but it cannot decide which old registration you still need.
+
+For Cursor, choose the matching configuration location in step 3. Do not switch from project configuration to global configuration just to upgrade. For other clients, keep using your existing installation method.
+
+### 2. Update the program and check its version
+
+For an npm installation:
+
+```bash
+npm i -g @zlnap/astrolabe@latest
+astrolabe --version
+```
+
+If this still prints the old version, check whether your terminal's `PATH` points to another copy. If you used the install script, a downloaded binary, or a source build, update that copy using the corresponding instructions above; you do not need a second npm installation. You can replace `astrolabe setup` below with `npx -y @zlnap/astrolabe@latest setup`. To keep using your own binary, add `--command="/absolute/path/to/astrolabe"` to setup (use the actual `.exe` path on Windows).
+
+### 3. Refresh the configuration for your client
+
+**Cursor: pick one of these two commands, based on where you configured it before.**
+
+- **Global configuration** lives in `~/.cursor/mcp.json` and is shared across projects. This is setup's default. Run this from a project where you want to use Astrolabe:
+
+  ```bash
+  astrolabe setup --clients=cursor --with-hooks
+  ```
+
+- **Project configuration** lives in `<project>/.cursor/mcp.json`. If that is where you previously registered Astrolabe, update it there. Replace the example path with your project root:
+
+  ```bash
+  astrolabe setup --clients=cursor --with-hooks --scope=project --project "/path/to/my-project"
+  ```
+
+A project entry overrides a global entry with the same name. Updating only the global file may leave the project starting an old binary. Setup does not remove registrations from the other location. If you decide to stop using one, back it up and remove only that Astrolabe entry—not the whole file or other servers.
+
+Setup refreshes recognized launch paths, short tool-name allowlists, and hook commands, including the `astrolabe-.*` matcher for Cursor. It also attempts approval for the current project and removes Astrolabe's disabled entries. Approval depends on the project path and configuration hash; changing the command or environment may require approval again. A global registration cannot pre-approve every project. If automatic approval fails, run this from the **project you actually want to use**:
+
+```bash
+cursor-agent mcp enable astrolabe
+```
+
+Even with project MCP configuration, setup writes Cursor hooks to the global `~/.cursor/hooks.json`. It does not also migrate project `.cursor/hooks.json` files or `.claude/settings.json`, which Cursor may load too. If you installed hooks by hand, check for duplicates. Remove only Astrolabe entries you have confirmed are no longer needed; preserve other tools' hooks.
+
+**Claude Code: setup registers MCP; add hooks separately.**
+
+```bash
+astrolabe setup --clients=claude-code
+```
+
+Currently, adding `--with-hooks` does not install Claude Code hooks. If you want them, merge the [Claude Code hook recipe](HOOKS.md#2-claude-code-配方) into your existing settings file without removing third-party hooks. This setup command also does not update or remove MCP entries you previously wrote into a project's `.mcp.json`; check those separately.
+
+**Other clients:** run `astrolabe setup --with-hooks` and select only the clients you use. To update one client, add `--clients=CLIENT_ID`; see the [client configuration section](#2-client-configuration) for IDs. The flag installs hooks or plugins only where supported. To preview changes, append `--dry-run` to the setup command you chose.
+
+**Review custom hooks after setup.** Recognized Astrolabe hook commands may be replaced, so custom `--deny-text-search` flags, context paths, or mode settings are not guaranteed to survive. Cursor's default `auto` mode allows the operation with a reminder when MCP is unapproved, not running, or cannot be reliably detected. `advisory` only reminds; `enforce` retains blocking regardless of MCP availability. Check these settings in the **hook process**, not just the MCP environment; see [Cursor hook modes](HOOKS.md#1-cursor-cli).
+
+### 4. Reload the client and make a real tool call
+
+Updating files on disk does not replace an already running MCP process. After setup and approval, reconnect MCP or restart the client as it requires, then open a new conversation so it loads the tool catalog and hooks again. Do not terminate processes that are serving someone else's active work.
+
+Check `astrolabe --version`, then ask the client to **actually call Astrolabe's `get_lang` or `search_code`** against the current project. If tools are still missing, check for a project entry overriding the global one and for missing project approval. A new version in your terminal does not prove that the current conversation is using it.
+
+### 5. Leave the cache alone unless there is a specific problem
+
+Upgrading from 0.17.7, 0.17.8, or 0.17.9 to 0.17.10 does not require deleting indexes or manually rebuilding them. These versions use the same storage format versions, and Astrolabe rebuilds incompatible caches when needed. Clearing caches is not a routine upgrade step.
+
 ## 2. Client configuration
 
 ### One-shot setup (required after install)
+
+For a fresh installation, run setup below. For an existing installation, use the [upgrade steps](#upgrade) first. Claude Code hooks need a [manual merge](HOOKS.md#2-claude-code-配方); `--with-hooks` does not install them.
 
 After installing the binary or npm package (or with `npx`), run:
 
@@ -86,7 +161,7 @@ npx -y @zlnap/astrolabe setup --with-hooks
 npx -y @zlnap/astrolabe setup --yes --with-hooks
 ```
 
-**Install without `setup` leaves you with a binary that clients do not call.** Hooks (`--with-hooks`) nudge agents away from Grep/Read toward Astrolabe; skip them only if you intentionally want MCP-only wiring.
+**For a fresh installation, run `setup` so your client can start Astrolabe.** Add `--with-hooks` to install the supported hooks or plugins; Claude Code hooks must be merged separately as described above.
 
 The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--with-hooks` (OpenCode guard plugin plus Cursor / Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`, `--scope=global|project` (Cursor; default global), `--project <dir>` (Cursor project root; default: cwd's git root).
 
@@ -182,6 +257,15 @@ One-shot setup above covers these. Manual path summary:
 | OpenCode | `~/.config/opencode/opencode.jsonc` (V1/V2) | `--with-hooks` → `plugins/astrolabe-guard.ts` |
 
 Stdio server args are `["."]` with the mild `default` context (no `--context` unless the client needs one).
+
+## Install instructions to give an AI assistant
+
+> Please install or upgrade Astrolabe for me:
+> 1. Confirm which client I use and whether Astrolabe is already installed. For an existing installation, follow the upgrade section above; do not add a second copy or change between global and project configuration without asking. Back up the files you will change.
+> 2. For a new npm installation, run `npm i -g @zlnap/astrolabe@latest`, then `astrolabe --version`. If I choose another installation method, use its instructions instead.
+> 3. **Run setup to register MCP.** Use `astrolabe setup --with-hooks` and select only my clients. For Cursor, check the existing configuration location first; use the project command above when appropriate. Merge entries rather than overwriting whole files, and preserve other servers and hooks.
+> 4. Claude Code setup registers only MCP; merge the [hook recipe](HOOKS.md#2-claude-code-配方) separately if I want hooks. Check hook support for other clients too, and review existing custom arguments. If Cursor approval fails, run `cursor-agent mcp enable astrolabe` in the target project.
+> 5. Ask me to reconnect MCP or restart the client and open a new conversation, without interrupting other active work. Verify the current project with a real Astrolabe `get_lang` or `search_code` call, not just the version command.
 
 ## 3. Environment variables and language servers
 

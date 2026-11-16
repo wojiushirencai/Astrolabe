@@ -2,6 +2,10 @@
 
 > **状态说明（2026-10-18）**：本文档描述的是**机制**（拦截规则、各客户端配置）。这套 Hook **没有做过效果基准**：我们的 A/B 实测（见 [bench/](../bench/README.md)）里 Astrolabe 组没有启用 Hook，因此没有数据证明它能提高工具采用率或降低成本。它是可选功能，不属于项目的卖点。需要它时请自行评估；如果你做了对照实验，欢迎提 issue。
 
+升级时先看[完整步骤](INSTALL_GUIDE.zh-CN.md#upgrade)（[English](INSTALL_GUIDE.md#upgrade)）。`setup --with-hooks` 只安装已支持客户端的 Hook／插件；Claude Code 仍要按下方配方手工合并。不要把“重跑 setup”当成“所有旧 Hook 都已迁移”：项目里的配置和其它兼容配置文件可能还在生效。
+
+自己改过 Astrolabe Hook 命令的，升级前先备份，重跑 setup 后再核对硬拦截参数、上下文路径和执行模式；识别到的命令可能被替换。只整理已确认重复的 Astrolabe 条目，保留第三方 Hook。配置改完后重连 MCP／重启客户端并开新会话，再实际调用工具验证。
+
 ## 1. 它做什么
 
 在支持 PreToolUse 钩子的客户端里，`astrolabe hooks remind` 会统计模型连续使用 grep / 整文件 Read 的次数，超过阈值时返回 deny 并提示改用 Astrolabe 工具。会话状态存在 `~/.astrolabe/hook_data/`。

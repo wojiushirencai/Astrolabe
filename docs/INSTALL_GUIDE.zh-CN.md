@@ -1,8 +1,8 @@
 # Astrolabe AI 安装与客户端配置指南（中文）
 
-英文版见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)。最后更新 2026-11-01（v0.17.5+：Windows 稳定性 #117/#119、MCP 短名、安装后必须 `setup`）。
+英文版见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)。最后更新 2026-11-16。
 
-本指南覆盖安装与各客户端的 MCP 配置。
+第一次使用请从[安装](#二安装)开始；已经装过的用户请看[升级旧版本](#upgrade)。
 
 ---
 
@@ -63,7 +63,7 @@ npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`），平�
 
 ```bash
 npm i -g @zlnap/astrolabe          # 或：npx -y @zlnap/astrolabe --version
-# 每次新装 / 升级后都必须：
+# 首次安装后，运行 setup 接入客户端：
 npx -y @zlnap/astrolabe setup --with-hooks
 ```
 
@@ -80,6 +80,79 @@ cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 
 ---
 
+<a id="upgrade"></a>
+
+## 升级旧版本
+
+**已经装过的用户从这里开始。** 升级不只是换一个可执行文件，还要让客户端用上它。重跑 `setup` 是为了同步配置，不代表每个补丁版都要手改 JSON。
+
+### 1. 先确认原来怎么装、配置写在哪里
+
+先备份准备改的 MCP 和 Hook 配置。尤其是自己改过启动命令、加过硬拦截参数的用户，先记下这些设置。`setup` 写入时也会备份已有文件，但不会替你判断哪一份旧配置还在使用。
+
+Cursor 用户先看第 3 步的两种配置位置；不要为了升级就从项目里的配置改成全局配置。其它客户端按原来的安装方式更新即可。
+
+### 2. 更新程序，检查版本
+
+用 npm 安装的用户运行：
+
+```bash
+npm i -g @zlnap/astrolabe@latest
+astrolabe --version
+```
+
+如果版本还是旧的，先检查终端的 `PATH` 是否指向另一份 Astrolabe。用安装脚本、手动下载或源码安装的用户，按本文对应方法更新原来的那份程序，不必为了升级再装一份 npm 版。下面的 `astrolabe setup` 也可用 `npx -y @zlnap/astrolabe@latest setup` 代替；要继续使用自己安装的二进制，可给 setup 加 `--command="/程序的绝对路径/astrolabe"`（Windows 用实际的 `.exe` 路径）。
+
+### 3. 按客户端更新配置
+
+**Cursor：先选对配置位置，两条命令选一条。**
+
+- **全局配置**是 `~/.cursor/mcp.json`，供多个项目使用，也是 setup 的默认位置。在要使用 Astrolabe 的项目目录运行：
+
+  ```bash
+  astrolabe setup --clients=cursor --with-hooks
+  ```
+
+- **项目里的配置**是 `<项目>/.cursor/mcp.json`。如果以前把 Astrolabe 配在这里，就更新这里；把示例路径换成自己的项目根目录：
+
+  ```bash
+  astrolabe setup --clients=cursor --with-hooks --scope=project --project "/path/to/my-project"
+  ```
+
+同名的项目配置会覆盖全局配置。只更新全局文件，可能仍然启动项目里写的旧程序。setup 不会自动删除另一处的旧注册；只有你决定不再使用那份配置时，才在备份后移除其中的 Astrolabe 条目，不要删整个文件或其它 server。
+
+setup 会更新它识别到的启动路径、工具免审批名单（短名 allowlist）和 Hook 命令，也会给 Cursor 的匹配规则补上 `astrolabe-.*`，并尝试审批当前项目、清理 Astrolabe 的禁用条目。审批认的是项目路径和当前启动配置（配置哈希）；修改启动命令或环境变量后可能要重新审批，全局配置也不能替所有项目预先批准。若 setup 提示自动审批失败，请在**实际要用的项目目录**运行：
+
+```bash
+cursor-agent mcp enable astrolabe
+```
+
+即使选择项目 MCP 配置，setup 写的 Cursor Hook 仍是全局 `~/.cursor/hooks.json`。项目里的 `.cursor/hooks.json`，以及 Cursor 也可能加载的 `.claude/settings.json`，不会因此一起迁移。若以前手工装过 Hook，请检查是否重复，只整理已确认不用的 Astrolabe 条目，保留其它工具的 Hook。
+
+**Claude Code：setup 配 MCP，Hook 另行合并。**
+
+```bash
+astrolabe setup --clients=claude-code
+```
+
+当前即使加上 `--with-hooks`，Claude Code 的 setup 也只注册 MCP，不会安装 Hook。需要 Hook 时，按 [Claude Code Hook 配方](HOOKS.md#2-claude-code-配方)合并到原来的 settings 文件，保留第三方 Hook。原来手写在项目 `.mcp.json` 里的 MCP 条目，也不会被这条命令自动更新或清理，请另行核对。
+
+**其它客户端：**运行 `astrolabe setup --with-hooks`，只选择自己使用的客户端；只想更新其中一个时，加 `--clients=客户端ID`，ID 见[下方配置说明](#三各-ai-编程工具-mcp-配置配方)。`--with-hooks` 只为已支持的客户端安装 Hook 或插件，不是所有客户端都支持。想先看改动，可在所选 setup 命令末尾加 `--dry-run`。
+
+**自己改过 Hook 的用户，再核对一次。** setup 可能替换它识别到的 Astrolabe Hook 命令，自定义的 `--deny-text-search`、上下文路径或执行模式不保证保留。Cursor 默认 `auto` 在 MCP 未获批准、未启动或无法可靠探测时会放行并提醒；`advisory` 只提醒，`enforce` 才是不依赖 MCP 可用性的强制拦截。需要保留自定义行为时，按 [Hook 模式说明](HOOKS.md#1-cursor-cli)核对 **Hook 进程**的设置，不要只改 MCP 的环境变量。
+
+### 4. 让客户端重新加载，再实际调用一次
+
+更新磁盘上的程序不会替换已经运行的 MCP 进程。完成配置和审批后，按客户端的方式重连 MCP 或重启客户端，再开一个新会话，让它重新读取工具列表和 Hook。不要在别人的任务运行中强行结束进程。
+
+先看 `astrolabe --version`，再在客户端里让 AI **实际调用 Astrolabe 的 `get_lang` 或 `search_code`**，确认能查到当前项目。如果仍看不到工具，先检查项目配置是否覆盖了全局配置，以及当前项目是否已批准；终端显示新版本不代表会话里也在运行新版本。
+
+### 5. 不用例行删缓存
+
+从 0.17.7／0.17.8／0.17.9 升到 0.17.10，不需要手动删除索引或重新建库。这几个版本的存储格式版本未变；需要时 Astrolabe 会自动重建不兼容的缓存。没有明确故障时，不要把清空缓存当成升级步骤。
+
+---
+
 ## 三、各 AI 编程工具 MCP 配置配方
 
 ### 一键配置（安装后必做）
@@ -92,7 +165,7 @@ npx -y @zlnap/astrolabe setup --with-hooks
 npx -y @zlnap/astrolabe setup --yes --with-hooks
 ```
 
-**只安装不跑 `setup`，等于客户端根本不会调用 Astrolabe。** `--with-hooks` 会写入防漂移 Hook，推动智能体少用 Grep/Read、多用 Astrolabe；只有你明确只要 MCP、不要 Hook 时才省略。
+**首次安装后要跑 `setup`，客户端才会得到 MCP 配置。** `--with-hooks` 会为支持的客户端安装防漂移 Hook 或插件；Claude Code 的 Hook 需要[另行手工合并](HOOKS.md#2-claude-code-配方)。已经装过的用户先看[升级步骤](#upgrade)，避免改错配置位置。
 
 会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件，以及 Cursor / Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`、`--scope=global|project`（Cursor，默认 global）、`--project <dir>`（Cursor 项目根，默认取 cwd 的 git 根）。
 
@@ -307,11 +380,12 @@ args = [".", "--context=codex"]
 
 ## 四、直接给 AI 工具执行的安装提示词模板
 
-> 请帮我安装并配置 Astrolabe（本地代码检索 MCP 服务）：
-> 1. 运行 `curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh`，确认输出 `sha256 OK`；
-> 2. Claude Code：运行 `claude mcp add --scope user astrolabe -- <astrolabe 的绝对路径> . --context=claude-code`；
-> 3. 若当前是 Cursor：在仓库根目录运行 `node scripts/setup-cursor-permissions.mjs`，并确认 Run Mode 已开启，不要写 `astrolabe:*`；
-> 4. 执行 `astrolabe --version`，并重启客户端会话让 MCP 生效。
+> 请帮我安装或升级 Astrolabe：
+> 1. 先确认我用哪个客户端、是否装过 Astrolabe；已安装的按本文“升级旧版本”操作，不要另装一份或擅自更换全局／项目配置。修改前备份相关文件。
+> 2. 首次用 npm 安装时，运行 `npm i -g @zlnap/astrolabe@latest`，再检查 `astrolabe --version`；如果我选择其它安装方式，就按本文对应方法安装。
+> 3. **必须运行 setup 配置 MCP。** 用 `astrolabe setup --with-hooks` 只选择我使用的客户端；Cursor 先确认原配置位置，项目里的配置要用上面的 `--scope=project --project` 命令。不要覆盖整个配置文件，也不要删除其它 server 或 Hook。
+> 4. Claude Code 的 setup 只注册 MCP；需要 Hook 时，按 [Claude Code 配方](HOOKS.md#2-claude-code-配方)另行合并。其它客户端也要检查 setup 是否支持其 Hook；保留并核对原有自定义参数。Cursor 自动审批失败时，在目标项目里运行 `cursor-agent mcp enable astrolabe`。
+> 5. 提醒我重连 MCP／重启客户端并开新会话，不要中断其它正在运行的任务。最后实际调用 Astrolabe 的 `get_lang` 或 `search_code` 验证当前项目可用，不要只看版本号。
 
 ---
 

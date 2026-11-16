@@ -32,6 +32,8 @@
 
 尽量不传 `index_root`，或只传**仓库根**；全新 root 首次冷建时稍等再重试。
 
+已经装过？请按[升级步骤](docs/INSTALL_GUIDE.zh-CN.md#upgrade)更新程序、用原来的配置位置重跑 `setup`，再重新加载客户端。只更新二进制不会更新正在运行的 MCP 服务。
+
 ## 三步上手
 
 **1. 安装**二进制（任选其一）：
@@ -59,6 +61,8 @@ astrolabe setup --with-hooks
 # 非交互：配置所有探测到的客户端
 npx -y @zlnap/astrolabe setup --yes --with-hooks
 ```
+
+`--with-hooks` 只为支持的客户端安装 Hook 或插件。Claude Code 的 setup 只注册 MCP，Hook 要按[配方](docs/HOOKS.md#2-claude-code-配方)另行合并，保留已有 Hook。
 
 Claude Code（仅手动写 MCP 时仍建议先跑上面的 `setup`）：
 
