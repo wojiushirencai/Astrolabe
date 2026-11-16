@@ -6,6 +6,43 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.10] - 2026-11-16
+
+### 中文
+
+本版本相对 v0.17.9 仅包含 #129、#130 与本次版本更新。
+
+#### 文本检索忽略文件过滤
+- 文本检索路径集合不再纳入 `.gitignore` / `.ignore`，使搜索结果与宿主 ripgrep 对这些忽略文件的处理一致。索引收录规则未改。
+
+#### Windows 轮询间隔
+- Windows 上默认文件监视轮询间隔从 10 秒调整为 2 秒；macOS 及其他平台仍为 10 秒。显式配置的 `WatchConfig::poll_interval` 与既有 duty-cycle 上限不受影响。
+
+#### 安装后必须 setup（含 hooks）
+```bash
+npm i -g @zlnap/astrolabe@0.17.10
+astrolabe setup --with-hooks
+```
+只安装二进制不会配置 MCP 或 hooks；请按客户端要求重新加载已有会话。
+
+### English
+
+Compared with v0.17.9, this release contains only the changes in #129 and #130 and the version update.
+
+#### Ignore-file filtering in text-only paths
+- `text_only_paths` no longer includes `.gitignore` / `.ignore`, so search results agree with host ripgrep's treatment of those ignore files. Index admission rules are unchanged.
+
+#### Windows poll interval
+- The default file-watch poll interval on Windows is now 2 seconds instead of 10 seconds; macOS and other platforms remain at 10 seconds. An explicit `WatchConfig::poll_interval` override and the existing duty-cycle clamp are unchanged.
+
+#### Required setup after installation (including hooks)
+```bash
+npm i -g @zlnap/astrolabe@0.17.10
+astrolabe setup --with-hooks
+```
+Installing the binary alone does not configure MCP or hooks. Reload existing sessions as required by the client.
+
+
 ## [0.17.9] - 2026-11-10
 
 ### 中文
