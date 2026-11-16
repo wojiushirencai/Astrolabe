@@ -389,7 +389,10 @@ impl RepoIndex {
     /// SQL, templates, unsupported languages …), filtered by the
     /// `path_filter` substring. These already passed the scanner's
     /// gitignore / size / binary gates. Lock files are skipped: they are
-    /// large, generated, and drown real hits.
+    /// large, generated, and drown real hits. VCS ignore files
+    /// (`.gitignore`, `.ignore`) are skipped too: host-side grep tools
+    /// treat them as hidden and never search them, so listing them here
+    /// would disagree with the user's own grep.
     pub(crate) fn text_only_paths(&self, filter: Option<&str>) -> Vec<&RelPath> {
         match &self.inner {
             InnerIndex::Incremental(inc) => {
@@ -401,6 +404,7 @@ impl RepoIndex {
                         filter.is_none_or(|f| s.contains(f))
                             && !in_graph_set.contains(s)
                             && !is_lock_file(s)
+                            && !is_vcs_ignore_file(s)
                     })
                     .collect()
             }
@@ -514,6 +518,17 @@ fn is_lock_file(path: &str) -> bool {
     ];
     let name = path.rsplit('/').next().unwrap_or(path);
     LOCKS.contains(&name)
+}
+
+/// VCS pattern files excluded from text-only search. Host-side grep tools
+/// (ripgrep-based) hide both: ripgrep never searches hidden files, so
+/// returning them from text-only search makes astrolabe disagree with the
+/// user's own grep on the same literal — and the files hold path patterns,
+/// not source.
+fn is_vcs_ignore_file(path: &str) -> bool {
+    const VCS_IGNORES: &[&str] = &[".gitignore", ".ignore"];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    VCS_IGNORES.contains(&name)
 }
 
 /// Read a source file through [`FileCache`], keyed by repo-relative path.
@@ -882,5 +897,30 @@ mod tests {
         assert_eq!(again.by_lower("s0"), &[0]);
         assert_eq!(index.file_symbols(FileId(0)).count(), 1);
         assert_eq!(index.shed_derived(), 2, "names and file lookup rebuilt");
+    }
+
+    /// VCS ignore files are admitted by the scanner but must stay off the
+    /// text-only list: host-side ripgrep hides them, so a hit there would
+    /// disagree with the user's own grep.
+    #[test]
+    fn text_only_paths_skip_vcs_ignore_files() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join(".gitignore"), "/target\nnode_modules/\n*.log\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "plain text notes\n").unwrap();
+        let index = build(&dir).expect("index build");
+        let listed: Vec<&str> = index
+            .text_only_paths(None)
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+        assert!(
+            !listed.iter().any(|p| p.ends_with(".gitignore")),
+            ".gitignore must not appear in text-only paths: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|p| p.ends_with("notes.txt")),
+            "sibling text file must still be listed: {listed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
