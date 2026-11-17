@@ -1022,6 +1022,37 @@ fn build_exclude_set(globs: Option<&[String]>) -> Result<Option<globset::GlobSet
         .map_err(|e| format!("exclude failed to compile: {e}"))
 }
 
+/// Include filter for `search_code` (`glob`, e.g. `*.rs`, `*.{ts,tsx}`,
+/// `crates/*/src/**`). A pattern without a `/` also matches at any depth, so
+/// `*.rs` behaves like `**/*.rs` — the shape a model means by "only Rust files".
+fn build_include_set(glob: Option<&str>) -> Result<Option<globset::GlobSet>, String> {
+    let Some(raw) = glob.map(str::trim).filter(|g| !g.is_empty()) else {
+        return Ok(None);
+    };
+    let base = raw.trim_start_matches("./").trim_end_matches('/');
+    if base.is_empty() {
+        return Ok(None);
+    }
+    let mut variants = vec![base.to_string()];
+    if !base.starts_with("**/") && !base.starts_with('/') {
+        variants.push(format!("**/{base}"));
+    }
+    if !base.contains(['/', '*', '?', '[']) {
+        variants.push(format!("**/{base}/**"));
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for v in variants {
+        let glob = globset::Glob::new(&v).map_err(|e| {
+            format!("Invalid glob `{raw}`: {e}; examples: *.rs, *.{{ts,tsx}}, src/**")
+        })?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map(Some)
+        .map_err(|e| format!("failed to compile glob: {e}"))
+}
+
 /// Gist of a whole result kept for the repeat-query pointer: counts, busiest
 /// files, and the first hit with its enclosing symbol signature.
 fn search_digest(index: &RepoIndex, hits: &[SearchHit]) -> String {
@@ -1928,6 +1959,9 @@ pub(crate) struct SearchParams {
     #[serde(default)]
     #[schemars(description = "Skip paths; bare name=segment: [\"vendor\",\"_test.go\"]")]
     pub exclude: Option<Vec<String>>,
+    #[serde(default)]
+    #[schemars(description = "Include-only glob; e.g. `*.rs` matches at any depth.")]
+    pub glob: Option<String>,
     #[serde(default)]
     #[schemars(description = "Only totals (hits, files).")]
     pub count_only: bool,
@@ -4286,6 +4320,12 @@ impl AstrolabeServer {
                     Err(message) => return text_error(message),
                 };
                 let excluded = |path: &str| exclude_set.as_ref().is_some_and(|set| set.is_match(path));
+                let include_set = match build_include_set(params.glob.as_deref()) {
+                    Ok(set) => set,
+                    Err(message) => return text_error(message),
+                };
+                let included =
+                    |path: &str| include_set.as_ref().is_none_or(|set| set.is_match(path));
                 let conf = if self.once("search_code.confidence") {
                     "confidence: exact (on-disk source literal match)\n"
                 } else {
@@ -4448,6 +4488,7 @@ impl AstrolabeServer {
                             .as_ref()
                             .is_none_or(|filter| path.contains(filter.as_str()))
                             && !excluded(path)
+                            && included(path)
                     })
                     .collect();
                 {
@@ -4473,7 +4514,7 @@ impl AstrolabeServer {
                 let text_paths: Vec<&RelPath> = filter_text_paths
                     .iter()
                     .copied()
-                    .filter(|p| !excluded(p.as_str()))
+                    .filter(|p| !excluded(p.as_str()) && included(p.as_str()))
                     .collect();
                 {
                     let rels: Vec<&str> = text_paths.iter().map(|p| p.as_str()).collect();
@@ -6612,6 +6653,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         })));
@@ -6885,6 +6927,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -6933,6 +6976,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -7018,6 +7062,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }
@@ -8264,6 +8309,53 @@ mod tests {
     }
 
     #[test]
+    fn include_glob_accepts_bare_suffix_and_directory_patterns() {
+        let set = build_include_set(Some("*.rs")).unwrap().unwrap();
+        assert!(set.is_match("a.rs"));
+        assert!(set.is_match("src/deep/a.rs"));
+        assert!(!set.is_match("src/a.go"));
+        let set = build_include_set(Some("crates/*/src/**")).unwrap().unwrap();
+        assert!(set.is_match("crates/astrolabe-mcp/src/lib.rs"));
+        assert!(!set.is_match("crates/astrolabe-mcp/tests/a.rs"));
+        assert!(build_include_set(Some("")).unwrap().is_none());
+        assert!(build_include_set(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn include_glob_filters_hits_in_lists_and_counts() {
+        let (server, dir) = counting_fixture();
+        let mut p = search("SysLog(");
+        p.aggregate = Some("dir".into());
+        p.glob = Some("svc/**".into());
+        let text = text_of(&server.search_code(Parameters(p)));
+        assert!(
+            text.contains("total 4 hit lines / 3 files / 1 dirs / 1 top-level dirs"),
+            "{text}"
+        );
+        assert!(!text.contains("web/c.go"), "{text}");
+        assert!(!text.contains("vendor"), "{text}");
+        let mut q = search("SysLog(");
+        q.glob = Some("svc/**".into());
+        q.exclude = Some(vec!["*_test.go".into()]);
+        let text = text_of(&server.search_code(Parameters(q)));
+        assert!(text.contains("svc/a.go"), "{text}");
+        assert!(!text.contains("a_test.go"), "{text}");
+        assert!(!text.contains("web/c.go"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_include_glob_error_names_the_pattern_and_examples() {
+        let (server, dir) = counting_fixture();
+        let mut bad = search("SysLog(");
+        bad.glob = Some("[".into());
+        let text = text_of(&server.search_code(Parameters(bad)));
+        assert!(text.contains("glob"), "{text}");
+        assert!(text.contains("examples"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn many_hits_get_next_step_hint_and_docs_are_listed_apart() {
         let rows: String = (0..45)
             .map(|i| format!("func f{i}() {{ HINTKEY({i}) }}\n"))
@@ -8917,6 +9009,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         };
@@ -8979,6 +9072,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -9015,6 +9109,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -9042,6 +9137,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -9078,6 +9174,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -9296,6 +9393,7 @@ mod tests {
                 agent_id: None,
                 aggregate: None,
                 exclude: None,
+                glob: None,
                 count_only: false,
                 skip_comments: false,
                 query: "needle".into(),
@@ -9360,6 +9458,7 @@ mod tests {
                 agent_id: None,
                 aggregate: None,
                 exclude: None,
+                glob: None,
                 count_only: false,
                 skip_comments: false,
                 query: "needle-a".into(),
@@ -9444,6 +9543,7 @@ mod tests {
                 agent_id: None,
                 aggregate: None,
                 exclude: None,
+                glob: None,
                 count_only: false,
                 skip_comments: false,
             }))
@@ -9577,6 +9677,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         };
@@ -9613,6 +9714,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -9649,6 +9751,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -9694,6 +9797,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -10072,6 +10176,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -10100,6 +10205,7 @@ mod tests {
                 agent_id: None,
                 aggregate: None,
                 exclude: None,
+                glob: None,
                 count_only: false,
                 skip_comments: false,
             }));
@@ -10912,6 +11018,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -10957,6 +11064,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -10993,6 +11101,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -11082,6 +11191,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -11119,6 +11229,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -11305,6 +11416,7 @@ mod tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }));
@@ -11590,6 +11702,7 @@ mod mcp_routing_tests {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }
@@ -12355,6 +12468,7 @@ mod mcp_routing_tests {
                 s(&[
                     "aggregate",
                     "case_sensitive",
+                    "glob",
                     "index_root",
                     "path_filter",
                     "query",

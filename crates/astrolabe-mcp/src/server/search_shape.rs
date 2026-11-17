@@ -375,6 +375,7 @@ mod behaviour {
             agent_id: None,
             aggregate: None,
             exclude: None,
+            glob: None,
             count_only: false,
             skip_comments: false,
         }
