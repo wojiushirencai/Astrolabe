@@ -4,32 +4,39 @@
 //! handful of sub-agents) used to each build the full graph, NameIndex,
 //! FileCache, watcher and language servers: N sessions, N copies. Here the
 //! process that wins `indexer.lock` (see `astrolabe_core::elect`) also serves
-//! a user-private Unix socket. Later sessions connect, hand-shake on version,
-//! and forward `tools/call` / `resources/read` instead of building anything;
-//! they are a thin stdio shim of a few MB.
+//! a user-private IPC endpoint (Unix domain socket on Unix, loopback TCP +
+//! endpoint JSON with a 256-bit `auth_token` on Windows). Later sessions
+//! connect, hand-shake on version, and forward `tools/call` / `resources/read`
+//! instead of building anything; they are a thin stdio shim of a few MB.
 //!
-//! * **Socket:** `$XDG_RUNTIME_DIR/astrolabe/<hash(root)>.sock` on Linux
+//! * **Unix socket:** `$XDG_RUNTIME_DIR/astrolabe/<hash(root)>.sock` on Linux
 //!   (`~/.cache/astrolabe/run/` when unset), `~/Library/Caches/astrolabe/` on
 //!   macOS. Directory 0700, socket 0600. Never under the repo: macOS
 //!   `sun_path` is 104 bytes. `ASTROLABE_SHARED_INDEX_DIR` overrides the
 //!   directory (tests).
+//! * **Windows loopback TCP:** `127.0.0.1:<ephemeral>` advertised in
+//!   `<runtime_dir>/<hash(root)>.endpoint.json` (`ASTROLABE_SHARED_INDEX_DIR`,
+//!   then `%LOCALAPPDATA%\astrolabe\run`, then `%USERPROFILE%\.astrolabe\run`;
+//!   `None` if none is set), authenticated with a 256-bit CSPRNG
+//!   `auth_token` verified in constant time before any handshake reply.
 //! * **Handshake:** protocol, package version, `EXTRACTOR_VERSION`,
 //!   `SCHEMA_VERSION`, `CACHE_FORMAT_VERSION`, a hash of the full tool
-//!   catalog, a hash of the `ASTROLABE_*` settings, and the canonical root.
-//!   Any difference → this session indexes on its own (the old behaviour).
+//!   catalog, a hash of the `ASTROLABE_*` settings, toolchain env hash, and
+//!   the normalized canonical root (`path_norm_key`). Any difference -> this
+//!   session indexes on its own (the old behaviour).
 //! * **Per-session state** (once-only legends, coverage note, loop guard,
 //!   dedup tables, resources, the client context and its output shape) lives
 //!   in a per-connection view on the leader, keyed by the connection.
-//! * **Leader exit:** close the socket (followers see EOF), then release the
+//! * **Leader exit:** close the endpoint (followers see EOF), then release the
 //!   lock. Followers race for the lock: the winner warm-loads from redb and
-//!   binds the socket, the others reconnect. Calls arriving meanwhile wait up
+//!   binds the endpoint, the others reconnect. Calls arriving meanwhile wait up
 //!   to [`QUEUE_BUDGET`], then the session falls back to its own index.
 //! * **Fault isolation:** a leader that stops answering (tool timeout + 30 s)
 //!   is abandoned and the follower indexes on its own.
-//! * `ASTROLABE_SHARED_INDEX=off` disables all of it. Multi-project mode and
-//!   Windows (no named-pipe transport yet) always run independently.
-// Windows has only the stub below; the protocol types are unused there.
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+//! * `ASTROLABE_SHARED_INDEX=off` disables all of it. Multi-project mode always
+//!   runs independently.
+// Platforms other than Unix and Windows use the stub below; protocol types are unused there.
+#![cfg_attr(not(any(unix, windows)), allow(dead_code, unused_imports))]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -57,6 +64,8 @@ const SETTINGS_IGNORED: &[&str] = &[
     "ASTROLABE_SHARED_INDEX_DIR",
     "ASTROLABE_ROOT",
     "ASTROLABE_CONTEXT",
+    "ASTROLABE_ALWAYS_LOAD",
+    "ASTROLABE_BUILD_WAIT_MS",
 ];
 
 /// Environment a language server or toolchain launched for a forwarded
@@ -114,6 +123,17 @@ pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// Platform-normalized canonical root key used for handshake comparison and
+/// endpoint hashing.
+pub(crate) fn root_key(root: &Path) -> String {
+    astrolabe_core::paths::path_norm_key(root)
+}
+
+/// Stable 64-bit hash of the normalized root key.
+pub(crate) fn root_hash(root: &Path) -> u64 {
+    fnv64(root_key(root).as_bytes())
 }
 
 /// Hash of every `ASTROLABE_*` setting that can change an answer.
@@ -189,6 +209,8 @@ pub(crate) struct Hello {
     pub pid: u32,
     pub cwd: String,
     pub context: WireContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_token: Option<String>,
 }
 
 impl Hello {
@@ -207,13 +229,14 @@ impl Hello {
             tools_hash,
             settings_hash: settings_hash(),
             toolchain_hash: toolchain_env_hash(),
-            root: root.display().to_string(),
+            root: root_key(root),
             session_id: format!("{pid}-{nanos:x}"),
             pid,
             cwd: std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             context: context.into(),
+            auth_token: None,
         }
     }
 
@@ -342,6 +365,7 @@ pub(crate) trait Host: Send + Sync {
 }
 
 /// Socket directory: see the module docs.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn socket_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("ASTROLABE_SHARED_INDEX_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
@@ -362,25 +386,41 @@ pub(crate) fn socket_dir() -> Option<PathBuf> {
 }
 
 /// Longest socket path accepted (macOS `sun_path` is 104 bytes incl. NUL).
+#[cfg_attr(not(unix), allow(dead_code))]
 const MAX_SOCKET_PATH: usize = 100;
 
 /// Socket for `root` inside `dir`.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn socket_path_in(dir: &Path, root: &Path) -> Option<PathBuf> {
-    let name = format!(
-        "{:016x}.sock",
-        fnv64(root.as_os_str().to_string_lossy().as_bytes())
-    );
+    let name = format!("{:016x}.sock", root_hash(root));
     let path = dir.join(name);
     (path.as_os_str().len() <= MAX_SOCKET_PATH).then_some(path)
 }
 
-#[cfg(unix)]
-mod imp;
-#[cfg(unix)]
-pub(crate) use imp::{private_socket_path, Shared};
+/// Endpoint metadata file for `root` inside `dir` (Windows loopback TCP).
+pub(crate) fn endpoint_path_in(dir: &Path, root: &Path) -> PathBuf {
+    dir.join(format!("{:016x}.endpoint.json", root_hash(root)))
+}
 
-/// Windows: no named-pipe transport yet, every session indexes on its own.
-#[cfg(not(unix))]
+#[cfg(any(unix, windows))]
+mod core;
+#[cfg(any(unix, windows))]
+mod tcp_transport;
+#[cfg(unix)]
+mod transport_unix;
+
+#[cfg(unix)]
+pub(crate) type Shared = core::Shared<transport_unix::UnixTransport>;
+#[cfg(unix)]
+pub(crate) use transport_unix::private_socket_path;
+
+#[cfg(windows)]
+pub(crate) type Shared = core::Shared<tcp_transport::TcpTransport>;
+#[cfg(windows)]
+pub(crate) use tcp_transport::private_endpoint_path as private_socket_path;
+
+/// Platforms without Unix or Windows transport index independently.
+#[cfg(not(any(unix, windows)))]
 mod stub {
     use super::*;
 
@@ -409,7 +449,7 @@ mod stub {
         None
     }
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) use stub::{private_socket_path, Shared};
 
 #[cfg(test)]
@@ -467,5 +507,113 @@ mod tests {
         assert!(a.as_os_str().len() <= MAX_SOCKET_PATH);
         let long = PathBuf::from(format!("/{}", "x".repeat(120)));
         assert!(socket_path_in(&long, Path::new("/a")).is_none());
+    }
+
+    #[test]
+    fn root_key_and_hash_normalize_windows_paths() {
+        let verbatim = Path::new(r"\\?\C:\repo");
+        let trailing = Path::new(r"C:\repo\");
+        let lower_slash = Path::new("c:/repo");
+
+        let k1 = root_key(verbatim);
+        let k2 = root_key(trailing);
+        let k3 = root_key(lower_slash);
+        assert_eq!(k1, "c:/repo");
+        assert_eq!(k1, k2);
+        assert_eq!(k2, k3);
+
+        let h1 = fnv64(k1.as_bytes());
+        let h2 = fnv64(k2.as_bytes());
+        let h3 = fnv64(k3.as_bytes());
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
+        assert_eq!(root_hash(verbatim), h1);
+        assert_eq!(root_hash(trailing), h1);
+        assert_eq!(root_hash(lower_slash), h1);
+
+        let unc_verbatim = Path::new(r"\\?\UNC\Server\Share\Repo\");
+        let unc_plain = Path::new(r"\\server\share\repo");
+        assert_eq!(root_key(unc_verbatim), "//server/share/repo");
+        assert_eq!(root_key(unc_verbatim), root_key(unc_plain));
+        assert_eq!(root_hash(unc_verbatim), root_hash(unc_plain));
+    }
+
+    #[test]
+    fn hello_auth_token_serde_omits_none_and_preserves_some() {
+        let h_none = hello();
+        assert_eq!(h_none.auth_token, None);
+        let json_none = serde_json::to_string(&h_none).unwrap();
+        assert!(
+            !json_none.contains("auth_token"),
+            "auth_token=None must be omitted: {json_none}"
+        );
+        let decoded_none: Hello = serde_json::from_str(&json_none).unwrap();
+        assert_eq!(decoded_none.auth_token, None);
+
+        let mut h_some = hello();
+        h_some.auth_token = Some("deadbeef".into());
+        assert_eq!(h_none.mismatch(&h_some), None);
+        let json_some = serde_json::to_string(&h_some).unwrap();
+        assert!(json_some.contains("\"auth_token\":\"deadbeef\""));
+        let decoded_some: Hello = serde_json::from_str(&json_some).unwrap();
+        assert_eq!(decoded_some.auth_token.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn win_runtime_dir_fallback_resolution() {
+        use std::ffi::OsStr;
+
+        // 1. ASTROLABE_SHARED_INDEX_DIR wins over everything else.
+        assert_eq!(
+            tcp_transport::win_runtime_dir_from(
+                Some(OsStr::new("/custom/shared")),
+                Some(OsStr::new("/local/app")),
+                Some(OsStr::new("/user/prof")),
+            ),
+            Some(PathBuf::from("/custom/shared"))
+        );
+
+        // Empty ASTROLABE_SHARED_INDEX_DIR falls through to LOCALAPPDATA.
+        assert_eq!(
+            tcp_transport::win_runtime_dir_from(
+                Some(OsStr::new("")),
+                Some(OsStr::new("/local/app")),
+                Some(OsStr::new("/user/prof")),
+            ),
+            Some(PathBuf::from("/local/app").join("astrolabe").join("run"))
+        );
+
+        // 2. LOCALAPPDATA when ASTROLABE_SHARED_INDEX_DIR is None.
+        assert_eq!(
+            tcp_transport::win_runtime_dir_from(
+                None,
+                Some(OsStr::new("/local/app")),
+                Some(OsStr::new("/user/prof")),
+            ),
+            Some(PathBuf::from("/local/app").join("astrolabe").join("run"))
+        );
+
+        // 3. USERPROFILE when LOCALAPPDATA is unset/empty.
+        assert_eq!(
+            tcp_transport::win_runtime_dir_from(
+                None,
+                Some(OsStr::new("")),
+                Some(OsStr::new("/user/prof")),
+            ),
+            Some(PathBuf::from("/user/prof").join(".astrolabe").join("run"))
+        );
+
+        // 4. None when all env vars are unset/empty (no shared %TEMP% fallback).
+        assert_eq!(
+            tcp_transport::win_runtime_dir_from(None, None, Some(OsStr::new(""))),
+            None
+        );
+        assert_eq!(tcp_transport::win_runtime_dir_from(None, None, None), None);
+    }
+
+    #[test]
+    fn settings_ignored_includes_always_load_and_build_wait() {
+        assert!(SETTINGS_IGNORED.contains(&"ASTROLABE_ALWAYS_LOAD"));
+        assert!(SETTINGS_IGNORED.contains(&"ASTROLABE_BUILD_WAIT_MS"));
     }
 }

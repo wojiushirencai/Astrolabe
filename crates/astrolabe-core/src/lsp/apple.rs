@@ -65,9 +65,10 @@ pub fn prepare_spec(spec: &ServerSpec, root: &Path) -> ServerSpec {
     }
     if let Some(db) = own_compile_commands(root) {
         match write_absolute_compile_db(root, &db) {
-            Ok(Some(dir)) => spec
-                .args
-                .push(format!("--compile-commands-dir={}", dir.display())),
+            Ok(Some(dir)) => spec.args.push(format!(
+                "--compile-commands-dir={}",
+                crate::paths::display_path(&dir)
+            )),
             Ok(None) => {}
             Err(err) => tracing::warn!(
                 error = %err,
@@ -81,9 +82,10 @@ pub fn prepare_spec(spec: &ServerSpec, root: &Path) -> ServerSpec {
         return spec;
     }
     match write_objc_compile_db(root, apple_sdk().as_deref()) {
-        Ok(dir) => spec
-            .args
-            .push(format!("--compile-commands-dir={}", dir.display())),
+        Ok(dir) => spec.args.push(format!(
+            "--compile-commands-dir={}",
+            crate::paths::display_path(&dir)
+        )),
         Err(err) => {
             tracing::warn!(error = %err, "could not write synthetic ObjC compile_commands.json")
         }
@@ -110,8 +112,11 @@ pub fn warm_up_file(spec: &ServerSpec, root: &Path) -> Option<RelPath> {
         if !file.extension().is_some_and(|x| x == "m" || x == "mm") {
             return None;
         }
-        let rel = file.strip_prefix(root).ok()?;
-        Some(RelPath::new(rel.to_string_lossy().replace('\\', "/")))
+        let rel = crate::paths::strip_prefix_normalized(root, file)?;
+        if rel.as_os_str().is_empty() {
+            return None;
+        }
+        Some(RelPath::new(rel.to_string_lossy()))
     })
 }
 
@@ -167,7 +172,7 @@ pub fn write_absolute_compile_db(root: &Path, db: &Path) -> std::io::Result<Opti
             continue;
         }
         let abs = normalize(&base.join(dir));
-        entry["directory"] = Value::String(abs.to_string_lossy().into_owned());
+        entry["directory"] = Value::String(crate::paths::display_path(&abs));
         rewritten += 1;
     }
     if rewritten == 0 {
@@ -281,9 +286,9 @@ pub fn write_objc_compile_db(root: &Path, sdk: Option<&str>) -> std::io::Result<
             write_shim(root, &shim, &angle_imports)?;
             // The GNU runtime rejects ARC; use the Apple runtime model.
             base.push("-fobjc-runtime=macosx".into());
-            base.push(format!("-I{}", shim.display()));
+            base.push(format!("-I{}", crate::paths::display_path(&shim)));
             base.push("-include".into());
-            base.push(shim.join(PRELUDE).display().to_string());
+            base.push(crate::paths::display_path(&shim.join(PRELUDE)));
             for def in [
                 "TARGET_OS_IOS=1",
                 "TARGET_OS_IPHONE=1",
@@ -299,18 +304,24 @@ pub fn write_objc_compile_db(root: &Path, sdk: Option<&str>) -> std::io::Result<
             }
         }
     }
-    base.extend(include_dirs.iter().map(|d| format!("-I{}", d.display())));
+    base.extend(
+        include_dirs
+            .iter()
+            .map(|d| format!("-I{}", crate::paths::display_path(d))),
+    );
 
+    let root_display = crate::paths::display_path(root);
     let commands: Vec<Value> = entries
         .iter()
         .map(|(abs, lang)| {
+            let abs_display = crate::paths::display_path(abs);
             let mut args = vec!["clang".to_string(), "-x".into(), (*lang).into()];
             args.extend(base.iter().cloned());
             args.push("-c".into());
-            args.push(abs.display().to_string());
+            args.push(abs_display.clone());
             json!({
-                "directory": root.display().to_string(),
-                "file": abs.display().to_string(),
+                "directory": root_display,
+                "file": abs_display,
                 "arguments": args,
             })
         })
@@ -374,7 +385,7 @@ fn write_shim(root: &Path, shim: &Path, imports: &BTreeSet<String>) -> std::io::
         // miss is fatal. Forward them to the real file; stub only what the
         // repository cannot provide.
         let body = match find_own_header(root, &headers, header) {
-            Some(real) => format!("#import \"{}\"\n", real.display()),
+            Some(real) => format!("#import \"{}\"\n", crate::paths::display_path(&real)),
             None => format!("#include \"{PRELUDE}\"\n"),
         };
         write_if_changed(&path, &body)?;
@@ -396,8 +407,8 @@ fn find_own_header(
     framework
         .and_then(|fw| {
             found.iter().find(|p| {
-                p.strip_prefix(root)
-                    .is_ok_and(|r| r.components().any(|c| c.as_os_str() == fw))
+                crate::paths::strip_prefix_normalized(root, p)
+                    .is_some_and(|r| r.components().any(|c| c.as_os_str() == fw))
             })
         })
         .or_else(|| found.first())
@@ -1094,10 +1105,13 @@ mod tests {
         )
         .unwrap();
         let root = std::fs::canonicalize(&t.0).unwrap();
-        assert_eq!(copy[0]["directory"], json!(root.to_string_lossy()));
+        assert_eq!(
+            copy[0]["directory"],
+            json!(crate::paths::display_path(&root))
+        );
         assert_eq!(
             copy[1]["directory"],
-            json!(root.join("lib").to_string_lossy())
+            json!(crate::paths::display_path(&root.join("lib")))
         );
         assert_eq!(copy[2]["directory"], json!("/abs/already"));
         assert_eq!(
@@ -1141,7 +1155,10 @@ mod tests {
         )
         .unwrap();
         let build = std::fs::canonicalize(t.0.join("build")).unwrap();
-        assert_eq!(copy[0]["directory"], json!(build.to_string_lossy()));
+        assert_eq!(
+            copy[0]["directory"],
+            json!(crate::paths::display_path(&build))
+        );
 
         let t2 = tmp("absdb");
         write(

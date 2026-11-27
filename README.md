@@ -11,7 +11,7 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 
 | | |
 |---|---|
-| Latest release | [v0.17.10](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.10), published 2026-11-16 |
+| Latest release | [v0.17.11](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.11), published 2026-11-27 |
 | What it exposes | 7 MCP tools (short names): `resolve_contx`, `search_code`, `find_symbol`, `find_refs`, `goto_def`, `get_diag`, `get_lang` (legacy long names still work as aliases) |
 | `tools/list` size | about 3.6 KB compact JSON (3,607 B measured on Linux for v0.16.0; not re-measured on macOS) |
 | Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |
@@ -85,7 +85,7 @@ Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/I
 | `get_diag` | Syntax and type errors for a file. (alias: `get_diagnostics`) |
 | `get_lang` | Languages, file counts, lines of code, language-server status, and index coverage (see below). (alias: `get_languages`) |
 
-`tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn), including optional per-call `index_root` on every tool (absolute or cwd-relative directory; omit to keep the process startup root). The others — `regex`, `exclude`, `count_only`, `context_lines`, `group`, `dedup`, `kind`, `depth`, `substring`, `dry_run_rename`, `character`, `severity`, `offset`, `page`, `budget_tokens`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
+`tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn), including optional per-call `index_root` on every tool (absolute or cwd-relative directory inside a git repository or a `.astrolabe/project.yml` project; omit to keep the process startup root). Astrolabe only indexes git repositories and directories declared by `.astrolabe/project.yml` (Serena's `.serena/project.yml` is accepted for compatibility); a directory that holds git repositories is never indexed itself. Any other startup directory or `index_root` is refused with its child repositories listed, unless `ASTROLABE_ALLOW_NON_GIT_ROOT=1` (see [REFERENCE](docs/REFERENCE.zh-CN.md)). The others — `regex`, `exclude`, `count_only`, `context_lines`, `group`, `dedup`, `kind`, `depth`, `substring`, `dry_run_rename`, `character`, `severity`, `offset`, `page`, `budget_tokens`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
 
 Tool descriptions and return text are **English-only** (schema copy, result bodies, hook reminders), so agents are not split across bilingual phrasing.
 

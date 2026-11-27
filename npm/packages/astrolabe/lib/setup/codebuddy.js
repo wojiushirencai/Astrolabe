@@ -2,27 +2,56 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+  expandHome,
+  readEnvDir,
+  hookCommand,
+  isAstrolabeHookCommand,
+} = require('./cursor');
 
+const REMIND_ARGS = ['hooks', 'remind', '--client=codebuddy'];
+const CLEANUP_ARGS = ['hooks', 'cleanup'];
 const REMIND_CMD = 'astrolabe hooks remind --client=codebuddy';
 const CLEANUP_CMD = 'astrolabe hooks cleanup';
 
-function resolveCodebuddyMcpPath(home, existsFn) {
-  const candidates = [
-    path.join(home, '.codebuddy', '.mcp.json'),
-    path.join(home, '.codebuddy', 'mcp.json'),
-    path.join(home, '.codebuddy.json'),
-  ];
+function resolveCodebuddyConfigDir(home, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) return explicit;
+  return (
+    readEnvDir(env, ['CODEBUDDY_CONFIG_DIR', 'CODEBUDDY_HOME'], home) ||
+    path.join(home, '.codebuddy')
+  );
+}
+
+function resolveCodebuddyMcpPath(home, existsFn, env = process.env, configDir = null) {
+  const dir = resolveCodebuddyConfigDir(home, env, configDir);
+  const hasCustom = Boolean(
+    expandHome(configDir, home) ||
+      readEnvDir(env, ['CODEBUDDY_CONFIG_DIR', 'CODEBUDDY_HOME'], home),
+  );
+  const candidates = [path.join(dir, '.mcp.json'), path.join(dir, 'mcp.json')];
+  if (!hasCustom) {
+    candidates.push(path.join(home, '.codebuddy.json'));
+  }
   for (const cand of candidates) {
     if (existsFn(cand)) return cand;
   }
   return candidates[0];
 }
 
+function resolveCodebuddySettingsPath(home, env = process.env, configDir = null) {
+  return path.join(resolveCodebuddyConfigDir(home, env, configDir), 'settings.json');
+}
+
 function detectCodebuddy(home, env, { whichFn, existsFn }) {
   const evidence = [];
+  const dir = resolveCodebuddyConfigDir(home, env);
+  const hasCustom = Boolean(readEnvDir(env, ['CODEBUDDY_CONFIG_DIR', 'CODEBUDDY_HOME'], home));
   if (whichFn('codebuddy', env)) evidence.push('codebuddy on PATH');
-  if (existsFn(path.join(home, '.codebuddy'))) evidence.push('~/.codebuddy/');
-  if (existsFn(path.join(home, '.codebuddy.json'))) evidence.push('~/.codebuddy.json');
+  if (existsFn(dir)) evidence.push(hasCustom ? dir : '~/.codebuddy/');
+  if (!hasCustom && existsFn(path.join(home, '.codebuddy.json'))) {
+    evidence.push('~/.codebuddy.json');
+  }
   return { detected: evidence.length > 0, evidence };
 }
 
@@ -33,19 +62,25 @@ function commandHookEntry(command) {
   };
 }
 
-function entryHasAstrolabeCommand(entry, needle) {
+function entryIsAstrolabeHook(entry, subcommand, binPath, platform = process.platform) {
   if (!entry || typeof entry !== 'object') return false;
   const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
-  return hooks.some(
-    (h) => h && typeof h.command === 'string' && h.command.includes(needle),
-  );
+  if (hooks.length !== 1) return false;
+  return isAstrolabeHookCommand(hooks[0] && hooks[0].command, {
+    subcommands: [subcommand],
+    binPath,
+    platform,
+  });
 }
 
 /**
  * Merge CC-compatible PreToolUse + SessionEnd into ~/.codebuddy/settings.json
  * without clobbering other hook entries.
  */
-function mergeCodebuddyHooksSettings(filePath, { create = true, existsFn = fs.existsSync } = {}) {
+function mergeCodebuddyHooksSettings(
+  filePath,
+  { create = true, existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
+) {
   let created = false;
   let doc = {};
   if (existsFn(filePath)) {
@@ -66,28 +101,61 @@ function mergeCodebuddyHooksSettings(filePath, { create = true, existsFn = fs.ex
   const hooks = doc.hooks;
   let replaced = false;
 
-  for (const [event, command, needle] of [
-    ['PreToolUse', REMIND_CMD, 'astrolabe hooks remind --client=codebuddy'],
-    ['SessionEnd', CLEANUP_CMD, 'astrolabe hooks cleanup'],
+  const nextRemind = commandHookEntry(hookCommand(binPath, REMIND_ARGS, platform));
+  const nextCleanup = commandHookEntry(hookCommand(binPath, CLEANUP_ARGS, platform));
+
+  for (const [event, subcommand, next] of [
+    ['PreToolUse', 'remind', nextRemind],
+    ['SessionEnd', 'cleanup', nextCleanup],
   ]) {
     if (!Array.isArray(hooks[event])) hooks[event] = [];
-    const idx = hooks[event].findIndex((e) => entryHasAstrolabeCommand(e, needle));
-    const next = commandHookEntry(command);
-    if (idx >= 0) {
-      hooks[event][idx] = next;
-      replaced = true;
-    } else {
-      hooks[event].push(next);
+    let inserted = false;
+    const nextList = [];
+    for (const entry of hooks[event]) {
+      if (entryIsAstrolabeHook(entry, subcommand, binPath, platform)) {
+        if (!inserted) {
+          nextList.push(next);
+          inserted = true;
+        }
+        replaced = true;
+        continue;
+      }
+      if (entry && typeof entry === 'object' && Array.isArray(entry.hooks)) {
+        const filtered = entry.hooks.filter(
+          (h) =>
+            !isAstrolabeHookCommand(h && h.command, {
+              subcommands: [subcommand],
+              binPath,
+              platform,
+            }),
+        );
+        if (filtered.length !== entry.hooks.length) {
+          replaced = true;
+          if (filtered.length > 0) {
+            nextList.push({ ...entry, hooks: filtered });
+          }
+          continue;
+        }
+      }
+      nextList.push(entry);
     }
+    if (!inserted) {
+      nextList.push(next);
+    }
+    hooks[event] = nextList;
   }
 
   return { filePath, doc, created, replaced };
 }
 
 module.exports = {
+  REMIND_ARGS,
+  CLEANUP_ARGS,
   REMIND_CMD,
   CLEANUP_CMD,
+  resolveCodebuddyConfigDir,
   resolveCodebuddyMcpPath,
+  resolveCodebuddySettingsPath,
   detectCodebuddy,
   mergeCodebuddyHooksSettings,
 };

@@ -132,7 +132,7 @@ impl RootDispatcher {
         let exact: Vec<&PathBuf> = self
             .children
             .iter()
-            .filter(|c| c.file_name().and_then(|s| s.to_str()) == Some(name))
+            .filter(|c| child_dir_name(c).as_deref() == Some(name))
             .collect();
         if exact.len() == 1 {
             return Some(exact[0].as_path());
@@ -141,11 +141,7 @@ impl RootDispatcher {
         let loose: Vec<&PathBuf> = self
             .children
             .iter()
-            .filter(|c| {
-                c.file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|n| n.to_lowercase() == lower)
-            })
+            .filter(|c| child_dir_name(c).is_some_and(|n| n.to_lowercase() == lower))
             .collect();
         if loose.len() == 1 {
             Some(loose[0].as_path())
@@ -163,10 +159,17 @@ impl RootDispatcher {
             return None;
         }
         let p = Path::new(path);
-        if p.is_absolute() {
-            let hits: Vec<&PathBuf> = self.children.iter().filter(|c| p.starts_with(c)).collect();
+        if is_abs_path(path) {
+            let matches: Vec<(&PathBuf, PathBuf)> = self
+                .children
+                .iter()
+                .filter_map(|c| {
+                    astrolabe_core::paths::strip_prefix_normalized(c, p).map(|rel| (c, rel))
+                })
+                .collect();
+            let hits: Vec<&PathBuf> = matches.iter().map(|(c, _)| *c).collect();
             let child = pick_unique_or_nested(&hits)?;
-            let rel = p.strip_prefix(child).ok()?;
+            let (_, rel) = matches.into_iter().find(|(c, _)| c.as_path() == child)?;
             return Some((child, rel.to_string_lossy().replace('\\', "/")));
         }
         let norm = path.replace('\\', "/");
@@ -178,7 +181,7 @@ impl RootDispatcher {
         let hits: Vec<&PathBuf> = self
             .children
             .iter()
-            .filter(|c| c.file_name().and_then(|s| s.to_str()) == Some(first))
+            .filter(|c| child_dir_name(c).as_deref() == Some(first))
             .collect();
         if hits.len() == 1 {
             Some((hits[0].as_path(), rest.to_string()))
@@ -267,6 +270,60 @@ fn paths_eq(a: &Path, b: &Path) -> bool {
     astrolabe_core::paths::paths_eq_normalized(a, b)
 }
 
+fn is_abs_path(s: &str) -> bool {
+    if Path::new(s).is_absolute() {
+        return true;
+    }
+    let b = s.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || s.starts_with(r"\\")
+        || s.starts_with("//")
+}
+
+fn child_dir_name(child: &Path) -> Option<String> {
+    let s = child.to_string_lossy();
+    let trimmed = s.trim_end_matches(['/', '\\']);
+    let name = trimmed.rsplit(['/', '\\']).next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let b = name.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn looks_windows_norm_key(key: &str) -> bool {
+    let b = key.as_bytes();
+    (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()) || key.starts_with("//")
+}
+
+fn normalize_hint_for_match(hint: &str, windows_ci: bool) -> String {
+    let s = hint.replace('\\', "/");
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(idx) = rest.find("//?/") {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 4..];
+        if after
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"UNC/"))
+        {
+            out.push_str("//");
+            rest = &after[4..];
+        } else {
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    if windows_ci {
+        out.make_ascii_lowercase();
+    }
+    out
+}
+
 /// True when `child` is a component-bounded path prefix of `hint`.
 ///
 /// `/proj/foo` matches `/proj/foo/src/lib.rs` and a mention of that path
@@ -275,23 +332,28 @@ fn child_is_path_prefix(child: &Path, hint: &str) -> bool {
     if child.as_os_str().is_empty() {
         return false;
     }
-    if Path::new(hint).starts_with(child) {
+    if astrolabe_core::paths::is_under_normalized(child, Path::new(hint)) {
         return true;
     }
-    let child_s = child.to_string_lossy();
-    for (pos, _) in hint.match_indices(child_s.as_ref()) {
+    let child_key = astrolabe_core::paths::path_norm_key(child);
+    if child_key.is_empty() {
+        return false;
+    }
+    let norm_hint = normalize_hint_for_match(hint, looks_windows_norm_key(&child_key));
+    for (pos, _) in norm_hint.match_indices(&child_key) {
         let before_ok = pos == 0 || {
-            hint[..pos]
+            norm_hint[..pos]
                 .chars()
                 .next_back()
-                .is_some_and(|c| !is_path_token_char(c))
+                .is_some_and(|c| !is_path_token_char(c) && !is_path_separator(c))
         };
-        let after_pos = pos + child_s.len();
-        let after_ok = after_pos == hint.len() || {
-            hint[after_pos..]
-                .chars()
-                .next()
-                .is_some_and(|c| is_path_separator(c) || !is_path_token_char(c))
+        let after_pos = pos + child_key.len();
+        let after_ok = after_pos == norm_hint.len() || {
+            child_key.ends_with('/')
+                || norm_hint[after_pos..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| is_path_separator(c) || !is_path_token_char(c))
         };
         if before_ok && after_ok {
             return true;
@@ -309,15 +371,15 @@ fn is_path_token_char(c: char) -> bool {
 }
 
 fn child_name_matches(child: &Path, hint: &str) -> bool {
-    let Some(name) = child.file_name().and_then(|s| s.to_str()) else {
+    let Some(name) = child_dir_name(child) else {
         return false;
     };
-    if is_generic_dir_name(name) {
+    if is_generic_dir_name(&name) {
         // Common words ("api", "web", "docs") appear in ordinary prose; only
         // trust them when written like a path or code token.
-        return mentions_as_token(hint, name);
+        return mentions_as_token(hint, &name);
     }
-    contains_word(hint, name)
+    contains_word(hint, &name)
 }
 
 /// Directory names that are ordinary English/engineering words.
@@ -331,11 +393,13 @@ fn is_generic_dir_name(name: &str) -> bool {
     GENERIC.contains(&name.to_lowercase().as_str())
 }
 
-/// `name/`, `` `name` ``, or `./name` in the hint (case-sensitive).
+/// `name/`, `name\`, `` `name` ``, `./name`, or `.\name` in the hint (case-sensitive).
 fn mentions_as_token(hint: &str, name: &str) -> bool {
     hint.contains(&format!("{name}/"))
+        || hint.contains(&format!("{name}\\"))
         || hint.contains(&format!("`{name}`"))
         || hint.contains(&format!("./{name}"))
+        || hint.contains(&format!(".\\{name}"))
 }
 
 /// Case-insensitive word-boundary search.
@@ -369,6 +433,19 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
 }
 
+fn normalized_segment_count(p: &Path) -> usize {
+    astrolabe_core::paths::path_norm_key(p)
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .count()
+}
+
+fn is_nested(sorted: &[&PathBuf]) -> bool {
+    sorted
+        .windows(2)
+        .all(|w| astrolabe_core::paths::is_under_normalized(w[0], w[1]))
+}
+
 /// One hit, or a nesting chain (longest / most specific wins). Incomparable
 /// hits are ambiguous.
 fn pick_unique_or_nested<'a>(hits: &[&'a PathBuf]) -> Option<&'a Path> {
@@ -377,9 +454,8 @@ fn pick_unique_or_nested<'a>(hits: &[&'a PathBuf]) -> Option<&'a Path> {
         1 => Some(hits[0].as_path()),
         _ => {
             let mut sorted: Vec<&'a PathBuf> = hits.to_vec();
-            sorted.sort_by_key(|p| p.components().count());
-            let nested = sorted.windows(2).all(|w| w[1].starts_with(w[0].as_path()));
-            if nested {
+            sorted.sort_by_key(|p| normalized_segment_count(p));
+            if is_nested(&sorted) {
                 sorted.last().map(|p| p.as_path())
             } else {
                 None
@@ -678,5 +754,64 @@ mod tests {
             Some(Path::new("/ws/billing")),
             "distinctive names still match by word"
         );
+    }
+
+    #[test]
+    fn windows_verbatim_routing_hints_and_nesting() {
+        let d = disp(&[r"\\?\C:\ws\api", r"\\?\C:\ws\web"], 300, 3);
+        let api = Path::new(r"\\?\C:\ws\api");
+
+        // route_path across verbatim child and non-verbatim / mixed-case / slash paths
+        assert_eq!(
+            d.route_path(r"C:\ws\api\src\lib.rs"),
+            Some((api, "src/lib.rs".to_string()))
+        );
+        assert_eq!(
+            d.route_path("c:/ws/api/src/lib.rs"),
+            Some((api, "src/lib.rs".to_string()))
+        );
+        assert_eq!(
+            d.route_path(r"api\src\lib.rs"),
+            Some((api, "src/lib.rs".to_string()))
+        );
+
+        // route with path or token hints
+        assert_eq!(d.route(r"check C:\ws\api\src\lib.rs please"), Some(api));
+        assert_eq!(d.route("check c:/ws/api/src/lib.rs please"), Some(api));
+        assert_eq!(d.route(r"look in api\src\lib.rs"), Some(api));
+        assert_eq!(d.route(r"open .\api"), Some(api));
+
+        // is_nested / pick_unique_or_nested across verbatim and non-verbatim paths
+        let outer = PathBuf::from(r"\\?\C:\ws\mono");
+        let inner = PathBuf::from(r"C:\ws\mono\nested");
+        let other = PathBuf::from(r"C:\ws\other");
+        assert!(is_nested(&[&outer, &inner]));
+        assert!(!is_nested(&[&outer, &other]));
+        assert_eq!(
+            pick_unique_or_nested(&[&inner, &outer]),
+            Some(inner.as_path())
+        );
+
+        let nested_disp = disp(&[r"\\?\C:\ws\mono", r"C:\ws\mono\nested"], 300, 3);
+        assert_eq!(
+            nested_disp.route_path(r"c:/ws/mono/nested/src/lib.rs"),
+            Some((inner.as_path(), "src/lib.rs".to_string()))
+        );
+        assert_eq!(
+            nested_disp.route(r"fix C:\ws\mono\nested\src\lib.rs"),
+            Some(inner.as_path())
+        );
+    }
+
+    #[test]
+    fn windows_verbatim_utf8_hints_do_not_panic() {
+        let d = disp(&[r"\\?\C:\项目", r"\\?\C:\ws\other"], 300, 3);
+        let proj = Path::new(r"\\?\C:\项目");
+
+        assert_eq!(d.route(r"check \\?\C:\项目\src\lib.rs"), Some(proj));
+        assert_eq!(d.route(r"check \\?\C:\项目a\src\lib.rs"), None);
+        assert_eq!(d.route(r"check \\?\项目"), Some(proj));
+        assert_eq!(d.route(r"check \\?\项目x"), None);
+        assert_eq!(d.route(r"check \\?\项"), None);
     }
 }

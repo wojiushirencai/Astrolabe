@@ -110,7 +110,7 @@ impl AstrolabeServer {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     /// Hash of the full (context-independent) tool catalog.
     fn tools_hash(&self) -> String {
         let tools = self.tool_router.list_all();
@@ -122,7 +122,7 @@ impl AstrolabeServer {
     /// index), become the leader, or index independently. Replaces
     /// [`Self::start_indexing`] for the stdio server.
     pub fn start_indexing_shared(&mut self) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if shared_index::enabled() && self.dispatch.is_none() {
             if let Some(sock) = shared_index::private_socket_path(&self.root) {
                 let hello = shared_index::Hello::new(&self.root, self.tools_hash(), &self.context);

@@ -7,7 +7,7 @@
 //! symbol, talks to a server, and never presents a failure as an empty hit
 //! list.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -694,7 +694,7 @@ pub fn lsp_path_to_rel(path: &str, repo_root: &Path) -> Option<RelPath> {
 
     let normalized = path.replace('\\', "/");
     let as_path = Path::new(&normalized);
-    if as_path.is_absolute() {
+    if as_path.is_absolute() || looks_like_windows_abs(&normalized) {
         return rel_under_root(as_path, repo_root);
     }
 
@@ -927,7 +927,7 @@ fn format_external_list(external: &[String]) -> String {
 
 fn display_external(raw: &str) -> String {
     abs_path_from_lsp(raw)
-        .map(|p| p.display().to_string())
+        .map(|p| crate::paths::display_path(&p))
         .unwrap_or_else(|| raw.to_string())
 }
 
@@ -987,117 +987,39 @@ fn server_label(language: Language) -> &'static str {
 }
 
 fn looks_like_file_uri(path: &str) -> bool {
-    path.len() >= 5 && path[..5].eq_ignore_ascii_case("file:")
+    path.as_bytes()
+        .get(..5)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"file:"))
+}
+
+fn looks_like_windows_abs(normalized: &str) -> bool {
+    if normalized.starts_with("//") {
+        return true;
+    }
+    let b = normalized.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
 }
 
 fn abs_path_from_lsp(raw: &str) -> Option<PathBuf> {
     if looks_like_file_uri(raw) {
-        return file_uri_to_path(raw);
+        return super::transport::file_uri_to_path(raw);
     }
     let normalized = raw.replace('\\', "/");
     let path = Path::new(&normalized);
-    if path.is_absolute() {
-        return Some(lexical_normalize(path));
+    if path.is_absolute() || looks_like_windows_abs(&normalized) {
+        return Some(crate::paths::lexical_normalize(path));
     }
     None
-}
-
-fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = if looks_like_file_uri(uri) {
-        &uri[5..]
-    } else {
-        return None;
-    };
-    let rest = rest.split_once('#').map(|(head, _)| head).unwrap_or(rest);
-    let rest = rest.split_once('?').map(|(head, _)| head).unwrap_or(rest);
-    let decoded = percent_decode(rest)?;
-
-    if let Some(after_authority) = decoded.strip_prefix("//") {
-        let slash = after_authority.find('/')?;
-        let host = &after_authority[..slash];
-        let path = &after_authority[slash..];
-        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
-            Some(local_fs_path(path))
-        } else {
-            // UNC / remote host: never treat as in-repo.
-            None
-        }
-    } else {
-        Some(local_fs_path(&decoded))
-    }
-}
-
-fn local_fs_path(path: &str) -> PathBuf {
-    // `file:///C:/Users/…` yields `/C:/Users/…`. On Windows that leading slash
-    // has to come off so `Path` sees a drive prefix.
-    #[cfg(windows)]
-    {
-        let bytes = path.as_bytes();
-        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
-            return lexical_normalize(Path::new(&path[1..]));
-        }
-    }
-    lexical_normalize(Path::new(path))
-}
-
-fn percent_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return None;
-            }
-            let high = from_hex(bytes[i + 1])?;
-            let low = from_hex(bytes[i + 2])?;
-            out.push((high << 4) | low);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn from_hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn rel_under_root(abs: &Path, repo_root: &Path) -> Option<RelPath> {
-    let abs_lex = lexical_normalize(abs);
-    let root_lex = lexical_normalize(repo_root);
-    if let Some(rel) = strip_prefix_path(&abs_lex, &root_lex) {
-        return path_to_rel(rel);
-    }
-    if let (Ok(abs_c), Ok(root_c)) = (abs.canonicalize(), repo_root.canonicalize()) {
-        if let Some(rel) = strip_prefix_path(&abs_c, &root_c) {
-            return path_to_rel(rel);
-        }
-    }
-    None
-}
-
-fn strip_prefix_path<'a>(abs: &'a Path, root: &Path) -> Option<&'a Path> {
-    let rel = abs.strip_prefix(root).ok()?;
-    if rel.as_os_str().is_empty() {
-        return None;
-    }
-    if rel.components().any(|c| matches!(c, Component::ParentDir)) {
-        return None;
-    }
-    Some(rel)
+    let rel = crate::paths::strip_prefix_normalized_with_canonical_fallback(repo_root, abs)?;
+    path_to_rel(&rel)
 }
 
 fn strip_root_string(raw: &str, repo_root: &Path) -> Option<RelPath> {
     let raw = raw.trim_start_matches('/');
-    let root = lexical_normalize(repo_root);
+    let root = crate::paths::lexical_normalize(&crate::paths::without_verbatim_prefix(repo_root));
     let root = root.to_string_lossy().replace('\\', "/");
     let root = root.trim_start_matches('/');
     // A single-component root such as `/repo` is also a plausible first
@@ -1126,22 +1048,6 @@ fn path_to_rel(rel: &Path) -> Option<RelPath> {
         return None;
     }
     Some(RelPath::new(s))
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push(component);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1693,6 +1599,42 @@ mod tests {
         assert!(lsp_path_to_rel("file:///repo/src/%zz.go", Path::new("/repo")).is_none());
         assert!(lsp_path_to_rel("file://host/share/x.go", Path::new("/repo")).is_none());
         assert!(lsp_path_to_rel("../outside.go", Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn windows_verbatim_and_unc_uris_resolve_under_root() {
+        let verbatim_root = Path::new(r"\\?\C:\repo");
+        assert_eq!(
+            lsp_path_to_rel("file:///c:/repo/Src/App.ts", verbatim_root)
+                .unwrap()
+                .as_str(),
+            "Src/App.ts"
+        );
+        assert_eq!(
+            lsp_path_to_rel("FILE://localhost/c%3a/repo/src/a.ts", verbatim_root)
+                .unwrap()
+                .as_str(),
+            "src/a.ts"
+        );
+        assert_eq!(
+            lsp_path_to_rel(
+                "file:///C:/%E9%A1%B9%E7%9B%AE%20%E7%9B%AE%E5%BD%95/a.ts",
+                Path::new(r"\\?\C:\项目 目录")
+            )
+            .unwrap()
+            .as_str(),
+            "a.ts"
+        );
+        assert_eq!(
+            lsp_path_to_rel(
+                "file://srv/share/repo/Src/a.rs",
+                Path::new(r"\\?\UNC\srv\share\repo")
+            )
+            .unwrap()
+            .as_str(),
+            "Src/a.rs"
+        );
+        assert!(lsp_path_to_rel("file:///C:/repo/../secret.txt", verbatim_root).is_none());
     }
 
     #[test]
@@ -2513,5 +2455,22 @@ mod tests {
         assert_eq!(second.confidence, Confidence::Exact);
         let ref_calls = server.ref_calls.lock().unwrap().clone();
         assert_eq!(ref_calls, vec![(RelPath::new("a.go"), pos(3, 5))]);
+    }
+
+    #[test]
+    fn non_ascii_relative_paths_do_not_panic_in_path_helpers() {
+        assert_eq!(
+            rel_under_root(Path::new("项目/a.rs"), Path::new("/repo")),
+            None
+        );
+        assert_eq!(
+            rel_under_root(Path::new("/repo/项目/a.rs"), Path::new("/repo")),
+            Some(RelPath::new("项目/a.rs"))
+        );
+        assert_eq!(
+            lsp_path_to_rel("项目/a.rs", Path::new("/repo")),
+            Some(RelPath::new("项目/a.rs"))
+        );
+        assert!(!looks_like_file_uri("项目/a.rs"));
     }
 }

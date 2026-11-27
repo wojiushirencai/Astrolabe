@@ -8,6 +8,9 @@
 //! - L3: Detailed tool descriptions and schemas implemented by `server.rs`.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+const GO_LAYOUT_HINT_BUDGET: Duration = Duration::from_millis(200);
 
 /// Shared Cursor L1 guidance. `astrolabe setup --scope=project` renders the
 /// same file into the project's `.cursor/rules/astrolabe.mdc`, so the MCP
@@ -40,7 +43,8 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
          scoped comes from the import graph; syntactic from name matching.\
          After edits, if build/tests already pass (e.g. go test, cargo test), skip get_diag; use it only when you cannot run build/tests.\
          When a language server is missing, precise tools say so and suggest alternatives — do not install one yourself (see get_lang).\
-         Source files in other languages are not indexed: empty search_code/find_symbol does not cover them — use Grep/Read.{}",
+         Source files in other languages are not indexed: empty search_code/find_symbol does not cover them — use Grep/Read. \
+         If Astrolabe tools are deferred, load all 7 in ONE ToolSearch call (select:mcp__astrolabe__resolve_contx,mcp__astrolabe__search_code,mcp__astrolabe__find_symbol,mcp__astrolabe__find_refs,mcp__astrolabe__goto_def,mcp__astrolabe__get_diag,mcp__astrolabe__get_lang) before Grep/Read — never one by one.{}",
         astrolabe_core::paths::display_path(root),
         go_layout_hint(root).map(|h| format!("\n{h}")).unwrap_or_default()
     )
@@ -53,19 +57,32 @@ pub fn connection_instructions(context_name: &str, root: &Path) -> String {
 /// ~10 turns. One line naming the module roots up front avoids that.
 /// `None` when the root itself is a module or holds no Go module at all.
 fn go_layout_hint(root: &Path) -> Option<String> {
+    go_layout_hint_with_budget(root, GO_LAYOUT_HINT_BUDGET)
+}
+
+fn go_layout_hint_with_budget(root: &Path, budget: Duration) -> Option<String> {
+    let start = Instant::now();
+    if start.elapsed() >= budget {
+        return None;
+    }
     if root.join("go.mod").is_file() {
         return None;
     }
     let from_work = root.join("go.work").is_file();
     let mut mods: Vec<String> = if from_work {
-        std::fs::read_to_string(root.join("go.work"))
-            .map(|w| go_work_uses(&w))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|d| d != "." && root.join(d).join("go.mod").is_file())
-            .collect()
+        let content = std::fs::read_to_string(root.join("go.work")).unwrap_or_default();
+        let mut work_mods = Vec::new();
+        for d in go_work_uses(&content) {
+            if start.elapsed() >= budget {
+                return None;
+            }
+            if d != "." && root.join(&d).join("go.mod").is_file() {
+                work_mods.push(d);
+            }
+        }
+        work_mods
     } else {
-        scan_go_modules(root)
+        scan_go_modules(root, start, budget)?
     };
     if mods.is_empty() {
         return None;
@@ -135,12 +152,16 @@ fn go_work_uses(text: &str) -> Vec<String> {
 
 /// Shallow, bounded walk (depth 3, 2000 dirs) for `go.mod` directories,
 /// not descending into a module once found nor into trees the go tool or
-/// the index ignore.
-fn scan_go_modules(root: &Path) -> Vec<String> {
+/// the index ignore. Returns `None` if `budget` elapses mid-walk so callers
+/// never receive a partial module hint.
+fn scan_go_modules(root: &Path, start: Instant, budget: Duration) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut queue = std::collections::VecDeque::from([(String::new(), 0usize)]);
     let mut seen = 0usize;
     while let Some((rel, depth)) = queue.pop_front() {
+        if start.elapsed() >= budget {
+            return None;
+        }
         seen += 1;
         if seen > 2000 {
             break;
@@ -160,7 +181,11 @@ fn scan_go_modules(root: &Path) -> Vec<String> {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
+        let mut children = Vec::new();
         for e in rd.flatten() {
+            if start.elapsed() >= budget {
+                return None;
+            }
             if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
@@ -174,6 +199,10 @@ fn scan_go_modules(root: &Path) -> Vec<String> {
             {
                 continue;
             }
+            children.push(name);
+        }
+        children.sort();
+        for name in children {
             let child = if rel.is_empty() {
                 name
             } else {
@@ -182,7 +211,7 @@ fn scan_go_modules(root: &Path) -> Vec<String> {
             queue.push_back((child, depth + 1));
         }
     }
-    out
+    Some(out)
 }
 
 /// L2: the full manual for hosts that inject it (Claude Code `--system-prompt`, tests).
@@ -761,5 +790,62 @@ mod tests {
         assert!(p.contains("Self-check"));
         assert!(p.contains("All Astrolabe tools are read-only"));
         assert_ne!(p, manual("claude-code"));
+    }
+
+    #[test]
+    fn connection_instructions_includes_single_toolsearch_batch_hint_and_is_deterministic() {
+        let root = Path::new("/workspace/test_repo");
+        let expected_hint = "If Astrolabe tools are deferred, load all 7 in ONE ToolSearch call \
+            (select:mcp__astrolabe__resolve_contx,mcp__astrolabe__search_code,\
+            mcp__astrolabe__find_symbol,mcp__astrolabe__find_refs,\
+            mcp__astrolabe__goto_def,mcp__astrolabe__get_diag,\
+            mcp__astrolabe__get_lang) before Grep/Read — never one by one.";
+
+        for ctx in ["claude-code", "default"] {
+            let first = connection_instructions(ctx, root);
+            let second = connection_instructions(ctx, root);
+            assert_eq!(
+                first, second,
+                "{ctx} L1 must be deterministic byte-for-byte"
+            );
+            assert!(first.contains(expected_hint), "{ctx}: {first}");
+            for tool in [
+                "mcp__astrolabe__resolve_contx",
+                "mcp__astrolabe__search_code",
+                "mcp__astrolabe__find_symbol",
+                "mcp__astrolabe__find_refs",
+                "mcp__astrolabe__goto_def",
+                "mcp__astrolabe__get_diag",
+                "mcp__astrolabe__get_lang",
+            ] {
+                assert!(first.contains(tool), "{ctx} missing {tool}");
+            }
+        }
+
+        let cursor = connection_instructions("cursor", root);
+        assert!(!cursor.contains("ToolSearch"), "{cursor}");
+    }
+
+    #[test]
+    fn go_layout_hint_with_budget_returns_none_on_zero_budget() {
+        let d = tmp_repo("zero_budget", &[("svc/a/go.mod", "module a\n")]);
+        assert!(go_layout_hint_with_budget(&d, GO_LAYOUT_HINT_BUDGET).is_some());
+
+        let t0 = Instant::now();
+        assert!(go_layout_hint_with_budget(&d, Duration::ZERO).is_none());
+        assert!(t0.elapsed() < Duration::from_millis(50));
+        assert!(scan_go_modules(&d, Instant::now(), Duration::ZERO).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+
+        let w = tmp_repo(
+            "zero_budget_work",
+            &[
+                ("go.work", "go 1.26.0\n\nuse ./src\n"),
+                ("src/go.mod", "module example.com/m\n"),
+            ],
+        );
+        assert!(go_layout_hint_with_budget(&w, GO_LAYOUT_HINT_BUDGET).is_some());
+        assert!(go_layout_hint_with_budget(&w, Duration::ZERO).is_none());
+        let _ = std::fs::remove_dir_all(&w);
     }
 }

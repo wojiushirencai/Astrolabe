@@ -6,6 +6,68 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.11] - 2026-11-27
+
+### 中文
+
+#### 根治 Prompt Cache 坍塌（Claude Code `alwaysLoad` + Soft-First Hook + 索引首调缓冲）
+- MCP 服务端 `list_tools` 默认在全部 7 个静态瘦身工具上附加 `_meta["anthropic/alwaysLoad"]: true`（可通过 `ASTROLABE_ALWAYS_LOAD=0` 关闭），从根源消除会话中途 `ToolSearch` 变更 `tools_hash` 导致的全前缀缓存归零；不声明 `tools/list_changed`，并锁定双实例逐字节确定性与纯 Schema 体积门禁。
+- `astrolabe setup` 为 `claude-code` 默认写入 `"alwaysLoad": true`（支持 `--no-always-load`），并补齐 `--with-hooks` 幂等合并 `~/.claude/settings.json`（`SessionStart` / `PreToolUse` / `SessionEnd`）。
+- 新增 `astrolabe hooks session-start` 静态预热子命令与 `ASTROLABE_HOOK_MODE=soft-first`（默认；另支持 `strict` / `advisory`）：冷态第 1 次温和提醒、第 2 次硬拦截并提示一次性加载全部 7 个工具；热态到达阈值先 `allow` + 温和提醒，持续漂移再硬兜底；不误伤非代码文件读取。
+- `go_layout_hint` 增加 200ms 耗时护栏与确定性目录排序，保障 `alwaysLoad` 5 秒初始化窗口；`with_index_barrier` 与休眠唤醒统一使用零 Runtime 标准库 `Condvar`（默认 `ASTROLABE_BUILD_WAIT_MS=2000`，响应 MCP 取消信号），切断首调 `Index is building...` 引发的回退链。
+
+#### Windows 全链路修复与跨进程共享索引
+- 补齐 `astrolabe_core::paths` 路径归一化底座（大小写不敏感 `\\?\UNC\`、尾随斜杠、盘符大写、多字节 UTF-8 安全切片、POSIX `///...` 防误判、`command_cwd`、`lexical_normalize` 与 `canonicalize` 回退）。
+- 修复 RFC 8089 LSP `file://` URI 编码与反解（彻底消除 `file:////%3F/`），剥离 `rootPath`、`current_dir` 与外部工具参数中的 `\\?\`。
+- 新增跨平台 `process::ChildProcessTree`（Win32 Job Object / Unix 进程组）与 `PATHEXT` 命令解析（命中 `tsc.cmd` / `npx.cmd`），修复 `diag_toolchain` 孙进程持管道死锁与诊断路径丢弃；`roots` / `root` / `scan` / `recent_symbol` / `installer` 全量归一化。
+- `hooks` 修复 Windows `save_counter` 唯一临时文件与共享冲突退避重试、`USERPROFILE` 优先、`%TEMP%`/`%TMP%` 豁免与反斜杠穿越封堵；新增 Cursor 跨平台共享文件锁探活与 `CURSOR_CONFIG_DIR` / `CURSOR_HOME` 支持。
+- 新增 Windows `shared_index`（`127.0.0.1:0` Loopback TCP + 私有目录 Endpoint 文件 + `BCryptGenRandom` 256-bit 恒定时间鉴权 Token + 防符号链接/Reparse Point 校验 + 连接数上限），多子 Agent 共享单份索引与 LSP。
+
+#### 全 Harness Setup 对齐与非默认目录/配置文件支持
+- `codebuddy` / `grok` / `kimicode` / `zcode` / `opencode` / `cursor` / `claude-code` 统一对齐绝对二进制路径、跨平台引号转义（含 POSIX 单引号与 Windows `cmd.exe` 元字符）及稳健去重迁移。
+- 全客户端自动尊重标准环境变量（`CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`CURSOR_CONFIG_DIR`、`OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`/`XDG_CONFIG_HOME`、`VSCODE_USER_DATA_DIR`、`CONTINUE_GLOBAL_DIR` 等），并新增显式 CLI 参数 `--config-dir`、`--mcp-config`、可重复 `--hooks-config` / `--settings` 与防误写/同路径碰撞护栏。
+
+#### 只索引 git 仓库和 `.astrolabe/project.yml` 项目 + `search_code` `include` glob
+- 新增 `.astrolabe/project.yml`（兼容 `.serena/project.yml`）项目标记与统一可索引判定（拒绝索引无标记非 git 目录，多项目父目录永不误索引/误唤醒，支持 `ASTROLABE_ALLOW_NON_GIT_ROOT=1` 逃生开关）。
+- `search_code` 支持 `include` glob 过滤（#132）。
+
+#### 安装后必须 setup（含 hooks）
+```bash
+npm i -g @zlnap/astrolabe@0.17.11
+astrolabe setup --with-hooks
+```
+只安装二进制不会配置 MCP 或 hooks；请按客户端要求重新加载已有会话。
+
+### English
+
+#### Fix Prompt Cache collapse (Claude Code `alwaysLoad` + Soft-First Hook + bounded index wait)
+- Emit `_meta["anthropic/alwaysLoad"]: true` on all 7 static slimmed tools in `list_tools` (opt-out via `ASTROLABE_ALWAYS_LOAD=0`) so Claude Code loads them upfront without mid-session `ToolSearch` mutating `tools_hash`; never advertise `tools/list_changed`, with byte-level determinism and pure-schema size gates.
+- `astrolabe setup` now defaults to `"alwaysLoad": true` for Claude Code (`--no-always-load` to omit) and implements idempotent `--with-hooks` merging for `~/.claude/settings.json` (`SessionStart` / `PreToolUse` / `SessionEnd`).
+- Add static `astrolabe hooks session-start` and default `ASTROLABE_HOOK_MODE=soft-first` (`strict` / `advisory` also supported): soft reminder before hard deny in both cold and warm states, atomic 7-tool batch `ToolSearch` hint for deferred environments, and no false positives on non-code reads.
+- Cap `go_layout_hint` directory scanning at 200ms with deterministic sorting; unify `with_index_barrier` and hibernation wake on a zero-runtime `Condvar` (`ASTROLABE_BUILD_WAIT_MS=2000`, cancellation-aware) to eliminate spurious `Index is building...` fallbacks.
+
+#### Windows full-stack fixes and shared index
+- Harden `astrolabe_core::paths` (case-insensitive `\\?\UNC\`, trailing slashes, uppercase drive letters, multibyte UTF-8 safety, POSIX `///...` handling, `command_cwd`, `lexical_normalize`, and canonical fallback).
+- Fix RFC 8089 LSP `file://` URI encoding/decoding (no more `file:////%3F/`), strip `\\?\` from `rootPath`, `current_dir`, and external tool arguments.
+- Extract cross-platform `process::ChildProcessTree` (Win32 Job Object / Unix process group) and `PATHEXT` resolution (`tsc.cmd` / `npx.cmd`), fix grandchild pipe-hold deadlocks in `diag_toolchain`, and normalize `roots` / `root` / `scan` / `recent_symbol` / `installer`.
+- Harden Windows `hooks` (`save_counter` unique temp file + sharing-violation retry, `USERPROFILE` precedence, `%TEMP%`/`%TMP%` exemption with backslash traversal rejection, cross-platform Cursor shared-lock liveness probe, and `CURSOR_CONFIG_DIR` / `CURSOR_HOME`).
+- Enable Windows `shared_index` over `127.0.0.1:0` loopback TCP with private endpoint files, 256-bit `BCryptGenRandom` constant-time auth tokens, symlink/reparse-point rejection, and connection caps.
+
+#### Harness setup alignment & custom config directories/files
+- Align `codebuddy`, `grok`, `kimicode`, `zcode`, `opencode`, `cursor`, and `claude-code` to resolved absolute binary paths, cross-platform quoting, and idempotent deduplication.
+- Respect standard harness env vars (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CURSOR_CONFIG_DIR`, `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`/`XDG_CONFIG_HOME`, `VSCODE_USER_DATA_DIR`, `CONTINUE_GLOBAL_DIR`, etc.) and add explicit `--config-dir`, `--mcp-config`, repeatable `--hooks-config` / `--settings` flags with single-client and same-path collision guards.
+
+#### Git-only / `.astrolabe/project.yml` index roots & `search_code` `include` glob
+- Refuse non-indexable directories unless marked by `.git` or `.astrolabe/project.yml` (`.serena/project.yml` compatible), keep multi-project parents dormant, and provide `ASTROLABE_ALLOW_NON_GIT_ROOT=1` escape hatch.
+- Support `include` glob filtering in `search_code` (#132).
+
+#### Required setup after installation (including hooks)
+```bash
+npm i -g @zlnap/astrolabe@0.17.11
+astrolabe setup --with-hooks
+```
+Installing the binary alone does not configure MCP or hooks. Reload existing sessions as required by the client.
+
 ## [0.17.10] - 2026-11-16
 
 ### 中文
@@ -41,7 +103,6 @@ npm i -g @zlnap/astrolabe@0.17.10
 astrolabe setup --with-hooks
 ```
 Installing the binary alone does not configure MCP or hooks. Reload existing sessions as required by the client.
-
 
 ## [0.17.9] - 2026-11-10
 

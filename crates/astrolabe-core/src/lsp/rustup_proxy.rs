@@ -97,7 +97,7 @@ fn check(command: &Path, cwd: Option<&Path>) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let Some(dir) = cwd.filter(|d| d.is_dir()) {
-        cmd.current_dir(dir);
+        cmd.current_dir(crate::paths::command_cwd(dir));
     }
     let Ok(mut child) = cmd.spawn() else {
         return Ok(()); // the normal start reports spawn errors

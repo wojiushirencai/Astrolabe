@@ -8,7 +8,7 @@
 
 | 项 | 状态 | 落点 |
 |---|---|---|
-| project root：`.git` **或** `.serena/project.yml` | **已落地** | `root.rs`（就近单次向上；显式路径不 walk） |
+| project root：`.git` 优先，其次 `.astrolabe/project.yml`（兼容 Serena 的 `.serena/project.yml`） | **已落地** | `root.rs`（git 向上 → 子仓 → 项目文件向上；显式路径不 walk） |
 | 内置 context YAML | **已落地** | `contexts/{default,claude-code,cursor,codex}.yml`（+ template） |
 | `context.rs` / `cli.rs` | **已落地** | `--context` / `ASTROLABE_CONTEXT`；`--help` 列出四名 |
 | structured 输出策略 | **已落地** | context 默认 + `ASTROLABE_STRUCTURED` 覆盖；始终非空 `content[0].text` |
@@ -50,11 +50,17 @@
 
 Serena `--project-from-cwd`：从进程 cwd **单次向上**找最近边界——`.serena/project.yml` **或** `.git`（目录或 worktree/submodule 指针）；就近获胜，嵌套 worktree 不被祖先劫持。找不到 → 项目 **inactive**。
 
-Astrolabe（`root.rs`，已对齐标记）：
+Astrolabe（`root.rs`，主标记为 `.astrolabe/project.yml`，`.serena/project.yml` 仅作 Serena 兼容）：
 
-- `.` / 省略 → `find_project_root`（`.git` **或** `.serena/project.yml`），存**绝对路径**。
-- 显式路径 → 只 canonicalize，**不**向上走（≈ Serena `--project`）。
-- **差异**：无标记时 Serena 保持 inactive；Astrolabe **回退 canonicalize(cwd) + warn**。
+- `.` / 省略 → `resolve_root`，**git 优先**，存**绝对路径**：
+  1. 向上找最近的 `.git` → 仓库根（仓库内更近的项目文件不会拆分仓库）；
+  2. 否则看 cwd 的直接子目录：恰好 1 个含 `.git` → 该子仓；≥2 个 → 多项目调度（cwd 有项目文件也一样）；
+  3. 否则向上找最近的 `.astrolabe/project.yml` 或 `.serena/project.yml`（同一目录两者都有即同一根；该目录自身装着子仓时不采纳）；只有空的 `.astrolabe/` / `.serena/` 不算；
+  4. 否则拒绝启动（NotGit；文件数超限为 TooLarge），`ASTROLABE_ALLOW_NON_GIT_ROOT=1` 时按 cwd 索引。
+  - 祖先目录（用户主目录或文件数超限）上的标记会被忽略并 warn。
+- 显式路径 → 只 canonicalize，**不**向上走（≈ Serena `--project`）；不可索引时改服务子仓，没有子仓则拒绝启动。
+- 工具调用的 `index_root` 与多项目父目录用同一判定（`is_indexable_root`）：不可索引的 `index_root` 直接报错并列出子仓；父目录休眠。
+- **差异**：Serena 就近获胜，`.serena/project.yml` 可压过祖先 `.git`；Astrolabe git 优先。无标记时 Serena 保持 inactive；Astrolabe 走子仓探测，仍无则拒绝启动。
 
 ## 3. `openai_tool_compatible` / Codex 怪癖
 
@@ -89,7 +95,7 @@ Astrolabe：**解析 + `tools/list` retain 已落地**（`server.rs` 单测 `exc
 
 ### 已完成（勿再当缺口）
 
-1. ~~`root.rs` 双标记~~ — `.git` 或 `.serena/project.yml`，就近获胜。
+1. ~~`root.rs` 项目标记~~ — `.git` 优先；无 git 时认 `.astrolabe/project.yml`（兼容 Serena 的 `.serena/project.yml`）。
 2. ~~内置 context + `context.rs`/`cli.rs`~~ — 四个 yml；`--context` / env；`--help` 列名。
 3. ~~structured 策略 + 非空文本~~ — Claude Code 默认关；cursor/codex 开且带完整 payload。
 4. ~~`excluded_tools` catalog 过滤~~ — retain 已测；yml 填值另议。

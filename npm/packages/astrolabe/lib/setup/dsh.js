@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { expandHome, readEnvDir } = require('./cursor');
 
 const MANAGED_BEGIN = '# >>> astrolabe-managed-dsh-guard >>>';
 const MANAGED_END = '# <<< astrolabe-managed-dsh-guard <<<';
@@ -14,6 +15,16 @@ const MANAGED_BLOCK = `${MANAGED_BEGIN}
         client: claude-code
 ${MANAGED_END}
 `;
+
+function resolveDshHome(home, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) return explicit;
+  return readEnvDir(env, ['DSH_HOME'], home) || path.join(home, '.dsh');
+}
+
+function resolveDshPatchPath(home, env = process.env, configDir = null) {
+  return path.join(resolveDshHome(home, env, configDir), 'cordis.patch.yml');
+}
 
 function resolveDshPluginSource(existsFn, startDir = __dirname) {
   const vendor = path.join(startDir, 'vendor', 'astrolabe-dsh-guard');
@@ -34,8 +45,9 @@ function resolveDshPluginSource(existsFn, startDir = __dirname) {
  * Prefer hoisted ~/.dsh/profiles/node_modules (seen on macOS installs), else
  * each profiles/<name>/node_modules, else create the hoisted path.
  */
-function resolveDshPluginInstallDirs(home, existsFn) {
-  const profiles = path.join(home, '.dsh', 'profiles');
+function resolveDshPluginInstallDirs(home, existsFn, env = process.env, configDir = null) {
+  const dshHome = resolveDshHome(home, env, configDir);
+  const profiles = path.join(dshHome, 'profiles');
   const dirs = [];
   const hoisted = path.join(profiles, 'node_modules');
   if (existsFn(hoisted) || existsFn(profiles)) {
@@ -61,7 +73,7 @@ function resolveDshPluginInstallDirs(home, existsFn) {
     }
   }
   if (!dirs.length) {
-    dirs.push(path.join(home, '.dsh', 'profiles', 'node_modules', 'astrolabe-dsh-guard'));
+    dirs.push(path.join(dshHome, 'profiles', 'node_modules', 'astrolabe-dsh-guard'));
   }
   // Dedupe while preferring hoisted first
   return [...new Set(dirs)];
@@ -117,10 +129,12 @@ function mergeDshCordisPatch(filePath, { create = true, existsFn = fs.existsSync
 
 function detectDsh(home, env, { whichFn, existsFn }) {
   const evidence = [];
+  const dshHome = resolveDshHome(home, env);
+  const hasCustom = Boolean(readEnvDir(env, ['DSH_HOME'], home));
   if (whichFn('dsh', env)) evidence.push('dsh on PATH');
-  if (existsFn(path.join(home, '.dsh'))) evidence.push('~/.dsh/');
-  if (existsFn(path.join(home, '.dsh', 'cordis.patch.yml'))) {
-    evidence.push('~/.dsh/cordis.patch.yml');
+  if (existsFn(dshHome)) evidence.push(hasCustom ? dshHome : '~/.dsh/');
+  if (existsFn(path.join(dshHome, 'cordis.patch.yml'))) {
+    evidence.push(hasCustom ? path.join(dshHome, 'cordis.patch.yml') : '~/.dsh/cordis.patch.yml');
   }
   return { detected: evidence.length > 0, evidence };
 }
@@ -129,6 +143,8 @@ module.exports = {
   MANAGED_BEGIN,
   MANAGED_END,
   MANAGED_BLOCK,
+  resolveDshHome,
+  resolveDshPatchPath,
   resolveDshPluginSource,
   resolveDshPluginInstallDirs,
   copyDirRecursive,

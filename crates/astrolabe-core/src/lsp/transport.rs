@@ -83,6 +83,7 @@ struct Shared {
     pid: u32,
     timeout: Duration,
     child: Mutex<Child>,
+    process_tree: Mutex<Option<crate::process::ChildProcessTree>>,
     /// Frames queued for the stdin writer thread. A bounded channel keeps a
     /// wedged server from making callers block inside `write(2)`: requests
     /// time out on their own clock instead.
@@ -190,6 +191,7 @@ impl LspTransport {
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args);
         if let Some(dir) = cwd.and_then(|root| kotlin_system_path(spec, root)) {
+            let dir = crate::paths::command_cwd(&dir);
             let _ = std::fs::create_dir_all(&dir);
             cmd.arg("--system-path").arg(dir);
         }
@@ -200,13 +202,9 @@ impl LspTransport {
         // JVM launchers, dotnet) spawn grandchildren that inherit our pipes.
         // Killing only the direct child leaves them alive and keeps the
         // stdout reader from ever seeing EOF.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        crate::process::configure_process_group(&mut cmd);
         if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
+            cmd.current_dir(crate::paths::command_cwd(cwd));
             // Roslyn's design-time builds would otherwise write obj/ into
             // the user's project (see `csharp::msbuild_redirect`).
             if is_roslyn(spec.language) {
@@ -240,8 +238,7 @@ impl LspTransport {
             .take()
             .ok_or_else(|| LspError::Startup(spec.language, "child stderr was not piped".into()))?;
         let pid = child.id();
-        #[cfg(windows)]
-        job::adopt(pid, &child);
+        let process_tree = crate::process::ChildProcessTree::attach(&child);
 
         let (stdin_tx, stdin_rx) = mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_FRAMES);
         let shared = Arc::new(Shared {
@@ -249,6 +246,7 @@ impl LspTransport {
             pid,
             timeout,
             child: Mutex::new(child),
+            process_tree: Mutex::new(Some(process_tree)),
             stdin: Mutex::new(Some(stdin_tx)),
             write_started: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
@@ -549,7 +547,7 @@ impl LspTransport {
 
         let mut params = json!({
             "processId": std::process::id(),
-            "rootPath": root.to_string_lossy(),
+            "rootPath": crate::paths::display_path(root),
             "rootUri": root_uri,
             "capabilities": client_capabilities(),
             "workspaceFolders": folders,
@@ -716,7 +714,7 @@ impl LspTransport {
         }
         {
             let mut child = lock(&self.shared.child);
-            reap_child(&mut child, grace);
+            reap_child(&mut child, &self.shared.process_tree, grace);
         }
         self.shared.life.store(LIFE_DEAD, Ordering::SeqCst);
         fail_pending(&self.shared);
@@ -1669,64 +1667,101 @@ fn text_edit_from_value(value: &Value) -> Option<TextEdit> {
 }
 
 fn uri_to_rel(uri: &str, root: &Path) -> Option<RelPath> {
-    let decoded = if let Some(rest) = uri.strip_prefix("file://") {
-        percent_decode(rest)
-    } else {
-        percent_decode(uri)
-    };
-    // `file:///C:/x` decodes to `/C:/x`; drop the slash before a drive letter.
-    let decoded = match decoded.as_bytes() {
-        [b'/', d, b':', ..] if d.is_ascii_alphabetic() => decoded[1..].to_string(),
-        _ => decoded,
-    };
-    let path = PathBuf::from(decoded);
-    // Fast path: servers report paths under the root as we sent them, so a
-    // plain prefix strip answers without two canonicalize syscalls per hit.
-    if path.is_absolute() {
-        if let Ok(rel) = path.strip_prefix(root) {
-            if !rel.as_os_str().is_empty()
-                && !rel
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Some(RelPath::new(rel.to_string_lossy()));
-            }
-        }
-    }
-    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let abs = if path.is_absolute() {
-        path.canonicalize().unwrap_or(path)
-    } else {
-        return Some(RelPath::new(path.to_string_lossy()));
-    };
-    let rel = abs.strip_prefix(&root_abs).ok()?;
-    if rel
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    let path = file_uri_to_path(uri)?;
+    let rel = crate::paths::strip_prefix_normalized_with_canonical_fallback(root, &path)?;
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
         return None;
     }
-    Some(RelPath::new(rel.to_string_lossy()))
+    Some(RelPath::new(s))
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let (has_authority, after_scheme) = if uri
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"file://"))
+    {
+        (true, uri.get(7..)?)
+    } else if uri
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"file:/"))
+    {
+        (false, uri.get(5..)?)
+    } else {
+        return None;
+    };
+
+    let before_frag = after_scheme
+        .split_once('#')
+        .map_or(after_scheme, |(h, _)| h);
+    let before_query = before_frag.split_once('?').map_or(before_frag, |(h, _)| h);
+
+    let local_or_unc = if has_authority {
+        let slash = before_query.find('/')?;
+        let raw_host = &before_query[..slash];
+        let raw_path = &before_query[slash..];
+        let host = percent_decode_utf8(raw_host)?;
+        let decoded_path = percent_decode_utf8(raw_path)?;
+        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+            strip_leading_slash_for_drive(decoded_path)
+        } else {
+            format!("//{host}{decoded_path}")
+        }
+    } else {
+        let decoded_path = percent_decode_utf8(before_query)?;
+        strip_leading_slash_for_drive(decoded_path)
+    };
+
+    if local_or_unc.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(local_or_unc))
+}
+
+fn strip_leading_slash_for_drive(path: String) -> String {
+    let b = path.as_bytes();
+    if b.len() >= 3
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && (b.len() == 3 || b[3] == b'/' || b[3] == b'\\')
+    {
+        path[1..].to_string()
+    } else {
+        path
+    }
+}
+
+fn percent_decode_utf8(input: &str) -> Option<String> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    out.push(byte);
-                    i += 3;
-                    continue;
-                }
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
             }
+            let high = from_hex(bytes[i + 1])?;
+            let low = from_hex(bytes[i + 2])?;
+            out.push((high << 4) | low);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).ok()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn client_capabilities() -> Value {
@@ -1828,132 +1863,39 @@ fn child_exited(shared: &Shared) -> bool {
     }
 }
 
-fn reap_child(child: &mut Child, timeout: Duration) {
-    let pid = child.id();
+fn reap_child(
+    child: &mut Child,
+    process_tree: &Mutex<Option<crate::process::ChildProcessTree>>,
+    timeout: Duration,
+) {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
                 // The wrapper exited; whatever it spawned may still be alive.
-                kill_process_group(pid);
+                kill_process_tree(process_tree);
                 return;
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                kill_process_group(pid);
+                kill_process_tree(process_tree);
                 let _ = child.kill();
                 let _ = child.wait();
                 return;
             }
             Err(_) => {
-                kill_process_group(pid);
+                kill_process_tree(process_tree);
                 return;
             }
         }
     }
 }
 
-/// SIGKILL the whole process group the server was started in (it is its own
-/// group leader, see `start`). No-op off Unix, where `Child::kill` is all
-/// there is.
-fn kill_process_group(pid: u32) {
-    #[cfg(unix)]
-    {
-        // Never signal pgid 0/1 or something that does not fit pid_t.
-        if pid > 1 && pid <= i32::MAX as u32 {
-            // SAFETY: plain syscall with integer arguments.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
-    }
-    #[cfg(windows)]
-    job::terminate(pid);
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-    }
-}
-
-/// Windows counterpart of the Unix process group: every server runs inside a
-/// Job Object created with `KILL_ON_JOB_CLOSE`, so terminating (or closing)
-/// the job takes the whole descendant tree with it, even if Astrolabe itself
-/// dies abnormally.
-#[cfg(windows)]
-mod job {
-    use std::collections::HashMap;
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
-    use std::sync::{Mutex, OnceLock};
-
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-
-    struct JobHandle(HANDLE);
-    // SAFETY: a job handle is a process-wide kernel object handle, usable from any thread.
-    unsafe impl Send for JobHandle {}
-
-    impl Drop for JobHandle {
-        fn drop(&mut self) {
-            // SAFETY: we own the handle; closing kills the job (KILL_ON_JOB_CLOSE).
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-
-    fn jobs() -> &'static Mutex<HashMap<u32, JobHandle>> {
-        static JOBS: OnceLock<Mutex<HashMap<u32, JobHandle>>> = OnceLock::new();
-        JOBS.get_or_init(Default::default)
-    }
-
-    /// Put the freshly spawned server into its own kill-on-close job.
-    /// Best effort: on failure the caller falls back to `Child::kill`.
-    pub fn adopt(pid: u32, child: &Child) {
-        // SAFETY: plain Win32 calls; the handle is checked and closed on every path.
-        unsafe {
-            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if handle.is_null() {
-                return;
-            }
-            let job = JobHandle(handle);
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let set = SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            if set == 0 {
-                return;
-            }
-            if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
-                return;
-            }
-            jobs()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(pid, job);
-        }
-    }
-
-    /// Kill every process in the server's job and release the handle.
-    pub fn terminate(pid: u32) {
-        let job = jobs()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&pid);
-        if let Some(job) = job {
-            // SAFETY: valid job handle owned by `job`.
-            unsafe {
-                TerminateJobObject(job.0, 1);
-            }
-        }
+/// Terminate the whole tracked process tree (Unix process group or Windows Job Object).
+fn kill_process_tree(process_tree: &Mutex<Option<crate::process::ChildProcessTree>>) {
+    let tree = lock(process_tree).take();
+    if let Some(mut tree) = tree {
+        tree.terminate();
     }
 }
 
@@ -2000,7 +1942,7 @@ fn write_stdin(
 fn kill_stuck_server(shared: &Shared) {
     shared.life.store(LIFE_DEAD, Ordering::SeqCst);
     *lock(&shared.stdin) = None;
-    kill_process_group(shared.pid);
+    kill_process_tree(&shared.process_tree);
     fail_pending(shared);
 }
 
@@ -2310,7 +2252,9 @@ fn track_kotlin_import(shared: &Shared, params: &Value) {
     if !built || shared.spec.language != Language::Kotlin {
         return;
     }
-    let dir = super::kotlin::export_dir(&super::kotlin::system_path(root));
+    let dir = crate::paths::command_cwd(&super::kotlin::export_dir(&super::kotlin::system_path(
+        root,
+    )));
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -2512,27 +2456,83 @@ fn parse_content_length(header: &[u8]) -> Option<usize> {
     None
 }
 
+fn is_rooted_or_windows_abs(s: &str) -> bool {
+    if s.starts_with('/') || s.starts_with(r"\\") {
+        return true;
+    }
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+}
+
+fn push_percent_encoded_path(out: &mut String, s: &str) {
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' | b':' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+}
+
+fn push_percent_encoded_authority(out: &mut String, s: &str) {
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+}
+
 pub(crate) fn path_to_file_uri(path: &Path) -> String {
-    let path = if path.is_absolute() {
+    let raw = path.to_string_lossy();
+    let abs = if path.is_absolute() || is_rooted_or_windows_abs(&raw) {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     };
-    let rendered = path.to_string_lossy().replace('\\', "/");
+    let stripped = crate::paths::without_verbatim_prefix(&abs);
+    let rendered = stripped.to_string_lossy().replace('\\', "/");
+
     let mut uri = String::from("file://");
-    if cfg!(windows) && !rendered.starts_with('/') {
-        uri.push('/');
-    }
-    for &b in rendered.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' | b':' => {
-                uri.push(b as char)
+    if let Some(after_unc) = rendered.strip_prefix("//") {
+        if !after_unc.starts_with('/') {
+            if let Some(slash) = after_unc.find('/') {
+                let authority = &after_unc[..slash];
+                let rest = &after_unc[slash..];
+                push_percent_encoded_authority(&mut uri, authority);
+                push_percent_encoded_path(&mut uri, rest);
+            } else {
+                push_percent_encoded_authority(&mut uri, after_unc);
             }
-            _ => uri.push_str(&format!("%{b:02X}")),
+            return uri;
         }
     }
+
+    let b = rendered.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || b[2] == b'/')
+    {
+        let drive = (b[0] as char).to_ascii_uppercase();
+        uri.push('/');
+        uri.push(drive);
+        uri.push(':');
+        let rest = &rendered[2..];
+        if rest.is_empty() {
+            uri.push('/');
+        } else {
+            push_percent_encoded_path(&mut uri, rest);
+        }
+        return uri;
+    }
+
+    if !rendered.starts_with('/') {
+        uri.push('/');
+    }
+    push_percent_encoded_path(&mut uri, &rendered);
     uri
 }
 
@@ -3240,7 +3240,7 @@ while True:
         let root_uri = path_to_file_uri(&tmp.0);
         let expected = json!({
             "processId": std::process::id(),
-            "rootPath": tmp.0.to_string_lossy(),
+            "rootPath": crate::paths::display_path(&tmp.0),
             "rootUri": root_uri,
             "capabilities": client_capabilities(),
             "workspaceFolders": [{
@@ -4004,6 +4004,73 @@ while True:
     }
 
     #[test]
+    fn path_to_file_uri_and_file_uri_to_path_handle_windows_unc_and_unicode() {
+        // Windows verbatim drive path with CJK and space
+        let verbatim_drive = Path::new(r"\\?\C:\项目 目录\a.ts");
+        let drive_uri = "file:///C:/%E9%A1%B9%E7%9B%AE%20%E7%9B%AE%E5%BD%95/a.ts";
+        assert_eq!(path_to_file_uri(verbatim_drive), drive_uri);
+        assert_eq!(
+            file_uri_to_path(drive_uri),
+            Some(PathBuf::from("C:/项目 目录/a.ts"))
+        );
+
+        // Lowercase drive letter + reserved URI chars (`#`, `?`, `%`, `[`, `]`)
+        assert_eq!(
+            path_to_file_uri(Path::new(r"c:/dir/a#b?c%d[e].ts")),
+            "file:///C:/dir/a%23b%3Fc%25d%5Be%5D.ts"
+        );
+        assert_eq!(
+            file_uri_to_path("file:///C:/dir/a%23b%3Fc%25d%5Be%5D.ts"),
+            Some(PathBuf::from("C:/dir/a#b?c%d[e].ts"))
+        );
+
+        // Windows verbatim UNC path -> RFC 8089 file://server/share/...
+        let verbatim_unc = Path::new(r"\\?\UNC\srv\share\repo\a.rs");
+        let unc_uri = "file://srv/share/repo/a.rs";
+        assert_eq!(path_to_file_uri(verbatim_unc), unc_uri);
+        assert_eq!(
+            file_uri_to_path(unc_uri),
+            Some(PathBuf::from("//srv/share/repo/a.rs"))
+        );
+
+        // POSIX path
+        assert_eq!(path_to_file_uri(Path::new("/dir/file")), "file:///dir/file");
+        assert_eq!(
+            file_uri_to_path("file:///dir/file"),
+            Some(PathBuf::from("/dir/file"))
+        );
+
+        // Case-insensitive scheme + localhost + percent-encoded colon + query/fragment
+        assert_eq!(
+            file_uri_to_path("FILE://localhost/c%3a/repo/src/a.ts?x=1#L2"),
+            Some(PathBuf::from("c:/repo/src/a.ts"))
+        );
+        assert_eq!(
+            uri_to_rel(
+                "FILE://localhost/c%3a/repo/src/a.ts",
+                Path::new(r"\\?\C:\repo")
+            ),
+            Some(RelPath::new("src/a.ts"))
+        );
+
+        // Case-preserving relative path under non-existent Windows verbatim root
+        assert_eq!(
+            uri_to_rel("file:///c:/repo/Src/App.ts", Path::new(r"\\?\C:\repo")),
+            Some(RelPath::new("Src/App.ts"))
+        );
+
+        // Traversal escape must be rejected
+        assert_eq!(
+            uri_to_rel("file:///C:/repo/../secret.txt", Path::new(r"C:\repo")),
+            None
+        );
+
+        // Invalid hex / non-file URI fails safely
+        assert_eq!(file_uri_to_path("file:///C:/repo/%zz.ts"), None);
+        assert_eq!(file_uri_to_path("https://example.com/a.ts"), None);
+    }
+
+    #[test]
     fn watched_file_events_are_batched() {
         let (session, _tmp) = spawn_session(&["--buffers"], Duration::from_secs(10));
         let changes: Vec<FileChange> = (0..WATCHED_FILES_BATCH + 10)
@@ -4408,5 +4475,10 @@ while True:
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn file_uri_to_path_rejects_non_ascii_relative_path_without_panicking() {
+        assert_eq!(file_uri_to_path("项目目录/a.rs"), None);
     }
 }

@@ -19,8 +19,8 @@
 //! tool definitions every session.
 
 use astrolabe_mcp::{
-    child_git_repos, count_root_files, is_cwd_sentinel, parse_launch, resolve_index_root,
-    resolve_root, AstrolabeServer, ClientContext, Launch, ResolvedRoot, StartupFailedServer,
+    allow_non_git_root_from_env, count_root_files, parse_launch, resolve_startup_root,
+    AstrolabeServer, ClientContext, Launch, ResolvedRoot, StartupFailedServer,
     DEFAULT_MAX_ROOT_FILES, USAGE,
 };
 use rmcp::{service::serve_directly, RoleServer};
@@ -67,10 +67,13 @@ async fn main() -> anyhow::Result<()> {
     // hint, which is exactly the failure mode this project refuses elsewhere.
     //
     // `.` (what MCP configs pass) is not taken literally. Like Serena's
-    // `--project-from-cwd`, it walks up from the client spawn cwd looking
-    // for `.git` or `.serena/project.yml` and stores the absolute path. An
-    // explicit directory is canonicalized as-is and is not replaced by an
-    // ancestor marker.
+    // `--project-from-cwd`, the client spawn cwd is resolved to a project
+    // root (nearest `.git`, then child repos, then nearest
+    // `.astrolabe/project.yml` or Serena's `.serena/project.yml`; see
+    // `root.rs`) and stored as an absolute path. An explicit directory is
+    // canonicalized as-is and is not replaced by an ancestor marker. Either
+    // way a root that is not indexable is refused unless
+    // ASTROLABE_ALLOW_NON_GIT_ROOT is set.
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let launch = match parse_launch(args.iter().cloned()) {
         Ok(launch) => launch,
@@ -114,14 +117,18 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 std::env::current_exe().ok()
             };
-            let mut command = std::process::Command::new("npx");
+            let npx = astrolabe_core::process::resolve_command("npx")
+                .unwrap_or_else(|| std::path::PathBuf::from("npx"));
+            let mut command = std::process::Command::new(npx);
             command
                 .arg("-y")
                 .arg("@zlnap/astrolabe")
                 .arg("setup")
                 .args(&args);
             if let Some(exe) = current_exe {
-                command.arg("--command").arg(exe);
+                command
+                    .arg("--command")
+                    .arg(astrolabe_core::paths::display_path(&exe));
             }
             let status = command.status();
             match status {
@@ -151,6 +158,9 @@ async fn main() -> anyhow::Result<()> {
         Launch::HooksGc => {
             std::process::exit(astrolabe_mcp::hooks::run_gc());
         }
+        Launch::HooksSessionStart => {
+            std::process::exit(astrolabe_mcp::hooks::run_session_start());
+        }
         Launch::PrintCcSystemPromptOverride => {
             print!(
                 "{}",
@@ -164,7 +174,8 @@ async fn main() -> anyhow::Result<()> {
         } => (requested_root, context),
     };
     let limit = max_root_files_from_env();
-    let mut server = match build_server(&requested, context.clone(), limit) {
+    let allow_non_git = allow_non_git_root_from_env();
+    let mut server = match build_server(&requested, context.clone(), limit, allow_non_git) {
         Ok(server) => server,
         Err(failure) => return serve_startup_failure(failure, context).await,
     };
@@ -239,62 +250,42 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `allow_non_git` is `ASTROLABE_ALLOW_NON_GIT_ROOT`, read once at startup.
 fn build_server(
     requested: &Path,
     context: ClientContext,
     limit: u64,
+    allow_non_git: bool,
 ) -> Result<AstrolabeServer, StartupFailure> {
-    let server = if is_cwd_sentinel(requested) {
-        let cwd = std::env::current_dir()
-            .map_err(|e| StartupFailure::new(format!("cannot read current directory: {e}"), 1))?;
-        match resolve_root(&cwd, limit) {
-            ResolvedRoot::Repo(path) => {
-                emit_root_telemetry(&path, "repo", limit);
-                boot_single(path, context)
-            }
-            ResolvedRoot::Single(path) => {
-                emit_root_telemetry(&path, "single", limit);
-                boot_single(path, context)
-            }
-            ResolvedRoot::MultiProject { root, children } => {
-                emit_root_telemetry(&root, "multi", limit);
-                tracing::info!(
-                    root = %root.display(),
-                    children = children.len(),
-                    "starting in multi-project dispatch mode"
-                );
-                for child in &children {
-                    tracing::info!(child = %child.display(), "multi-project child");
-                }
-                AstrolabeServer::with_multi_project(root, children, context)
-            }
-            refuse @ ResolvedRoot::TooLarge { .. } => {
-                let msg = refuse
-                    .refuse_guidance()
-                    .expect("TooLarge always has guidance");
-                return Err(StartupFailure::new(msg, 2));
-            }
+    let resolved = resolve_startup_root(requested, limit, allow_non_git)
+        .map_err(|e| StartupFailure::new(format!("{e:#}"), 1))?;
+    let server = match resolved {
+        ResolvedRoot::Repo(path) => {
+            emit_root_telemetry(&path, "repo", limit);
+            boot_single(path, context)
         }
-    } else {
-        let path =
-            resolve_index_root(requested).map_err(|e| StartupFailure::new(format!("{e:#}"), 1))?;
-        let nested = child_git_repos(&path);
-        if !nested.is_empty() {
-            tracing::warn!(
-                root = %path.display(),
-                nested_repos = nested.len(),
-                "explicit root contains nested git repositories; indexing anyway \
-                 (cd into a sub-repo, or set ASTROLABE_ROOT to force a specific root)"
+        ResolvedRoot::Single(path) => {
+            emit_root_telemetry(&path, "single", limit);
+            boot_single(path, context)
+        }
+        ResolvedRoot::MultiProject { root, children } => {
+            emit_root_telemetry(&root, "multi", limit);
+            tracing::info!(
+                root = %root.display(),
+                children = children.len(),
+                "starting in multi-project dispatch mode"
             );
+            for child in &children {
+                tracing::info!(child = %child.display(), "multi-project child");
+            }
+            AstrolabeServer::with_multi_project(root, children, context)
         }
-        let mode =
-            if path.join(".git").exists() || path.join(".serena").join("project.yml").is_file() {
-                "repo"
-            } else {
-                "single"
-            };
-        emit_root_telemetry(&path, mode, limit);
-        boot_single(path, context)
+        refuse @ (ResolvedRoot::TooLarge { .. } | ResolvedRoot::NotGit(_)) => {
+            let msg = refuse
+                .refuse_guidance()
+                .expect("TooLarge and NotGit always have guidance");
+            return Err(StartupFailure::new(msg, 2));
+        }
     };
     Ok(server)
 }

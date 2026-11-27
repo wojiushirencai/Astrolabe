@@ -16,6 +16,18 @@ const {
 const { parseArgs, USAGE } = require('./args');
 const { isTTY, confirm, selectClients } = require('./prompt');
 
+const HOOK_COMMAND_CLIENTS = new Set([
+  'claude-code',
+  'cursor',
+  'codebuddy',
+  'grok',
+  'kimicode',
+  'zcode',
+  'opencode',
+]);
+
+const PURE_MCP_CLIENTS = new Set(['codex', 'cline', 'roo', 'windsurf', 'continue']);
+
 function resolveHome(homeFlag) {
   if (homeFlag) return path.resolve(homeFlag);
   if (process.env.HOME) return process.env.HOME;
@@ -23,9 +35,9 @@ function resolveHome(homeFlag) {
   return os.homedir();
 }
 
-function detectAll(home) {
+function detectAll(home, env = process.env) {
   return CLIENTS.map((client) => {
-    const { detected, evidence } = client.detect(home);
+    const { detected, evidence } = client.detect(home, env);
     return {
       id: client.id,
       label: client.label,
@@ -148,12 +160,21 @@ async function runAsync(argv = process.argv.slice(2)) {
   }
 
   const home = resolveHome(opts.home);
-  const rows = detectAll(home);
+  const rows = detectAll(home, process.env);
   const detectedById = new Map(rows.map((row) => [row.id, row.detected]));
 
   if (opts.list) {
     printList(rows);
     return 0;
+  }
+
+  const hasExplicitPathOverride = Boolean(
+    opts.configDir || opts.mcpConfig || (opts.hooksConfig && opts.hooksConfig.length > 0),
+  );
+  if (hasExplicitPathOverride && (!opts.clients || !opts.clients.length)) {
+    throw new Error(
+      '--config-dir, --mcp-config, and --hooks-config/--settings require --clients=<single-client-id>',
+    );
   }
 
   let selectedIds;
@@ -168,8 +189,29 @@ async function runAsync(argv = process.argv.slice(2)) {
     return 0;
   }
 
+  if (hasExplicitPathOverride) {
+    if (selectedIds.length !== 1) {
+      throw new Error(
+        `--config-dir, --mcp-config, and --hooks-config/--settings require a single client via --clients=<id> (got ${selectedIds.join(', ')})`,
+      );
+    }
+    if (opts.hooksConfig && opts.hooksConfig.length > 0 && PURE_MCP_CLIENTS.has(selectedIds[0])) {
+      throw new Error(
+        `--hooks-config/--settings is not supported for MCP-only client "${selectedIds[0]}"`,
+      );
+    }
+    if (opts.mcpConfig && selectedIds[0] === 'deepseek-harness') {
+      throw new Error(
+        '--mcp-config is not supported for deepseek-harness (MCP servers are configured per-repo in the DSH UI)',
+      );
+    }
+  }
+
+  const effectiveWithHooks = Boolean(
+    opts.withHooks || (opts.hooksConfig && opts.hooksConfig.length > 0),
+  );
   const cursorSelected = selectedIds.includes('cursor');
-  const cursorDetected = cursorSelected && detectedById.get('cursor');
+  const cursorDetected = cursorSelected && (detectedById.get('cursor') || hasExplicitPathOverride);
   let projectRoot = null;
   let cursorBinPath = null;
   let cursorBinError = null;
@@ -221,6 +263,28 @@ async function runAsync(argv = process.argv.slice(2)) {
   }
 
   const actions = [];
+  const commandBinPath = opts.command ? resolveCommandBinary(opts.command, process.env) : null;
+  let hookBinPath = commandBinPath;
+  const needsHookBinary =
+    effectiveWithHooks &&
+    selectedIds.some(
+      (id) => HOOK_COMMAND_CLIENTS.has(id) && (id !== 'cursor' || cursorDetected),
+    );
+  if (!opts.command && needsHookBinary) {
+    hookBinPath = resolveCommandBinary('astrolabe', process.env);
+    if (!hookBinPath && cursorBinPath) {
+      hookBinPath = cursorBinPath;
+    }
+    if (!hookBinPath && !cursorDetected) {
+      try {
+        const { resolveBinary } = require('../resolve');
+        const resolved = await resolveBinary();
+        if (resolved) hookBinPath = path.resolve(resolved);
+      } catch {
+        // Fall back to null (bare 'astrolabe') when the packaged binary is unavailable.
+      }
+    }
+  }
   for (const id of selectedIds) {
     const client = getClient(id);
     const launch = resolveLaunch({
@@ -231,14 +295,19 @@ async function runAsync(argv = process.argv.slice(2)) {
     const plan = client.plan({
       home,
       launch,
-      withHooks: opts.withHooks,
+      withHooks: effectiveWithHooks,
+      alwaysLoad: opts.alwaysLoad,
+      binPath: hookBinPath,
       projectRoot,
       cursorBinPath,
       pyrightPath,
       env: process.env,
-      detected: detectedById.get(id),
+      detected: Boolean(detectedById.get(id) || hasExplicitPathOverride),
       scope: opts.scope,
       cursorCommandExplicit: Boolean(opts.command),
+      configDir: opts.configDir,
+      mcpConfigPath: opts.mcpConfig,
+      hooksConfigPaths: opts.hooksConfig,
     });
     const applied = plan.apply();
     actions.push({
@@ -256,11 +325,13 @@ async function runAsync(argv = process.argv.slice(2)) {
   let permissionsPlan = null;
   let allowlistCheck = null;
   if (opts.cursorPermissions && cursorApplied) {
-    allowlistCheck = checkCursorAllowlist(home);
+    allowlistCheck = checkCursorAllowlist(home, { env: process.env, configDir: opts.configDir });
     process.stdout.write(`\nCursor MCP allowlist check: ${allowlistCheck.message}\n`);
     permissionsPlan = mergeCursorPermissions(home, {
       dryRun: opts.dryRun,
       yes: opts.yes,
+      env: process.env,
+      configDir: opts.configDir,
     });
   }
 
@@ -357,6 +428,8 @@ async function runAsync(argv = process.argv.slice(2)) {
       home,
       projectRoot,
       env: process.env,
+      configDir: opts.configDir,
+      mcpConfigPath: opts.mcpConfig,
       whichFn: clientsMod.which,
     });
     if (cursorApproval.disabled && cursorApproval.disabled.changed && cursorApproval.disabled.doc) {
@@ -449,6 +522,15 @@ async function runAsync(argv = process.argv.slice(2)) {
   process.stdout.write('  2. Verify: npx -y @zlnap/astrolabe --version\n');
   if (selectedIds.includes('claude-code')) {
     process.stdout.write('  3. Claude Code: claude mcp get astrolabe\n');
+    if (effectiveWithHooks) {
+      process.stdout.write(
+        '     Hooks: merged SessionStart, PreToolUse, SessionEnd into ~/.claude/settings.json.\n',
+      );
+    } else {
+      process.stdout.write(
+        '     Tip: re-run with --with-hooks to merge SessionStart/PreToolUse/SessionEnd into ~/.claude/settings.json.\n',
+      );
+    }
   }
   if (selectedIds.includes('cursor')) {
     if (cursorDetected) {
@@ -471,7 +553,7 @@ async function runAsync(argv = process.argv.slice(2)) {
         '  3. Cursor: not detected; skipped config, rules and MCP approval.\n',
       );
     }
-    if (opts.withHooks) {
+    if (effectiveWithHooks) {
       process.stdout.write(
         '     Hooks: ~/.cursor/hooks.json uses an absolute binary path and --client=cursor ' +
           '(matcher includes astrolabe-.*).\n',
@@ -486,7 +568,7 @@ async function runAsync(argv = process.argv.slice(2)) {
     process.stdout.write(
       '  3. OpenCode: restart opencode; MCP is under mcp / mcp.servers in ~/.config/opencode/.\n',
     );
-    if (!opts.withHooks) {
+    if (!effectiveWithHooks) {
       process.stdout.write(
         '     Tip: re-run with --with-hooks to install plugins/astrolabe-guard.ts\n',
       );

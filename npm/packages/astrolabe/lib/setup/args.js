@@ -12,11 +12,21 @@ Options:
   --dry-run              Preview writes; do not modify files
   --native               Use command "astrolabe" on PATH instead of npx
   --command=<bin>        Override MCP command (default: npx, or astrolabe with --native)
+  --config-dir <dir>     Override the target client's config root directory
+                         (requires --clients=<single-id>; overrides env defaults)
+  --mcp-config <file>    Override the target client's MCP config file path
+                         (requires --clients=<single-id>)
+  --hooks-config <file>  Override the target client's hooks/settings/plugin file path
+  --settings <file>      Alias for --hooks-config; repeatable (e.g. multiple profiles)
+                         (requires --clients=<single-id>)
   --with-hooks           Also install drift-guard hooks/plugins where supported
-                         (OpenCode guard plugin; Cursor/Codebuddy/Grok/Kimi/ZCode hook
-                          recipes; DSH always installs its native guard).
+                         (OpenCode guard plugin; Claude Code/Cursor/Codebuddy/Grok/
+                          Kimi/ZCode hook recipes; DSH always installs its native guard).
+                         Claude Code writes ~/.claude/settings.json (--client=claude-code).
                          Cursor writes ~/.cursor/hooks.json (--client=cursor).
                          ZCode: PreToolUse only — never SessionEnd, never Stop cleanup
+  --no-always-load       Omit alwaysLoad: true from Claude Code ~/.claude.json entry
+  --always-load          Set alwaysLoad: true in Claude Code ~/.claude.json entry (default on)
   --no-cursor-permissions
                          Skip merging Cursor mcpAllowlist
   --cursor-permissions   Force Cursor allowlist merge when Cursor is selected (default on)
@@ -46,6 +56,10 @@ function parseArgs(argv) {
     scope: 'global',
     clients: null,
     command: null,
+    configDir: null,
+    mcpConfig: null,
+    hooksConfig: [],
+    alwaysLoad: true,
     cursorPermissions: true,
     withHooks: false,
   };
@@ -57,24 +71,30 @@ function parseArgs(argv) {
     else if (arg === '--native') opts.native = true;
     else if (arg === '--help' || arg === '-h') opts.help = true;
     else if (arg === '--with-hooks') opts.withHooks = true;
+    else if (arg === '--no-always-load') opts.alwaysLoad = false;
+    else if (arg === '--always-load') opts.alwaysLoad = true;
     else if (arg === '--no-cursor-permissions') opts.cursorPermissions = false;
     else if (arg === '--cursor-permissions') opts.cursorPermissions = true;
     else if (arg === '--home') {
-      const value = argv[i + 1];
+      const raw = argv[i + 1];
+      const value = typeof raw === 'string' ? raw.trim() : '';
       if (!value || value.startsWith('-')) throw new Error('--home needs a directory');
       opts.home = value;
       i += 1;
     } else if (arg.startsWith('--home=')) {
-      opts.home = arg.slice('--home='.length);
-      if (!opts.home) throw new Error('--home needs a directory');
+      const value = arg.slice('--home='.length).trim();
+      if (!value) throw new Error('--home needs a directory');
+      opts.home = value;
     } else if (arg === '--project') {
-      const value = argv[i + 1];
+      const raw = argv[i + 1];
+      const value = typeof raw === 'string' ? raw.trim() : '';
       if (!value || value.startsWith('-')) throw new Error('--project needs a directory');
       opts.project = value;
       i += 1;
     } else if (arg.startsWith('--project=')) {
-      opts.project = arg.slice('--project='.length);
-      if (!opts.project) throw new Error('--project needs a directory');
+      const value = arg.slice('--project='.length).trim();
+      if (!value) throw new Error('--project needs a directory');
+      opts.project = value;
     } else if (arg === '--scope') {
       const value = argv[i + 1];
       if (value !== 'global' && value !== 'project') {
@@ -105,6 +125,40 @@ function parseArgs(argv) {
       if (!value || value.startsWith('-')) throw new Error('--command needs a value');
       opts.command = value;
       i += 1;
+    } else if (arg === '--config-dir') {
+      const raw = argv[i + 1];
+      const value = typeof raw === 'string' ? raw.trim() : '';
+      if (!value || value.startsWith('-')) throw new Error('--config-dir needs a directory');
+      opts.configDir = value;
+      i += 1;
+    } else if (arg.startsWith('--config-dir=')) {
+      const value = arg.slice('--config-dir='.length).trim();
+      if (!value) throw new Error('--config-dir needs a directory');
+      opts.configDir = value;
+    } else if (arg === '--mcp-config') {
+      const raw = argv[i + 1];
+      const value = typeof raw === 'string' ? raw.trim() : '';
+      if (!value || value.startsWith('-')) throw new Error('--mcp-config needs a file path');
+      opts.mcpConfig = value;
+      i += 1;
+    } else if (arg.startsWith('--mcp-config=')) {
+      const value = arg.slice('--mcp-config='.length).trim();
+      if (!value) throw new Error('--mcp-config needs a file path');
+      opts.mcpConfig = value;
+    } else if (arg === '--hooks-config' || arg === '--settings') {
+      const raw = argv[i + 1];
+      const value = typeof raw === 'string' ? raw.trim() : '';
+      if (!value || value.startsWith('-')) throw new Error(`${arg} needs a file path`);
+      opts.hooksConfig.push(value);
+      i += 1;
+    } else if (arg.startsWith('--hooks-config=')) {
+      const value = arg.slice('--hooks-config='.length).trim();
+      if (!value) throw new Error('--hooks-config needs a file path');
+      opts.hooksConfig.push(value);
+    } else if (arg.startsWith('--settings=')) {
+      const value = arg.slice('--settings='.length).trim();
+      if (!value) throw new Error('--settings needs a file path');
+      opts.hooksConfig.push(value);
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }

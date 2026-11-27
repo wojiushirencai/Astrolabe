@@ -204,11 +204,12 @@ pub fn msbuild_redirect(root: &Path) -> Option<(&'static str, PathBuf)> {
         }
         None => roslyn_cache_dir(root),
     };
+    let base = crate::paths::command_cwd(&base);
     let chained = std::env::var_os(MSBUILD_HOOK_ENV)
         .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+        .map(|v| crate::paths::command_cwd(&PathBuf::from(v)));
     let props = write_redirect_props(&base, chained.as_deref()).ok()?;
-    Some((MSBUILD_HOOK_ENV, props))
+    Some((MSBUILD_HOOK_ENV, crate::paths::command_cwd(&props)))
 }
 
 /// `~/.astrolabe/roslyn/<repo>-<hash>`: one directory per repo root.
@@ -242,9 +243,9 @@ fn roslyn_cache_dir(root: &Path) -> PathBuf {
 /// Write `<base>/astrolabe-obj.props` (only when its content changed) and
 /// return its path.
 fn write_redirect_props(base: &Path, chained: Option<&Path>) -> std::io::Result<PathBuf> {
-    let obj = base.join("obj");
+    let obj = crate::paths::command_cwd(&base.join("obj"));
     std::fs::create_dir_all(&obj)?;
-    let props = base.join("astrolabe-obj.props");
+    let props = crate::paths::command_cwd(&base.join("astrolabe-obj.props"));
     let content = redirect_props_xml(&obj, chained, &props);
     if std::fs::read_to_string(&props).ok().as_deref() != Some(content.as_str()) {
         let tmp = base.join(format!("astrolabe-obj.props.{}.tmp", std::process::id()));
@@ -255,11 +256,13 @@ fn write_redirect_props(base: &Path, chained: Option<&Path>) -> std::io::Result<
 }
 
 fn redirect_props_xml(obj: &Path, chained: Option<&Path>, own: &Path) -> String {
+    let obj = crate::paths::command_cwd(obj);
+    let own = crate::paths::command_cwd(own);
     let mut dir = msbuild_literal(&obj.to_string_lossy());
     if !dir.ends_with('/') && !dir.ends_with('\\') {
         dir.push(std::path::MAIN_SEPARATOR);
     }
-    let import = match chained.filter(|c| *c != own) {
+    let import = match chained.map(crate::paths::command_cwd).filter(|c| c != &own) {
         Some(c) => {
             let c = msbuild_literal(&c.to_string_lossy());
             format!("  <Import Project=\"{c}\" Condition=\"Exists('{c}')\" />\n")

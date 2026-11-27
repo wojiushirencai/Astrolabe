@@ -1,9 +1,9 @@
-//! Unix-socket transport, election and hand-over for [`super`].
+//! Platform-independent framing, connection multiplexing, election, and
+//! hand-over state machine for [`super`].
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -11,60 +11,44 @@ use std::time::{Duration, Instant};
 use astrolabe_core::elect::IndexerLock;
 use serde::Serialize;
 
-use super::{
-    socket_dir, socket_path_in, Forwarded, Hello, HelloReply, Host, Op, Req, Resp, QUEUE_BUDGET,
-    STARTUP_GRACE,
-};
+use super::{Forwarded, Hello, HelloReply, Host, Op, Req, Resp, QUEUE_BUDGET, STARTUP_GRACE};
 use crate::session::LockOrRecover;
 
 /// Handshake read/write cap on both ends.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 /// A peer that stops reading for this long is treated as gone.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll step while waiting for the lock / a reply.
-const STEP: Duration = Duration::from_millis(25);
+pub(crate) const STEP: Duration = Duration::from_millis(25);
 /// How often an independent session checks whether it can take the lock.
 const PROMOTE_POLL: Duration = Duration::from_secs(1);
 /// Reconnect attempts per call after the leader went away mid-call.
 const MAX_HANDOVERS_PER_CALL: usize = 3;
+/// Upper bound on the initial `Hello` frame before authentication.
+const MAX_HELLO_BYTES: u64 = 64 * 1024;
 
-/// Socket for `root` in the private directory, creating the directory
-/// (0700). `None` when there is no usable private directory or the path
-/// would be too long.
-pub(crate) fn private_socket_path(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dir = socket_dir()?;
-    let path = socket_path_in(&dir, root)?;
-    match ensure_private_dir(&dir) {
-        Ok(()) => Some(path),
-        Err(error) => {
-            tracing::warn!(dir = %dir.display(), %error, "shared index: no private socket directory; indexing independently");
-            None
-        }
-    }
+pub(crate) trait Stream: io::Read + io::Write + Send + Sized + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+    #[allow(dead_code)]
+    fn read_timeout(&self) -> io::Result<Option<Duration>>;
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()>;
 }
 
-/// Create `dir` as 0700 and refuse a symlink or a directory others can
-/// write to (chmod only succeeds for the owner).
-fn ensure_private_dir(dir: &std::path::Path) -> io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.is_dir() {
-        return Err(io::Error::other("socket directory is not a directory"));
-    }
-    if meta.mode() & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        let meta = std::fs::symlink_metadata(dir)?;
-        if meta.mode() & 0o077 != 0 {
-            return Err(io::Error::other("socket directory is not private"));
-        }
-    }
-    Ok(())
+pub(crate) trait StopListener: Send + 'static {
+    fn stop(self);
 }
 
-fn write_frame(mut stream: &UnixStream, frame: &impl Serialize) -> io::Result<()> {
+pub(crate) trait Transport: Send + Sync + 'static {
+    type Stream: Stream;
+    type Listener: StopListener;
+
+    fn dial(endpoint: &Path, hello: &Hello) -> Result<(Self::Stream, Hello), ConnectError>;
+    fn bind(endpoint: &Path, hello: Hello, host: Arc<dyn Host>) -> io::Result<Self::Listener>;
+}
+
+pub(crate) fn write_frame<W: io::Write>(mut stream: W, frame: &impl Serialize) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
     bytes.push(b'\n');
     stream.write_all(&bytes)?;
@@ -75,39 +59,44 @@ fn write_frame(mut stream: &UnixStream, frame: &impl Serialize) -> io::Result<()
 
 /// A follower's connection to the leader. Calls are multiplexed by id; a
 /// reader thread routes replies and notices EOF.
-pub(crate) struct Conn {
-    writer: Mutex<UnixStream>,
+pub(crate) struct Conn<S: Stream> {
+    writer: Mutex<S>,
     pending: Mutex<HashMap<u64, mpsc::Sender<Resp>>>,
     next: AtomicU64,
     alive: AtomicBool,
     leader_pid: u32,
 }
 
-enum ConnectError {
+#[derive(Debug)]
+pub(crate) enum ConnectError {
     /// Nobody (sharing-capable) is listening.
     NoLeader,
     /// A leader answered and refused this follower (version / settings).
     Refused(String),
 }
 
-enum CallError {
+#[derive(Debug)]
+pub(crate) enum CallError {
     Disconnected,
     Timeout,
     Cancelled,
 }
 
-fn connect(
-    sock: &std::path::Path,
+pub(crate) type Connected<S> = (Arc<Conn<S>>, BufReader<S>);
+
+pub(crate) fn connect<T: Transport>(
+    endpoint: &Path,
     hello: &Hello,
-) -> Result<(Arc<Conn>, BufReader<UnixStream>), ConnectError> {
-    let stream = UnixStream::connect(sock).map_err(|_| ConnectError::NoLeader)?;
+) -> Result<Connected<T::Stream>, ConnectError> {
+    let (mut stream, wire_hello) = T::dial(endpoint, hello)?;
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HELLO_TIMEOUT));
-    write_frame(&stream, hello).map_err(|_| ConnectError::NoLeader)?;
+    write_frame(&mut stream, &wire_hello).map_err(|_| ConnectError::NoLeader)?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|_| ConnectError::NoLeader)?);
+    let _ = reader.get_ref().set_read_timeout(Some(HELLO_TIMEOUT));
     let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(n) if n > 0 => {}
+    match io::Read::take(&mut reader, MAX_HELLO_BYTES).read_line(&mut line) {
+        Ok(n) if n > 0 && line.ends_with('\n') => {}
         _ => return Err(ConnectError::NoLeader),
     }
     let reply: HelloReply = serde_json::from_str(&line).map_err(|_| ConnectError::NoLeader)?;
@@ -117,6 +106,7 @@ fn connect(
         ));
     }
     let _ = stream.set_read_timeout(None);
+    let _ = reader.get_ref().set_read_timeout(None);
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     Ok((
         Arc::new(Conn {
@@ -130,9 +120,9 @@ fn connect(
     ))
 }
 
-fn spawn_reader(
-    conn: Arc<Conn>,
-    reader: BufReader<UnixStream>,
+pub(crate) fn spawn_reader<S: Stream>(
+    conn: Arc<Conn<S>>,
+    reader: BufReader<S>,
     on_eof: impl FnOnce() + Send + 'static,
 ) {
     let spawned = std::thread::Builder::new()
@@ -159,8 +149,8 @@ fn spawn_reader(
     }
 }
 
-impl Conn {
-    fn request(
+impl<S: Stream> Conn<S> {
+    pub(crate) fn request(
         &self,
         op: &Op,
         timeout: Option<Duration>,
@@ -184,7 +174,7 @@ impl Conn {
                 uri: uri.clone(),
             },
         };
-        if write_frame(&self.writer.lock_or_recover(), &frame).is_err() {
+        if write_frame(&mut *self.writer.lock_or_recover(), &frame).is_err() {
             self.pending.lock_or_recover().remove(&id);
             return Err(CallError::Disconnected);
         }
@@ -209,10 +199,10 @@ impl Conn {
 
     fn cancel(&self, id: u64) {
         self.pending.lock_or_recover().remove(&id);
-        let _ = write_frame(&self.writer.lock_or_recover(), &Req::Cancel { id });
+        let _ = write_frame(&mut *self.writer.lock_or_recover(), &Req::Cancel { id });
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         let _ = self
             .writer
             .lock_or_recover()
@@ -222,38 +212,38 @@ impl Conn {
 
 // ---------------------------------------------------------------- election
 
-enum Elected {
-    Follower(Arc<Conn>, BufReader<UnixStream>),
+enum Elected<S: Stream> {
+    Follower(Arc<Conn<S>>, BufReader<S>),
     Leader(IndexerLock),
     Independent(String),
 }
 
-enum Role {
-    Follower(Arc<Conn>),
+enum Role<S: Stream> {
+    Follower(Arc<Conn<S>>),
     Electing,
     Local,
     Closed,
 }
 
 /// Sharing state of one server process (single-root mode only).
-pub(crate) struct Shared {
-    root: std::path::PathBuf,
-    sock: std::path::PathBuf,
+pub(crate) struct Shared<T: Transport> {
+    root: PathBuf,
+    sock: PathBuf,
     hello: Hello,
-    role: Mutex<Role>,
+    role: Mutex<Role<T::Stream>>,
     settled: Condvar,
     host: Mutex<Option<Arc<dyn Host>>>,
-    leader: Mutex<Option<Listener>>,
+    leader: Mutex<Option<T::Listener>>,
     local_started: AtomicBool,
     local_since: Mutex<Option<Instant>>,
     /// The promotion watcher is running (or done).
     promote_watch: AtomicBool,
     /// Binding the socket failed once; do not keep retrying.
     bind_failed: AtomicBool,
-    me: Weak<Shared>,
+    me: Weak<Shared<T>>,
 }
 
-impl std::fmt::Debug for Shared {
+impl<T: Transport> std::fmt::Debug for Shared<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let role = match &*self.role.lock_or_recover() {
             Role::Follower(_) => "follower",
@@ -268,12 +258,8 @@ impl std::fmt::Debug for Shared {
     }
 }
 
-impl Shared {
-    pub(crate) fn new(
-        root: std::path::PathBuf,
-        sock: std::path::PathBuf,
-        hello: Hello,
-    ) -> Arc<Self> {
+impl<T: Transport> Shared<T> {
+    pub(crate) fn new(root: PathBuf, sock: PathBuf, hello: Hello) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             root,
             sock,
@@ -299,7 +285,7 @@ impl Shared {
     }
 
     /// Startup election: follow a live leader, become the leader, or index
-    /// independently. Returns quickly (≤ [`STARTUP_GRACE`] when a
+    /// independently. Returns quickly (<= [`STARTUP_GRACE`] when a
     /// non-sharing process holds the lock).
     pub(crate) fn boot(&self) {
         let outcome = self.elect(STARTUP_GRACE);
@@ -316,18 +302,18 @@ impl Shared {
         *self.local_since.lock_or_recover()
     }
 
-    fn elect(&self, grace: Duration) -> Elected {
+    fn elect(&self, grace: Duration) -> Elected<T::Stream> {
         let started = Instant::now();
         loop {
-            match connect(&self.sock, &self.hello) {
-                Ok((conn, reader)) => return Elected::Follower(conn, reader),
-                Err(ConnectError::Refused(reason)) => return Elected::Independent(reason),
-                Err(ConnectError::NoLeader) => {}
-            }
             match IndexerLock::try_acquire(&self.root) {
                 Ok(Some(lock)) => return Elected::Leader(lock),
                 Ok(None) => {}
                 Err(error) => return Elected::Independent(format!("indexer lock: {error}")),
+            }
+            match connect::<T>(&self.sock, &self.hello) {
+                Ok((conn, reader)) => return Elected::Follower(conn, reader),
+                Err(ConnectError::Refused(reason)) => return Elected::Independent(reason),
+                Err(ConnectError::NoLeader) => {}
             }
             if started.elapsed() >= grace {
                 return Elected::Independent(
@@ -340,7 +326,7 @@ impl Shared {
         }
     }
 
-    fn settle(&self, outcome: Elected, handover: bool) {
+    fn settle(&self, outcome: Elected<T::Stream>, handover: bool) {
         match outcome {
             Elected::Follower(conn, reader) => {
                 let mut role = self.role.lock_or_recover();
@@ -383,7 +369,7 @@ impl Shared {
         self.go_local(handover);
     }
 
-    /// Bind and serve the socket (we hold the lock). `true` when serving.
+    /// Bind and serve the endpoint (we hold the lock). `true` when serving.
     fn serve_socket(&self, host: &Arc<dyn Host>, how: &str) -> bool {
         let mut leader = self.leader.lock_or_recover();
         if leader.is_some() {
@@ -392,7 +378,7 @@ impl Shared {
         if matches!(*self.role.lock_or_recover(), Role::Closed) {
             return false;
         }
-        match Listener::bind(&self.sock, self.hello.clone(), Arc::clone(host)) {
+        match T::bind(&self.sock, self.hello.clone(), Arc::clone(host)) {
             Ok(listener) => {
                 tracing::info!(sock = %self.sock.display(), "shared index: leader, serving other sessions{how}");
                 *leader = Some(listener);
@@ -465,7 +451,7 @@ impl Shared {
     }
 
     /// The leader connection `conn` is gone: re-elect in the background.
-    fn on_disconnect(&self, conn: &Arc<Conn>) {
+    fn on_disconnect(&self, conn: &Arc<Conn<T::Stream>>) {
         {
             let mut role = self.role.lock_or_recover();
             match &*role {
@@ -490,7 +476,7 @@ impl Shared {
     }
 
     /// The leader stopped answering: stop using it for good.
-    fn abandon(&self, conn: &Arc<Conn>) {
+    fn abandon(&self, conn: &Arc<Conn<T::Stream>>) {
         tracing::warn!(
             leader_pid = conn.leader_pid,
             "shared index: leader did not answer in time; indexing independently"
@@ -573,134 +559,74 @@ impl Shared {
         if let Some(listener) = listener {
             listener.stop();
         }
-        // Break the server ↔ shared reference cycle.
+        // Break the server <-> shared reference cycle.
         self.host.lock_or_recover().take();
     }
 }
 
 // ---------------------------------------------------------------- leader
 
-struct Listener {
-    path: std::path::PathBuf,
-    stop: Arc<AtomicBool>,
-    conns: Arc<Mutex<HashMap<u64, UnixStream>>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    inode: (u64, u64),
-}
-
-impl Listener {
-    fn bind(path: &std::path::Path, hello: Hello, host: Arc<dyn Host>) -> io::Result<Self> {
-        // We hold the indexer lock, so a socket file here is stale (its
-        // leader died without unlinking).
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let listener = UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        let meta = std::fs::symlink_metadata(path)?;
-        let inode = (meta.dev(), meta.ino());
-        let stop = Arc::new(AtomicBool::new(false));
-        let conns: Arc<Mutex<HashMap<u64, UnixStream>>> = Arc::new(Mutex::new(HashMap::new()));
-        let thread = {
-            let stop = Arc::clone(&stop);
-            let conns = Arc::clone(&conns);
-            std::thread::Builder::new()
-                .name("astrolabe-shared-accept".into())
-                .spawn(move || {
-                    let mut next = 0u64;
-                    for stream in listener.incoming() {
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let stream = match stream {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                tracing::warn!(%error, "shared index: accept failed");
-                                std::thread::sleep(STEP * 4);
-                                continue;
-                            }
-                        };
-                        next += 1;
-                        let key = next;
-                        if let Ok(clone) = stream.try_clone() {
-                            conns.lock_or_recover().insert(key, clone);
-                        }
-                        let hello = hello.clone();
-                        let host = Arc::clone(&host);
-                        let conns = Arc::clone(&conns);
-                        let _ = std::thread::Builder::new()
-                            .name("astrolabe-shared-session".into())
-                            .spawn(move || {
-                                serve_conn(stream, &hello, host.as_ref());
-                                conns.lock_or_recover().remove(&key);
-                            });
-                    }
-                })?
-        };
-        Ok(Self {
-            path: path.to_path_buf(),
-            stop,
-            conns,
-            thread: Some(thread),
-            inode,
-        })
-    }
-
-    /// Stop accepting, drop every follower (they see EOF), unlink the socket.
-    fn stop(mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        // Wake the blocking accept so the listener is dropped.
-        let _ = UnixStream::connect(&self.path);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        for (_, stream) in self.conns.lock_or_recover().drain() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-        if let Ok(meta) = std::fs::symlink_metadata(&self.path) {
-            if (meta.dev(), meta.ino()) == self.inode {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-    }
-}
-
 /// One follower session on the leader.
-fn serve_conn(stream: UnixStream, mine: &Hello, host: &dyn Host) {
+pub(crate) fn serve_conn<S: Stream>(
+    mut stream: S,
+    mine: &Hello,
+    host: &dyn Host,
+    expected_token: Option<&str>,
+) {
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(read_half);
+    let _ = reader.get_ref().set_read_timeout(Some(HELLO_TIMEOUT));
     let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(n) if n > 0 => {}
-        _ => return,
+    match (&mut reader).take(MAX_HELLO_BYTES).read_line(&mut line) {
+        Ok(n) if n > 0 && line.ends_with('\n') => {}
+        Ok(n) => {
+            if expected_token.is_none() && n > 0 {
+                let _ = write_frame(
+                    &mut stream,
+                    &HelloReply {
+                        ok: false,
+                        reason: Some("hello frame too large or incomplete".into()),
+                        leader_pid: std::process::id(),
+                    },
+                );
+            }
+            return;
+        }
+        Err(_) => return,
     }
     let theirs: Hello = match serde_json::from_str(&line) {
         Ok(hello) => hello,
         Err(error) => {
-            let _ = write_frame(
-                &stream,
-                &HelloReply {
-                    ok: false,
-                    reason: Some(format!("bad hello: {error}")),
-                    leader_pid: std::process::id(),
-                },
-            );
+            if expected_token.is_none() {
+                let _ = write_frame(
+                    &mut stream,
+                    &HelloReply {
+                        ok: false,
+                        reason: Some(format!("bad hello: {error}")),
+                        leader_pid: std::process::id(),
+                    },
+                );
+            }
             return;
         }
     };
+    if let Some(expected) = expected_token {
+        let provided = theirs.auth_token.as_deref().unwrap_or("");
+        if !super::tcp_transport::constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+            return;
+        }
+    }
     let reason = mine.mismatch(&theirs);
     let reply = HelloReply {
         ok: reason.is_none(),
         reason: reason.clone(),
         leader_pid: std::process::id(),
     };
-    if write_frame(&stream, &reply).is_err() {
+    if write_frame(&mut stream, &reply).is_err() {
         return;
     }
     if let Some(reason) = reason {
@@ -708,6 +634,7 @@ fn serve_conn(stream: UnixStream, mine: &Hello, host: &dyn Host) {
         return;
     }
     let _ = stream.set_read_timeout(None);
+    let _ = reader.get_ref().set_read_timeout(None);
     tracing::info!(
         follower_pid = theirs.pid,
         session = %theirs.session_id,
@@ -718,15 +645,14 @@ fn serve_conn(stream: UnixStream, mine: &Hello, host: &dyn Host) {
     let view = host.open_session(theirs.context.clone().into());
     let writer = Arc::new(Mutex::new(stream));
     let flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let reply = |writer: &Mutex<UnixStream>,
-                 id: u64,
-                 result: Result<serde_json::Value, serde_json::Value>| {
-        let (ok, err) = match result {
-            Ok(value) => (Some(value), None),
-            Err(error) => (None, Some(error)),
+    let reply =
+        |writer: &Mutex<S>, id: u64, result: Result<serde_json::Value, serde_json::Value>| {
+            let (ok, err) = match result {
+                Ok(value) => (Some(value), None),
+                Err(error) => (None, Some(error)),
+            };
+            let _ = write_frame(&mut *writer.lock_or_recover(), &Resp { id, ok, err });
         };
-        let _ = write_frame(&writer.lock_or_recover(), &Resp { id, ok, err });
-    };
     for line in reader.lines() {
         let Ok(line) = line else { break };
         match serde_json::from_str::<Req>(&line) {
@@ -735,15 +661,16 @@ fn serve_conn(stream: UnixStream, mine: &Hello, host: &dyn Host) {
                 flags.lock_or_recover().insert(id, Arc::clone(&flag));
                 let view = Arc::clone(&view);
                 let worker_writer = Arc::clone(&writer);
-                let flags = Arc::clone(&flags);
+                let worker_flags = Arc::clone(&flags);
                 let spawned = std::thread::Builder::new()
                     .name("astrolabe-shared-call".into())
                     .spawn(move || {
                         let result = view.call(&name, args, flag);
-                        flags.lock_or_recover().remove(&id);
+                        worker_flags.lock_or_recover().remove(&id);
                         reply(&worker_writer, id, result);
                     });
                 if spawned.is_err() {
+                    flags.lock_or_recover().remove(&id);
                     reply(
                         &writer,
                         id,
