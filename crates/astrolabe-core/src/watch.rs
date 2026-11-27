@@ -1226,11 +1226,7 @@ impl EventFeed for NotifyFeed {
                 // content. Our own scans, rebuilds and search reads generate a
                 // constant stream of these on inotify; treating them as
                 // suspects kept untouched repos permanently "stale".
-                let mut paths = if is_content_event(&ev.kind) {
-                    ev.paths
-                } else {
-                    Vec::new()
-                };
+                let mut paths = intake_paths(&ev.kind, ev.paths, &self.root);
                 if let Some(sel) = self.selective.as_mut() {
                     let found = sel.adopt(&mut self.watcher, &paths, &self.overflow);
                     paths.extend(found);
@@ -1273,8 +1269,15 @@ fn requires_full_verification(event: &notify::Event, root: &Path, scan: &ScanOpt
         return false;
     }
     event.paths.iter().any(|p| {
+        // The watch root itself only invalidates the tree when it is removed
+        // or renamed. FSEvents reports late Create / metadata events for a
+        // root that was created just before the stream started; latching
+        // distrust for those made every query right after startup Degrade.
+        if crate::paths::paths_eq_normalized(p, root) {
+            return invalidates_registration(&event.kind);
+        }
         // Excluded build trees must not turn their deletes into full scans.
-        (p == root || keep_event_path(root, scan, p).is_some())
+        keep_event_path(root, scan, p).is_some()
             && (invalidates_registration(&event.kind)
                 || matches!(
                     event.kind,
@@ -1288,6 +1291,24 @@ fn requires_full_verification(event: &notify::Event, root: &Path, scan: &ScanOpt
                     notify::EventKind::Create(notify::event::CreateKind::Any)
                 ) && p.is_dir()))
     })
+}
+
+/// Paths of one native event that reach [`Intake::absorb`]. Access-only
+/// events contribute nothing. The watch root is forwarded only for remove /
+/// rename (where `absorb` must distrust the tree); any other event naming the
+/// root (directory metadata, a late create replay) says nothing about file
+/// contents and must not distrust the log.
+fn intake_paths(kind: &notify::EventKind, paths: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
+    if !is_content_event(kind) {
+        return Vec::new();
+    }
+    if invalidates_registration(kind) {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter(|p| !crate::paths::paths_eq_normalized(p, root))
+        .collect()
 }
 
 /// Whether a notify event can reflect a content / tree change. Pure
@@ -2651,13 +2672,47 @@ mod tests {
                 "kind {kind:?} on a file must not require full verification"
             );
         }
-        let create_any_dir = notify::Event::new(notify::EventKind::Create(CreateKind::Any))
-            .add_path(dir.path().to_path_buf());
+        dir.write("sub/x.rs", "fn x() {}");
+        let create_any_dir =
+            notify::Event::new(notify::EventKind::Create(CreateKind::Any)).add_path(dir.abs("sub"));
         assert!(requires_full_verification(
             &create_any_dir,
             dir.path(),
             &scan
         ));
+        // The root itself: only remove / rename invalidate the tree.
+        for kind in [
+            notify::EventKind::Create(CreateKind::Folder),
+            notify::EventKind::Create(CreateKind::Any),
+            notify::EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::Any)),
+        ] {
+            let ev = notify::Event::new(kind).add_path(dir.path().to_path_buf());
+            assert!(
+                !requires_full_verification(&ev, dir.path(), &scan),
+                "{kind:?} on the root must not require full verification"
+            );
+            assert!(intake_paths(&kind, ev.paths, dir.path()).is_empty());
+        }
+        for kind in [
+            notify::EventKind::Remove(RemoveKind::Folder),
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+        ] {
+            let ev = notify::Event::new(kind).add_path(dir.path().to_path_buf());
+            assert!(requires_full_verification(&ev, dir.path(), &scan));
+            assert_eq!(
+                intake_paths(&kind, ev.paths, dir.path()),
+                vec![dir.path().to_path_buf()]
+            );
+        }
+        let kind = notify::EventKind::Create(CreateKind::File);
+        assert_eq!(
+            intake_paths(
+                &kind,
+                vec![dir.path().to_path_buf(), dir.abs("f0.rs")],
+                dir.path()
+            ),
+            vec![dir.abs("f0.rs")]
+        );
         let create_any_file = notify::Event::new(notify::EventKind::Create(CreateKind::Any))
             .add_path(dir.abs("f0.rs"));
         assert!(!requires_full_verification(
