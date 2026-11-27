@@ -6,28 +6,77 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
-## [0.17.10] - 2026-11-15
+### 中文
+
+#### 根治 Prompt Cache 坍塌（Claude Code `alwaysLoad` + Soft-First Hook + 索引首调缓冲）
+- MCP 服务端 `list_tools` 默认在全部 7 个静态瘦身工具上附加 `_meta["anthropic/alwaysLoad"]: true`（可通过 `ASTROLABE_ALWAYS_LOAD=0` 关闭），从根源消除会话中途 `ToolSearch` 变更 `tools_hash` 导致的全前缀缓存归零；不声明 `tools/list_changed`，并锁定双实例逐字节确定性与纯 Schema 体积门禁。
+- `astrolabe setup` 为 `claude-code` 默认写入 `"alwaysLoad": true`（支持 `--no-always-load`），并补齐 `--with-hooks` 幂等合并 `~/.claude/settings.json`（`SessionStart` / `PreToolUse` / `SessionEnd`）。
+- 新增 `astrolabe hooks session-start` 静态预热子命令与 `ASTROLABE_HOOK_MODE=soft-first`（默认；另支持 `strict` / `advisory`）：冷态第 1 次温和提醒、第 2 次硬拦截并提示一次性加载全部 7 个工具；热态到达阈值先 `allow` + 温和提醒，持续漂移再硬兜底；不误伤非代码文件读取。
+- `go_layout_hint` 增加 200ms 耗时护栏与确定性目录排序，保障 `alwaysLoad` 5 秒初始化窗口；`with_index_barrier` 与休眠唤醒统一使用零 Runtime 标准库 `Condvar`（默认 `ASTROLABE_BUILD_WAIT_MS=2000`，响应 MCP 取消信号），切断首调 `Index is building...` 引发的回退链。
+
+#### Windows 全链路修复与跨进程共享索引
+- 补齐 `astrolabe_core::paths` 路径归一化底座（大小写不敏感 `\\?\UNC\`、尾随斜杠、盘符大写、多字节 UTF-8 安全切片、POSIX `///...` 防误判、`command_cwd`、`lexical_normalize` 与 `canonicalize` 回退）。
+- 修复 RFC 8089 LSP `file://` URI 编码与反解（彻底消除 `file:////%3F/`），剥离 `rootPath`、`current_dir` 与外部工具参数中的 `\\?\`。
+- 新增跨平台 `process::ChildProcessTree`（Win32 Job Object / Unix 进程组）与 `PATHEXT` 命令解析（命中 `tsc.cmd` / `npx.cmd`），修复 `diag_toolchain` 孙进程持管道死锁与诊断路径丢弃；`roots` / `root` / `scan` / `recent_symbol` / `installer` 全量归一化。
+- `hooks` 修复 Windows `save_counter` 唯一临时文件与共享冲突退避重试、`USERPROFILE` 优先、`%TEMP%`/`%TMP%` 豁免与反斜杠穿越封堵；新增 Cursor 跨平台共享文件锁探活与 `CURSOR_CONFIG_DIR` / `CURSOR_HOME` 支持。
+- 新增 Windows `shared_index`（`127.0.0.1:0` Loopback TCP + 私有目录 Endpoint 文件 + `BCryptGenRandom` 256-bit 恒定时间鉴权 Token + 防符号链接/Reparse Point 校验 + 连接数上限），多子 Agent 共享单份索引与 LSP。
+
+#### 全 Harness Setup 对齐与非默认目录/配置文件支持
+- `codebuddy` / `grok` / `kimicode` / `zcode` / `opencode` / `cursor` / `claude-code` 统一对齐绝对二进制路径、跨平台引号转义（含 POSIX 单引号与 Windows `cmd.exe` 元字符）及稳健去重迁移。
+- 全客户端自动尊重标准环境变量（`CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`CURSOR_CONFIG_DIR`、`OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`/`XDG_CONFIG_HOME`、`VSCODE_USER_DATA_DIR`、`CONTINUE_GLOBAL_DIR` 等），并新增显式 CLI 参数 `--config-dir`、`--mcp-config`、可重复 `--hooks-config` / `--settings` 与防误写/同路径碰撞护栏。
+
+#### 只索引 git 仓库和 `.astrolabe/project.yml` 项目 + `search_code` `include` glob
+- 新增 `.astrolabe/project.yml`（兼容 `.serena/project.yml`）项目标记与统一可索引判定（拒绝索引无标记非 git 目录，多项目父目录永不误索引/误唤醒，支持 `ASTROLABE_ALLOW_NON_GIT_ROOT=1` 逃生开关）。
+- `search_code` 支持 `include` glob 过滤（#132）。
+
+#### 安装后必须 setup（含 hooks）
+```bash
+npm i -g @zlnap/astrolabe@0.17.11
+astrolabe setup --with-hooks
+```
+只安装二进制不会配置 MCP 或 hooks；请按客户端要求重新加载已有会话。
+
+### English
+
+#### Fix Prompt Cache collapse (Claude Code `alwaysLoad` + Soft-First Hook + bounded index wait)
+- Emit `_meta["anthropic/alwaysLoad"]: true` on all 7 static slimmed tools in `list_tools` (opt-out via `ASTROLABE_ALWAYS_LOAD=0`) so Claude Code loads them upfront without mid-session `ToolSearch` mutating `tools_hash`; never advertise `tools/list_changed`, with byte-level determinism and pure-schema size gates.
+- `astrolabe setup` now defaults to `"alwaysLoad": true` for Claude Code (`--no-always-load` to omit) and implements idempotent `--with-hooks` merging for `~/.claude/settings.json` (`SessionStart` / `PreToolUse` / `SessionEnd`).
+- Add static `astrolabe hooks session-start` and default `ASTROLABE_HOOK_MODE=soft-first` (`strict` / `advisory` also supported): soft reminder before hard deny in both cold and warm states, atomic 7-tool batch `ToolSearch` hint for deferred environments, and no false positives on non-code reads.
+- Cap `go_layout_hint` directory scanning at 200ms with deterministic sorting; unify `with_index_barrier` and hibernation wake on a zero-runtime `Condvar` (`ASTROLABE_BUILD_WAIT_MS=2000`, cancellation-aware) to eliminate spurious `Index is building...` fallbacks.
+
+#### Windows full-stack fixes and shared index
+- Harden `astrolabe_core::paths` (case-insensitive `\\?\UNC\`, trailing slashes, uppercase drive letters, multibyte UTF-8 safety, POSIX `///...` handling, `command_cwd`, `lexical_normalize`, and canonical fallback).
+- Fix RFC 8089 LSP `file://` URI encoding/decoding (no more `file:////%3F/`), strip `\\?\` from `rootPath`, `current_dir`, and external tool arguments.
+- Extract cross-platform `process::ChildProcessTree` (Win32 Job Object / Unix process group) and `PATHEXT` resolution (`tsc.cmd` / `npx.cmd`), fix grandchild pipe-hold deadlocks in `diag_toolchain`, and normalize `roots` / `root` / `scan` / `recent_symbol` / `installer`.
+- Harden Windows `hooks` (`save_counter` unique temp file + sharing-violation retry, `USERPROFILE` precedence, `%TEMP%`/`%TMP%` exemption with backslash traversal rejection, cross-platform Cursor shared-lock liveness probe, and `CURSOR_CONFIG_DIR` / `CURSOR_HOME`).
+- Enable Windows `shared_index` over `127.0.0.1:0` loopback TCP with private endpoint files, 256-bit `BCryptGenRandom` constant-time auth tokens, symlink/reparse-point rejection, and connection caps.
+
+#### Harness setup alignment & custom config directories/files
+- Align `codebuddy`, `grok`, `kimicode`, `zcode`, `opencode`, `cursor`, and `claude-code` to resolved absolute binary paths, cross-platform quoting, and idempotent deduplication.
+- Respect standard harness env vars (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CURSOR_CONFIG_DIR`, `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`/`XDG_CONFIG_HOME`, `VSCODE_USER_DATA_DIR`, `CONTINUE_GLOBAL_DIR`, etc.) and add explicit `--config-dir`, `--mcp-config`, repeatable `--hooks-config` / `--settings` flags with single-client and same-path collision guards.
+
+#### Git-only / `.astrolabe/project.yml` index roots & `search_code` `include` glob
+- Refuse non-indexable directories unless marked by `.git` or `.astrolabe/project.yml` (`.serena/project.yml` compatible), keep multi-project parents dormant, and provide `ASTROLABE_ALLOW_NON_GIT_ROOT=1` escape hatch.
+- Support `include` glob filtering in `search_code` (#132).
+
+#### Required setup after installation (including hooks)
+```bash
+npm i -g @zlnap/astrolabe@0.17.11
+astrolabe setup --with-hooks
+```
+Installing the binary alone does not configure MCP or hooks. Reload existing sessions as required by the client.
+
+## [0.17.10] - 2026-11-16
 
 ### 中文
 
-#### 只索引 git 仓库和 `.astrolabe/project.yml` 项目
-- 新增项目标记 `.astrolabe/project.yml`，用于在没有 git 的目录声明项目（目前只看文件是否存在）。只认这个文件：Astrolabe 会在每个建过索引的目录下自动创建 `.astrolabe/`（索引、锁、memories），只有这个目录不算项目标记。`.serena/project.yml` 作为兼容 Serena 的写法同样认；通过它命中时，日志会建议改用 `.astrolabe/project.yml`。
-- 统一的“可索引”判定，启动时 `.`、显式根、工具调用的 `index_root`、多项目分发模式父目录共用同一套：
-  1. 目录自身或某个上级目录含 `.git`（目录或文件，worktree / submodule 均算），且该 `.git` 不在 `$HOME`（dotfiles 用的 `~/.git` 不算）→ 可索引；
-  2. 否则，直接子目录里有 git 仓库 → 该目录本身不可索引，即使它带 `.astrolabe/project.yml` 或 `.serena/project.yml`，改为服务这些子仓库；
-  3. 否则，向上找最近的项目文件（`.astrolabe/project.yml`，兼容 `.serena/project.yml`；同一目录两种都有即同一个项目）→ 可索引；但项目文件所在目录自身装着子 git 仓库时不采纳；
-  4. 都不满足 → 不可索引。
-- 启动时 `.`（从 cwd 探测）：① 最近的 `.git` 即仓库根，仓库内子目录里更近的项目文件不再把仓库拆开；② 否则子仓库恰好 1 个就直接服务它，2 个及以上进入多项目分发模式；③ 否则采用最近的项目文件所在目录；④ 都没有时，此前“文件数 ≤ 2 万”会被当作普通目录索引，现在改为拒绝启动（退出码 2，与文件数超限相同的启动失败提示），提示 cd 进仓库、`git init`，或用 `.astrolabe/project.yml` 声明非 git 项目。祖先目录上的标记（用户主目录或文件数超限）照旧忽略并告警：被忽略的 `.git` 之下若还有更近的项目文件，改用项目文件所在目录，否则按 cwd 自身判定。
-- 显式根（位置参数或 `ASTROLABE_ROOT`）仍不向上查找：可索引时照旧按给定路径索引；不可索引时，恰有 1 个直接子仓库就直接服务它，≥2 个进入多项目分发模式，没有子仓库则拒绝启动。启动日志里的 repo / single 标签同样认 `.astrolabe/project.yml`。
-- 工具调用的 `index_root`：不可索引、且没有已激活索引覆盖它时，返回错误（`confidence: unknown`），列出其下直接子 git 仓库（最多 20 个）并建议改传其中一个；不创建会话、不建索引。只有 `.astrolabe/project.yml`、没有 git 的目录照常可以作为 `index_root`。
-- 多项目分发模式下，父目录（不可索引，带项目文件也一样）永远不会被索引或唤醒：子路径 `index_root` 不再落到父目录会话上（此前会命中父目录，卡在“索引构建中”，`search_code` 还会以父目录为根做整树磁盘扫描）；父目录作为路由目标时直接报错，冷构建、休眠唤醒和后台重建入口也都拒绝它。
-- 行为变化：newapi 这类非 git 工作区（根目录有 `.serena/project.yml`，下有 6 个子仓库，外加一个装有 25 个 git worktree、约 12 万源码文件的非 git 目录）此前被当成一个仓库整体建索引（一次实际启动约 9 万文件，进程物理内存峰值约 6.2 GB），现在进入多项目模式，只按需索引用到的子仓库；从它的普通子目录（如 `docs/`）启动也不再采纳父目录的项目文件，而是拒绝启动。git 仓库内部带 `.serena/project.yml` 的子目录不再单独成根，而是归入外层仓库。启动目录正好是带 `~/.git` 的 `$HOME` 时，`~/.git` 同样不算标记：有子仓库就服务子仓库，否则拒绝启动。
+本版本相对 v0.17.9 仅包含 #129、#130 与本次版本更新。
 
-#### 逃生开关
-- `ASTROLABE_ALLOW_NON_GIT_ROOT=1`（也接受 `true` / `yes` / `on`）恢复旧行为：`.` 下不可索引、文件数不超限的目录照常索引；显式根总按给定路径索引（不改为子仓库或分发模式）；`index_root` 可指向任意目录；分发模式父目录不再休眠。启动时读取一次；`ASTROLABE_MAX_ROOT_FILES` 文件数上限照旧生效。
+#### 文本检索忽略文件过滤
+- 文本检索路径集合不再纳入 `.gitignore` / `.ignore`，使搜索结果与宿主 ripgrep 对这些忽略文件的处理一致。索引收录规则未改。
 
-#### 验证
-- 新增 root / knobs / server 单元测试，覆盖 `.astrolabe/project.yml` 与 `.serena/project.yml` 的识别和优先级（裸 `.astrolabe/` 不算标记）、git 判定（含 `$HOME` 标记、worktree 指针文件）、启动分类、显式根分类、`index_root` 拒绝文本、分发模式父目录拒绝与逃生开关；以及：带子仓库的项目文件目录不会从其普通子目录被采纳、对“项目文件 + 子仓库”目录的 `index_root` 被拒绝并列出子仓库、只有 `.astrolabe/project.yml` 的非 git 目录可作为 `index_root`、带 `.serena/project.yml` 的分发父目录仍休眠。原有把非 git 临时目录当作 `Single` 的测试改为断言 `NotGit`。
+#### Windows 轮询间隔
+- Windows 上默认文件监视轮询间隔从 10 秒调整为 2 秒；macOS 及其他平台仍为 10 秒。显式配置的 `WatchConfig::poll_interval` 与既有 duty-cycle 上限不受影响。
 
 #### 安装后必须 setup（含 hooks）
 ```bash
@@ -38,19 +87,13 @@ astrolabe setup --with-hooks
 
 ### English
 
-#### Index only git repositories and `.astrolabe/project.yml` projects
-- Add the `.astrolabe/project.yml` project marker for declaring a project in a directory without git. Only the file counts: Astrolabe creates `.astrolabe/` (index, lock, memories) in every indexed directory, so the bare directory is not a marker. `.serena/project.yml` is still accepted for Serena compatibility; when it is the matching marker, the log suggests switching to `.astrolabe/project.yml`.
-- One "indexable root" rule now drives startup `.`, explicit roots, per-call `index_root`, and multi-project parents:
-  1. The directory or an ancestor contains `.git` (directory or file; worktrees and submodules count) outside `$HOME` → indexable.
-  2. Otherwise, if direct children are git repositories → the directory itself is not indexable, even with a project file; its child repositories are served instead.
-  3. Otherwise, the nearest project file (`.astrolabe/project.yml`, or `.serena/project.yml` for compatibility) → indexable, unless the directory holding it contains child git repositories.
-  4. Otherwise → not indexable.
-- Startup from `.` now refuses a non-indexable directory (exit code 2, same startup-failure guidance as the file-count cap) instead of indexing it when it holds at most 20k files. An explicit root that is not indexable serves its single child repository, starts multi-project dispatch for two or more, or is refused.
-- Per-call `index_root` outside any project returns an error listing up to 20 child repositories; no session or index is created. A multi-project parent is never indexed or woken; previously a sub-path `index_root` could land on the parent session, hang in "index building", and scan the whole tree on disk.
-- Behavior change: a non-git workspace such as `newapi` (root `.serena/project.yml`, 6 child repositories, plus a non-git directory holding 25 git worktrees and ~120k source files) was previously indexed as one repository (~90k files, ~6.2 GB peak physical memory). It now starts in multi-project mode and indexes child repositories on demand.
+Compared with v0.17.9, this release contains only the changes in #129 and #130 and the version update.
 
-#### Escape hatch
-- `ASTROLABE_ALLOW_NON_GIT_ROOT=1` (also `true` / `yes` / `on`) restores the previous behavior. It is read once at startup; `ASTROLABE_MAX_ROOT_FILES` still applies.
+#### Ignore-file filtering in text-only paths
+- `text_only_paths` no longer includes `.gitignore` / `.ignore`, so search results agree with host ripgrep's treatment of those ignore files. Index admission rules are unchanged.
+
+#### Windows poll interval
+- The default file-watch poll interval on Windows is now 2 seconds instead of 10 seconds; macOS and other platforms remain at 10 seconds. An explicit `WatchConfig::poll_interval` override and the existing duty-cycle clamp are unchanged.
 
 #### Required setup after installation (including hooks)
 ```bash

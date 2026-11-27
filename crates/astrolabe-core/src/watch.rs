@@ -38,7 +38,10 @@
 //!    stampede.
 //! 6. **Automatic polling fallback**: If the OS notification system fails
 //!    to initialize or errors at runtime, the watcher logs a warning and
-//!    polls at [`WatchConfig::poll_interval`] (default 10 s).
+//!    polls at [`WatchConfig::poll_interval`] (default 2 s on Windows, 10 s
+//!    elsewhere: a fallback is expected to be shorter-lived than the safety
+//!    scan, and the old 10 s cycle kept a new file invisible for a full
+//!    cycle).
 //!
 //! ## Cost model
 //!
@@ -113,6 +116,15 @@ const EVENT_SAFETY_INTERVAL: Duration = Duration::from_secs(1800);
 /// within this cap rather than waiting out [`WatchConfig::safety_interval`].
 const DISTRUST_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_STORM_PATHS: usize = 5000;
+/// Default polling cadence for the fallback watcher. Windows keeps it short:
+/// its event backend is the one most likely to be unavailable (network
+/// shares, filter drivers), and a 10 s cycle let a new file stay invisible
+/// for a full cycle.
+const DEFAULT_POLL_INTERVAL: Duration = if cfg!(windows) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10)
+};
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01b3;
 
@@ -144,7 +156,7 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         WatchConfig {
-            poll_interval: Duration::from_secs(10),
+            poll_interval: DEFAULT_POLL_INTERVAL,
             debounce: Duration::from_millis(500),
             safety_interval: EVENT_SAFETY_INTERVAL,
             safety_jitter: true,
@@ -3737,6 +3749,16 @@ mod tests {
             took < Duration::from_secs(2),
             "stop took {took:?}; it must not wait out the 5 s scan"
         );
+    }
+
+    #[test]
+    fn default_poll_interval_is_shorter_on_windows() {
+        let expected = if cfg!(windows) {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(10)
+        };
+        assert_eq!(WatchConfig::default().poll_interval, expected);
     }
 
     #[test]
