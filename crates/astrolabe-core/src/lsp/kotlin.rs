@@ -231,7 +231,7 @@ const BUILD_FILES: &[&str] = &[
 /// workspace model ([`exported_workspace`]).
 pub fn system_path(root: &Path) -> PathBuf {
     if let Some(dir) = std::env::var_os(ENV_SYSTEM_PATH).filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
+        return crate::paths::command_cwd(&PathBuf::from(dir));
     }
     use sha2::{Digest, Sha256};
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -244,13 +244,16 @@ pub fn system_path(root: &Path) -> PathBuf {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("kotlin-lsp")
-        .join(format!("{name}-{}", &hex::encode(digest)[..12]))
+    crate::paths::command_cwd(
+        &base
+            .join("kotlin-lsp")
+            .join(format!("{name}-{}", &hex::encode(digest)[..12])),
+    )
 }
 
 /// Directory kotlin-lsp's `exportWorkspace` command writes `workspace.json` into.
 pub fn export_dir(system_path: &Path) -> PathBuf {
-    system_path.join("astrolabe-export")
+    crate::paths::command_cwd(&system_path.join("astrolabe-export"))
 }
 
 /// The exported workspace model, when it exists and is newer than every

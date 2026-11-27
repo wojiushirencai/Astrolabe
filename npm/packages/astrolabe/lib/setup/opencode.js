@@ -3,8 +3,13 @@
 const fs = require('fs');
 const path = require('path');
 const { parseJsonc, upsertJsoncProperty } = require('./jsonc');
+const { expandHome, readEnvDir } = require('./cursor');
 
-const OPENCODE_GUARD_TS = `import type { Plugin } from "@opencode-ai/plugin";
+function renderOpenCodeGuardTs(binPath = null) {
+  const binLiteral = JSON.stringify(binPath || 'astrolabe');
+  return `import type { Plugin } from "@opencode-ai/plugin";
+
+const ASTROLABE_BIN = ${binLiteral};
 
 export const AstrolabeGuard: Plugin = async () => {
   return {
@@ -14,7 +19,7 @@ export const AstrolabeGuard: Plugin = async () => {
         tool_name: input.tool,
         tool_input: output.args ?? {},
       });
-      const proc = Bun.spawnSync(["astrolabe", "hooks", "remind", "--client=opencode"], {
+      const proc = Bun.spawnSync([ASTROLABE_BIN, "hooks", "remind", "--client=opencode"], {
         stdin: payload,
         stdout: "pipe",
         stderr: "pipe",
@@ -31,21 +36,77 @@ export const AstrolabeGuard: Plugin = async () => {
 };
 export default AstrolabeGuard;
 `;
+}
 
-function resolveOpenCodeConfigPath(home, existsFn) {
+const OPENCODE_GUARD_TS = renderOpenCodeGuardTs();
+
+function resolveOpenCodeConfigDir(home, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) return explicit;
+  const envDir = readEnvDir(env, ['OPENCODE_CONFIG_DIR'], home);
+  if (envDir) return envDir;
+  const xdgConfig = readEnvDir(env, ['XDG_CONFIG_HOME'], home);
+  if (xdgConfig) return path.join(xdgConfig, 'opencode');
+  return path.join(home, '.config', 'opencode');
+}
+
+function resolveOpenCodePluginPath(home, env = process.env, configDir = null) {
+  return path.join(resolveOpenCodeConfigDir(home, env, configDir), 'plugins', 'astrolabe-guard.ts');
+}
+
+function resolveOpenCodeConfigPath(home, existsFn, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) {
+    const candidates = [
+      path.join(explicit, 'opencode.jsonc'),
+      path.join(explicit, 'opencode.json'),
+      path.join(explicit, 'config.json'),
+    ];
+    for (const cand of candidates) {
+      if (existsFn(cand)) return cand;
+    }
+    return candidates[0];
+  }
+  const envConfig = readEnvDir(env, ['OPENCODE_CONFIG'], home);
+  if (envConfig) return envConfig;
+
+  const envDir = readEnvDir(env, ['OPENCODE_CONFIG_DIR'], home);
+  if (envDir) {
+    const candidates = [
+      path.join(envDir, 'opencode.jsonc'),
+      path.join(envDir, 'opencode.json'),
+      path.join(envDir, 'config.json'),
+    ];
+    for (const cand of candidates) {
+      if (existsFn(cand)) return cand;
+    }
+    return candidates[0];
+  }
+
+  const xdgConfig = readEnvDir(env, ['XDG_CONFIG_HOME'], home);
+  const primaryDir = xdgConfig ? path.join(xdgConfig, 'opencode') : path.join(home, '.config', 'opencode');
   const candidates = [
-    path.join(home, '.config', 'opencode', 'opencode.jsonc'),
-    path.join(home, '.config', 'opencode', 'opencode.json'),
-    path.join(home, '.config', 'opencode', 'config.json'),
+    path.join(primaryDir, 'opencode.jsonc'),
+    path.join(primaryDir, 'opencode.json'),
+    path.join(primaryDir, 'config.json'),
+  ];
+  if (xdgConfig) {
+    candidates.push(
+      path.join(home, '.config', 'opencode', 'opencode.jsonc'),
+      path.join(home, '.config', 'opencode', 'opencode.json'),
+      path.join(home, '.config', 'opencode', 'config.json'),
+    );
+  }
+  candidates.push(
     path.join(home, '.opencode', 'opencode.jsonc'),
     path.join(home, '.opencode', 'opencode.json'),
     path.join(home, '.opencode', 'config.json'),
-  ];
+  );
   for (const cand of candidates) {
     if (existsFn(cand)) return cand;
   }
   // Default: new-style user config (JSONC).
-  return path.join(home, '.config', 'opencode', 'opencode.jsonc');
+  return path.join(primaryDir, 'opencode.jsonc');
 }
 
 /**
@@ -122,15 +183,28 @@ function mergeOpenCodeMcpFile(filePath, launch, { create = true, existsFn = fs.e
 function detectOpenCode(home, env, { whichFn, existsFn }) {
   const evidence = [];
   if (whichFn('opencode', env)) evidence.push('opencode on PATH');
+  const envConfig = readEnvDir(env, ['OPENCODE_CONFIG'], home);
+  if (envConfig && existsFn(envConfig)) evidence.push(envConfig);
+  const envDir = readEnvDir(env, ['OPENCODE_CONFIG_DIR'], home);
+  if (envDir && existsFn(envDir)) evidence.push(envDir);
+  const xdgConfig = readEnvDir(env, ['XDG_CONFIG_HOME'], home);
+  if (xdgConfig && existsFn(path.join(xdgConfig, 'opencode'))) {
+    evidence.push(path.join(xdgConfig, 'opencode'));
+  }
   if (existsFn(path.join(home, '.config', 'opencode'))) evidence.push('~/.config/opencode/');
   if (existsFn(path.join(home, '.opencode'))) evidence.push('~/.opencode/');
   return { detected: evidence.length > 0, evidence };
 }
 
-function planOpenCodeGuardPlugin(home, existsFn) {
-  // Prefer user-level plugins dir used by OpenCode 1.x on this Mac.
-  const userPlugins = path.join(home, '.config', 'opencode', 'plugins');
-  const filePath = path.join(userPlugins, 'astrolabe-guard.ts');
+function planOpenCodeGuardPlugin(
+  home,
+  existsFn,
+  { binPath = null, pluginFilePath = null, env = process.env, configDir = null } = {},
+) {
+  const filePath = pluginFilePath
+    ? expandHome(pluginFilePath, home)
+    : resolveOpenCodePluginPath(home, env, configDir);
+  const text = renderOpenCodeGuardTs(binPath);
   return {
     kind: 'opencode-guard',
     filePath,
@@ -141,7 +215,7 @@ function planOpenCodeGuardPlugin(home, existsFn) {
         filePath,
         created,
         replaced: !created,
-        text: OPENCODE_GUARD_TS,
+        text,
         write: null,
       };
     },
@@ -150,6 +224,9 @@ function planOpenCodeGuardPlugin(home, existsFn) {
 
 module.exports = {
   OPENCODE_GUARD_TS,
+  renderOpenCodeGuardTs,
+  resolveOpenCodeConfigDir,
+  resolveOpenCodePluginPath,
   resolveOpenCodeConfigPath,
   detectOpenCodeMcpFormat,
   openCodeServerEntry,

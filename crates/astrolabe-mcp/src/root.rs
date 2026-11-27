@@ -232,7 +232,7 @@ fn serve_child_repos(root: PathBuf, mut children: Vec<PathBuf>) -> ResolvedRoot 
 /// `found` if it may serve as the root for `cwd`; an ancestor that
 /// [`ancestor_rejection`] refuses is skipped with a warning.
 fn adopt_marked_root(found: PathBuf, cwd: &Path, limit: u64) -> Option<PathBuf> {
-    if found == cwd {
+    if astrolabe_core::paths::paths_eq_normalized(&found, cwd) {
         return Some(found);
     }
     match ancestor_rejection(&found, limit) {
@@ -251,7 +251,10 @@ fn adopt_marked_root(found: PathBuf, cwd: &Path, limit: u64) -> Option<PathBuf> 
 
 /// Why an ancestor project root must not be adopted, if any.
 fn ancestor_rejection(found: &Path, limit: u64) -> Option<String> {
-    if home_dirs().iter().any(|home| home == found) {
+    if home_dirs()
+        .iter()
+        .any(|home| astrolabe_core::paths::paths_eq_normalized(home, found))
+    {
         return Some("it is the home directory".to_string());
     }
     let (_, truncated) = count_root_files(found, limit);
@@ -282,14 +285,19 @@ enum Standing {
 
 /// `homes` markers never count.
 fn standing(path: &Path, homes: &[PathBuf]) -> Standing {
-    if let Some(found) = find_git_root(path).filter(|found| !homes.contains(found)) {
+    let is_home = |found: &Path| {
+        homes
+            .iter()
+            .any(|home| astrolabe_core::paths::paths_eq_normalized(home, found))
+    };
+    if let Some(found) = find_git_root(path).filter(|found| !is_home(found)) {
         return Standing::Git(found);
     }
     let children = child_git_repos(path);
     if !children.is_empty() {
         return Standing::GitParent(children);
     }
-    match project_file_root(path).filter(|found| !homes.contains(found)) {
+    match project_file_root(path).filter(|found| !is_home(found)) {
         Some(found) => Standing::ProjectFile(found),
         None => Standing::Unmarked,
     }
@@ -1500,5 +1508,12 @@ mod tests {
         );
         assert!(msg.ends_with("confidence: unknown"), "{msg}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopt_marked_root_treats_verbatim_and_plain_as_equal() {
+        let found = PathBuf::from(r"\\?\C:\repo");
+        let cwd = Path::new("c:/repo/");
+        assert_eq!(adopt_marked_root(found.clone(), cwd, 0), Some(found));
     }
 }

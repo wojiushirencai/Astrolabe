@@ -2635,8 +2635,6 @@ mod tests {
         let mut w = watcher(&dir);
         assert!(w.check().is_empty());
 
-        let path = dir.abs("test.rs");
-
         // Simulate file becoming temporarily unreadable (000 permissions on unix).
         // `scan` drops ReadError paths from the watched set, so the file is
         // removed while unreadable and re-added when readable again — not a
@@ -2644,6 +2642,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let path = dir.abs("test.rs");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
 
             let cs1 = w.check();

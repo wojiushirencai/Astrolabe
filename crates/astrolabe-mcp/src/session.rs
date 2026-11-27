@@ -160,6 +160,9 @@ impl fmt::Debug for SharedFileCache {
 pub(crate) struct RootSession {
     pub root: PathBuf,
     pub state: Arc<RwLock<IndexState>>,
+    /// Wakes callers waiting on an initial cold build or warm wake to leave
+    /// `IndexState::Building` (or a hibernated in-flight rebuild to publish).
+    pub state_cv: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
     pub watch: Arc<Mutex<Option<WatchHandle>>>,
     pub freshness: Arc<Mutex<Option<Arc<FreshnessLog>>>>,
     pub indexer_lock: Arc<Mutex<Option<astrolabe_core::elect::IndexerLock>>>,
@@ -215,6 +218,8 @@ pub(crate) struct RootSession {
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     #[cfg(test)]
     pub(crate) wake_wait_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    pub(crate) wake_wait_override: Mutex<Option<Duration>>,
 }
 
 impl fmt::Debug for RootSession {
@@ -259,6 +264,7 @@ impl RootSession {
             precise: Arc::new(precise),
             root,
             state,
+            state_cv: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             watch: Arc::new(Mutex::new(None)),
             freshness: Arc::new(Mutex::new(None)),
             indexer_lock: Arc::new(Mutex::new(None)),
@@ -286,7 +292,53 @@ impl RootSession {
             wake_before_publish: Mutex::new(None),
             #[cfg(test)]
             wake_wait_started: Mutex::new(None),
+            #[cfg(test)]
+            wake_wait_override: Mutex::new(None),
         })
+    }
+
+    pub fn notify_state_change(&self) {
+        let mut gen = self.state_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+        *gen = gen.wrapping_add(1);
+        self.state_cv.1.notify_all();
+    }
+
+    /// Block (bounded by `budget`) while `state` is [`IndexState::Building`],
+    /// waking immediately on [`Self::notify_state_change`] and stopping promptly
+    /// if the session closes or the current request is cancelled.
+    ///
+    /// Returns `true` if `state` left `IndexState::Building` (and the session is
+    /// not closed), `false` if closed, cancelled, or `budget` elapsed while still
+    /// `Building`.
+    pub fn wait_while_building(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            let observed_gen = *self.state_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            let still_building = matches!(
+                &*self.state.read().unwrap_or_else(|e| e.into_inner()),
+                IndexState::Building
+            );
+            if !still_building {
+                return true;
+            }
+            if crate::server::cancel::is_cancelled() {
+                return false;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let slice = remaining.min(Duration::from_millis(25));
+            let guard = self.state_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard == observed_gen {
+                let _ = self.state_cv.1.wait_timeout(guard, slice);
+            }
+        }
     }
 
     /// Wait (bounded) until no full build of this session is running.
@@ -324,6 +376,7 @@ impl RootSession {
         }
         *self.indexer_lock.lock_or_recover() = None;
         *self.freshness.lock_or_recover() = None;
+        self.notify_state_change();
     }
 
     /// Record that a tool call routed to this session (idle-policy clock).
@@ -405,6 +458,7 @@ impl RootSession {
                 }
             }
         };
+        self.notify_state_change();
         self.file_cache.clear();
         self.soft_evicted.store(false, Ordering::Relaxed);
         let spawned = std::thread::Builder::new()
@@ -474,6 +528,7 @@ impl RootSession {
         self.last_wake.store(now, Ordering::Relaxed);
         *state = IndexState::Building;
         drop(state);
+        self.notify_state_change();
         self.touch();
         tracing::info!(root = %self.root.display(), "waking hibernated primary index");
         self.spawn_wake();
@@ -490,6 +545,7 @@ impl RootSession {
         // publication, not merely through parsing inside build_session_index.
         let Some(active) = BuildActive::enter_if_open(self) else {
             self.rebuild_inflight.store(false, Ordering::SeqCst);
+            self.notify_state_change();
             return;
         };
         let session = Arc::clone(self);
@@ -534,28 +590,39 @@ impl RootSession {
                         session.soft_evicted.store(false, Ordering::Relaxed);
                     }
                     Some(outcome @ IndexState::Failed(_)) => {
-                        let mut state = session.state.write().unwrap_or_else(|e| e.into_inner());
-                        if matches!(*state, IndexState::Building) {
-                            *state = outcome;
+                        {
+                            let mut state =
+                                session.state.write().unwrap_or_else(|e| e.into_inner());
+                            if matches!(*state, IndexState::Building) {
+                                *state = outcome;
+                            }
                         }
+                        session.notify_state_change();
                     }
                     Some(IndexState::Building) => {}
                     None | Some(IndexState::Hibernated) => {
                         // Closed mid-wake (teardown/shutdown): stay retryable.
-                        let mut state = session.state.write().unwrap_or_else(|e| e.into_inner());
-                        if matches!(*state, IndexState::Building) {
-                            *state = IndexState::Hibernated;
+                        {
+                            let mut state =
+                                session.state.write().unwrap_or_else(|e| e.into_inner());
+                            if matches!(*state, IndexState::Building) {
+                                *state = IndexState::Hibernated;
+                            }
                         }
+                        session.notify_state_change();
                     }
                 }
             });
         if let Err(error) = spawned {
             tracing::warn!(%error, "failed to spawn wake rebuild thread");
             self.rebuild_inflight.store(false, Ordering::SeqCst);
-            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-            if matches!(*state, IndexState::Building) {
-                *state = IndexState::Hibernated;
+            {
+                let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+                if matches!(*state, IndexState::Building) {
+                    *state = IndexState::Hibernated;
+                }
             }
+            self.notify_state_change();
         }
     }
 
@@ -567,22 +634,68 @@ impl RootSession {
         }
         let deadline = Instant::now() + timeout;
         loop {
+            let observed_gen = *self.state_cv.0.lock().unwrap_or_else(|e| e.into_inner());
             if self.closed.load(Ordering::SeqCst) {
                 return false;
             }
-            match &*self.state.read().unwrap_or_else(|e| e.into_inner()) {
+            let is_building = match &*self.state.read().unwrap_or_else(|e| e.into_inner()) {
                 IndexState::Ready(_) => return true,
                 // A failed wake is terminal for this call. `Hibernated` can
                 // still mean "a background rebuild was already in flight and
                 // will publish Ready", so keep waiting on it.
                 IndexState::Failed(_) => return false,
-                IndexState::Building | IndexState::Hibernated => {}
-            }
-            if Instant::now() >= deadline {
+                IndexState::Building => true,
+                IndexState::Hibernated => false,
+            };
+            if crate::server::cancel::is_cancelled() {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            if is_building {
+                let _ = self.wait_while_building(remaining);
+                continue;
+            }
+            let slice = remaining.min(Duration::from_millis(25));
+            let guard = self.state_cv.0.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard == observed_gen {
+                let _ = self.state_cv.1.wait_timeout(guard, slice);
+            }
         }
+    }
+
+    /// Wake a hibernated index and wait briefly for it to serve. Returns
+    /// `(is_ready, did_wait_wake)`, where `did_wait_wake` is `true` iff this
+    /// call actually ran [`Self::wait_wake`].
+    pub(crate) fn ensure_awake_tracked(self: &Arc<Self>) -> (bool, bool) {
+        if self.closed.load(Ordering::SeqCst) || self.is_dormant() {
+            return (false, false);
+        }
+        let needs_wake = {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            match &*state {
+                IndexState::Ready(_) => return (true, false),
+                IndexState::Failed(_) => return (false, false),
+                IndexState::Building => self.last_wake.load(Ordering::Relaxed) != 0,
+                IndexState::Hibernated => true,
+            }
+        };
+        if !needs_wake || !self.wake_if_hibernated() {
+            return (false, false);
+        }
+        #[cfg(test)]
+        let timeout = self
+            .wake_wait_override
+            .lock_or_recover()
+            .unwrap_or(WAKE_WAIT);
+        #[cfg(not(test))]
+        let timeout = WAKE_WAIT;
+        let ready = self.wait_wake(timeout);
+        (ready, true)
     }
 
     /// Wake a hibernated index and wait briefly for it to serve. Returns
@@ -590,19 +703,7 @@ impl RootSession {
     /// hibernated"), `false` when the index is still building after the
     /// bounded wait or the wake was refused (cooldown).
     pub(crate) fn ensure_awake(self: &Arc<Self>) -> bool {
-        if self.closed.load(Ordering::SeqCst) || self.is_dormant() {
-            return false;
-        }
-        let needs_wake = {
-            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            match &*state {
-                IndexState::Ready(_) => return true,
-                IndexState::Failed(_) => return false,
-                IndexState::Building => self.last_wake.load(Ordering::Relaxed) != 0,
-                IndexState::Hibernated => true,
-            }
-        };
-        needs_wake && self.wake_if_hibernated() && self.wait_wake(WAKE_WAIT)
+        self.ensure_awake_tracked().0
     }
 }
 
@@ -885,6 +986,7 @@ fn publish_ready(session: &RootSession, mut outcome: IndexState) {
         session.soft_evicted.store(false, Ordering::Relaxed);
     }
     *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
+    session.notify_state_change();
 }
 
 /// Apply buffered changes when the index is Ready. The caller holds the
@@ -919,6 +1021,7 @@ fn apply_pending(session: &RootSession, pending: &mut ChangeSet) -> bool {
         ));
         next.prewarm(false);
         *session.state.write().unwrap_or_else(|e| e.into_inner()) = IndexState::Ready(next);
+        session.notify_state_change();
         // Free the superseded graph (unless a reader still holds it) off this
         // thread: this may be a query waiting on its inline repair, and
         // tearing down a large repository's graph and parse products cost it
@@ -1315,9 +1418,17 @@ fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
             .last_active
             .store(current_time_secs(), Ordering::Relaxed);
     }
-    let mut state = session.state.write().unwrap_or_else(|e| e.into_inner());
-    if !session.closed.load(Ordering::SeqCst) {
-        *state = outcome;
+    let published = {
+        let mut state = session.state.write().unwrap_or_else(|e| e.into_inner());
+        if !session.closed.load(Ordering::SeqCst) {
+            *state = outcome;
+            true
+        } else {
+            false
+        }
+    };
+    if published {
+        session.notify_state_change();
     }
 }
 
@@ -2595,5 +2706,119 @@ mod tests {
         assert!(session.snapshot_ready().is_none());
         assert!(session.indexer_lock.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_while_building_and_wait_wake_respond_to_notify_cancel_and_close() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let knobs = McpKnobs {
+            watch_mode: None,
+            ..McpKnobs::default()
+        };
+
+        // 1. wait_while_building wakes immediately on notify_state_change.
+        let session = RootSession::new(dir.clone(), knobs.clone(), 8 * 1024 * 1024);
+        let built = build_index(&dir, false, session.knobs.parse_cache_bytes);
+        let producer_session = Arc::clone(&session);
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            *producer_session.state.write().unwrap() = built;
+            producer_session.notify_state_change();
+        });
+        let started = Instant::now();
+        assert!(session.wait_while_building(Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_while_building should wake immediately on notify_state_change"
+        );
+        producer.join().unwrap();
+
+        // 2. wait_while_building wakes immediately on teardown (close).
+        let session_close = RootSession::new(dir.clone(), knobs.clone(), 8 * 1024 * 1024);
+        let closer_session = Arc::clone(&session_close);
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            closer_session.teardown();
+        });
+        let started = Instant::now();
+        assert!(!session_close.wait_while_building(Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_while_building should stop promptly on close"
+        );
+        closer.join().unwrap();
+
+        // 3. wait_while_building stops promptly on cancel::scope flag.
+        let session_cancel = RootSession::new(dir.clone(), knobs.clone(), 8 * 1024 * 1024);
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_bg = Arc::clone(&flag);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            flag_bg.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let ok = crate::server::cancel::scope(flag, || {
+            session_cancel.wait_while_building(Duration::from_secs(5))
+        });
+        assert!(!ok);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_while_building should stop promptly on cancel"
+        );
+        canceller.join().unwrap();
+
+        // 4. wait_wake wakes immediately on notify_state_change (including from Hibernated).
+        let session_wake = RootSession::new(dir.clone(), knobs.clone(), 8 * 1024 * 1024);
+        *session_wake.state.write().unwrap() = IndexState::Hibernated;
+        let built_wake = build_index(&dir, false, session_wake.knobs.parse_cache_bytes);
+        let waker_session = Arc::clone(&session_wake);
+        let waker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            *waker_session.state.write().unwrap() = built_wake;
+            waker_session.notify_state_change();
+        });
+        let started = Instant::now();
+        assert!(session_wake.wait_wake(Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_wake should wake immediately on notify_state_change"
+        );
+        waker.join().unwrap();
+
+        // 5. wait_wake stops promptly on cancel and on close.
+        let session_wake_cancel = RootSession::new(dir.clone(), knobs.clone(), 8 * 1024 * 1024);
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_bg = Arc::clone(&flag);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            flag_bg.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let ok = crate::server::cancel::scope(flag, || {
+            session_wake_cancel.wait_wake(Duration::from_secs(5))
+        });
+        assert!(!ok);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_wake should stop promptly on cancel"
+        );
+        canceller.join().unwrap();
+
+        let session_wake_close = RootSession::new(dir.clone(), knobs, 8 * 1024 * 1024);
+        let closer_session = Arc::clone(&session_wake_close);
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            closer_session.teardown();
+        });
+        let started = Instant::now();
+        assert!(!session_wake_close.wait_wake(Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "wait_wake should stop promptly on close"
+        );
+        closer.join().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

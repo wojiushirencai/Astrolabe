@@ -5,11 +5,13 @@ const os = require('os');
 const path = require('path');
 const opencodeMod = require('./opencode');
 const dshMod = require('./dsh');
+const claudeCodeMod = require('./claude-code');
 const codebuddyMod = require('./codebuddy');
 const grokMod = require('./grok');
 const kimicodeMod = require('./kimicode');
 const zcodeMod = require('./zcode');
 const cursorMod = require('./cursor');
+const { expandHome, readEnvDir } = cursorMod;
 const PACKAGE_NAME = '@zlnap/astrolabe';
 const SERVER_NAME = 'astrolabe';
 
@@ -290,8 +292,11 @@ function migrateIdeAllowlist(existing, extras) {
  * Inspect an existing Cursor mcpAllowlist without writing.
  * status: missing | short-ok | needs-migrate | empty
  */
-function checkCursorAllowlist(home) {
-  const permissionsPath = path.join(home, '.cursor', 'permissions.json');
+function checkCursorAllowlist(home, { env = process.env, configDir = null } = {}) {
+  const permissionsPath = path.join(
+    cursorMod.resolveCursorConfigDir(home, env, configDir),
+    'permissions.json',
+  );
   if (!exists(permissionsPath)) {
     return {
       filePath: permissionsPath,
@@ -343,8 +348,14 @@ function checkCursorAllowlist(home) {
   return { filePath: permissionsPath, status, legacyNames: uniqueLegacy, shortPresent, message };
 }
 
-function mergeCursorPermissions(home, { dryRun = false, yes = false } = {}) {
-  const permissionsPath = path.join(home, '.cursor', 'permissions.json');
+function mergeCursorPermissions(
+  home,
+  { dryRun = false, yes = false, env = process.env, configDir = null } = {},
+) {
+  const permissionsPath = path.join(
+    cursorMod.resolveCursorConfigDir(home, env, configDir),
+    'permissions.json',
+  );
   const extras = CATALOG_TOOL_NAMES.map((name) => `${SERVER_NAME}:${name}`);
   let doc = {};
   let created = false;
@@ -372,8 +383,138 @@ function mergeCursorPermissions(home, { dryRun = false, yes = false } = {}) {
   };
 }
 
-function clineSettingsPath(home) {
-  if (process.platform === 'darwin') {
+function resolveHookBinPath({ binPath = null, launch = null, env = process.env } = {}) {
+  if (binPath) return binPath;
+  if (launch && launch.command && launch.command !== 'npx' && launch.command !== 'astrolabe') {
+    return launch.command;
+  }
+  return which('astrolabe', env);
+}
+
+function normalizeComparablePath(filePath, platform = process.platform) {
+  const abs = path.resolve(filePath);
+  const pathImpl = platform === 'win32' ? path.win32 : path;
+  let resolved = abs;
+  try {
+    resolved = fs.realpathSync(abs);
+  } catch {
+    let cur = abs;
+    const tail = [];
+    for (;;) {
+      const parent = pathImpl.dirname(cur);
+      if (parent === cur) {
+        resolved = abs;
+        break;
+      }
+      tail.unshift(pathImpl.basename(cur));
+      cur = parent;
+      try {
+        const realParent = fs.realpathSync(cur);
+        resolved = pathImpl.join(realParent, ...tail);
+        break;
+      } catch {
+        // keep walking up to the nearest existing ancestor
+      }
+    }
+  }
+  return platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function sameComparablePath(a, b, platform = process.platform) {
+  if (!a || !b) return false;
+  return normalizeComparablePath(a, platform) === normalizeComparablePath(b, platform);
+}
+
+function normalizeExplicitHooks(hooksConfigPaths, home) {
+  if (!Array.isArray(hooksConfigPaths) || hooksConfigPaths.length === 0) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of hooksConfigPaths) {
+    const expanded = expandHome(raw, home);
+    if (!expanded) continue;
+    const key = normalizeComparablePath(expanded);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(expanded);
+  }
+  return out;
+}
+
+function resolveHooksPaths(hooksConfigPaths, defaultPath, home) {
+  const normalized = normalizeExplicitHooks(hooksConfigPaths, home);
+  return normalized.length > 0 ? normalized : [defaultPath];
+}
+
+function assertNoHooksConfigOverride(clientId, hooksConfigPaths) {
+  if (
+    Array.isArray(hooksConfigPaths) &&
+    hooksConfigPaths.some((p) => typeof p === 'string' && p.trim().length > 0)
+  ) {
+    throw new Error(
+      `--hooks-config/--settings is not supported for MCP-only client "${clientId}"`,
+    );
+  }
+}
+
+function assertDistinctMcpAndHooksPaths(clientId, mcpFilePath, hooksPaths) {
+  if (!mcpFilePath || !Array.isArray(hooksPaths)) return;
+  for (const hp of hooksPaths) {
+    if (hp && sameComparablePath(mcpFilePath, hp)) {
+      throw new Error(
+        `${clientId}: --mcp-config (${mcpFilePath}) and --hooks-config/--settings (${hp}) must not point to the same file`,
+      );
+    }
+  }
+}
+
+function resolveCodexDir(home, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) return explicit;
+  return readEnvDir(env, ['CODEX_HOME'], home) || path.join(home, '.codex');
+}
+
+function resolveWindsurfDir(home, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) return explicit;
+  const windsurfDir = readEnvDir(env, ['WINDSURF_CONFIG_DIR'], home);
+  if (windsurfDir) return windsurfDir;
+  const codeiumDir = readEnvDir(env, ['CODEIUM_CONFIG_DIR'], home);
+  if (codeiumDir) {
+    if (
+      exists(path.join(codeiumDir, 'windsurf')) &&
+      !exists(path.join(codeiumDir, 'mcp_config.json'))
+    ) {
+      return path.join(codeiumDir, 'windsurf');
+    }
+    return codeiumDir;
+  }
+  return path.join(home, '.codeium', 'windsurf');
+}
+
+function resolveContinueDir(home, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) return explicit;
+  return readEnvDir(env, ['CONTINUE_GLOBAL_DIR'], home) || path.join(home, '.continue');
+}
+
+function vscodeExtensionSettingsPath(
+  home,
+  env = process.env,
+  configDir = null,
+  extId,
+  fileName,
+  platform = process.platform,
+) {
+  const explicit = expandHome(configDir, home);
+  const envDir = !explicit ? readEnvDir(env, ['VSCODE_USER_DATA_DIR'], home) : null;
+  const customRoot = explicit || envDir;
+  if (customRoot) {
+    if (exists(path.join(customRoot, 'globalStorage')) && !exists(path.join(customRoot, 'User'))) {
+      return path.join(customRoot, 'globalStorage', extId, 'settings', fileName);
+    }
+    return path.join(customRoot, 'User', 'globalStorage', extId, 'settings', fileName);
+  }
+  if (platform === 'darwin') {
     return path.join(
       home,
       'Library',
@@ -381,70 +522,49 @@ function clineSettingsPath(home) {
       'Code',
       'User',
       'globalStorage',
-      'saoudrizwan.claude-dev',
+      extId,
       'settings',
-      'cline_mcp_settings.json',
+      fileName,
     );
   }
-  if (process.platform === 'win32') {
-    const base = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
-    return path.join(
-      base,
-      'Code',
-      'User',
-      'globalStorage',
-      'saoudrizwan.claude-dev',
-      'settings',
-      'cline_mcp_settings.json',
-    );
+  if (platform === 'win32') {
+    const base = (env && env.APPDATA) || path.join(home, 'AppData', 'Roaming');
+    return path.join(base, 'Code', 'User', 'globalStorage', extId, 'settings', fileName);
   }
-  return path.join(
+  const xdgConfig = readEnvDir(env, ['XDG_CONFIG_HOME'], home);
+  const base = xdgConfig || path.join(home, '.config');
+  return path.join(base, 'Code', 'User', 'globalStorage', extId, 'settings', fileName);
+}
+
+function clineSettingsPath(
+  home,
+  env = process.env,
+  configDir = null,
+  platform = process.platform,
+) {
+  return vscodeExtensionSettingsPath(
     home,
-    '.config',
-    'Code',
-    'User',
-    'globalStorage',
+    env,
+    configDir,
     'saoudrizwan.claude-dev',
-    'settings',
     'cline_mcp_settings.json',
+    platform,
   );
 }
 
-function rooSettingsPath(home) {
-  if (process.platform === 'darwin') {
-    return path.join(
-      home,
-      'Library',
-      'Application Support',
-      'Code',
-      'User',
-      'globalStorage',
-      'rooveterinaryinc.roo-cline',
-      'settings',
-      'mcp_settings.json',
-    );
-  }
-  if (process.platform === 'win32') {
-    const base = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
-    return path.join(
-      base,
-      'Code',
-      'User',
-      'globalStorage',
-      'rooveterinaryinc.roo-cline',
-      'settings',
-      'mcp_settings.json',
-    );
-  }
-  return path.join(
+function rooSettingsPath(
+  home,
+  env = process.env,
+  configDir = null,
+  platform = process.platform,
+) {
+  return vscodeExtensionSettingsPath(
     home,
-    '.config',
-    'Code',
-    'User',
-    'globalStorage',
+    env,
+    configDir,
     'rooveterinaryinc.roo-cline',
-    'settings',
     'mcp_settings.json',
+    platform,
   );
 }
 
@@ -465,15 +585,42 @@ const CLIENTS = [
     context: 'claude-code',
     detect(home, env = process.env) {
       const evidence = [];
+      const customDir = claudeCodeMod.resolveClaudeConfigDir(home, env);
+      const mcpPath = claudeCodeMod.resolveClaudeMcpPath(home, env);
+      const dirPath = customDir || path.join(home, '.claude');
       if (which('claude', env)) evidence.push('claude on PATH');
-      if (exists(path.join(home, '.claude.json'))) evidence.push('~/.claude.json');
-      if (exists(path.join(home, '.claude'))) evidence.push('~/.claude/');
+      if (exists(mcpPath)) evidence.push(customDir ? mcpPath : '~/.claude.json');
+      if (exists(dirPath)) evidence.push(customDir ? dirPath : '~/.claude/');
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch }) {
-      const filePath = path.join(home, '.claude.json');
+    plan({
+      home,
+      launch,
+      withHooks = false,
+      alwaysLoad = true,
+      binPath = null,
+      env = process.env,
+      configDir = null,
+      mcpConfigPath = null,
+      hooksConfigPaths = null,
+    }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
+      const filePath = explicitMcp || claudeCodeMod.resolveClaudeMcpPath(home, env, explicitConfigDir);
+      const defaultSettingsPath = claudeCodeMod.resolveClaudeSettingsPath(home, env, explicitConfigDir);
+      const settingsPaths = resolveHooksPaths(hooksConfigPaths, defaultSettingsPath, home);
+      if (effectiveWithHooks) {
+        assertDistinctMcpAndHooksPaths('claude-code', filePath, settingsPaths);
+      }
       const entry = jsonServerEntry(launch, { typed: true });
-      return {
+      if (alwaysLoad !== false) {
+        entry.alwaysLoad = true;
+      }
+      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
+      const steps = [];
+      steps.push({
         kind: 'json-mcp',
         filePath,
         entry,
@@ -481,7 +628,56 @@ const CLIENTS = [
         apply() {
           const result = mergeClaudeJson(filePath, entry);
           if (result.skipped) return result;
-          return { ...result, write: () => writeJsonAtomic(filePath, result.doc) };
+          return { ...result, entry, write: () => writeJsonAtomic(filePath, result.doc) };
+        },
+      });
+      if (effectiveWithHooks) {
+        for (const settingsPath of settingsPaths) {
+          steps.push({
+            kind: 'claude-code-hooks',
+            filePath: settingsPath,
+            summary: `merge SessionStart/PreToolUse/SessionEnd into ${settingsPath}`,
+            apply() {
+              const result = claudeCodeMod.mergeClaudeCodeHooksSettings(settingsPath, {
+                create: true,
+                existsFn: exists,
+                binPath: hookBinPath,
+              });
+              if (result.skipped) return result;
+              return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
+            },
+          });
+        }
+      }
+      return {
+        kind: effectiveWithHooks ? 'claude-code' : 'json-mcp',
+        filePath,
+        entry,
+        summary:
+          steps[0].summary +
+          (effectiveWithHooks ? `; hooks → ${settingsPaths.join(', ')}` : ''),
+        steps,
+        apply() {
+          const results = [];
+          for (const step of steps) {
+            const applied = step.apply();
+            if (!applied.skipped && !applied.write && applied.doc) {
+              const fp = applied.filePath;
+              applied.write = () => writeJsonAtomic(fp, applied.doc);
+            }
+            results.push(applied);
+          }
+          const primary = results.find((r) => !r.skipped) || results[0];
+          return {
+            ...primary,
+            entry,
+            results,
+            write: () => {
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
+            },
+          };
         },
       };
     },
@@ -492,17 +688,51 @@ const CLIENTS = [
     context: 'cursor',
     detect(home, env = process.env) {
       const evidence = [];
+      const cursorDir = cursorMod.resolveCursorConfigDir(home, env);
+      const hasCustom = Boolean(readEnvDir(env, ['CURSOR_CONFIG_DIR', 'CURSOR_HOME'], home));
       if (which('cursor', env)) evidence.push('cursor on PATH');
-      if (exists(path.join(home, '.cursor'))) evidence.push('~/.cursor/');
+      if (exists(cursorDir)) evidence.push(hasCustom ? cursorDir : '~/.cursor/');
       if (process.platform === 'darwin' && exists('/Applications/Cursor.app')) {
         evidence.push('/Applications/Cursor.app');
       }
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch, withHooks = false, projectRoot = null, cursorBinPath = null, env = process.env, pyrightPath = null, detected = true, scope = 'global', cursorCommandExplicit = false }) {
-      const globalMcpPath = path.join(home, '.cursor', 'mcp.json');
-      const hooksPath = cursorMod.resolveCursorHooksPath(home);
+    plan({
+      home,
+      launch,
+      withHooks = false,
+      projectRoot = null,
+      cursorBinPath = null,
+      env = process.env,
+      pyrightPath = null,
+      detected = true,
+      scope = 'global',
+      cursorCommandExplicit = false,
+      configDir = null,
+      mcpConfigPath = null,
+      hooksConfigPaths = null,
+    }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
+      const cursorDir = cursorMod.resolveCursorConfigDir(home, env, explicitConfigDir);
+      const globalMcpPath = explicitMcp || path.join(cursorDir, 'mcp.json');
+      const defaultHooksPath = cursorMod.resolveCursorHooksPath(home, env, explicitConfigDir);
+      const hooksPaths = resolveHooksPaths(hooksConfigPaths, defaultHooksPath, home);
       const projectScope = scope === 'project';
+      if (effectiveWithHooks) {
+        const earlyMcpPath =
+          explicitMcp ||
+          (projectScope
+            ? projectRoot
+              ? path.join(cursorMod.canonicalizePath(projectRoot), '.cursor', 'mcp.json')
+              : null
+            : globalMcpPath);
+        if (earlyMcpPath) {
+          assertDistinctMcpAndHooksPaths('cursor', earlyMcpPath, hooksPaths);
+        }
+      }
       if (!detected) {
         return {
           kind: 'cursor',
@@ -519,6 +749,11 @@ const CLIENTS = [
       const root = projectRoot
         ? cursorMod.canonicalizePath(projectRoot)
         : cursorMod.resolveProjectRoot(process.cwd());
+      const projectMcpPath = explicitMcp || path.join(root, '.cursor', 'mcp.json');
+      const primaryPath = projectScope ? projectMcpPath : globalMcpPath;
+      if (effectiveWithHooks) {
+        assertDistinctMcpAndHooksPaths('cursor', primaryPath, hooksPaths);
+      }
       // Absolute native binary: a bare `astrolabe`/`npx` command depends on the
       // client's PATH and silently fails on hooks and on stdio spawn.
       const binPath =
@@ -536,7 +771,6 @@ const CLIENTS = [
           },
         };
       }
-      const projectMcpPath = path.join(root, '.cursor', 'mcp.json');
       const rulesPath = path.join(root, '.cursor', 'rules', 'astrolabe.mdc');
       const projectEntry = cursorMod.cursorServerEntry({
         binPath,
@@ -594,24 +828,24 @@ const CLIENTS = [
           },
         });
       }
-      if (withHooks) {
-        steps.push({
-          kind: 'cursor-hooks',
-          filePath: hooksPath,
-          summary: `merge preToolUse/sessionEnd into ${hooksPath} (--client=cursor, absolute hook command)`,
-          apply() {
-            const create = exists(path.join(home, '.cursor')) || exists(hooksPath);
-            const result = cursorMod.mergeCursorHooksFile(hooksPath, {
-              create,
-              existsFn: exists,
-              binPath,
-            });
-            if (result.skipped) return result;
-            return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
-          },
-        });
+      if (effectiveWithHooks) {
+        for (const hooksPath of hooksPaths) {
+          steps.push({
+            kind: 'cursor-hooks',
+            filePath: hooksPath,
+            summary: `merge preToolUse/sessionEnd into ${hooksPath} (--client=cursor, absolute hook command)`,
+            apply() {
+              const result = cursorMod.mergeCursorHooksFile(hooksPath, {
+                create: true,
+                existsFn: exists,
+                binPath,
+              });
+              if (result.skipped) return result;
+              return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
+            },
+          });
+        }
       }
-      const primaryPath = projectScope ? projectMcpPath : globalMcpPath;
       const primaryEntry = projectScope ? projectEntry : globalEntry;
       return {
         kind: 'cursor',
@@ -620,12 +854,12 @@ const CLIENTS = [
         summary: projectScope
           ? `project ${projectMcpPath} (absolute binary, cwd=project root, env)` +
             `; rules ${rulesPath} (explicit --scope=project)` +
-            (withHooks
-              ? `; hooks → ${hooksPath} (--client=cursor, matcher incl. astrolabe-.*)`
+            (effectiveWithHooks
+              ? `; hooks → ${hooksPaths.join(', ')} (--client=cursor, matcher incl. astrolabe-.*)`
               : '')
           : `global ${globalMcpPath} (absolute binary, env)` +
-            (withHooks
-              ? `; hooks → ${hooksPath} (--client=cursor, matcher incl. astrolabe-.*)`
+            (effectiveWithHooks
+              ? `; hooks → ${hooksPaths.join(', ')} (--client=cursor, matcher incl. astrolabe-.*)`
               : ''),
         steps,
         apply() {
@@ -654,12 +888,16 @@ const CLIENTS = [
     context: 'codex',
     detect(home, env = process.env) {
       const evidence = [];
+      const dir = resolveCodexDir(home, env);
+      const hasCustom = Boolean(readEnvDir(env, ['CODEX_HOME'], home));
       if (which('codex', env)) evidence.push('codex on PATH');
-      if (exists(path.join(home, '.codex'))) evidence.push('~/.codex/');
+      if (exists(dir)) evidence.push(hasCustom ? dir : '~/.codex/');
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch }) {
-      const filePath = path.join(home, '.codex', 'config.toml');
+    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+      assertNoHooksConfigOverride('codex', hooksConfigPaths);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const filePath = explicitMcp || path.join(resolveCodexDir(home, env, configDir), 'config.toml');
       return {
         kind: 'codex-toml',
         filePath,
@@ -677,15 +915,22 @@ const CLIENTS = [
     context: null,
     detect(home, env = process.env) {
       const evidence = [];
+      const dir = resolveWindsurfDir(home, env);
+      const hasCustom = Boolean(
+        readEnvDir(env, ['WINDSURF_CONFIG_DIR', 'CODEIUM_CONFIG_DIR'], home),
+      );
       if (which('windsurf', env)) evidence.push('windsurf on PATH');
-      if (exists(path.join(home, '.codeium', 'windsurf'))) evidence.push('~/.codeium/windsurf/');
+      if (exists(dir)) evidence.push(hasCustom ? dir : '~/.codeium/windsurf/');
       if (process.platform === 'darwin' && exists('/Applications/Windsurf.app')) {
         evidence.push('/Applications/Windsurf.app');
       }
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch }) {
-      const filePath = path.join(home, '.codeium', 'windsurf', 'mcp_config.json');
+    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+      assertNoHooksConfigOverride('windsurf', hooksConfigPaths);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const filePath =
+        explicitMcp || path.join(resolveWindsurfDir(home, env, configDir), 'mcp_config.json');
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -703,15 +948,18 @@ const CLIENTS = [
     id: 'cline',
     label: 'Cline (VS Code)',
     context: null,
-    detect(home) {
+    detect(home, env = process.env) {
       const evidence = [];
-      const settings = clineSettingsPath(home);
+      const settings = clineSettingsPath(home, env);
       if (exists(settings)) evidence.push(settings);
       else if (exists(path.dirname(settings))) evidence.push(path.dirname(settings));
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch }) {
-      const filePath = clineSettingsPath(home);
+    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+      assertNoHooksConfigOverride('cline', hooksConfigPaths);
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const filePath = explicitMcp || clineSettingsPath(home, env, explicitConfigDir);
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -719,8 +967,11 @@ const CLIENTS = [
         entry,
         summary: `merge mcpServers.astrolabe into ${filePath}`,
         apply() {
-          // Only create when the extension settings dir already exists.
-          const create = exists(path.dirname(filePath)) || exists(filePath);
+          // Only create when the extension settings dir already exists (or explicit override).
+          const create =
+            exists(path.dirname(filePath)) ||
+            exists(filePath) ||
+            Boolean(explicitConfigDir || explicitMcp);
           const result = mergeJsonMcpFile(filePath, entry, { create });
           if (result.skipped) return result;
           return { ...result, write: () => writeJsonAtomic(filePath, result.doc) };
@@ -732,15 +983,18 @@ const CLIENTS = [
     id: 'roo',
     label: 'Roo Code (VS Code)',
     context: null,
-    detect(home) {
+    detect(home, env = process.env) {
       const evidence = [];
-      const settings = rooSettingsPath(home);
+      const settings = rooSettingsPath(home, env);
       if (exists(settings)) evidence.push(settings);
       else if (exists(path.dirname(settings))) evidence.push(path.dirname(settings));
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch }) {
-      const filePath = rooSettingsPath(home);
+    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+      assertNoHooksConfigOverride('roo', hooksConfigPaths);
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const filePath = explicitMcp || rooSettingsPath(home, env, explicitConfigDir);
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -748,7 +1002,10 @@ const CLIENTS = [
         entry,
         summary: `merge mcpServers.astrolabe into ${filePath}`,
         apply() {
-          const create = exists(path.dirname(filePath)) || exists(filePath);
+          const create =
+            exists(path.dirname(filePath)) ||
+            exists(filePath) ||
+            Boolean(explicitConfigDir || explicitMcp);
           const result = mergeJsonMcpFile(filePath, entry, { create });
           if (result.skipped) return result;
           return { ...result, write: () => writeJsonAtomic(filePath, result.doc) };
@@ -760,17 +1017,23 @@ const CLIENTS = [
     id: 'continue',
     label: 'Continue',
     context: null,
-    detect(home) {
+    detect(home, env = process.env) {
       const evidence = [];
-      if (exists(path.join(home, '.continue'))) evidence.push('~/.continue/');
+      const dir = resolveContinueDir(home, env);
+      const hasCustom = Boolean(readEnvDir(env, ['CONTINUE_GLOBAL_DIR'], home));
+      if (exists(dir)) evidence.push(hasCustom ? dir : '~/.continue/');
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch }) {
+    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+      assertNoHooksConfigOverride('continue', hooksConfigPaths);
       // Continue's primary config is YAML; MCP servers for the IDE extension
       // commonly live in ~/.continue/mcpServers/astrolabe.yaml or mcp.json.
       // We write the documented JSON mcpServers shape to ~/.continue/mcp.json
       // (merge-only) which matches INSTALL_GUIDE examples.
-      const filePath = path.join(home, '.continue', 'mcp.json');
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const dir = resolveContinueDir(home, env, explicitConfigDir);
+      const filePath = explicitMcp || path.join(dir, 'mcp.json');
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -778,7 +1041,7 @@ const CLIENTS = [
         entry,
         summary: `merge mcpServers.astrolabe into ${filePath}`,
         apply() {
-          const create = exists(path.join(home, '.continue')) || exists(filePath);
+          const create = exists(dir) || exists(filePath) || Boolean(explicitConfigDir || explicitMcp);
           const result = mergeJsonMcpFile(filePath, entry, { create });
           if (result.skipped) return result;
           return { ...result, write: () => writeJsonAtomic(filePath, result.doc) };
@@ -794,8 +1057,30 @@ const CLIENTS = [
     detect(home, env = process.env) {
       return opencodeMod.detectOpenCode(home, env, { whichFn: which, existsFn: exists });
     },
-    plan({ home, launch, withHooks = false }) {
-      const filePath = opencodeMod.resolveOpenCodeConfigPath(home, exists);
+    plan({
+      home,
+      launch,
+      withHooks = false,
+      binPath = null,
+      env = process.env,
+      configDir = null,
+      mcpConfigPath = null,
+      hooksConfigPaths = null,
+    }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
+      const filePath = explicitMcp || opencodeMod.resolveOpenCodeConfigPath(home, exists, env, explicitConfigDir);
+      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
+      const pluginPaths = resolveHooksPaths(
+        hooksConfigPaths,
+        opencodeMod.resolveOpenCodePluginPath(home, env, explicitConfigDir),
+        home,
+      );
+      if (effectiveWithHooks) {
+        assertDistinctMcpAndHooksPaths('opencode', filePath, pluginPaths);
+      }
       const steps = [];
       const mcpPlan = {
         kind: 'opencode-mcp',
@@ -811,14 +1096,25 @@ const CLIENTS = [
         },
       };
       steps.push(mcpPlan);
-      if (withHooks) {
-        steps.push(opencodeMod.planOpenCodeGuardPlugin(home, exists));
+      if (effectiveWithHooks) {
+        for (const pluginFilePath of pluginPaths) {
+          steps.push(
+            opencodeMod.planOpenCodeGuardPlugin(home, exists, {
+              binPath: hookBinPath,
+              pluginFilePath,
+              env,
+              configDir: explicitConfigDir,
+            }),
+          );
+        }
       }
       // Primary plan surface remains the MCP file; hooks are optional extras applied by run.js
       return {
         kind: 'opencode',
         filePath,
-        summary: mcpPlan.summary + (withHooks ? '; optional guard plugin' : ''),
+        summary:
+          mcpPlan.summary +
+          (effectiveWithHooks ? `; optional guard plugin → ${pluginPaths.join(', ')}` : ''),
         steps,
         apply() {
           const results = [];
@@ -857,15 +1153,27 @@ const CLIENTS = [
     detect(home, env = process.env) {
       return dshMod.detectDsh(home, env, { whichFn: which, existsFn: exists });
     },
-    plan({ home }) {
-      const patchPath = path.join(home, '.dsh', 'cordis.patch.yml');
+    plan({ home, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      if (explicitMcp) {
+        throw new Error(
+          '--mcp-config is not supported for deepseek-harness (MCP servers are configured per-repo in the DSH UI)',
+        );
+      }
+      const dshHome = dshMod.resolveDshHome(home, env, explicitConfigDir);
+      const defaultPatchPath = dshMod.resolveDshPatchPath(home, env, explicitConfigDir);
+      const patchPaths = resolveHooksPaths(hooksConfigPaths, defaultPatchPath, home);
+      const patchPath = patchPaths[0];
       const source = dshMod.resolveDshPluginSource(exists);
-      const installDirs = dshMod.resolveDshPluginInstallDirs(home, exists);
+      const installDirs = dshMod.resolveDshPluginInstallDirs(home, exists, env, explicitConfigDir);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const hasExplicitOverride = Boolean(explicitConfigDir || explicitHooks.length > 0);
       return {
         kind: 'dsh-guard',
         filePath: patchPath,
         summary:
-          `install astrolabe-dsh-guard into DSH profile node_modules and merge ${patchPath}` +
+          `install astrolabe-dsh-guard into DSH profile node_modules and merge ${patchPaths.join(', ')}` +
           ' (MCP servers are per-repo in the DSH UI — setup does not write them)',
         apply() {
           if (!source) {
@@ -875,25 +1183,37 @@ const CLIENTS = [
                 'dsh-plugin sources not found (expected vendor/astrolabe-dsh-guard next to setup or repo dsh-plugin/)',
             };
           }
-          const patch = dshMod.mergeDshCordisPatch(patchPath, {
-            create: exists(path.join(home, '.dsh')) || exists(patchPath),
-            existsFn: exists,
-          });
-          if (patch.skipped) return patch;
+          const patches = [];
+          for (const pp of patchPaths) {
+            const patch = dshMod.mergeDshCordisPatch(pp, {
+              create: exists(dshHome) || exists(pp) || hasExplicitOverride,
+              existsFn: exists,
+            });
+            if (patch.skipped && patchPaths.length === 1) return patch;
+            patches.push(patch);
+          }
+          const primary = patches.find((p) => !p.skipped) || patches[0];
+          const results = patches.map((p) => ({
+            ...p,
+            write: p.skipped ? null : () => writeTextAtomic(p.filePath, p.text),
+          }));
           return {
-            filePath: patchPath,
-            created: patch.created,
-            replaced: patch.replaced,
-            text: patch.text,
+            filePath: primary.filePath,
+            created: primary.created,
+            replaced: primary.replaced,
+            text: primary.text,
             source,
             installDirs,
+            results: patchPaths.length > 1 ? results : undefined,
             entryPreview: dshMod.MANAGED_BLOCK.trim(),
             write: () => {
               for (const dest of installDirs) {
                 fs.rmSync(dest, { recursive: true, force: true });
                 dshMod.copyDirRecursive(source, dest);
               }
-              writeTextAtomic(patchPath, patch.text);
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
             },
           };
         },
@@ -908,9 +1228,35 @@ const CLIENTS = [
     detect(home, env = process.env) {
       return codebuddyMod.detectCodebuddy(home, env, { whichFn: which, existsFn: exists });
     },
-    plan({ home, launch, withHooks = false }) {
-      const mcpPath = codebuddyMod.resolveCodebuddyMcpPath(home, exists);
-      const settingsPath = path.join(home, '.codebuddy', 'settings.json');
+    plan({
+      home,
+      launch,
+      withHooks = false,
+      binPath = null,
+      env = process.env,
+      configDir = null,
+      mcpConfigPath = null,
+      hooksConfigPaths = null,
+    }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
+      const dir = codebuddyMod.resolveCodebuddyConfigDir(home, env, explicitConfigDir);
+      const hasCustomDir = Boolean(
+        explicitConfigDir ||
+          readEnvDir(env, ['CODEBUDDY_CONFIG_DIR', 'CODEBUDDY_HOME'], home),
+      );
+      const mcpPath = explicitMcp || codebuddyMod.resolveCodebuddyMcpPath(home, exists, env, explicitConfigDir);
+      const settingsPaths = resolveHooksPaths(
+        hooksConfigPaths,
+        codebuddyMod.resolveCodebuddySettingsPath(home, env, explicitConfigDir),
+        home,
+      );
+      if (effectiveWithHooks) {
+        assertDistinctMcpAndHooksPaths('codebuddy', mcpPath, settingsPaths);
+      }
+      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
       const entry = jsonServerEntry(launch, { typed: true });
       const steps = [];
       steps.push({
@@ -919,35 +1265,42 @@ const CLIENTS = [
         summary: `merge mcpServers.astrolabe into ${mcpPath}`,
         apply() {
           const create =
-            exists(path.join(home, '.codebuddy')) ||
+            exists(dir) ||
             exists(mcpPath) ||
-            exists(path.join(home, '.codebuddy.json'));
+            (!hasCustomDir && exists(path.join(home, '.codebuddy.json'))) ||
+            hasCustomDir ||
+            Boolean(explicitMcp);
           const result = mergeJsonMcpFile(mcpPath, entry, { create });
           if (result.skipped) return result;
           return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
         },
       });
-      if (withHooks) {
-        steps.push({
-          kind: 'codebuddy-hooks',
-          filePath: settingsPath,
-          summary: `merge PreToolUse/SessionEnd into ${settingsPath}`,
-          apply() {
-            const create = exists(path.join(home, '.codebuddy')) || exists(settingsPath);
-            const result = codebuddyMod.mergeCodebuddyHooksSettings(settingsPath, {
-              create,
-              existsFn: exists,
-            });
-            if (result.skipped) return result;
-            return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
-          },
-        });
+      if (effectiveWithHooks) {
+        const hasExplicitHooks = Boolean(hasCustomDir || explicitHooks.length > 0);
+        for (const settingsPath of settingsPaths) {
+          steps.push({
+            kind: 'codebuddy-hooks',
+            filePath: settingsPath,
+            summary: `merge PreToolUse/SessionEnd into ${settingsPath}`,
+            apply() {
+              const create = exists(dir) || exists(settingsPath) || hasExplicitHooks;
+              const result = codebuddyMod.mergeCodebuddyHooksSettings(settingsPath, {
+                create,
+                existsFn: exists,
+                binPath: hookBinPath,
+              });
+              if (result.skipped) return result;
+              return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
+            },
+          });
+        }
       }
       return {
         kind: 'codebuddy',
         filePath: mcpPath,
         summary:
-          steps[0].summary + (withHooks ? `; hooks → ${settingsPath}` : ''),
+          steps[0].summary +
+          (effectiveWithHooks ? `; hooks → ${settingsPaths.join(', ')}` : ''),
         steps,
         apply() {
           const results = [];
@@ -981,16 +1334,42 @@ const CLIENTS = [
     detect(home, env = process.env) {
       return grokMod.detectGrok(home, env, { whichFn: which, existsFn: exists });
     },
-    plan({ home, launch, withHooks = false }) {
-      const tomlPath = grokMod.resolveGrokConfigToml(home);
-      const hooksPath = grokMod.resolveGrokHooksPath(home);
+    plan({
+      home,
+      launch,
+      withHooks = false,
+      binPath = null,
+      env = process.env,
+      configDir = null,
+      mcpConfigPath = null,
+      hooksConfigPaths = null,
+    }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
+      const dir = grokMod.resolveGrokConfigDir(home, env, explicitConfigDir);
+      const hasCustomDir = Boolean(
+        explicitConfigDir ||
+          readEnvDir(env, ['GROK_CONFIG_DIR', 'GROK_HOME'], home),
+      );
+      const tomlPath = explicitMcp || grokMod.resolveGrokConfigToml(home, env, explicitConfigDir);
+      const hooksPaths = resolveHooksPaths(
+        hooksConfigPaths,
+        grokMod.resolveGrokHooksPath(home, env, explicitConfigDir),
+        home,
+      );
+      if (effectiveWithHooks) {
+        assertDistinctMcpAndHooksPaths('grok', tomlPath, hooksPaths);
+      }
+      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
       const steps = [];
       steps.push({
         kind: 'grok-toml',
         filePath: tomlPath,
         summary: `merge [mcp_servers.astrolabe] into ${tomlPath}`,
         apply() {
-          const create = exists(path.join(home, '.grok')) || exists(tomlPath);
+          const create = exists(dir) || exists(tomlPath) || hasCustomDir || Boolean(explicitMcp);
           if (!create) {
             return { skipped: true, reason: `missing ${tomlPath} (will not create)` };
           }
@@ -998,23 +1377,32 @@ const CLIENTS = [
           return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
         },
       });
-      if (withHooks) {
-        steps.push({
-          kind: 'grok-hooks',
-          filePath: hooksPath,
-          summary: `write ${hooksPath}`,
-          apply() {
-            const create = exists(path.join(home, '.grok')) || exists(hooksPath);
-            const result = grokMod.mergeGrokHooksFile(hooksPath, { create, existsFn: exists });
-            if (result.skipped) return result;
-            return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
-          },
-        });
+      if (effectiveWithHooks) {
+        const hasExplicitHooks = Boolean(hasCustomDir || explicitHooks.length > 0);
+        for (const hooksPath of hooksPaths) {
+          steps.push({
+            kind: 'grok-hooks',
+            filePath: hooksPath,
+            summary: `write ${hooksPath}`,
+            apply() {
+              const create = exists(dir) || exists(hooksPath) || hasExplicitHooks;
+              const result = grokMod.mergeGrokHooksFile(hooksPath, {
+                create,
+                existsFn: exists,
+                binPath: hookBinPath,
+              });
+              if (result.skipped) return result;
+              return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
+            },
+          });
+        }
       }
       return {
         kind: 'grok',
         filePath: tomlPath,
-        summary: steps[0].summary + (withHooks ? `; hooks → ${hooksPath}` : ''),
+        summary:
+          steps[0].summary +
+          (effectiveWithHooks ? `; hooks → ${hooksPaths.join(', ')}` : ''),
         steps,
         apply() {
           const results = [];
@@ -1044,9 +1432,35 @@ const CLIENTS = [
     detect(home, env = process.env) {
       return kimicodeMod.detectKimiCode(home, env, { whichFn: which, existsFn: exists });
     },
-    plan({ home, launch, withHooks = false }) {
-      const mcpPath = kimicodeMod.resolveKimiMcpPath(home);
-      const tomlPath = kimicodeMod.resolveKimiConfigToml(home);
+    plan({
+      home,
+      launch,
+      withHooks = false,
+      binPath = null,
+      env = process.env,
+      configDir = null,
+      mcpConfigPath = null,
+      hooksConfigPaths = null,
+    }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
+      const dir = kimicodeMod.resolveKimiConfigDir(home, env, explicitConfigDir);
+      const hasCustomDir = Boolean(
+        explicitConfigDir ||
+          readEnvDir(env, ['KIMI_CONFIG_DIR', 'KIMI_HOME'], home),
+      );
+      const mcpPath = explicitMcp || kimicodeMod.resolveKimiMcpPath(home, env, explicitConfigDir);
+      const tomlPaths = resolveHooksPaths(
+        hooksConfigPaths,
+        kimicodeMod.resolveKimiConfigToml(home, env, explicitConfigDir),
+        home,
+      );
+      if (effectiveWithHooks) {
+        assertDistinctMcpAndHooksPaths('kimicode', mcpPath, tomlPaths);
+      }
+      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
       const entry = jsonServerEntry(launch);
       const steps = [];
       steps.push({
@@ -1054,29 +1468,38 @@ const CLIENTS = [
         filePath: mcpPath,
         summary: `merge mcpServers.astrolabe into ${mcpPath}`,
         apply() {
-          const create = exists(path.join(home, '.kimi-code')) || exists(mcpPath);
+          const create = exists(dir) || exists(mcpPath) || hasCustomDir || Boolean(explicitMcp);
           const result = mergeJsonMcpFile(mcpPath, entry, { create });
           if (result.skipped) return result;
           return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
         },
       });
-      if (withHooks) {
-        steps.push({
-          kind: 'kimi-hooks',
-          filePath: tomlPath,
-          summary: `merge [[hooks]] into ${tomlPath}`,
-          apply() {
-            const create = exists(path.join(home, '.kimi-code')) || exists(tomlPath);
-            const result = kimicodeMod.mergeKimiHooksToml(tomlPath, { create, existsFn: exists });
-            if (result.skipped) return result;
-            return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
-          },
-        });
+      if (effectiveWithHooks) {
+        const hasExplicitHooks = Boolean(hasCustomDir || explicitHooks.length > 0);
+        for (const tomlPath of tomlPaths) {
+          steps.push({
+            kind: 'kimi-hooks',
+            filePath: tomlPath,
+            summary: `merge [[hooks]] into ${tomlPath}`,
+            apply() {
+              const create = exists(dir) || exists(tomlPath) || hasExplicitHooks;
+              const result = kimicodeMod.mergeKimiHooksToml(tomlPath, {
+                create,
+                existsFn: exists,
+                binPath: hookBinPath,
+              });
+              if (result.skipped) return result;
+              return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
+            },
+          });
+        }
       }
       return {
         kind: 'kimicode',
         filePath: mcpPath,
-        summary: steps[0].summary + (withHooks ? `; hooks → ${tomlPath}` : ''),
+        summary:
+          steps[0].summary +
+          (effectiveWithHooks ? `; hooks → ${tomlPaths.join(', ')}` : ''),
         steps,
         apply() {
           const results = [];
@@ -1105,26 +1528,113 @@ const CLIENTS = [
     detect(home, env = process.env) {
       return zcodeMod.detectZCode(home, env, { whichFn: which, existsFn: exists });
     },
-    plan({ home, launch, withHooks = false }) {
-      const filePath = zcodeMod.resolveZcodeConfigPath(home, exists);
-      return {
+    plan({
+      home,
+      launch,
+      withHooks = false,
+      binPath = null,
+      env = process.env,
+      configDir = null,
+      mcpConfigPath = null,
+      hooksConfigPaths = null,
+    }) {
+      const explicitConfigDir = expandHome(configDir, home);
+      const explicitMcp = expandHome(mcpConfigPath, home);
+      const normalizedHooks = normalizeExplicitHooks(hooksConfigPaths, home);
+      const explicitHooks = normalizedHooks.length > 0 ? normalizedHooks : null;
+      const effectiveWithHooks = Boolean(withHooks || explicitHooks);
+      const dir = zcodeMod.resolveZcodeConfigDir(home, env, explicitConfigDir);
+      const hasCustomDir = Boolean(
+        explicitConfigDir ||
+          readEnvDir(env, ['ZCODE_CONFIG_DIR', 'ZCODE_HOME'], home),
+      );
+      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
+
+      const stepSpecs = [];
+      if (!explicitMcp && !explicitHooks) {
+        stepSpecs.push({
+          filePath: zcodeMod.resolveZcodeConfigPath(home, exists, env, explicitConfigDir),
+          writeMcp: true,
+          withHooks: effectiveWithHooks,
+        });
+      } else if (explicitMcp && !explicitHooks) {
+        stepSpecs.push({
+          filePath: explicitMcp,
+          writeMcp: true,
+          withHooks: effectiveWithHooks,
+        });
+      } else if (!explicitMcp && explicitHooks) {
+        for (const fp of explicitHooks) {
+          stepSpecs.push({
+            filePath: fp,
+            writeMcp: true,
+            withHooks: true,
+          });
+        }
+      } else {
+        const includesMcp = explicitHooks.some((fp) => sameComparablePath(fp, explicitMcp));
+        stepSpecs.push({
+          filePath: explicitMcp,
+          writeMcp: true,
+          withHooks: includesMcp,
+        });
+        for (const fp of explicitHooks) {
+          if (sameComparablePath(fp, explicitMcp)) continue;
+          stepSpecs.push({
+            filePath: fp,
+            writeMcp: false,
+            withHooks: true,
+          });
+        }
+      }
+
+      const hasExplicitOverride = Boolean(hasCustomDir || explicitMcp || explicitHooks);
+      const primaryPath = stepSpecs[0].filePath;
+      const steps = stepSpecs.map((spec) => ({
         kind: 'zcode',
-        filePath,
-        summary:
-          `merge mcp.servers.astrolabe into ${filePath}` +
-          (withHooks ? ' (+ hooks.events.PreToolUse; no SessionEnd; scrub Stop cleanup)' : ''),
+        filePath: spec.filePath,
         apply() {
           const create =
-            exists(path.join(home, '.zcode')) ||
-            exists(path.join(home, '.zcode', 'cli')) ||
-            exists(filePath);
-          const result = zcodeMod.mergeZcodeConfigFile(filePath, launch, {
+            exists(dir) ||
+            exists(path.join(dir, 'cli')) ||
+            exists(spec.filePath) ||
+            hasExplicitOverride;
+          const result = zcodeMod.mergeZcodeConfigFile(spec.filePath, launch, {
             create,
-            withHooks,
+            withHooks: spec.withHooks,
+            writeMcp: spec.writeMcp,
             existsFn: exists,
+            binPath: hookBinPath,
           });
           if (result.skipped) return result;
-          return { ...result, write: () => writeJsonAtomic(filePath, result.doc) };
+          return { ...result, write: () => writeJsonAtomic(spec.filePath, result.doc) };
+        },
+      }));
+
+      return {
+        kind: 'zcode',
+        filePath: primaryPath,
+        summary:
+          `merge mcp.servers.astrolabe into ${primaryPath}` +
+          (effectiveWithHooks
+            ? ` (+ hooks.events.PreToolUse${explicitHooks ? ` → ${explicitHooks.join(', ')}` : ''}; no SessionEnd; scrub Stop cleanup)`
+            : ''),
+        steps,
+        apply() {
+          if (steps.length === 1) {
+            return steps[0].apply();
+          }
+          const results = steps.map((s) => s.apply());
+          const primary = results.find((r) => !r.skipped) || results[0];
+          return {
+            ...primary,
+            results,
+            write: () => {
+              for (const r of results) {
+                if (!r.skipped && r.write) r.write();
+              }
+            },
+          };
         },
       };
     },
@@ -1165,26 +1675,46 @@ module.exports = {
   getClient,
   canonicalClientId,
   appSupport,
+  clineSettingsPath,
+  rooSettingsPath,
+  normalizeComparablePath,
+  sameComparablePath,
   // OpenCode / DSH helpers (tests)
   mergeOpenCodeMcpFile: opencodeMod.mergeOpenCodeMcpFile,
   detectOpenCodeMcpFormat: opencodeMod.detectOpenCodeMcpFormat,
+  resolveOpenCodeConfigDir: opencodeMod.resolveOpenCodeConfigDir,
+  resolveOpenCodePluginPath: opencodeMod.resolveOpenCodePluginPath,
   resolveOpenCodeConfigPath: opencodeMod.resolveOpenCodeConfigPath,
   mergeDshCordisPatch: dshMod.mergeDshCordisPatch,
+  resolveDshHome: dshMod.resolveDshHome,
+  resolveDshPatchPath: dshMod.resolveDshPatchPath,
   resolveDshPluginSource: dshMod.resolveDshPluginSource,
   resolveDshPluginInstallDirs: dshMod.resolveDshPluginInstallDirs,
   OPENCODE_GUARD_TS: opencodeMod.OPENCODE_GUARD_TS,
+  renderOpenCodeGuardTs: opencodeMod.renderOpenCodeGuardTs,
   parseJsonc: require('./jsonc').parseJsonc,
-  // Codebuddy / Grok / Kimi / ZCode / Cursor helpers (tests)
+  // Claude Code / Codebuddy / Grok / Kimi / ZCode / Cursor helpers (tests)
+  resolveClaudeConfigDir: claudeCodeMod.resolveClaudeConfigDir,
+  resolveClaudeMcpPath: claudeCodeMod.resolveClaudeMcpPath,
+  resolveClaudeSettingsPath: claudeCodeMod.resolveClaudeSettingsPath,
+  mergeClaudeCodeHooksSettings: claudeCodeMod.mergeClaudeCodeHooksSettings,
+  CLAUDE_CODE_REMIND_MATCHER: claudeCodeMod.REMIND_MATCHER,
+  resolveCodebuddyConfigDir: codebuddyMod.resolveCodebuddyConfigDir,
   resolveCodebuddyMcpPath: codebuddyMod.resolveCodebuddyMcpPath,
+  resolveCodebuddySettingsPath: codebuddyMod.resolveCodebuddySettingsPath,
   mergeCodebuddyHooksSettings: codebuddyMod.mergeCodebuddyHooksSettings,
+  resolveGrokConfigDir: grokMod.resolveGrokConfigDir,
   resolveGrokConfigToml: grokMod.resolveGrokConfigToml,
   resolveGrokHooksPath: grokMod.resolveGrokHooksPath,
   mergeGrokHooksFile: grokMod.mergeGrokHooksFile,
+  resolveKimiConfigDir: kimicodeMod.resolveKimiConfigDir,
   resolveKimiMcpPath: kimicodeMod.resolveKimiMcpPath,
   resolveKimiConfigToml: kimicodeMod.resolveKimiConfigToml,
   mergeKimiHooksToml: kimicodeMod.mergeKimiHooksToml,
+  resolveZcodeConfigDir: zcodeMod.resolveZcodeConfigDir,
   resolveZcodeConfigPath: zcodeMod.resolveZcodeConfigPath,
   mergeZcodeConfigFile: zcodeMod.mergeZcodeConfigFile,
+  resolveCursorConfigDir: cursorMod.resolveCursorConfigDir,
   resolveCursorHooksPath: cursorMod.resolveCursorHooksPath,
   mergeCursorHooksFile: cursorMod.mergeCursorHooksFile,
   CURSOR_REMIND_MATCHER: cursorMod.REMIND_MATCHER,

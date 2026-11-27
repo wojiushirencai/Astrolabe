@@ -221,8 +221,10 @@ pub fn ensure_installed_with(
 ) -> Result<PathBuf, InstallError> {
     validate_spec(spec)?;
     let dest = spec.binary_path(&ctx.cache_root);
-    if is_runnable(&dest) && spec.marker_path(&ctx.cache_root).is_file() {
-        return Ok(dest);
+    if spec.marker_path(&ctx.cache_root).is_file() {
+        if let Some(resolved) = resolve_runnable_in(&dest, cfg!(windows)) {
+            return Ok(resolved);
+        }
     }
 
     if ctx.offline {
@@ -244,8 +246,10 @@ pub fn ensure_installed_with(
         .map_err(|e| InstallError::Lock(spec.name.clone(), e.to_string()))?;
 
     // Re-check after lock: another process may have finished.
-    if is_runnable(&dest) && spec.marker_path(&ctx.cache_root).is_file() {
-        return Ok(dest);
+    if spec.marker_path(&ctx.cache_root).is_file() {
+        if let Some(resolved) = resolve_runnable_in(&dest, cfg!(windows)) {
+            return Ok(resolved);
+        }
     }
 
     let url = rewrite_mirror(&spec.url, ctx.mirror_github.as_deref());
@@ -295,7 +299,7 @@ pub fn ensure_installed_with(
     write_marker(spec, &ctx.cache_root)?;
 
     let final_bin = spec.binary_path(&ctx.cache_root);
-    if !is_runnable(&final_bin) {
+    let Some(resolved) = resolve_runnable_in(&final_bin, cfg!(windows)) else {
         return Err(InstallError::Extract(
             spec.name.clone(),
             format!(
@@ -303,8 +307,8 @@ pub fn ensure_installed_with(
                 final_bin.display()
             ),
         ));
-    }
-    Ok(final_bin)
+    };
+    Ok(resolved)
 }
 
 fn validate_spec(spec: &InstallSpec) -> Result<(), InstallError> {
@@ -390,12 +394,41 @@ fn env_truthy(key: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn is_runnable(path: &Path) -> bool {
+    is_runnable_in(path, cfg!(windows))
+}
+
+#[cfg(test)]
+fn is_runnable_in(path: &Path, is_windows: bool) -> bool {
+    resolve_runnable_in(path, is_windows).is_some()
+}
+
+fn resolve_runnable_in(path: &Path, is_windows: bool) -> Option<PathBuf> {
+    if !is_windows {
+        return is_runnable_exact(path, false).then(|| path.to_path_buf());
+    }
+    if path.extension().is_some() {
+        return is_runnable_exact(path, true).then(|| path.to_path_buf());
+    }
+    for ext in ["exe", "cmd", "bat"] {
+        let with_ext = path.with_extension(ext);
+        if is_runnable_exact(&with_ext, true) {
+            return Some(with_ext);
+        }
+    }
+    None
+}
+
+fn is_runnable_exact(path: &Path, is_windows: bool) -> bool {
     let Ok(meta) = path.metadata() else {
         return false;
     };
     if !meta.is_file() {
         return false;
+    }
+    if is_windows {
+        return true;
     }
     #[cfg(unix)]
     {
@@ -429,13 +462,9 @@ pub fn find_cached_binary(
     versions.sort();
     for dir in versions.into_iter().rev() {
         let candidate = dir.join(binary_relative);
-        let marker = dir.join(".installed");
-        if is_runnable(&candidate) && marker.is_file() {
-            return Some(candidate);
-        }
-        // Accept runnable binary even without marker (manual drop-in).
-        if is_runnable(&candidate) {
-            return Some(candidate);
+        let _marker = dir.join(".installed");
+        if let Some(resolved) = resolve_runnable_in(&candidate, cfg!(windows)) {
+            return Some(resolved);
         }
     }
     None
@@ -784,5 +813,53 @@ mod tests {
         assert_eq!(a, b);
         // At most two fetches if both raced before marker; usually one.
         assert!(fetcher.hits.lock().unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn is_runnable_in_windows_probes_exe_and_cmd_when_extensionless() {
+        let dir = scratch();
+        let exe_base = dir.path().join("clangd");
+        assert!(!is_runnable_in(&exe_base, true));
+        fs::write(dir.path().join("clangd.exe"), b"mz").unwrap();
+        assert!(is_runnable_in(&exe_base, true));
+        assert!(!is_runnable_in(&exe_base, false));
+
+        let cmd_base = dir.path().join("tsls");
+        fs::write(dir.path().join("tsls.cmd"), b"@echo off\r\n").unwrap();
+        assert!(is_runnable_in(&cmd_base, true));
+
+        // Explicit extension does not probe `.exe` / `.cmd`.
+        let with_ext = dir.path().join("tool.py");
+        fs::write(dir.path().join("tool.py.exe"), b"mz").unwrap();
+        assert!(!is_runnable_in(&with_ext, true));
+    }
+
+    #[test]
+    fn resolve_runnable_in_windows_ignores_extensionless_and_prefers_windows_exts() {
+        let dir_both = scratch();
+        let tsls_both = dir_both.path().join("tsls");
+        fs::write(&tsls_both, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = fs::metadata(&tsls_both).unwrap().permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&tsls_both, p).unwrap();
+        }
+        let tsls_cmd = dir_both.path().join("tsls.cmd");
+        fs::write(&tsls_cmd, b"@echo off\r\n").unwrap();
+        assert_eq!(resolve_runnable_in(&tsls_both, true), Some(tsls_cmd));
+
+        let dir_only = scratch();
+        let tsls_only = dir_only.path().join("tsls");
+        fs::write(&tsls_only, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = fs::metadata(&tsls_only).unwrap().permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&tsls_only, p).unwrap();
+        }
+        assert_eq!(resolve_runnable_in(&tsls_only, true), None);
     }
 }

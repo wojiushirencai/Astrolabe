@@ -17,7 +17,7 @@
 //! environment-fault detection in [`crate::diag_env`] sees them unchanged.
 
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -213,15 +213,12 @@ fn run(mut cmd: Command, timeout: Duration) -> Result<Output, RunError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    astrolabe_core::process::configure_process_group(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RunError::Missing,
         _ => RunError::Other(e.to_string()),
     })?;
+    let mut tree = astrolabe_core::process::ChildProcessTree::attach(&child);
     let mut out = child.stdout.take();
     let mut err = child.stderr.take();
     let read_out = std::thread::spawn(move || {
@@ -243,7 +240,8 @@ fn run(mut cmd: Command, timeout: Duration) -> Result<Output, RunError> {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                kill_group(&mut child);
+                tree.terminate();
+                let _ = child.kill();
                 let _ = child.wait();
                 let _ = read_out.join();
                 let _ = read_err.join();
@@ -253,24 +251,14 @@ fn run(mut cmd: Command, timeout: Duration) -> Result<Output, RunError> {
             Err(e) => return Err(RunError::Other(e.to_string())),
         }
     };
+    tree.terminate();
+    #[allow(clippy::drop_non_drop)]
+    drop(tree);
     Ok(Output {
         status: status.code(),
         stdout: read_out.join().unwrap_or_default(),
         stderr: read_err.join().unwrap_or_default(),
     })
-}
-
-fn kill_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
 }
 
 fn skipped(tool: &str, error: RunError) -> Outcome {
@@ -289,32 +277,25 @@ fn null_device() -> &'static str {
     }
 }
 
-/// `dir/../x` → `x`, without touching the file system.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
+fn is_abs_path(s: &str) -> bool {
+    if Path::new(s).is_absolute() {
+        return true;
     }
-    out
+    let b = s.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || s.starts_with(r"\\")
+        || s.starts_with("//")
 }
 
 /// Repo-relative path of a tool-printed `file` (relative to `cwd` or
 /// absolute); `None` outside the repo.
 fn repo_rel(root: &Path, cwd: &Path, file: &str) -> Option<RelPath> {
-    let p = Path::new(file);
-    let abs = if p.is_absolute() {
-        normalize(p)
+    let abs = if is_abs_path(file) {
+        PathBuf::from(file)
     } else {
-        normalize(&cwd.join(p))
+        cwd.join(file)
     };
-    let root = normalize(root);
-    let rel = abs.strip_prefix(&root).ok()?;
+    let rel = astrolabe_core::paths::strip_prefix_normalized_with_canonical_fallback(root, &abs)?;
     let s = rel.to_string_lossy().replace('\\', "/");
     (!s.is_empty()).then(|| RelPath::new(s))
 }
@@ -348,10 +329,12 @@ fn find_up(root: &Path, start: &Path, name: &str) -> Option<PathBuf> {
         if d.join(name).is_file() {
             return Some(d.to_path_buf());
         }
-        if d == root {
+        if astrolabe_core::paths::paths_eq_normalized(d, root) {
             break;
         }
-        dir = d.parent().filter(|p| p.starts_with(root));
+        dir = d
+            .parent()
+            .filter(|p| astrolabe_core::paths::is_under_normalized(root, p));
     }
     None
 }
@@ -374,9 +357,7 @@ fn go_check(root: &Path, rel: &RelPath) -> Outcome {
     // module pulled in by `replace`, e.g. aicon's src/third_party/go-qrcode)
     // only builds with the workspace off.
     let mut work_off = go_needs_work_off(&dir, &mod_dir);
-    let pkg = dir
-        .strip_prefix(root)
-        .ok()
+    let pkg = astrolabe_core::paths::strip_prefix_normalized_with_canonical_fallback(root, &dir)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| ".".into());
@@ -502,9 +483,12 @@ fn run_go(
     timeout: Duration,
 ) -> Result<Output, RunError> {
     let started = Instant::now();
+    let go_bin =
+        astrolabe_core::process::resolve_command("go").unwrap_or_else(|| PathBuf::from("go"));
     let go = |off: bool, t: Duration| {
-        let mut cmd = Command::new("go");
-        cmd.args(args).current_dir(dir);
+        let mut cmd = Command::new(&go_bin);
+        cmd.args(args)
+            .current_dir(astrolabe_core::paths::command_cwd(dir));
         if off {
             cmd.env("GOWORK", "off");
         }
@@ -582,12 +566,13 @@ pub(crate) fn go_work_uses(work: &Path, text: &str) -> Vec<PathBuf> {
         if spec.is_empty() {
             continue;
         }
-        let p = Path::new(spec);
-        out.push(normalize(&if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            base.join(p)
-        }));
+        out.push(astrolabe_core::paths::lexical_normalize(
+            &if is_abs_path(spec) {
+                PathBuf::from(spec)
+            } else {
+                base.join(spec)
+            },
+        ));
     }
     out
 }
@@ -600,8 +585,9 @@ fn go_needs_work_off(dir: &Path, mod_dir: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(&work) else {
         return false;
     };
-    let module = normalize(mod_dir);
-    !go_work_uses(&work, &text).contains(&module)
+    !go_work_uses(&work, &text)
+        .iter()
+        .any(|u| astrolabe_core::paths::paths_eq_normalized(u, mod_dir))
 }
 
 /// `go vet` output that means the package (or a dependency) does not build:
@@ -721,13 +707,15 @@ fn rust_check(root: &Path, rel: &RelPath) -> Outcome {
     };
     let in_targets = ["tests", "benches", "examples"]
         .iter()
-        .any(|t| file.starts_with(krate.join(t)));
-    let mut cmd = Command::new("cargo");
+        .any(|t| astrolabe_core::paths::is_under_normalized(&krate.join(t), &file));
+    let cargo_bin =
+        astrolabe_core::process::resolve_command("cargo").unwrap_or_else(|| PathBuf::from("cargo"));
+    let mut cmd = Command::new(cargo_bin);
     cmd.args(["check", "--message-format=json", "--quiet"]);
     if in_targets {
         cmd.arg("--all-targets");
     }
-    cmd.current_dir(&krate);
+    cmd.current_dir(astrolabe_core::paths::command_cwd(&krate));
     let out = match run(cmd, timeout_for(90)) {
         Ok(out) => out,
         Err(e) => return skipped("cargo check", e),
@@ -736,12 +724,11 @@ fn rust_check(root: &Path, rel: &RelPath) -> Outcome {
     // Cargo.toml with a [workspace] table (or the crate itself).
     let ws = workspace_root(root, &krate);
     let diags = parse_cargo(root, &ws, rel, &out.stdout, &out.stderr);
-    let scope = krate
-        .strip_prefix(root)
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| ".".into());
+    let scope =
+        astrolabe_core::paths::strip_prefix_normalized_with_canonical_fallback(root, &krate)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| ".".into());
     Outcome::Ran {
         tool: if in_targets {
             "cargo check --all-targets"
@@ -756,7 +743,7 @@ fn rust_check(root: &Path, rel: &RelPath) -> Outcome {
 fn workspace_root(root: &Path, krate: &Path) -> PathBuf {
     let mut best = krate.to_path_buf();
     let mut dir = krate.parent();
-    while let Some(d) = dir.filter(|d| d.starts_with(root)) {
+    while let Some(d) = dir.filter(|d| astrolabe_core::paths::is_under_normalized(root, d)) {
         if std::fs::read_to_string(d.join("Cargo.toml")).is_ok_and(|t| t.contains("[workspace]")) {
             best = d.to_path_buf();
         }
@@ -865,13 +852,20 @@ fn ts_check(root: &Path, rel: &RelPath) -> Outcome {
                 found = Some(bin);
                 break;
             }
-            d = p.parent().filter(|x| x.starts_with(root));
+            d = p
+                .parent()
+                .filter(|x| astrolabe_core::paths::is_under_normalized(root, x));
         }
         found
     };
-    let mut cmd = Command::new(local.as_deref().unwrap_or(Path::new("tsc")));
+    let tsc_bin = local
+        .map(|p| astrolabe_core::paths::command_cwd(&p))
+        .unwrap_or_else(|| {
+            astrolabe_core::process::resolve_command("tsc").unwrap_or_else(|| PathBuf::from("tsc"))
+        });
+    let mut cmd = Command::new(tsc_bin);
     cmd.args(["--noEmit", "--pretty", "false", "-p", "tsconfig.json"])
-        .current_dir(&project);
+        .current_dir(astrolabe_core::paths::command_cwd(&project));
     let out = match run(cmd, timeout_for(45)) {
         Ok(out) => out,
         Err(e) => return skipped("tsc", e),
@@ -882,13 +876,12 @@ fn ts_check(root: &Path, rel: &RelPath) -> Outcome {
         rel,
         &format!("{}\n{}", out.stdout, out.stderr),
     );
-    let scope = project
-        .strip_prefix(root)
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .filter(|p| !p.is_empty())
-        .map(|p| format!("{p}/tsconfig.json"))
-        .unwrap_or_else(|| "tsconfig.json".into());
+    let scope =
+        astrolabe_core::paths::strip_prefix_normalized_with_canonical_fallback(root, &project)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty())
+            .map(|p| format!("{p}/tsconfig.json"))
+            .unwrap_or_else(|| "tsconfig.json".into());
     Outcome::Ran {
         tool: "tsc --noEmit",
         scope,
@@ -962,19 +955,24 @@ except SyntaxError as e:\n print('%s\\t%s\\t%s: %s'%(e.lineno or 1,e.offset or 1
 except ValueError as e:\n print('1\\t1\\tValueError: %s'%e)\n";
 
 fn python_check(root: &Path, rel: &RelPath) -> Outcome {
-    let interpreter = [
-        ".venv/bin/python",
-        "venv/bin/python",
-        ".venv/Scripts/python.exe",
-    ]
-    .iter()
-    .map(|p| root.join(p))
-    .find(|p| p.is_file())
-    .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }));
+    let default_py = if cfg!(windows) { "python" } else { "python3" };
+    #[cfg(windows)]
+    let candidates = [".venv/Scripts/python.exe", "venv/Scripts/python.exe"];
+    #[cfg(not(windows))]
+    let candidates = [".venv/bin/python", "venv/bin/python"];
+    let interpreter = candidates
+        .iter()
+        .map(|p| root.join(p))
+        .find(|p| p.is_file())
+        .map(|p| astrolabe_core::paths::command_cwd(&p))
+        .unwrap_or_else(|| {
+            astrolabe_core::process::resolve_command(default_py)
+                .unwrap_or_else(|| PathBuf::from(default_py))
+        });
     let mut cmd = Command::new(&interpreter);
     cmd.args(["-B", "-c", PY_SCRIPT])
-        .arg(root.join(rel.as_str()))
-        .current_dir(root);
+        .arg(astrolabe_core::paths::command_cwd(&root.join(rel.as_str())))
+        .current_dir(astrolabe_core::paths::command_cwd(root));
     let out = match run(cmd, timeout_for(10)) {
         Ok(out) => out,
         Err(e) => return skipped("python", e),
@@ -1066,13 +1064,15 @@ mod tests {
     }
 
     fn have(bin: &str) -> bool {
-        Command::new(bin)
+        let bin =
+            astrolabe_core::process::resolve_command(bin).unwrap_or_else(|| PathBuf::from(bin));
+        Command::new(&bin)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok()
-            || Command::new(bin)
+            || Command::new(&bin)
                 .arg("version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1421,5 +1421,44 @@ FAIL\tex.com/m/p [build failed]\n";
             ),
             Err(RunError::Missing)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_terminates_grandchild_holding_pipes_without_deadlock() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "(sleep 30) & exit 0"]);
+        let t = Instant::now();
+        let out = match run(cmd, Duration::from_secs(5)) {
+            Ok(out) => out,
+            Err(RunError::Missing) => return,
+            Err(RunError::TimedOut(d)) => panic!("timed out after {d:?}"),
+            Err(RunError::Other(e)) => panic!("unexpected error: {e}"),
+        };
+        assert_eq!(out.status, Some(0));
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "elapsed: {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn repo_rel_handles_windows_verbatim_and_drive_case() {
+        let root = Path::new(r"\\?\C:\repo");
+        assert_eq!(
+            repo_rel(root, root, r"C:\repo\src\a.ts"),
+            Some(RelPath::new("src/a.ts"))
+        );
+        assert_eq!(
+            repo_rel(root, root, r"c:\repo\Src\A.ts"),
+            Some(RelPath::new("Src/A.ts"))
+        );
+        assert_eq!(
+            repo_rel(root, Path::new(r"\\?\C:\repo\web"), r"src\a.ts"),
+            Some(RelPath::new("web/src/a.ts"))
+        );
+        assert_eq!(repo_rel(root, root, r"C:\other\src\a.ts"), None);
+        assert_eq!(repo_rel(root, root, r"..\outside\a.ts"), None);
     }
 }

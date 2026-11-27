@@ -28,7 +28,7 @@ pub(crate) struct RecentSymbols {
 }
 
 fn key(root: &Path, symbol: &str) -> String {
-    format!("{}\0{}", root.display(), symbol)
+    format!("{}\0{}", astrolabe_core::paths::path_norm_key(root), symbol)
 }
 
 impl RecentSymbols {
@@ -100,5 +100,27 @@ mod tests {
         store.remember(&root, "Init", "", None);
         assert!(store.recall(&root, "Init").is_none());
         assert!(store.recall(&root, "  ").is_none());
+    }
+
+    #[test]
+    fn windows_verbatim_plain_and_slash_roots_share_cache_key() {
+        let store = RecentSymbols::new();
+        let verbatim = Path::new(r"\\?\C:\repo");
+        let plain = Path::new(r"C:\repo");
+        let lower_slash = Path::new("c:/repo/");
+
+        assert_eq!(key(verbatim, "Init"), key(plain, "Init"));
+        assert_eq!(key(verbatim, "Init"), key(lower_slash, "Init"));
+
+        store.remember(verbatim, "Init", "src/lib.rs", Some(42));
+        let hit_plain = store.recall(plain, "Init").expect("recall via plain");
+        assert_eq!(hit_plain.path, "src/lib.rs");
+        assert_eq!(hit_plain.line, Some(42));
+
+        let hit_slash = store
+            .recall(lower_slash, "Init")
+            .expect("recall via lower slash");
+        assert_eq!(hit_slash.path, "src/lib.rs");
+        assert_eq!(hit_slash.line, Some(42));
     }
 }

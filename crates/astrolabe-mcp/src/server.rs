@@ -1737,6 +1737,44 @@ fn structured_output_for(context: &ClientContext) -> bool {
     structured_output_override().unwrap_or_else(|| context.structured_or_auto_off())
 }
 
+/// 解析 `ASTROLABE_ALWAYS_LOAD`：默认开启 `true`，显式传入
+/// `0|false|no|off`（大小写不敏感）时关闭。
+fn parse_always_load(raw: Option<&str>) -> bool {
+    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    !matches!(
+        val.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn always_load_enabled() -> bool {
+    parse_always_load(std::env::var("ASTROLABE_ALWAYS_LOAD").ok().as_deref())
+}
+
+const DEFAULT_BUILD_WAIT_MS: u64 = 2_000;
+const MAX_BUILD_WAIT_MS: u64 = 30_000;
+
+/// 解析 `ASTROLABE_BUILD_WAIT_MS`：默认 2000ms，0 禁用等待，上限 30_000ms 防误配。
+fn parse_build_wait_ms(raw: Option<&str>) -> std::time::Duration {
+    let ms = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUILD_WAIT_MS)
+        .min(MAX_BUILD_WAIT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn build_wait_budget_from_env() -> std::time::Duration {
+    parse_build_wait_ms(std::env::var("ASTROLABE_BUILD_WAIT_MS").ok().as_deref())
+}
+
+fn is_cursor_context(name: &str) -> bool {
+    name == "cursor" || name.starts_with("cursor")
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct BudgetOnly {
     #[serde(default)]
@@ -2018,6 +2056,14 @@ type AgentSentRanges = HashMap<String, HashMap<String, (u64, u64)>>;
 /// Per-agent map of already-returned search/resolve digests (agent → result key → digest).
 type AgentSearchDigests = HashMap<String, HashMap<String, String>>;
 
+struct LiveLockGuard(#[allow(dead_code)] crate::hooks::CursorLiveLock);
+
+impl std::fmt::Debug for LiveLockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveLockGuard").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
     /// Parent (multi) or the single index root. Memory tools use this;
@@ -2063,6 +2109,13 @@ pub struct AstrolabeServer {
     /// Last unambiguous symbol → path[:line] from find_symbol / goto_def
     /// in this MCP process, so find_refs can inherit a missing path.
     recent_symbols: Arc<crate::recent_symbol::RecentSymbols>,
+    /// Whether `list_tools` injects `_meta["anthropic/alwaysLoad"]: true`.
+    always_load: bool,
+    /// Optional per-instance override for `ASTROLABE_BUILD_WAIT_MS` (tests).
+    build_wait_budget: Option<std::time::Duration>,
+    /// Kernel live lock held while serving a Cursor MCP session so hooks can
+    /// verify the server process is alive; released automatically on drop.
+    _cursor_live_lock: Option<Arc<LiveLockGuard>>,
 }
 
 impl AstrolabeServer {
@@ -2088,7 +2141,27 @@ impl AstrolabeServer {
         budget_bytes: u64,
         context: ClientContext,
     ) -> Self {
-        Self::assemble(root, budget_bytes, context, McpKnobs::from_env(), None)
+        Self::assemble(
+            root,
+            budget_bytes,
+            context,
+            McpKnobs::from_env(),
+            None,
+            true,
+        )
+    }
+
+    /// Catalog-only stand-in used by [`StartupFailedServer`]: never indexed
+    /// and never acquires a project live lock on `temp_dir()`.
+    fn new_placeholder(root: PathBuf, context: ClientContext) -> Self {
+        Self::assemble(
+            root,
+            cache_budget_from_env(),
+            context,
+            McpKnobs::from_env(),
+            None,
+            false,
+        )
     }
 
     /// Multi-project dispatch mode: do not index the parent; children activate
@@ -2113,7 +2186,7 @@ impl AstrolabeServer {
             tracing::info!(child = %child.display(), "multi-project child");
         }
         let dispatch = DispatchState::new(children, knobs.clone(), budget);
-        Self::assemble(root, budget, context, knobs, Some(dispatch))
+        Self::assemble(root, budget, context, knobs, Some(dispatch), true)
     }
 
     #[cfg(test)]
@@ -2134,6 +2207,7 @@ impl AstrolabeServer {
             ClientContext::default_builtin(),
             knobs,
             Some(dispatch),
+            true,
         )
     }
 
@@ -2145,7 +2219,20 @@ impl AstrolabeServer {
             ClientContext::default_builtin(),
             knobs,
             None,
+            true,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_always_load(mut self, enabled: bool) -> Self {
+        self.always_load = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_build_wait_budget(mut self, budget: std::time::Duration) -> Self {
+        self.build_wait_budget = Some(budget);
+        self
     }
 
     fn assemble(
@@ -2154,13 +2241,22 @@ impl AstrolabeServer {
         context: ClientContext,
         knobs: McpKnobs,
         dispatch: Option<Arc<DispatchState>>,
+        acquire_live_lock: bool,
     ) -> Self {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let structured_output = structured_output_for(&context);
+        let always_load = always_load_enabled();
+        let cursor_live_lock = if acquire_live_lock && is_cursor_context(&context.name) {
+            crate::hooks::acquire_cursor_live_lock(&root).map(|lock| Arc::new(LiveLockGuard(lock)))
+        } else {
+            None
+        };
         tracing::info!(
             root = %root.display(),
             context = %context.name,
             structured_output,
+            always_load,
+            cursor_live_lock = cursor_live_lock.is_some(),
             cache_budget_bytes = budget_bytes,
             "configured bounded file cache"
         );
@@ -2193,6 +2289,9 @@ impl AstrolabeServer {
             shared: None,
             coverage_note_override: None,
             recent_symbols: Arc::new(crate::recent_symbol::RecentSymbols::new()),
+            always_load,
+            build_wait_budget: None,
+            _cursor_live_lock: cursor_live_lock,
         }
     }
 
@@ -2343,8 +2442,11 @@ impl AstrolabeServer {
     /// Wake a hard-hibernated index and wait briefly (bounded) for its warm
     /// start, so every indexed tool path gets a served snapshot instead of a
     /// "building" answer. Also joins an in-flight warm wake.
-    fn wake_if_hibernated(&self, session: &Arc<RootSession>) {
-        session.ensure_awake();
+    ///
+    /// Returns `true` iff this call executed a warm-wake wait (even if it timed
+    /// out or was cancelled).
+    fn wake_if_hibernated(&self, session: &Arc<RootSession>) -> bool {
+        session.ensure_awake_tracked().1
     }
 
     /// Resolve optional per-call `index_root`, then fall back to multi-project
@@ -2777,7 +2879,26 @@ confidence: unknown"
         };
         // A hibernated index has no snapshot to serve: warm-start it first
         // (bounded), then run the ordinary freshness barrier on the result.
-        self.wake_if_hibernated(&session);
+        let wake_waited = self.wake_if_hibernated(&session);
+        if cancel::is_cancelled() {
+            return text_error("Request cancelled. confidence: unknown");
+        }
+        let budget = self
+            .build_wait_budget
+            .unwrap_or_else(build_wait_budget_from_env);
+        if !wake_waited
+            && !budget.is_zero()
+            && !session.closed.load(Ordering::SeqCst)
+            && matches!(
+                &*session.state.read().unwrap_or_else(|e| e.into_inner()),
+                IndexState::Building
+            )
+        {
+            session.wait_while_building(budget);
+            if cancel::is_cancelled() {
+                return text_error("Request cancelled. confidence: unknown");
+            }
+        }
         let effect = if barrier {
             run_barrier(&session)
         } else {
@@ -2905,6 +3026,16 @@ confidence: unknown"
             // (`isConcurrencySafe`); without it they queue serially. A tool
             // that writes must not get this hint.
             tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+            if self.always_load {
+                let mut meta = rmcp::model::MetaObject::new();
+                meta.insert(
+                    "anthropic/alwaysLoad".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                tool.meta = Some(meta);
+            } else {
+                tool.meta = None;
+            }
         }
         if self.context.openai_tool_compatible() {
             for tool in &mut tools {
@@ -3192,7 +3323,7 @@ fn slim_schema(value: &mut Value) {
 ///
 /// `call_tool` sets a per-thread flag; long loops may poll [`is_cancelled`]
 /// and bail out early. Tool bodies are synchronous and cannot be preempted.
-mod cancel {
+pub(crate) mod cancel {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -3201,7 +3332,7 @@ mod cancel {
         static FLAG: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn scope<T>(flag: Arc<AtomicBool>, f: impl FnOnce() -> T) -> T {
+    pub(crate) fn scope<T>(flag: Arc<AtomicBool>, f: impl FnOnce() -> T) -> T {
         FLAG.with(|cell| *cell.borrow_mut() = Some(flag));
         let out = f();
         FLAG.with(|cell| *cell.borrow_mut() = None);
@@ -3214,7 +3345,7 @@ mod cancel {
         FLAG.with(|cell| cell.borrow().clone())
     }
 
-    pub(super) fn is_cancelled() -> bool {
+    pub(crate) fn is_cancelled() -> bool {
         FLAG.with(|cell| {
             cell.borrow()
                 .as_ref()
@@ -3340,7 +3471,7 @@ impl StartupFailedServer {
     pub fn new(message: impl Into<String>, context: ClientContext) -> Self {
         let message = message.into();
         // Only supplies the catalog and protocol negotiation; never indexed.
-        let inner = AstrolabeServer::with_context(std::env::temp_dir(), context);
+        let inner = AstrolabeServer::new_placeholder(std::env::temp_dir(), context);
         Self { message, inner }
     }
 
@@ -12692,10 +12823,21 @@ mod mcp_routing_tests {
             bytes <= TOOLS_LIST_MAX_BYTES,
             "tools/list is {bytes} B, limit {TOOLS_LIST_MAX_BYTES} B (v0.15.0: ~7,300 B)"
         );
+        // Strip `_meta` and guard the pure Schema + Description footprint at <= 5,200 B.
+        let mut stripped = tools.clone();
+        for tool in &mut stripped {
+            tool.meta = None;
+        }
+        let stripped_bytes = serde_json::to_vec(&stripped).unwrap().len();
+        assert!(
+            stripped_bytes <= 5_200,
+            "tools/list without _meta is {stripped_bytes} B, limit 5200 B"
+        );
     }
 
-    /// Upper bound for the compact `tools` array. Raise only with a reason.
-    const TOOLS_LIST_MAX_BYTES: usize = 5_200;
+    /// Upper bound for the compact `tools` array (+252 B from 7 × `_meta["anthropic/alwaysLoad"]`).
+    /// Raise only with a reason.
+    const TOOLS_LIST_MAX_BYTES: usize = 5_600;
 
     /// Snapshot of the advertised parameters. Everything else is still
     /// accepted (see `unadvertised_params_are_still_accepted`); add a name
@@ -12981,5 +13123,238 @@ mod mcp_routing_tests {
             assert!(cancel::is_cancelled());
         });
         assert!(!cancel::is_cancelled());
+    }
+
+    #[test]
+    fn listed_tools_injects_always_load_meta_and_respects_toggle() {
+        assert!(parse_always_load(None));
+        assert!(parse_always_load(Some("")));
+        assert!(parse_always_load(Some("1")));
+        assert!(parse_always_load(Some("true")));
+        assert!(!parse_always_load(Some("0")));
+        assert!(!parse_always_load(Some("false")));
+        assert!(!parse_always_load(Some("FALSE")));
+        assert!(!parse_always_load(Some("No")));
+        assert!(!parse_always_load(Some("oFf")));
+
+        let dir = tmp("always_load");
+        let enabled_server = AstrolabeServer::new(dir.clone()).with_always_load(true);
+        let tools = enabled_server.listed_tools();
+        assert_eq!(tools.len(), 7);
+        for tool in &tools {
+            let meta = tool
+                .meta
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} missing _meta", tool.name));
+            assert_eq!(
+                meta.get("anthropic/alwaysLoad"),
+                Some(&Value::Bool(true)),
+                "{} must set _meta[\"anthropic/alwaysLoad\"] = true",
+                tool.name
+            );
+        }
+
+        let disabled_server = AstrolabeServer::new(dir.clone()).with_always_load(false);
+        for tool in disabled_server.listed_tools() {
+            assert!(
+                tool.meta.is_none(),
+                "{} must omit _meta when always_load is off",
+                tool.name
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_tools_is_byte_deterministic_and_never_declares_list_changed() {
+        let dir_a = tmp("det_a");
+        let dir_b = tmp("det_b");
+        let server_a = AstrolabeServer::new(dir_a.clone());
+        let server_b = AstrolabeServer::new(dir_b.clone());
+
+        let json_a = serde_json::to_string(&server_a.listed_tools()).unwrap();
+        let json_b = serde_json::to_string(&server_b.listed_tools()).unwrap();
+        assert_eq!(json_a, json_b, "tools/list JSON must be byte-identical");
+
+        let tools_cap = server_a
+            .get_info()
+            .capabilities
+            .tools
+            .expect("tools capability must be enabled");
+        assert!(
+            tools_cap.list_changed.is_none(),
+            "must never declare tools/list_changed, got {:?}",
+            tools_cap.list_changed
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn build_wait_budget_parsing_respects_default_zero_and_cap() {
+        assert_eq!(parse_build_wait_ms(None), Duration::from_millis(2_000));
+        assert_eq!(parse_build_wait_ms(Some("")), Duration::from_millis(2_000));
+        assert_eq!(
+            parse_build_wait_ms(Some("bad")),
+            Duration::from_millis(2_000)
+        );
+        assert_eq!(parse_build_wait_ms(Some("0")), Duration::ZERO);
+        assert_eq!(parse_build_wait_ms(Some("500")), Duration::from_millis(500));
+        assert_eq!(
+            parse_build_wait_ms(Some("999999")),
+            Duration::from_millis(30_000)
+        );
+    }
+
+    #[test]
+    fn with_index_barrier_waits_for_building_transition_to_ready() {
+        let dir = tmp("wait_ready");
+        std::fs::write(dir.join("a.py"), "def cold_start_target():\n    return 1\n").unwrap();
+        let mut server =
+            AstrolabeServer::new(dir.clone()).with_build_wait_budget(Duration::from_millis(1_000));
+        server.structured_output = false;
+
+        let session = Arc::clone(&server.primary);
+        let build_dir = dir.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let built = crate::session::build_index(&build_dir, false, 0);
+            assert!(matches!(built, IndexState::Ready(_)));
+            *session.state.write().unwrap() = built;
+            session.notify_state_change();
+        });
+
+        let res = server.with_index_barrier("", false, false, |_s, index| {
+            let count = index.graph().symbols.len();
+            CallToolResult::success(vec![ContentBlock::text(format!("ready symbols={count}"))])
+        });
+        producer.join().unwrap();
+
+        let body = text(&res);
+        assert!(
+            res.is_error != Some(true) && !body.contains("Index is building"),
+            "with_index_barrier should wait for Ready, got: {body}"
+        );
+        assert!(body.contains("ready symbols="), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_index_barrier_returns_building_error_when_wait_budget_expires() {
+        let dir = tmp("wait_timeout");
+        let server =
+            AstrolabeServer::new(dir.clone()).with_build_wait_budget(Duration::from_millis(20));
+
+        let res = server.with_index_barrier("", false, false, |_s, _index| {
+            CallToolResult::success(vec![ContentBlock::text("unexpected ready")])
+        });
+        let body = text(&res);
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            body.contains("Index is building in the background"),
+            "expected building error after budget timeout, got: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_index_barrier_does_not_stack_build_wait_onto_wake_wait() {
+        let dir = tmp("no_stack_wake_wait");
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let server = AstrolabeServer::new_with_knobs(dir.clone(), quiet_knobs(), 8 * 1024 * 1024)
+            .with_build_wait_budget(Duration::from_millis(500));
+
+        *server.primary.state.write().unwrap() = IndexState::Hibernated;
+        *server.primary.wake_wait_override.lock().unwrap() = Some(Duration::from_millis(20));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *server.primary.wake_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        assert!(server.primary.wake_if_hibernated());
+        entered.wait();
+
+        let started = std::time::Instant::now();
+        let res = server.with_index_barrier("", false, false, |_s, _index| {
+            CallToolResult::success(vec![ContentBlock::text("unexpected ready")])
+        });
+        let elapsed = started.elapsed();
+
+        resume.wait();
+        assert!(server.primary.wait_builds_idle(Duration::from_secs(5)));
+
+        let body = text(&res);
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            body.contains("Index is building in the background"),
+            "expected building error after wake wait timeout, got: {body}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "with_index_barrier stacked build_wait_budget onto wake wait: {elapsed:?}"
+        );
+        server.primary.teardown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_index_barrier_interrupts_building_wait_on_cancel() {
+        let dir = tmp("cancel_build_wait");
+        let server = AstrolabeServer::new_with_knobs(dir.clone(), quiet_knobs(), 8 * 1024 * 1024)
+            .with_build_wait_budget(Duration::from_millis(2_000));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_bg = Arc::clone(&flag);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            flag_bg.store(true, Ordering::Relaxed);
+        });
+
+        let started = std::time::Instant::now();
+        let res = cancel::scope(flag, || {
+            server.with_index_barrier("", false, false, |_s, _index| {
+                CallToolResult::success(vec![ContentBlock::text("unexpected ready")])
+            })
+        });
+        let elapsed = started.elapsed();
+        canceller.join().unwrap();
+
+        assert_eq!(res.is_error, Some(true));
+        assert_eq!(text(&res), "Request cancelled. confidence: unknown");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel did not interrupt with_index_barrier promptly: {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_context_acquires_live_lock_and_placeholder_skips_it() {
+        let dir = tmp("cursor_lock");
+        let cursor_ctx = crate::ClientContext::builtin("cursor").unwrap();
+
+        let default_server = AstrolabeServer::new(dir.clone());
+        assert!(default_server._cursor_live_lock.is_none());
+
+        let failed = StartupFailedServer::new("bad root", cursor_ctx.clone());
+        assert!(failed.inner._cursor_live_lock.is_none());
+
+        let cursor_server = AstrolabeServer::with_context(dir.clone(), cursor_ctx);
+        if let Some(lock_path) = crate::hooks::cursor_live_lock_path(&dir) {
+            assert!(cursor_server._cursor_live_lock.is_some());
+            assert_eq!(crate::hooks::is_cursor_live_lock_held(&dir), Some(true));
+            drop(cursor_server);
+            // A parallel test spawning a subprocess (`fork` before `exec`) may briefly
+            // retain an `O_CLOEXEC` fd copy across the drop; wait briefly for release.
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            let mut released = crate::hooks::is_cursor_live_lock_held(&dir);
+            while released == Some(true) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+                released = crate::hooks::is_cursor_live_lock_held(&dir);
+            }
+            assert_eq!(released, Some(false));
+            let _ = std::fs::remove_file(lock_path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -117,14 +117,18 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 std::env::current_exe().ok()
             };
-            let mut command = std::process::Command::new("npx");
+            let npx = astrolabe_core::process::resolve_command("npx")
+                .unwrap_or_else(|| std::path::PathBuf::from("npx"));
+            let mut command = std::process::Command::new(npx);
             command
                 .arg("-y")
                 .arg("@zlnap/astrolabe")
                 .arg("setup")
                 .args(&args);
             if let Some(exe) = current_exe {
-                command.arg("--command").arg(exe);
+                command
+                    .arg("--command")
+                    .arg(astrolabe_core::paths::display_path(&exe));
             }
             let status = command.status();
             match status {
@@ -153,6 +157,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Launch::HooksGc => {
             std::process::exit(astrolabe_mcp::hooks::run_gc());
+        }
+        Launch::HooksSessionStart => {
+            std::process::exit(astrolabe_mcp::hooks::run_session_start());
         }
         Launch::PrintCcSystemPromptOverride => {
             print!(

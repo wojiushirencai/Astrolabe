@@ -33,34 +33,66 @@ const REMIND_MATCHER = 'Shell|Read|Grep|astrolabe-.*|mcp__astrolabe__.*';
 const REMIND_ARGS = ['hooks', 'remind', '--client=cursor'];
 const CLEANUP_ARGS = ['hooks', 'cleanup'];
 
-function resolveCursorHooksPath(home) {
-  return path.join(home, '.cursor', 'hooks.json');
+function expandHome(value, home = os.homedir()) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed === '~') return path.resolve(home);
+  if (trimmed.startsWith('~/') || trimmed.startsWith('~\\')) {
+    const rel = trimmed.slice(2).replace(/^[/\\]+/, '');
+    return rel ? path.resolve(home, rel) : path.resolve(home);
+  }
+  return path.resolve(trimmed);
 }
 
-/** Quote a binary path so hook commands survive spaces (both platforms). */
-function quoteCommandPath(binPath) {
+function readEnvDir(env, names, home = os.homedir()) {
+  if (!env || typeof env !== 'object') return null;
+  for (const name of names) {
+    const raw = env[name];
+    if (typeof raw === 'string' && raw.trim()) {
+      return expandHome(raw, home);
+    }
+  }
+  return null;
+}
+
+function resolveCursorConfigDir(home, env = process.env, configDir = null) {
+  const explicit = expandHome(configDir, home);
+  if (explicit) return explicit;
+  return readEnvDir(env, ['CURSOR_CONFIG_DIR', 'CURSOR_HOME'], home) || path.join(home, '.cursor');
+}
+
+function resolveCursorHooksPath(home, env = process.env, configDir = null) {
+  return path.join(resolveCursorConfigDir(home, env, configDir), 'hooks.json');
+}
+
+/** Quote a binary path so hook commands survive spaces and shell metacharacters. */
+function quoteCommandPath(binPath, platform = process.platform) {
   if (!binPath) return 'astrolabe';
-  if (process.platform === 'win32') {
-    return /\s/.test(binPath) ? `"${binPath}"` : binPath;
+  if (platform === 'win32') {
+    if (binPath.includes('"')) {
+      throw new Error(`Invalid Windows binary path (contains double quote): ${binPath}`);
+    }
+    return /^[A-Za-z0-9_./:\\-]+$/.test(binPath) ? binPath : `"${binPath}"`;
   }
   if (/^[A-Za-z0-9_./:@%+,\-]+$/.test(binPath)) return binPath;
   return `'${binPath.replace(/'/g, `'\\''`)}'`;
 }
 
-function hookCommand(binPath, args) {
-  return [quoteCommandPath(binPath), ...args].join(' ');
+function hookCommand(binPath, args, platform = process.platform) {
+  return [quoteCommandPath(binPath, platform), ...args].join(' ');
 }
 
-function remindEntry(binPath) {
+function remindEntry(binPath, platform = process.platform) {
   return {
-    command: hookCommand(binPath, REMIND_ARGS),
+    command: hookCommand(binPath, REMIND_ARGS, platform),
     matcher: REMIND_MATCHER,
   };
 }
 
-function cleanupEntry(binPath) {
+function cleanupEntry(binPath, platform = process.platform) {
   return {
-    command: hookCommand(binPath, CLEANUP_ARGS),
+    command: hookCommand(binPath, CLEANUP_ARGS, platform),
   };
 }
 
@@ -74,21 +106,68 @@ function entryCommand(entry) {
   return '';
 }
 
-function isAstrolabeHook(entry, subcommand, binPath) {
+/**
+ * Unquote a single shell executable token from a hook command. Supports
+ * Windows double-quoted paths, unquoted paths (preserving backslashes), and
+ * POSIX adjacent single-quoted / escaped-quote segments such as
+ * `'/Users/o'\''neill/bin/astrolabe'`. Returns null if the token contains
+ * unquoted whitespace, shell operators, or malformed quoting.
+ */
+function unquoteHookExecutable(executable) {
+  if (typeof executable !== 'string' || !executable) return null;
+  if (/^"([^"]*)"$/.test(executable)) {
+    return executable.slice(1, -1);
+  }
+  if (/^[^\s"';&|<>`]+$/.test(executable)) {
+    return executable;
+  }
+  const partRe = /'([^']*)'|\\(.)|([^\s'"\\;&|<>`]+)/gy;
+  let out = '';
+  let matched = 0;
+  let match;
+  while ((match = partRe.exec(executable)) !== null) {
+    matched = partRe.lastIndex;
+    if (match[1] !== undefined) out += match[1];
+    else if (match[2] !== undefined) out += match[2];
+    else out += match[3];
+  }
+  return matched === executable.length ? out : null;
+}
+
+function isAstrolabeHookCommand(
+  command,
+  {
+    subcommands = ['session-start', 'remind', 'cleanup'],
+    binPath = null,
+    platform = process.platform,
+  } = {},
+) {
+  if (typeof command !== 'string') return false;
+  const match = command.match(/^\s*(.*?)\s+hooks\s+(session-start|remind|cleanup)(?:\s|$)/);
+  if (!match) return false;
+  const allowed = Array.isArray(subcommands) ? subcommands : [subcommands];
+  if (!allowed.includes(match[2])) return false;
+  const executable = match[1];
+  // Explicit --command paths may have arbitrary names. Otherwise only claim
+  // the actual Astrolabe executable, not another program with similar args.
+  const unquoted = unquoteHookExecutable(executable);
+  if (binPath && (executable === quoteCommandPath(binPath, platform) || unquoted === binPath)) {
+    return true;
+  }
+  if (!unquoted) return false;
+  return /^(?:.*[/\\])?astrolabe(?:\.(?:exe|cmd|bat))?$/i.test(unquoted);
+}
+
+function isAstrolabeHook(entry, subcommand, binPath, platform = process.platform) {
   // Never replace a legacy group containing unrelated hooks as a whole.
   if (entry && !entry.command && Array.isArray(entry.hooks) && entry.hooks.length !== 1) {
     return false;
   }
-  const command = entryCommand(entry);
-  const match = command.match(/^\s*(.*?)\s+hooks\s+(remind|cleanup)(?:\s|$)/);
-  if (!match || match[2] !== subcommand) return false;
-  const executable = match[1];
-  // Explicit --command paths may have arbitrary names. Otherwise only claim
-  // the actual Astrolabe executable, not another program with similar args.
-  if (binPath && executable === quoteCommandPath(binPath)) return true;
-  if (!/^(?:"[^"]*"|'[^']*'|[^\s"';&|<>`]+)$/.test(executable)) return false;
-  const unquoted = executable.replace(/^(?:"([^"]*)"|'([^']*)')$/, (_, a, b) => a || b);
-  return /^(?:.*[/\\])?astrolabe(?:\.(?:exe|cmd|bat))?$/i.test(unquoted);
+  return isAstrolabeHookCommand(entryCommand(entry), {
+    subcommands: [subcommand],
+    binPath,
+    platform,
+  });
 }
 
 /**
@@ -99,7 +178,7 @@ function isAstrolabeHook(entry, subcommand, binPath) {
  */
 function mergeCursorHooksFile(
   filePath,
-  { create = true, existsFn = fs.existsSync, binPath = null } = {},
+  { create = true, existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
 ) {
   let created = false;
   let doc = {};
@@ -123,8 +202,10 @@ function mergeCursorHooksFile(
   let replaced = false;
 
   if (!Array.isArray(hooks.preToolUse)) hooks.preToolUse = [];
-  const remindIdx = hooks.preToolUse.findIndex((entry) => isAstrolabeHook(entry, 'remind', binPath));
-  const nextRemind = remindEntry(binPath);
+  const remindIdx = hooks.preToolUse.findIndex((entry) =>
+    isAstrolabeHook(entry, 'remind', binPath, platform),
+  );
+  const nextRemind = remindEntry(binPath, platform);
   if (remindIdx >= 0) {
     hooks.preToolUse[remindIdx] = nextRemind;
     replaced = true;
@@ -133,8 +214,10 @@ function mergeCursorHooksFile(
   }
 
   if (!Array.isArray(hooks.sessionEnd)) hooks.sessionEnd = [];
-  const cleanupIdx = hooks.sessionEnd.findIndex((entry) => isAstrolabeHook(entry, 'cleanup', binPath));
-  const nextCleanup = cleanupEntry(binPath);
+  const cleanupIdx = hooks.sessionEnd.findIndex((entry) =>
+    isAstrolabeHook(entry, 'cleanup', binPath, platform),
+  );
+  const nextCleanup = cleanupEntry(binPath, platform);
   if (cleanupIdx >= 0) {
     hooks.sessionEnd[cleanupIdx] = nextCleanup;
     replaced = true;
@@ -219,16 +302,20 @@ function projectSlug(projectRoot) {
     .replace(/^-+|-+$/g, '');
 }
 
-function resolveCursorProjectDir(home, projectRoot) {
-  return path.join(home, '.cursor', 'projects', projectSlug(canonicalizePath(projectRoot)));
+function resolveCursorProjectDir(home, projectRoot, { env = process.env, configDir = null } = {}) {
+  return path.join(
+    resolveCursorConfigDir(home, env, configDir),
+    'projects',
+    projectSlug(canonicalizePath(projectRoot)),
+  );
 }
 
-function resolveApprovalPath(home, projectRoot) {
-  return path.join(resolveCursorProjectDir(home, projectRoot), 'mcp-approvals.json');
+function resolveApprovalPath(home, projectRoot, opts) {
+  return path.join(resolveCursorProjectDir(home, projectRoot, opts), 'mcp-approvals.json');
 }
 
-function resolveDisabledPath(home, projectRoot) {
-  return path.join(resolveCursorProjectDir(home, projectRoot), 'mcp-disabled.json');
+function resolveDisabledPath(home, projectRoot, opts) {
+  return path.join(resolveCursorProjectDir(home, projectRoot, opts), 'mcp-disabled.json');
 }
 
 function whichOnPath(cmd, env = process.env) {
@@ -396,13 +483,18 @@ function checkApprovalFile(filePath, { projectRoot, server, serverName = SERVER_
   return { filePath, exists: entries !== null, approved, expectedKey, entries: entries || [] };
 }
 
-function currentServer(home, projectRoot) {
+function currentServer(
+  home,
+  projectRoot,
+  { env = process.env, configDir = null, mcpConfigPath = null } = {},
+) {
   // Project entries override global entries, as in Cursor. Invalid project
   // configuration must not turn a global approval into a successful check.
-  for (const filePath of [
-    path.join(projectRoot, '.cursor', 'mcp.json'),
-    path.join(home, '.cursor', 'mcp.json'),
-  ]) {
+  const candidates = [];
+  if (mcpConfigPath) candidates.push(expandHome(mcpConfigPath, home));
+  candidates.push(path.join(projectRoot, '.cursor', 'mcp.json'));
+  candidates.push(path.join(resolveCursorConfigDir(home, env, configDir), 'mcp.json'));
+  for (const filePath of [...new Set(candidates.filter(Boolean))]) {
     try {
       const doc = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
       if (doc.mcpServers && Object.hasOwn(doc.mcpServers, SERVER_NAME)) {
@@ -434,13 +526,19 @@ function removeAstrolabeFromDisabled(
   return { filePath, skipped: false, changed: doc.length !== parsed.length, doc };
 }
 
-function approvalEnv(env, home) {
+function approvalEnv(env, home, configDir = null) {
   const out = { ...env };
   // cursor-agent reads approvals relative to the user's home; mirror --home
   // so tests (and portable installs) write into the same tree setup targets.
   if (home) {
     out.HOME = home;
     if (process.platform === 'win32') out.USERPROFILE = home;
+  }
+  const hasCustomConfigDir = Boolean(
+    expandHome(configDir, home) || readEnvDir(env, ['CURSOR_CONFIG_DIR', 'CURSOR_HOME'], home),
+  );
+  if (hasCustomConfigDir) {
+    out.CURSOR_CONFIG_DIR = resolveCursorConfigDir(home, env, configDir);
   }
   return out;
 }
@@ -484,14 +582,16 @@ function enableCursorApproval({
   home,
   projectRoot,
   env = process.env,
+  configDir = null,
+  mcpConfigPath = null,
   whichFn = whichOnPath,
   spawnFn = spawnSync,
   existsFn = fs.existsSync,
   platform = process.platform,
 } = {}) {
   const root = canonicalizePath(projectRoot);
-  const approvalPath = resolveApprovalPath(home, root);
-  const disabledPath = resolveDisabledPath(home, root);
+  const approvalPath = resolveApprovalPath(home, root, { env, configDir });
+  const disabledPath = resolveDisabledPath(home, root, { env, configDir });
 
   let disabled = null;
   try {
@@ -504,7 +604,10 @@ function enableCursorApproval({
   if (!agent) {
     return {
       available: false,
-      approval: checkApprovalFile(approvalPath, { projectRoot: root, server: currentServer(home, root) }),
+      approval: checkApprovalFile(approvalPath, {
+        projectRoot: root,
+        server: currentServer(home, root, { env, configDir, mcpConfigPath }),
+      }),
       disabled,
       root,
       approvalPath,
@@ -515,11 +618,12 @@ function enableCursorApproval({
     spawnFn,
     agent,
     ['mcp', 'enable', SERVER_NAME],
-    { cwd: root, env: approvalEnv(env, home) },
+    { cwd: root, env: approvalEnv(env, home, configDir) },
     platform,
   );
   const approval = checkApprovalFile(approvalPath, {
-    projectRoot: root, server: currentServer(home, root),
+    projectRoot: root,
+    server: currentServer(home, root, { env, configDir, mcpConfigPath }),
   });
   if (result.status !== 0 || result.error || result.signal) approval.approved = false;
   return {
@@ -546,8 +650,14 @@ module.exports = {
   CLEANUP_ARGS,
   FALLBACK_L1_TEMPLATE,
   spawnCursorAgent,
+  expandHome,
+  readEnvDir,
+  resolveCursorConfigDir,
   resolveCursorHooksPath,
   quoteCommandPath,
+  unquoteHookExecutable,
+  isAstrolabeHookCommand,
+  isAstrolabeHook,
   hookCommand,
   remindEntry,
   cleanupEntry,
@@ -568,5 +678,6 @@ module.exports = {
   approvalKey,
   checkApprovalFile,
   removeAstrolabeFromDisabled,
+  approvalEnv,
   enableCursorApproval,
 };

@@ -26,6 +26,8 @@ fn fixture(nm: &Path, tag: &str) -> PathBuf {
     std::fs::create_dir_all(root.join("src")).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(nm, root.join("node_modules")).unwrap();
+    #[cfg(not(unix))]
+    let _ = nm;
     std::fs::write(root.join("package.json"), r#"{"name":"fx","private":true}"#).unwrap();
     std::fs::write(
         root.join("tsconfig.json"),

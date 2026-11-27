@@ -163,7 +163,9 @@ pub fn is_default_excluded_dir(root: &Path, dir: &Path) -> bool {
         return false;
     }
     match dir.parent() {
-        Some(parent) => parent == root || dir_is_project_root(parent),
+        Some(parent) => {
+            crate::paths::paths_eq_normalized(parent, root) || dir_is_project_root(parent)
+        }
         None => false,
     }
 }
@@ -593,8 +595,8 @@ fn is_pruned_dir(entry: &DirEntry, root: &Path, excludes: &ExcludeMatcher) -> bo
 }
 
 fn path_to_rel(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
+    crate::paths::strip_prefix_normalized(root, path)
+        .unwrap_or_else(|| path.to_path_buf())
         .to_string_lossy()
         .replace('\\', "/")
 }
@@ -1508,6 +1510,26 @@ mod tests {
             PathAdmission::Indexed,
             "a new (mtime, len) must miss the cache and re-sniff"
         );
+    }
+
+    #[test]
+    fn normalized_root_matching_handles_verbatim_and_trailing_slashes() {
+        assert_eq!(
+            path_to_rel(
+                Path::new(r"\\?\C:\Repo\"),
+                Path::new(r"c:\repo\src\Main.rs")
+            ),
+            "src/Main.rs"
+        );
+        assert!(is_default_excluded_dir(
+            Path::new(r"\\?\C:\Repo\"),
+            Path::new("c:/repo/target")
+        ));
+        #[cfg(windows)]
+        assert!(is_default_excluded_dir(
+            Path::new(r"\\?\C:\Repo\"),
+            Path::new(r"c:\repo\target")
+        ));
     }
 
     #[test]

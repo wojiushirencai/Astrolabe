@@ -47,6 +47,7 @@ Subcommands (Serena-style anti-drift hooks and prompt output):
   hooks gc                     remove session state dirs idle longer than 24h (ASTROLABE_HOOK_GC_HOURS tunable);
                                remind also opportunistically runs once per hour
                                (for hosts like ZCode without SessionEnd events)
+  hooks session-start          SessionStart hook: emit static ToolSearch batch-load guidance JSON
   print-cc-system-prompt-override
                                emit Claude Code --system-prompt full replacement text
   setup                        detect local AI clients and write MCP config (implemented in the npm package;
@@ -67,6 +68,8 @@ pub enum Launch {
     HooksCleanup,
     /// `hooks gc`：清理过期会话状态目录
     HooksGc,
+    /// `hooks session-start`：SessionStart hook 输出静态 ToolSearch 引导 JSON
+    HooksSessionStart,
     PrintCcSystemPromptOverride,
     /// npm-shipped interactive MCP client setup (cargo binary prints a hint).
     Setup {
@@ -186,7 +189,7 @@ where
     })
 }
 
-/// `astrolabe hooks <remind|cleanup|gc> [--client=NAME]`：hook 协议入口不索引仓库，
+/// `astrolabe hooks <remind|cleanup|gc|session-start> [--client=NAME]`：hook 协议入口不索引仓库，
 /// 由 main 直接分发到 hooks 模块。
 fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
     // `hooks -h` / `hooks remind --help` should show usage, not "unknown …".
@@ -197,7 +200,9 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
         }
     }
     let Some(sub) = rest.first() else {
-        anyhow::bail!("hooks requires a subcommand: remind | cleanup | gc\n{USAGE}");
+        anyhow::bail!(
+            "hooks requires a subcommand: remind | cleanup | gc | session-start\n{USAGE}"
+        );
     };
     match sub.to_string_lossy().as_ref() {
         "remind" => {
@@ -259,6 +264,15 @@ fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
                 );
             }
             Ok(Launch::HooksGc)
+        }
+        "session-start" => {
+            if rest.len() > 1 {
+                anyhow::bail!(
+                    "unexpected extra argument: {}\n{USAGE}",
+                    rest[1].to_string_lossy()
+                );
+            }
+            Ok(Launch::HooksSessionStart)
         }
         other => anyhow::bail!("unknown hooks subcommand: {other}\n{USAGE}"),
     }
@@ -339,8 +353,18 @@ mod tests {
             parse(&["astrolabe", "hooks", "gc"]),
             Launch::HooksGc
         ));
+        assert!(matches!(
+            parse(&["astrolabe", "hooks", "session-start"]),
+            Launch::HooksSessionStart
+        ));
         assert!(parse_launch_from(
             ["astrolabe", "hooks", "gc", "x"].iter().copied(),
+            None,
+            None
+        )
+        .is_err());
+        assert!(parse_launch_from(
+            ["astrolabe", "hooks", "session-start", "x"].iter().copied(),
             None,
             None
         )

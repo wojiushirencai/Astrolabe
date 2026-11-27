@@ -44,6 +44,10 @@ pub(crate) const NON_SYMBOLIC_THRESHOLD: u32 = 4;
 /// 连续切片读提醒阈值默认值：连续 N 次切片读且期间无任何 astrolabe 工具调用 → deny 提醒。
 /// 实测漂移会话出现过 259 次切片读零拦截（旧实现完全豁免），故切片读改为连续额度制。
 pub(crate) const DEFAULT_SLICE_READ_THRESHOLD: u32 = 10;
+/// `soft-first` 冷态（`!astrolabe_seen`）触发硬 deny 的默认累计次数。
+pub(crate) const DEFAULT_COLD_DENY_THRESHOLD: u32 = 2;
+/// `soft-first` 热态（`astrolabe_seen`）在 SoftNudge 后再连续漂移触发硬 deny 的额外次数。
+pub(crate) const DEFAULT_HARD_EXTRA: u32 = 2;
 
 /// 重置周期（秒）：两次同类调用间隔超过该值才重置计数
 pub(crate) const GREP_RESET_PERIOD_SECONDS: f64 = 1000.0;
@@ -69,8 +73,44 @@ pub(crate) const ENV_READ_THRESHOLD: &str = "ASTROLABE_READ_THRESHOLD";
 pub(crate) const ENV_GREP_THRESHOLD: &str = "ASTROLABE_GREP_THRESHOLD";
 pub(crate) const ENV_DENY_SILENCE_SECS: &str = "ASTROLABE_DENY_SILENCE_SECS";
 pub(crate) const ENV_DENY_TEXT_SEARCH: &str = "ASTROLABE_DENY_TEXT_SEARCH";
+/// Hook 总体干预策略：soft-first（默认）| strict | advisory。
+pub(crate) const ENV_HOOK_MODE: &str = "ASTROLABE_HOOK_MODE";
+pub(crate) const ENV_COLD_DENY_THRESHOLD: &str = "ASTROLABE_COLD_DENY_THRESHOLD";
+pub(crate) const ENV_HARD_EXTRA: &str = "ASTROLABE_HARD_EXTRA";
 /// Cursor 拦截策略手动逃生口：auto（默认）| enforce | advisory。
 pub(crate) const ENV_HOOK_CURSOR_MODE: &str = "ASTROLABE_HOOK_CURSOR_MODE";
+
+/// Hook 总体防漂移策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum HookMode {
+    /// 冷态第 1 次温和提醒、第 2 次硬拦截；热态到达阈值先温和提醒，再漂移 `hard_extra` 次后硬拦截。
+    #[default]
+    SoftFirst,
+    /// 原有严格策略：到达阈值即硬拦截（3/3/4/10）。
+    Strict,
+    /// 仅在到达阈值时温和提醒（不硬拦截，受静默窗节流）。
+    Advisory,
+}
+
+impl HookMode {
+    /// 解析 `ASTROLABE_HOOK_MODE`；空/缺失/非法值回退 `soft-first` 并告警。
+    pub(crate) fn from_env(raw: Option<&str>) -> Self {
+        let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Self::SoftFirst;
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "soft-first" | "soft_first" | "soft" => Self::SoftFirst,
+            "strict" => Self::Strict,
+            "advisory" => Self::Advisory,
+            other => {
+                tracing::warn!(
+                    "invalid {ENV_HOOK_MODE}={other:?}; using soft-first (expected soft-first|strict|advisory)"
+                );
+                Self::SoftFirst
+            }
+        }
+    }
+}
 
 /// Cursor 客户端的 anti-drift 拦截策略。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -114,6 +154,12 @@ pub(crate) struct HooksConfig {
     /// Hard-deny Grep/Glob/shell text-search on first use.
     pub deny_text_search: bool,
     pub min_deny_interval_seconds: f64,
+    /// Hook 总体策略（soft-first | strict | advisory）。
+    pub hook_mode: HookMode,
+    /// `soft-first` 冷态硬 deny 阈值（最小 1，默认 2）。
+    pub cold_deny_threshold: u32,
+    /// `soft-first` 热态 SoftNudge 后再漂移的额外次数（最小 1，默认 2）。
+    pub hard_extra: u32,
     /// Cursor 客户端拦截策略（其它客户端忽略）。
     pub cursor_mode: CursorMode,
 }
@@ -127,6 +173,9 @@ impl Default for HooksConfig {
             grep_threshold: DEFAULT_GREP_THRESHOLD,
             deny_text_search: false,
             min_deny_interval_seconds: DEFAULT_MIN_DENY_INTERVAL_SECONDS,
+            hook_mode: HookMode::SoftFirst,
+            cold_deny_threshold: DEFAULT_COLD_DENY_THRESHOLD,
+            hard_extra: DEFAULT_HARD_EXTRA,
             cursor_mode: CursorMode::Auto,
         }
     }
@@ -135,8 +184,12 @@ impl Default for HooksConfig {
 impl HooksConfig {
     /// 从环境变量解析配置；无效值回退默认并 tracing::warn
     pub fn from_env() -> Self {
-        let slice_read_max_limit = std::env::var(ENV_SLICE_READ_MAX)
-            .ok()
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// 从自定义键值查找器解析配置（便于无全局 env 竞态的单测）。
+    pub(crate) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let slice_read_max_limit = get(ENV_SLICE_READ_MAX)
             .and_then(|s| {
                 s.trim().parse::<u64>().ok().or_else(|| {
                     tracing::warn!(
@@ -148,8 +201,7 @@ impl HooksConfig {
             })
             .unwrap_or(DEFAULT_SLICE_READ_MAX_LIMIT);
 
-        let slice_read_threshold = std::env::var(ENV_SLICE_READ_THRESHOLD)
-            .ok()
+        let slice_read_threshold = get(ENV_SLICE_READ_THRESHOLD)
             .and_then(|s| {
                 s.trim().parse::<u32>().ok().or_else(|| {
                     tracing::warn!(
@@ -161,8 +213,7 @@ impl HooksConfig {
             })
             .unwrap_or(DEFAULT_SLICE_READ_THRESHOLD);
 
-        let read_threshold = std::env::var(ENV_READ_THRESHOLD)
-            .ok()
+        let read_threshold = get(ENV_READ_THRESHOLD)
             .and_then(|s| {
                 s.trim().parse::<u32>().ok().or_else(|| {
                     tracing::warn!(
@@ -174,8 +225,7 @@ impl HooksConfig {
             })
             .unwrap_or(DEFAULT_READ_THRESHOLD);
 
-        let grep_threshold = std::env::var(ENV_GREP_THRESHOLD)
-            .ok()
+        let grep_threshold = get(ENV_GREP_THRESHOLD)
             .and_then(|s| {
                 s.trim().parse::<u32>().ok().or_else(|| {
                     tracing::warn!(
@@ -193,10 +243,9 @@ impl HooksConfig {
         }
 
         let deny_text_search =
-            parse_env_bool(std::env::var(ENV_DENY_TEXT_SEARCH).ok().as_deref()).unwrap_or(false);
+            parse_env_bool(get(ENV_DENY_TEXT_SEARCH).as_deref()).unwrap_or(false);
 
-        let min_deny_interval_seconds = std::env::var(ENV_DENY_SILENCE_SECS)
-            .ok()
+        let min_deny_interval_seconds = get(ENV_DENY_SILENCE_SECS)
             .and_then(|s| {
                 s.trim().parse::<f64>().ok().or_else(|| {
                     tracing::warn!(
@@ -208,7 +257,45 @@ impl HooksConfig {
             })
             .unwrap_or(DEFAULT_MIN_DENY_INTERVAL_SECONDS);
 
-        let cursor_mode = CursorMode::from_env(std::env::var(ENV_HOOK_CURSOR_MODE).ok().as_deref());
+        let hook_mode = HookMode::from_env(get(ENV_HOOK_MODE).as_deref());
+
+        let cold_deny_threshold = get(ENV_COLD_DENY_THRESHOLD)
+            .and_then(|s| {
+                s.trim().parse::<u32>().ok().or_else(|| {
+                    tracing::warn!(
+                        "invalid {ENV_COLD_DENY_THRESHOLD}={s:?}; using default {}",
+                        DEFAULT_COLD_DENY_THRESHOLD
+                    );
+                    None
+                })
+            })
+            .unwrap_or(DEFAULT_COLD_DENY_THRESHOLD);
+        let cold_deny_threshold = if cold_deny_threshold < 1 {
+            tracing::warn!("{ENV_COLD_DENY_THRESHOLD}=0 clamped to minimum 1");
+            1
+        } else {
+            cold_deny_threshold
+        };
+
+        let hard_extra = get(ENV_HARD_EXTRA)
+            .and_then(|s| {
+                s.trim().parse::<u32>().ok().or_else(|| {
+                    tracing::warn!(
+                        "invalid {ENV_HARD_EXTRA}={s:?}; using default {}",
+                        DEFAULT_HARD_EXTRA
+                    );
+                    None
+                })
+            })
+            .unwrap_or(DEFAULT_HARD_EXTRA);
+        let hard_extra = if hard_extra < 1 {
+            tracing::warn!("{ENV_HARD_EXTRA}=0 clamped to minimum 1");
+            1
+        } else {
+            hard_extra
+        };
+
+        let cursor_mode = CursorMode::from_env(get(ENV_HOOK_CURSOR_MODE).as_deref());
 
         Self {
             slice_read_max_limit,
@@ -217,6 +304,9 @@ impl HooksConfig {
             grep_threshold,
             deny_text_search,
             min_deny_interval_seconds,
+            hook_mode,
+            cold_deny_threshold,
+            hard_extra,
             cursor_mode,
         }
     }
@@ -388,6 +478,22 @@ impl Client {
             _ => Client::Other,
         }
     }
+
+    pub(crate) fn supports_toolsearch_hint(self) -> bool {
+        matches!(
+            self,
+            Client::ClaudeCode
+                | Client::Codebuddy
+                | Client::Vscode
+                | Client::KimiCode
+                | Client::ZCode
+                | Client::Other
+        )
+    }
+
+    pub(crate) fn supports_soft_nudge(self) -> bool {
+        !matches!(self, Client::Codex | Client::Grok | Client::OpenCode)
+    }
 }
 
 /// Cursor project 目录名 slug 算法（与 npm `setup/cursor.js:188-193` 及
@@ -494,19 +600,53 @@ pub(crate) fn mcp_json_has_astrolabe_server(path: &Path) -> bool {
     }
 }
 
-/// 本项目是否视为已启用 astrolabe MCP。
+fn expand_leading_tilde(raw: &str, get: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if raw == "~" {
+        return home_from_lookup(get);
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        let mut home = home_from_lookup(get)?;
+        for part in rest.split(['/', '\\']).filter(|s| !s.is_empty()) {
+            home.push(part);
+        }
+        return Some(home);
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// 解析 Cursor 全局配置目录：
+/// `CURSOR_CONFIG_DIR`（非空）→ `CURSOR_HOME`（非空）→ `<home>/.cursor`。
+/// 支持在 `CURSOR_CONFIG_DIR` / `CURSOR_HOME` 中展开前导 `~`、`~/`、`~\`。
+pub(crate) fn cursor_config_dir_with(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let nonempty = |key: &str| {
+        get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(raw) = nonempty("CURSOR_CONFIG_DIR").or_else(|| nonempty("CURSOR_HOME")) {
+        return expand_leading_tilde(&raw, &get);
+    }
+    home_from_lookup(&get).map(|h| h.join(".cursor"))
+}
+
+/// 从当前进程环境变量解析 Cursor 全局配置目录。
+pub(crate) fn cursor_config_dir() -> Option<PathBuf> {
+    cursor_config_dir_with(|k| std::env::var(k).ok())
+}
+
+/// 本项目在指定 Cursor 配置目录下是否视为已启用 astrolabe MCP。
 ///
 /// 判定顺序（与 cursor-agent 的 ServerApprovalMiddleware 对齐）：
-/// 1. `mcp-disabled.json` 命中 astrolabe → 未启用；
+/// 1. `<cursor_dir>/projects/<slug>/mcp-disabled.json` 命中 astrolabe → 未启用；
 /// 2. 项目级 `<workspace_root>/.cursor/mcp.json` 声明 astrolabe → 必须
-///    `mcp-approvals.json` 命中（项目级 server 才走审批门禁）；
-/// 3. 否则全局 `~/.cursor/mcp.json` 声明 astrolabe → 已启用（全局 server 不走审批）；
+///    `<cursor_dir>/projects/<slug>/mcp-approvals.json` 命中（项目级 server 才走审批门禁）；
+/// 3. 否则全局 `<cursor_dir>/mcp.json` 声明 astrolabe → 已启用（全局 server 不走审批）；
 /// 4. 都没有 → 未启用。
-pub(crate) fn cursor_mcp_approved(home: &Path, workspace_root: &Path) -> bool {
+pub(crate) fn cursor_mcp_approved_in_dir(cursor_dir: &Path, workspace_root: &Path) -> bool {
     let Some(project_dir) = cursor_project_dir_name(workspace_root) else {
         return false;
     };
-    let base = home.join(".cursor").join("projects").join(project_dir);
+    let base = cursor_dir.join("projects").join(project_dir);
     if list_contains_astrolabe(load_cursor_mcp_server_list(&base.join("mcp-disabled.json"))) {
         return false;
     }
@@ -517,7 +657,25 @@ pub(crate) fn cursor_mcp_approved(home: &Path, workspace_root: &Path) -> bool {
     if mcp_json_has_astrolabe_server(&project_mcp) {
         return approved;
     }
-    mcp_json_has_astrolabe_server(&home.join(".cursor").join("mcp.json"))
+    mcp_json_has_astrolabe_server(&cursor_dir.join("mcp.json"))
+}
+
+/// 使用自定义环境变量查找函数判定本项目是否已启用 astrolabe MCP。
+#[allow(dead_code)]
+pub(crate) fn cursor_mcp_approved_with(
+    workspace_root: &Path,
+    get: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some(cursor_dir) = cursor_config_dir_with(get) else {
+        return false;
+    };
+    cursor_mcp_approved_in_dir(&cursor_dir, workspace_root)
+}
+
+/// 测试兼容封装：在 `<home>/.cursor` 下判定本项目是否视为已启用 astrolabe MCP。
+#[allow(dead_code)]
+pub(crate) fn cursor_mcp_approved(home: &Path, workspace_root: &Path) -> bool {
+    cursor_mcp_approved_in_dir(&home.join(".cursor"), workspace_root)
 }
 
 /// 从 hook payload 提取工作区根目录。
@@ -587,6 +745,7 @@ pub(crate) fn resolve_cursor_workspace_root_with(
 }
 
 /// 命令行是否带 Cursor 客户端上下文（`--context=cursor` 或 `--context cursor`）。
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn cmdline_has_cursor_context(lower_cmdline: &str) -> bool {
     let tokens: Vec<&str> = lower_cmdline.split_whitespace().collect();
     if tokens.iter().any(|t| {
@@ -609,24 +768,17 @@ pub(crate) fn cmdline_has_cursor_context(lower_cmdline: &str) -> bool {
     })
 }
 
-/// 路径等价判定：优先 canonicalize（macOS `/var` ↔ `/private/var`），失败时退化为
-/// 分隔符归一化后的字符串比较。
+/// 路径等价判定：优先 canonicalize（macOS `/var` ↔ `/private/var`），
+/// 无论 canonicalize 成功与否均以 [`astrolabe_core::paths::paths_eq_normalized`] 收尾。
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        _ => {
-            let norm = |p: &Path| {
-                p.to_string_lossy()
-                    .replace('\\', "/")
-                    .trim_end_matches('/')
-                    .to_string()
-            };
-            norm(a) == norm(b)
-        }
-    }
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    astrolabe_core::paths::paths_eq_normalized(&ca, &cb)
 }
 
 /// 单条进程记录是否匹配「正在为该项目提供服务的 astrolabe cursor MCP」。
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) fn process_matches_cursor_astrolabe(
     cmdline: &str,
     proc_cwd: Option<&Path>,
@@ -647,6 +799,7 @@ pub(crate) fn process_matches_cursor_astrolabe(
     }
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn process_is_cursor_astrolabe_server(
     pid: u32,
     cmdline: &str,
@@ -658,7 +811,92 @@ fn process_is_cursor_astrolabe_server(
 
 // ---- 进程存活探测 ----------------------------------------------------------
 // 只关心 Cursor 会话里的 astrolabe MCP 进程（`--context=cursor`）。
+// 优先使用跨平台内核文件锁（`cursor-<hash>.lock`），Unix 兼容回退 ps/lsof。
 // 无法可靠读取 cwd 时按「不存活」处理，倾向于降级放行（避免再次死锁）。
+
+/// Cursor MCP 服务端的跨平台内核存活共享锁（持有至进程退出/强杀自动释放）。
+#[allow(dead_code)]
+pub(crate) struct CursorLiveLock {
+    _file: std::fs::File,
+}
+
+/// 在指定 `home` 下计算 Cursor 存活锁路径：
+/// `<home>/.astrolabe/live/cursor-<fnv1a64(path_norm_key(root))>.lock`。
+pub(crate) fn cursor_live_lock_path_in(home: &Path, root: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let norm_key = astrolabe_core::paths::path_norm_key(&canonical);
+    let hash = fnv1a64(&norm_key);
+    home.join(".astrolabe")
+        .join("live")
+        .join(format!("cursor-{hash:016x}.lock"))
+}
+
+/// 返回 `<home>/.astrolabe/live/cursor-<fnv1a64(path_norm_key(root))>.lock`。
+#[allow(dead_code)]
+pub(crate) fn cursor_live_lock_path(root: &Path) -> Option<PathBuf> {
+    get_user_home().map(|home| cursor_live_lock_path_in(&home, root))
+}
+
+#[allow(dead_code)]
+pub(crate) fn acquire_cursor_live_lock_in(home: &Path, root: &Path) -> Option<CursorLiveLock> {
+    let lock_path = cursor_live_lock_path_in(home, root);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    for attempt in 0..10 {
+        match file.try_lock_shared() {
+            Ok(()) => return Some(CursorLiveLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if attempt + 1 < 10 {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            Err(std::fs::TryLockError::Error(_)) => return None,
+        }
+    }
+    None
+}
+
+/// 为指定项目根目录获取 Cursor 存活共享锁（供 MCP server 进程持有，支持同项目多实例并存）。
+#[allow(dead_code)]
+pub(crate) fn acquire_cursor_live_lock(root: &Path) -> Option<CursorLiveLock> {
+    let home = get_user_home()?;
+    acquire_cursor_live_lock_in(&home, root)
+}
+
+pub(crate) fn is_cursor_live_lock_held_in(home: &Path, root: &Path) -> Option<bool> {
+    let lock_path = cursor_live_lock_path_in(home, root);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    match file.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => Some(true),
+        Ok(()) => Some(false),
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
+}
+
+/// 探测 Cursor 存活锁是否被持有：
+/// - `Some(true)`: 锁被占用（进程存活）
+/// - `Some(false)`: 锁文件存在但可立即获锁（进程已退出）
+/// - `None`: 锁文件不存在（未写锁的旧版二进制）
+#[allow(dead_code)]
+pub(crate) fn is_cursor_live_lock_held(root: &Path) -> Option<bool> {
+    let home = get_user_home()?;
+    is_cursor_live_lock_held_in(&home, root)
+}
 
 #[cfg(target_os = "macos")]
 fn process_cwd_for_pid(pid: &str) -> Option<PathBuf> {
@@ -681,7 +919,7 @@ fn process_cwd_for_pid(pid: &str) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
+fn astrolabe_cursor_process_alive_legacy(workspace_root: Option<&Path>) -> bool {
     let Ok(out) = std::process::Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output()
@@ -712,7 +950,7 @@ fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
+fn astrolabe_cursor_process_alive_legacy(workspace_root: Option<&Path>) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;
     };
@@ -744,11 +982,37 @@ fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn astrolabe_cursor_process_alive(_workspace_root: Option<&Path>) -> bool {
-    // No reliable project-scoped probe is available on these platforms (including
+fn astrolabe_cursor_process_alive_legacy(_workspace_root: Option<&Path>) -> bool {
+    // No reliable legacy project-scoped probe is available on these platforms (including
     // Windows). Unknown availability must not strand auto mode in a hard deny;
     // users who require unconditional blocking can explicitly select enforce.
     false
+}
+
+fn astrolabe_cursor_process_alive_in(
+    home_override: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> bool {
+    if let Some(root) = workspace_root {
+        let held = match home_override {
+            Some(home) => is_cursor_live_lock_held_in(home, root),
+            None => is_cursor_live_lock_held(root),
+        };
+        match held {
+            Some(true) => return true,
+            Some(false) | None => {
+                if cfg!(windows) {
+                    return false;
+                }
+            }
+        }
+    }
+    astrolabe_cursor_process_alive_legacy(workspace_root)
+}
+
+#[allow(dead_code)]
+fn astrolabe_cursor_process_alive(workspace_root: Option<&Path>) -> bool {
+    astrolabe_cursor_process_alive_in(None, workspace_root)
 }
 
 /// 结合批准状态与进程存活状态决定是否维持强制拦截。
@@ -777,17 +1041,22 @@ pub(crate) fn cursor_enforcement_for_payload(
     let Some(workspace_root) = workspace_root else {
         return false;
     };
-    let Some(home) = home_override.map(PathBuf::from).or_else(get_user_home) else {
-        return false;
+    let cursor_dir = match home_override {
+        Some(h) => h.join(".cursor"),
+        None => match cursor_config_dir() {
+            Some(dir) => dir,
+            None => return false,
+        },
     };
-    let approved = cursor_mcp_approved(&home, &workspace_root);
+    let approved = cursor_mcp_approved_in_dir(&cursor_dir, &workspace_root);
     if !approved {
         return false;
     }
+    let home = home_override.map(PathBuf::from).or_else(get_user_home);
     cursor_should_enforce(
         CursorMode::Auto,
         approved,
-        astrolabe_cursor_process_alive(Some(&workspace_root)),
+        astrolabe_cursor_process_alive_in(home.as_deref(), Some(&workspace_root)),
     )
 }
 
@@ -827,10 +1096,14 @@ pub(crate) struct CounterState {
     pub(crate) last_non_symbolic_ts: Option<f64>,
     pub(crate) last_slice_ts: Option<f64>,
     pub(crate) last_deny_ts: Option<f64>,
+    /// 一旦命中 `AstrolabeSymbolic | AstrolabeNonSymbolic` 置 `true`，不随 `reset_burst()` 清零。
+    pub(crate) astrolabe_seen: bool,
+    /// 当前 burst 周期是否已发过 `SoftNudge`，随 `reset_burst()` 清零。
+    pub(crate) soft_nudged: bool,
 }
 
 impl CounterState {
-    /// 清零连续突发计数（保留 last_deny_ts 以维持静默窗口）
+    /// 清零连续突发计数（保留 `last_deny_ts` 与 `astrolabe_seen`）
     pub(crate) fn reset_burst(&mut self) {
         self.n_grep = 0;
         self.n_read = 0;
@@ -840,13 +1113,14 @@ impl CounterState {
         self.last_read_ts = None;
         self.last_non_symbolic_ts = None;
         self.last_slice_ts = None;
+        self.soft_nudged = false;
     }
 
     /// 判定当前是否处于静默窗口之外（可正常触发 hook）
-    pub(crate) fn is_hook_active(&self, now: f64) -> bool {
+    pub(crate) fn is_hook_active(&self, now: f64, min_deny_interval_seconds: f64) -> bool {
         match self.last_deny_ts {
             None => true,
-            Some(ts) => (now - ts) >= config().min_deny_interval_seconds,
+            Some(ts) => (now - ts) >= min_deny_interval_seconds,
         }
     }
 }
@@ -900,6 +1174,8 @@ pub(crate) enum Decision {
     NeutralAllow,
     /// grep/read/slice 调用未超阈值，更新计数并保存，无输出
     Allow,
+    /// Soft-First / Advisory 温和提醒：放行工具并注入 additionalContext / agent_message
+    SoftNudge { kind: DenyKind, cold: bool },
     /// 达到阈值 deny，计数清零并记录 last_deny_ts，输出对应 deny JSON
     Deny(DenyKind),
 }
@@ -912,25 +1188,38 @@ fn current_timestamp() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// 读取用户主目录：优先 `HOME`，其次 Windows 的 `USERPROFILE`，
-/// 最后 `HOMEDRIVE`+`HOMEPATH`（原生 Windows 宿主通常没有 HOME）。
+/// 读取用户主目录：
+/// - Windows：`USERPROFILE` → `HOMEDRIVE`+`HOMEPATH` → `HOME`
+/// - 非 Windows：`HOME` → `USERPROFILE` → `HOMEDRIVE`+`HOMEPATH`
 fn get_user_home() -> Option<PathBuf> {
     home_from_lookup(|k| std::env::var(k).ok())
 }
 
 fn home_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    home_from_lookup_for(cfg!(windows), get)
+}
+
+fn home_from_lookup_for(is_windows: bool, get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let nonempty = |key: &str| {
         get(key)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    nonempty("HOME")
-        .or_else(|| nonempty("USERPROFILE"))
-        .or_else(|| match (nonempty("HOMEDRIVE"), nonempty("HOMEPATH")) {
-            (Some(d), Some(p)) => Some(format!("{d}{p}")),
-            _ => None,
-        })
-        .map(PathBuf::from)
+    let from_homedrive = || match (nonempty("HOMEDRIVE"), nonempty("HOMEPATH")) {
+        (Some(d), Some(p)) => Some(format!("{d}{p}")),
+        _ => None,
+    };
+    if is_windows {
+        nonempty("USERPROFILE")
+            .or_else(from_homedrive)
+            .or_else(|| nonempty("HOME"))
+            .map(PathBuf::from)
+    } else {
+        nonempty("HOME")
+            .or_else(|| nonempty("USERPROFILE"))
+            .or_else(from_homedrive)
+            .map(PathBuf::from)
+    }
 }
 
 /// 校验 session_id 可作为单一路径分量使用。
@@ -1019,30 +1308,77 @@ pub(crate) fn load_counter(path: &Path) -> CounterState {
     CounterState::default()
 }
 
-/// 写回 CounterState 到磁盘（先写 `.tmp` 再 rename，保证原子替换）
+const SAVE_RENAME_RETRY_DELAYS_MS: &[u64] = &[5, 10, 20, 40, 80];
+
+fn is_transient_rename_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(5) | Some(32))
+}
+
+fn rename_with_retry_op(
+    tmp_path: &Path,
+    dest_path: &Path,
+    mut rename_fn: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match rename_fn(tmp_path, dest_path) {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if is_transient_rename_error(&err)
+                    && attempt < SAVE_RENAME_RETRY_DELAYS_MS.len() =>
+            {
+                std::thread::sleep(Duration::from_millis(SAVE_RENAME_RETRY_DELAYS_MS[attempt]));
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// 写回 CounterState 到磁盘（唯一临时名 `counter.<pid>.<subsec_nanos>.<seq>.tmp` + flush/close + rename 退避重试）
 pub(crate) fn save_counter(path: &Path, counter: &CounterState) {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp_path = {
-        let mut tmp = path.as_os_str().to_os_string();
-        tmp.push(".tmp");
-        PathBuf::from(tmp)
-    };
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("counter");
+    let tmp_path = path.with_file_name(format!("{stem}.{pid}.{nanos}.{seq}.tmp"));
+
     let write_ok = (|| -> std::io::Result<()> {
-        let file = std::fs::File::create(&tmp_path)?;
-        let writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(writer, counter).map_err(std::io::Error::other)?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, counter).map_err(std::io::Error::other)?;
+        writer.flush()?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        drop(file);
         Ok(())
     })();
+
     match write_ok {
         Ok(()) => {
-            if std::fs::rename(&tmp_path, path).is_err() {
+            if let Err(err) = rename_with_retry_op(&tmp_path, path, |a, b| std::fs::rename(a, b)) {
                 let _ = std::fs::remove_file(&tmp_path);
+                tracing::warn!(path = %path.display(), error = %err, "failed to rename counter tmp file");
             }
         }
-        Err(_) => {
+        Err(err) => {
             let _ = std::fs::remove_file(&tmp_path);
+            tracing::warn!(path = %path.display(), error = %err, "failed to write counter tmp file");
         }
     }
 }
@@ -1197,17 +1533,67 @@ fn is_non_code_resource(path: &str) -> bool {
 
 /// A deliberately small, lexical exception for explicit temporary diagnostic text.
 /// No globs, substitutions, traversal, directories, source files or implicit cwd searches.
+fn is_temporary_diagnostic_path_with(path: &str, extra_temp_dirs: &[PathBuf]) -> bool {
+    let cleaned = path.trim().trim_matches(['\'', '"']);
+    if cleaned.is_empty() {
+        return false;
+    }
+    let stripped = astrolabe_core::paths::without_verbatim_prefix(Path::new(cleaned));
+    let stripped_str = stripped.to_string_lossy();
+    if stripped_str.contains(['$', '`', '*', '?', '[', ']', '<', '>', '\n', '\r']) {
+        return false;
+    }
+    let slashed = stripped_str.replace('\\', "/");
+    if slashed.split('/').any(|part| part == ".." || part == ".") {
+        return false;
+    }
+    let ext_ok = Path::new(&slashed)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "txt" | "log"));
+    if !ext_ok || !is_non_code_resource(&slashed) {
+        return false;
+    }
+    let norm_path = astrolabe_core::paths::path_norm_key(Path::new(&slashed));
+    if norm_path.starts_with("/tmp/")
+        || norm_path.starts_with("/private/tmp/")
+        || norm_path.starts_with("/var/tmp/")
+    {
+        return true;
+    }
+    extra_temp_dirs.iter().any(|dir| {
+        let dir_key = astrolabe_core::paths::path_norm_key(dir);
+        let is_abs_key = dir_key.starts_with('/')
+            || (dir_key.len() >= 3
+                && dir_key.as_bytes()[0].is_ascii_alphabetic()
+                && dir_key.as_bytes()[1] == b':'
+                && dir_key.as_bytes()[2] == b'/');
+        let is_root_key =
+            dir_key == "/" || dir_key == "//" || (dir_key.len() <= 3 && dir_key.ends_with(":/"));
+        if dir_key.is_empty() || !is_abs_key || is_root_key {
+            return false;
+        }
+        let prefix = if dir_key.ends_with('/') {
+            dir_key
+        } else {
+            format!("{dir_key}/")
+        };
+        norm_path.starts_with(&prefix) && norm_path.len() > prefix.len()
+    })
+}
+
 fn is_temporary_diagnostic_path(path: &str) -> bool {
-    (path.starts_with("/tmp/")
-        || path.starts_with("/private/tmp/")
-        || path.starts_with("/var/tmp/"))
-        && !path.contains(['$', '`', '*', '?', '[', ']', '<', '>', '\n'])
-        && !path.split('/').any(|part| part == ".." || part == ".")
-        && matches!(
-            Path::new(path).extension().and_then(|s| s.to_str()),
-            Some("txt" | "log")
-        )
-        && is_non_code_resource(path)
+    let mut extras = Vec::with_capacity(3);
+    extras.push(std::env::temp_dir());
+    for key in ["TEMP", "TMP"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                extras.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+    is_temporary_diagnostic_path_with(path, &extras)
 }
 
 fn is_diagnostic_text_search(inv: &ShellInvocation) -> bool {
@@ -2098,12 +2484,26 @@ pub(crate) fn decide(counter: &mut CounterState, tool_kind: ToolKind, now: f64) 
     decide_with(counter, tool_kind, now, config())
 }
 
-/// 可注入配置的决策函数（测试与 CLI/context 覆盖用）。
+/// 可注入配置的决策函数（测试与 CLI/context 覆盖用；默认按 Claude Code 客户端语义）。
+#[allow(dead_code)]
 pub(crate) fn decide_with(
     counter: &mut CounterState,
     tool_kind: ToolKind,
     now: f64,
     cfg: &HooksConfig,
+) -> Decision {
+    decide_with_client(counter, tool_kind, now, cfg, Client::ClaudeCode)
+}
+
+/// 可注入配置与客户端协议的决策函数。
+/// 对不支持 `SoftNudge` 的客户端（Codex/Grok/OpenCode），`SoftFirst` 退化为 `Strict`，
+/// 避免冷态缩阈值至 2 且吞掉 `SoftNudge` 后直接硬拦。
+pub(crate) fn decide_with_client(
+    counter: &mut CounterState,
+    tool_kind: ToolKind,
+    now: f64,
+    cfg: &HooksConfig,
+    client: Client,
 ) -> Decision {
     // 0. 硬禁用模式：Grep/Glob 一律拦截，不受静默窗约束
     //    （否则首个 grep 被拦后 min_deny_interval 内的重试会全部放行，等于没禁用）
@@ -2123,7 +2523,7 @@ pub(crate) fn decide_with(
         }
     }
 
-    // 1. 任意 Astrolabe MCP 工具（符号 + 非符号）→ 全量清零 burst，并结束静默窗。
+    // 1. 任意 Astrolabe MCP 工具（符号 + 非符号）→ 标记 astrolabe_seen，全量清零 burst，并结束静默窗。
     //    必须排在静默窗判定之前：否则 deny 后跟文案调用 search_code/find_symbol
     //    会落在 Silenced 分支，计数/sticky deny 状态得不到恢复。
     //    PreToolUse 时尚未知工具成败；与既有符号路径一致，以「即将调用」为准。
@@ -2131,6 +2531,7 @@ pub(crate) fn decide_with(
         tool_kind,
         ToolKind::AstrolabeSymbolic | ToolKind::AstrolabeNonSymbolic
     ) {
+        counter.astrolabe_seen = true;
         counter.reset_burst();
         counter.last_deny_ts = None;
         return match tool_kind {
@@ -2140,32 +2541,75 @@ pub(crate) fn decide_with(
     }
 
     // 2. 静默窗内 → no-op（allow，无输出更新）；Astrolabe 已在上面处理
-    if !counter.is_hook_active(now) {
+    if !counter.is_hook_active(now, cfg.min_deny_interval_seconds) {
         return Decision::Silenced;
     }
+
+    let effective_mode = match cfg.hook_mode {
+        HookMode::SoftFirst if !client.supports_soft_nudge() => HookMode::Strict,
+        mode => mode,
+    };
 
     // 2.7 切片读（Read 带 limit<=max）→ 连续额度制：
     // 不并入 n_non_symbolic（保持 mixed 语义不变）、不计 read/grep；
     // 间隔超 SLICE_RESET_PERIOD_SECONDS 则重置为 1 否则 +1；
-    // 连续达阈值且期间无任何 astrolabe 工具调用（额度未被清零）→ Slice deny
+    // 按 effective_mode 决定立即 deny / SoftNudge / 延后至 +hard_extra。
     if tool_kind == ToolKind::SliceRead {
         if let Some(last_ts) = counter.last_slice_ts {
             if (now - last_ts) <= SLICE_RESET_PERIOD_SECONDS {
                 counter.n_slice += 1;
             } else {
                 counter.n_slice = 1;
+                if counter.n_non_symbolic == 0 {
+                    counter.soft_nudged = false;
+                }
             }
         } else {
             counter.n_slice = 1;
         }
         counter.last_slice_ts = Some(now);
 
-        if counter.n_slice >= cfg.slice_read_threshold {
-            counter.reset_burst();
-            counter.last_deny_ts = Some(now);
-            return Decision::Deny(DenyKind::Slice);
+        match effective_mode {
+            HookMode::Strict => {
+                if counter.n_slice >= cfg.slice_read_threshold {
+                    counter.reset_burst();
+                    counter.last_deny_ts = Some(now);
+                    return Decision::Deny(DenyKind::Slice);
+                }
+                return Decision::Allow;
+            }
+            HookMode::Advisory => {
+                if counter.n_slice >= cfg.slice_read_threshold {
+                    let cold = !counter.astrolabe_seen;
+                    counter.reset_burst();
+                    counter.last_deny_ts = Some(now);
+                    return Decision::SoftNudge {
+                        kind: DenyKind::Slice,
+                        cold,
+                    };
+                }
+                return Decision::Allow;
+            }
+            HookMode::SoftFirst => {
+                let hard_extra = cfg.hard_extra.max(1);
+                if !counter.soft_nudged {
+                    if counter.n_slice >= cfg.slice_read_threshold {
+                        counter.soft_nudged = true;
+                        return Decision::SoftNudge {
+                            kind: DenyKind::Slice,
+                            cold: !counter.astrolabe_seen,
+                        };
+                    }
+                    return Decision::Allow;
+                }
+                if counter.n_slice >= cfg.slice_read_threshold.saturating_add(hard_extra) {
+                    counter.reset_burst();
+                    counter.last_deny_ts = Some(now);
+                    return Decision::Deny(DenyKind::Slice);
+                }
+                return Decision::Allow;
+            }
         }
-        return Decision::Allow;
     }
 
     // 3. 非追踪工具（既非 grep 类也非 read 类）→ 中立：不增不重置，直接 allow
@@ -2210,6 +2654,9 @@ pub(crate) fn decide_with(
                 counter.n_non_symbolic += 1;
             } else {
                 counter.n_non_symbolic = 1;
+                if counter.n_slice == 0 {
+                    counter.soft_nudged = false;
+                }
             }
         } else {
             counter.n_non_symbolic = 1;
@@ -2219,37 +2666,131 @@ pub(crate) fn decide_with(
 
     // 阈值判定（grep_threshold 可经 ASTROLABE_GREP_THRESHOLD 调整；0/1 ≈ hard deny for grep）
     let grep_threshold = cfg.grep_threshold.max(1);
-    let too_many_greps = counter.n_grep >= grep_threshold;
-    let too_many_reads = counter.n_read >= cfg.read_threshold;
-    let too_many_non_symbolic = counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD;
+    let pick_deny_kind =
+        |too_many_greps: bool, too_many_reads: bool, too_many_non_symbolic: bool| {
+            if is_grep && too_many_greps {
+                Some(DenyKind::Grep)
+            } else if is_code_file_read && too_many_reads {
+                Some(DenyKind::Read)
+            } else if too_many_greps {
+                Some(DenyKind::Grep)
+            } else if too_many_reads {
+                Some(DenyKind::Read)
+            } else if too_many_non_symbolic {
+                Some(DenyKind::Mixed)
+            } else {
+                None
+            }
+        };
 
-    // 依次判定：
-    // 当前调用是 grep 类且 n_grep≥threshold → grep deny；
-    // 当前是 read-代码文件 且 n_read≥threshold → read deny；
-    // 否则 n_grep≥threshold → grep deny；
-    // n_read≥threshold → read deny；
-    // n_non_symbolic≥4 → mixed deny。
-    let deny_kind = if is_grep && too_many_greps {
-        Some(DenyKind::Grep)
-    } else if is_code_file_read && too_many_reads {
-        Some(DenyKind::Read)
-    } else if too_many_greps {
-        Some(DenyKind::Grep)
-    } else if too_many_reads {
-        Some(DenyKind::Read)
-    } else if too_many_non_symbolic {
-        Some(DenyKind::Mixed)
-    } else {
-        None
-    };
-
-    if let Some(kind) = deny_kind {
-        // 触发即：burst 计数清零、记录 last_deny_ts
-        counter.reset_burst();
-        counter.last_deny_ts = Some(now);
-        Decision::Deny(kind)
-    } else {
-        Decision::Allow
+    match effective_mode {
+        HookMode::Strict => {
+            let deny_kind = pick_deny_kind(
+                counter.n_grep >= grep_threshold,
+                counter.n_read >= cfg.read_threshold,
+                counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD,
+            );
+            if let Some(kind) = deny_kind {
+                counter.reset_burst();
+                counter.last_deny_ts = Some(now);
+                Decision::Deny(kind)
+            } else {
+                Decision::Allow
+            }
+        }
+        HookMode::Advisory => {
+            let deny_kind = pick_deny_kind(
+                counter.n_grep >= grep_threshold,
+                counter.n_read >= cfg.read_threshold,
+                counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD,
+            );
+            if let Some(kind) = deny_kind {
+                let cold = !counter.astrolabe_seen;
+                counter.reset_burst();
+                counter.last_deny_ts = Some(now);
+                Decision::SoftNudge { kind, cold }
+            } else {
+                Decision::Allow
+            }
+        }
+        HookMode::SoftFirst => {
+            if !counter.astrolabe_seen {
+                let cold_deny = cfg.cold_deny_threshold.max(1);
+                if (is_grep || is_code_file_read)
+                    && counter.n_grep.saturating_add(counter.n_read) >= cold_deny
+                {
+                    let kind = if is_grep && (counter.n_grep >= cold_deny || counter.n_read == 0) {
+                        DenyKind::Grep
+                    } else if is_code_file_read
+                        && (counter.n_read >= cold_deny || counter.n_grep == 0)
+                    {
+                        DenyKind::Read
+                    } else if counter.n_grep >= cold_deny {
+                        DenyKind::Grep
+                    } else if counter.n_read >= cold_deny {
+                        DenyKind::Read
+                    } else {
+                        DenyKind::Mixed
+                    };
+                    counter.reset_burst();
+                    counter.last_deny_ts = Some(now);
+                    Decision::Deny(kind)
+                } else if (is_grep || is_code_file_read) && !counter.soft_nudged {
+                    counter.soft_nudged = true;
+                    let kind = if is_grep {
+                        DenyKind::Grep
+                    } else {
+                        DenyKind::Read
+                    };
+                    Decision::SoftNudge { kind, cold: true }
+                } else if counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD {
+                    let hard_extra = cfg.hard_extra.max(1);
+                    if !counter.soft_nudged {
+                        counter.soft_nudged = true;
+                        Decision::SoftNudge {
+                            kind: DenyKind::Mixed,
+                            cold: true,
+                        }
+                    } else if counter.n_non_symbolic
+                        >= NON_SYMBOLIC_THRESHOLD.saturating_add(hard_extra)
+                    {
+                        counter.reset_burst();
+                        counter.last_deny_ts = Some(now);
+                        Decision::Deny(DenyKind::Mixed)
+                    } else {
+                        Decision::Allow
+                    }
+                } else {
+                    Decision::Allow
+                }
+            } else if !counter.soft_nudged {
+                let deny_kind = pick_deny_kind(
+                    counter.n_grep >= grep_threshold,
+                    counter.n_read >= cfg.read_threshold,
+                    counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD,
+                );
+                if let Some(kind) = deny_kind {
+                    counter.soft_nudged = true;
+                    Decision::SoftNudge { kind, cold: false }
+                } else {
+                    Decision::Allow
+                }
+            } else {
+                let hard_extra = cfg.hard_extra.max(1);
+                let deny_kind = pick_deny_kind(
+                    counter.n_grep >= grep_threshold.saturating_add(hard_extra),
+                    counter.n_read >= cfg.read_threshold.saturating_add(hard_extra),
+                    counter.n_non_symbolic >= NON_SYMBOLIC_THRESHOLD.saturating_add(hard_extra),
+                );
+                if let Some(kind) = deny_kind {
+                    counter.reset_burst();
+                    counter.last_deny_ts = Some(now);
+                    Decision::Deny(kind)
+                } else {
+                    Decision::Allow
+                }
+            }
+        }
     }
 }
 
@@ -2316,9 +2857,119 @@ fn build_agent_id_inject_output(
     )
 }
 
+/// SessionStart hook 静态常量 JSON：无时间戳/ID/计数，保证提示词前缀缓存稳定。
+pub(crate) const SESSION_START_OUTPUT: &str = r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"If Astrolabe MCP tools are deferred, load all 7 in ONE ToolSearch call (select:mcp__astrolabe__resolve_contx,mcp__astrolabe__search_code,mcp__astrolabe__find_symbol,mcp__astrolabe__find_refs,mcp__astrolabe__goto_def,mcp__astrolabe__get_diag,mcp__astrolabe__get_lang) before running Grep/Read — never load them one by one."}}"#;
+
+const TOOLSEARCH_ALL_SEVEN_HINT: &str = " If Astrolabe MCP tools are deferred, load all 7 in ONE ToolSearch call (select:mcp__astrolabe__resolve_contx,mcp__astrolabe__search_code,mcp__astrolabe__find_symbol,mcp__astrolabe__find_refs,mcp__astrolabe__goto_def,mcp__astrolabe__get_diag,mcp__astrolabe__get_lang) — never load them one by one.";
+
+pub(crate) fn run_session_start_impl<W: Write>(mut stdout: W) -> i32 {
+    let _ = writeln!(stdout, "{SESSION_START_OUTPUT}");
+    0
+}
+
+/// `astrolabe hooks session-start`：输出 100% 静态常量 JSON 引导批量加载 7 个 Astrolabe 工具。
+pub fn run_session_start() -> i32 {
+    let stdout = std::io::stdout();
+    run_session_start_impl(stdout.lock())
+}
+
+/// SoftNudge 的静态提醒文案（不含动态计数/时间戳）。
+/// 仅 Claude Code 系列客户端在冷态附带 ToolSearch 7 工具批量加载提示。
+fn soft_nudge_message(client: Client, deny_kind: DenyKind, cold: bool) -> String {
+    let base = match (deny_kind, cold) {
+        (DenyKind::Grep | DenyKind::TextSearch, true) => {
+            "Astrolabe reminder: Prefer Astrolabe symbolic tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx) or mcp__astrolabe__search_code over Grep/rg for code discovery — they return exact bodies and path:line anchors and reset this counter."
+        }
+        (DenyKind::Read, true) => {
+            "Astrolabe reminder: Prefer Astrolabe symbolic tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx) over full-file Read for code discovery — they return exact symbol bodies and reset this counter."
+        }
+        (DenyKind::Mixed, true) => {
+            "Astrolabe reminder: Prefer Astrolabe symbolic tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx) or mcp__astrolabe__search_code over repeated Grep/Read for code discovery."
+        }
+        (DenyKind::Glob, true) => {
+            "Astrolabe reminder: Prefer Astrolabe tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx, mcp__astrolabe__search_code) over Glob for code discovery."
+        }
+        (DenyKind::Slice, true) => {
+            "Astrolabe reminder: You have made many consecutive slice Read calls without calling Astrolabe. Prefer mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx, or mcp__astrolabe__search_code."
+        }
+        (DenyKind::Grep | DenyKind::TextSearch, false) => {
+            "Astrolabe reminder: You have made several consecutive Grep/rg calls. Switch back to Astrolabe tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx, mcp__astrolabe__search_code) to reset the burst counter before hard blocking kicks in."
+        }
+        (DenyKind::Read, false) => {
+            "Astrolabe reminder: You have made several consecutive full-file Read calls. Switch back to Astrolabe symbolic tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx) or targeted slice reads to reset the burst counter before hard blocking kicks in."
+        }
+        (DenyKind::Mixed, false) => {
+            "Astrolabe reminder: You have made several consecutive grep/read calls. Switch back to Astrolabe tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx, mcp__astrolabe__search_code) to reset the burst counter before hard blocking kicks in."
+        }
+        (DenyKind::Glob, false) => {
+            "Astrolabe reminder: Prefer Astrolabe tools (mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx, mcp__astrolabe__search_code) over Glob for code discovery."
+        }
+        (DenyKind::Slice, false) => {
+            "Astrolabe reminder: You have made several consecutive slice Read calls without using Astrolabe. Call mcp__astrolabe__find_symbol, mcp__astrolabe__resolve_contx, or mcp__astrolabe__search_code to locate symbols directly and reset the burst counter."
+        }
+    };
+    if cold && client.supports_toolsearch_hint() {
+        format!("{base}{TOOLSEARCH_ALL_SEVEN_HINT}")
+    } else {
+        base.to_string()
+    }
+}
+
+/// 构造 SoftNudge 客户端协议 JSON；不支持 `allow` + `additionalContext` 的客户端返回 `None`（静默放行）。
+pub(crate) fn build_soft_nudge_output(
+    client: Client,
+    deny_kind: DenyKind,
+    cold: bool,
+) -> Option<String> {
+    if !client.supports_soft_nudge() {
+        return None;
+    }
+    let msg = soft_nudge_message(client, deny_kind, cold);
+    match client {
+        Client::Codex | Client::Grok | Client::OpenCode => None,
+        Client::Cursor => Some(
+            serde_json::json!({
+                "permission": "allow",
+                "agent_message": msg,
+            })
+            .to_string(),
+        ),
+        Client::ClaudeCode
+        | Client::Codebuddy
+        | Client::Vscode
+        | Client::KimiCode
+        | Client::ZCode
+        | Client::Other => Some(
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "additionalContext": msg,
+                }
+            })
+            .to_string(),
+        ),
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
-    let max_limit = config().slice_read_max_limit;
-    let slice_threshold = config().slice_read_threshold;
+    build_output_for_state(client, deny_kind, false)
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_output_for_state(client: Client, deny_kind: DenyKind, cold: bool) -> String {
+    build_output_for_state_with(client, deny_kind, cold, config())
+}
+
+pub(crate) fn build_output_for_state_with(
+    client: Client,
+    deny_kind: DenyKind,
+    cold: bool,
+    cfg: &HooksConfig,
+) -> String {
+    let max_limit = cfg.slice_read_max_limit;
+    let slice_threshold = cfg.slice_read_threshold;
     let readonly_note = format!(" Note: all Astrolabe tools are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
     let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_lang tool), grep is the correct tool for them — ignore this reminder.";
     // Prefer relevant symbolic tools for discovery; every recognized Astrolabe
@@ -2359,7 +3010,13 @@ pub(crate) fn build_output(client: Client, deny_kind: DenyKind) -> String {
             "You were using many slice reads (small limit-bounded Read calls) recently without calling any Astrolabe tool. Slice reads are still permitted for precision work, but locate the region first: prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx; mcp__astrolabe__search_code also resets the full grep/read/slice burst. Call an Astrolabe tool now (read-only, safe).".to_string(),
         ),
     };
-    let ctx = format!("{ctx}{readonly_note}");
+    let cold_suffix = if cold && client.supports_toolsearch_hint() {
+        TOOLSEARCH_ALL_SEVEN_HINT
+    } else {
+        ""
+    };
+    let reason = format!("{reason}{cold_suffix}");
+    let ctx = format!("{ctx}{readonly_note}{cold_suffix}");
 
     match client {
         Client::Grok | Client::OpenCode => serde_json::json!({
@@ -2780,21 +3437,47 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
     };
 
     // load → decide → save 在同一把文件锁内串行化
-    let decision = match persistence_path.as_ref() {
+    let (decision, is_cold_deny, enforce) = match persistence_path.as_ref() {
         Some(path) => with_counter_locked(path, |mut counter| {
             let before = counter.clone();
-            let decision = decide_with(&mut counter, tool_kind, now_ts, cfg);
+            let cold_before = !counter.astrolabe_seen;
+            let decision = decide_with_client(&mut counter, tool_kind, now_ts, cfg, client);
+            let enforce = if client == Client::Cursor
+                && matches!(decision, Decision::SoftNudge { .. } | Decision::Deny(_))
+            {
+                cursor_enforcement_for_payload(cfg.cursor_mode, &input_data, home_override)
+            } else {
+                true
+            };
+            // Cursor 未启用/未批准 MCP 时 SoftNudge 会降级为 advisory 并放行：
+            // 必须在持锁持久化前进入静默窗并清零 burst，防止第 2 次调用再次刷屏。
+            if client == Client::Cursor
+                && !enforce
+                && matches!(decision, Decision::SoftNudge { .. })
+            {
+                counter.reset_burst();
+                counter.last_deny_ts = Some(now_ts);
+            }
             // 重置类决定在状态本来就是零时不落盘（省一次 rename + 锁）
             let should_save = match decision {
                 Decision::ResetSymbolic | Decision::ResetSlice => counter != before,
-                Decision::Allow | Decision::Deny(_) => true,
+                Decision::Allow | Decision::SoftNudge { .. } | Decision::Deny(_) => true,
                 _ => false,
             };
-            (counter, should_save, decision)
+            (counter, should_save, (decision, cold_before, enforce))
         }),
         None => {
             let mut counter = CounterState::default();
-            decide_with(&mut counter, tool_kind, now_ts, cfg)
+            let cold_before = !counter.astrolabe_seen;
+            let decision = decide_with_client(&mut counter, tool_kind, now_ts, cfg, client);
+            let enforce = if client == Client::Cursor
+                && matches!(decision, Decision::SoftNudge { .. } | Decision::Deny(_))
+            {
+                cursor_enforcement_for_payload(cfg.cursor_mode, &input_data, home_override)
+            } else {
+                true
+            };
+            (decision, cold_before, enforce)
         }
     };
 
@@ -2825,18 +3508,40 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
             // 正常累加计数未超阈值：已保存，无输出
             0
         }
+        Decision::SoftNudge { kind, cold } => {
+            if client == Client::Cursor {
+                if enforce {
+                    if let Some(output_str) = build_soft_nudge_output(client, kind, cold) {
+                        tracing::info!(?kind, cold, client = %client_name, "emitting soft-nudge hint");
+                        let _ = writeln!(stdout, "{output_str}");
+                    }
+                } else {
+                    tracing::info!(
+                        ?kind,
+                        cold,
+                        client = %client_name,
+                        "cursor astrolabe MCP unavailable; downgrading soft-nudge to advisory"
+                    );
+                    let _ = writeln!(stdout, "{}", build_cursor_advisory_output(kind));
+                }
+            } else if let Some(output_str) = build_soft_nudge_output(client, kind, cold) {
+                tracing::info!(?kind, cold, client = %client_name, "emitting soft-nudge hint");
+                let _ = writeln!(stdout, "{output_str}");
+            }
+            0
+        }
         Decision::Deny(deny_kind) => {
             // 超阈值触发 deny：已清零并保存，输出 JSON。
             // Cursor 自动模式：仅当本项目已批准 astrolabe MCP 且对应进程存活时才维持
             // 强制拦截；否则降级为 `permission: allow` + 温和提醒（退出码仍为 0）。
-            let enforce = if client == Client::Cursor {
-                cursor_enforcement_for_payload(cfg.cursor_mode, &input_data, home_override)
-            } else {
-                true
-            };
             if enforce {
-                let output_str = build_output(client, deny_kind);
-                tracing::info!(?deny_kind, client = %client_name, "emitting anti-drift deny hint");
+                let output_str = build_output_for_state_with(client, deny_kind, is_cold_deny, cfg);
+                tracing::info!(
+                    ?deny_kind,
+                    cold = is_cold_deny,
+                    client = %client_name,
+                    "emitting anti-drift deny hint"
+                );
                 let _ = writeln!(stdout, "{output_str}");
             } else {
                 tracing::info!(
@@ -2988,6 +3693,32 @@ pub fn run_cleanup() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strict_cfg() -> HooksConfig {
+        HooksConfig {
+            hook_mode: HookMode::Strict,
+            ..Default::default()
+        }
+    }
+
+    fn run_remind_strict<R: Read, W: Write, E: Write>(
+        client_name: &str,
+        reader: R,
+        stdout: W,
+        stderr: E,
+        now: Option<f64>,
+        home_override: Option<&Path>,
+    ) -> i32 {
+        run_remind_impl_with(
+            client_name,
+            reader,
+            stdout,
+            stderr,
+            now,
+            home_override,
+            &strict_cfg(),
+        )
+    }
 
     const FORENSICS_COMMAND: &str = r#"ps aux | grep -c '[s]trings'; echo '--- lines ---'; wc -l /tmp/agcli-151-strings.txt; echo '--- tail ---'; tail -c 300 /tmp/agcli-151-strings.txt | cat -v | tail -5; echo; echo '--- version strings ---'; grep -oE '1\.5\.[0-9]' /tmp/agcli-151-strings.txt | sort -u | head"#;
 
@@ -3229,22 +3960,23 @@ mod tests {
 
     #[test]
     fn test_1_consecutive_grep_deny_and_burst_reset() {
+        let cfg = strict_cfg();
         let mut counter = CounterState::default();
         let t0 = 1000.0;
         // 第 1 次 grep
-        let d1 = decide(&mut counter, ToolKind::Grep, t0);
+        let d1 = decide_with(&mut counter, ToolKind::Grep, t0, &cfg);
         assert_eq!(d1, Decision::Allow);
         assert_eq!(counter.n_grep, 1);
         assert_eq!(counter.n_non_symbolic, 1);
 
         // 第 2 次 grep（间隔 1s）
-        let d2 = decide(&mut counter, ToolKind::Grep, t0 + 1.0);
+        let d2 = decide_with(&mut counter, ToolKind::Grep, t0 + 1.0, &cfg);
         assert_eq!(d2, Decision::Allow);
         assert_eq!(counter.n_grep, 2);
         assert_eq!(counter.n_non_symbolic, 2);
 
         // 第 3 次 grep（间隔 1s）-> 触发 grep deny
-        let d3 = decide(&mut counter, ToolKind::Grep, t0 + 2.0);
+        let d3 = decide_with(&mut counter, ToolKind::Grep, t0 + 2.0, &cfg);
         assert_eq!(d3, Decision::Deny(DenyKind::Grep));
         // burst 计数必须清零，且记录 last_deny_ts
         assert_eq!(counter.n_grep, 0);
@@ -3354,30 +4086,35 @@ mod tests {
 
     #[test]
     fn test_2_astrolabe_symbolic_resets_burst_counters() {
+        let cfg = strict_cfg();
         let mut counter = CounterState::default();
         let t0 = 1000.0;
         // 前 2 次 grep
-        assert_eq!(decide(&mut counter, ToolKind::Grep, t0), Decision::Allow);
         assert_eq!(
-            decide(&mut counter, ToolKind::Grep, t0 + 1.0),
+            decide_with(&mut counter, ToolKind::Grep, t0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, t0 + 1.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_grep, 2);
 
         // 插入 Astrolabe 符号工具调用（如 find_references）
-        let d_reset = decide(&mut counter, ToolKind::AstrolabeSymbolic, t0 + 2.0);
+        let d_reset = decide_with(&mut counter, ToolKind::AstrolabeSymbolic, t0 + 2.0, &cfg);
         assert_eq!(d_reset, Decision::ResetSymbolic);
         assert_eq!(counter.n_grep, 0);
         assert_eq!(counter.n_non_symbolic, 0);
+        assert!(counter.astrolabe_seen);
 
         // 之后第 3、4 次 grep 重新累积，仍为 allow
         assert_eq!(
-            decide(&mut counter, ToolKind::Grep, t0 + 3.0),
+            decide_with(&mut counter, ToolKind::Grep, t0 + 3.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_grep, 1);
         assert_eq!(
-            decide(&mut counter, ToolKind::Grep, t0 + 4.0),
+            decide_with(&mut counter, ToolKind::Grep, t0 + 4.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_grep, 2);
@@ -3416,6 +4153,7 @@ mod tests {
             last_non_symbolic_ts: Some(100.3),
             last_slice_ts: Some(100.5),
             last_deny_ts: Some(90.0),
+            ..Default::default()
         };
 
         // search_code：全量清零 burst（含 grep/read/non_symbolic/slice）并结束静默窗
@@ -3472,6 +4210,7 @@ mod tests {
 
     #[test]
     fn test_4_read_non_code_file_no_read_deny_counts_non_symbolic() {
+        let cfg = strict_cfg();
         let mut counter = CounterState::default();
         let t0 = 1000.0;
         let non_code_kind = ToolKind::Read {
@@ -3479,12 +4218,15 @@ mod tests {
         };
 
         // 连续 3 次读取 .md 文件（非代码文件）
-        assert_eq!(decide(&mut counter, non_code_kind, t0), Decision::Allow);
+        assert_eq!(
+            decide_with(&mut counter, non_code_kind, t0, &cfg),
+            Decision::Allow
+        );
         assert_eq!(counter.n_read, 0); // 不计入 read 计数
         assert_eq!(counter.n_non_symbolic, 1); // 计入 non_symbolic
 
         assert_eq!(
-            decide(&mut counter, non_code_kind, t0 + 1.0),
+            decide_with(&mut counter, non_code_kind, t0 + 1.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_read, 0);
@@ -3492,37 +4234,44 @@ mod tests {
 
         // 第 3 次：不触发 read deny
         assert_eq!(
-            decide(&mut counter, non_code_kind, t0 + 2.0),
+            decide_with(&mut counter, non_code_kind, t0 + 2.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_read, 0);
         assert_eq!(counter.n_non_symbolic, 3);
 
         // 第 4 次：non_symbolic 达到 4 阈值，触发 mixed deny
-        let d4 = decide(&mut counter, non_code_kind, t0 + 3.0);
+        let d4 = decide_with(&mut counter, non_code_kind, t0 + 3.0, &cfg);
         assert_eq!(d4, Decision::Deny(DenyKind::Mixed));
         assert_eq!(counter.n_non_symbolic, 0);
     }
 
     #[test]
     fn test_5_mixed_grep_and_read_burst_triggers_mixed_deny() {
+        let cfg = strict_cfg();
         let mut counter = CounterState::default();
         let t0 = 1000.0;
         let code_read = ToolKind::Read { is_code_file: true };
 
         // 4 次交替调用：grep -> read -> grep -> read
-        assert_eq!(decide(&mut counter, ToolKind::Grep, t0), Decision::Allow);
+        assert_eq!(
+            decide_with(&mut counter, ToolKind::Grep, t0, &cfg),
+            Decision::Allow
+        );
         assert_eq!(counter.n_grep, 1);
         assert_eq!(counter.n_read, 0);
         assert_eq!(counter.n_non_symbolic, 1);
 
-        assert_eq!(decide(&mut counter, code_read, t0 + 1.0), Decision::Allow);
+        assert_eq!(
+            decide_with(&mut counter, code_read, t0 + 1.0, &cfg),
+            Decision::Allow
+        );
         assert_eq!(counter.n_grep, 1);
         assert_eq!(counter.n_read, 1);
         assert_eq!(counter.n_non_symbolic, 2);
 
         assert_eq!(
-            decide(&mut counter, ToolKind::Grep, t0 + 2.0),
+            decide_with(&mut counter, ToolKind::Grep, t0 + 2.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_grep, 2);
@@ -3530,7 +4279,7 @@ mod tests {
         assert_eq!(counter.n_non_symbolic, 3);
 
         // 第 4 次到达 non_symbolic=4，触发 mixed deny
-        let d4 = decide(&mut counter, code_read, t0 + 3.0);
+        let d4 = decide_with(&mut counter, code_read, t0 + 3.0, &cfg);
         assert_eq!(d4, Decision::Deny(DenyKind::Mixed));
         assert_eq!(counter.n_grep, 0);
         assert_eq!(counter.n_read, 0);
@@ -3540,34 +4289,36 @@ mod tests {
 
     #[test]
     fn test_6_silent_window_within_15s() {
+        let cfg = strict_cfg();
         let mut counter = CounterState {
             last_deny_ts: Some(1000.0),
             ..CounterState::default()
         };
 
         // 10s 后调用处于 15s 静默窗口内，应当为 Silenced，不更新计数
-        let d1 = decide(&mut counter, ToolKind::Grep, 1010.0);
+        let d1 = decide_with(&mut counter, ToolKind::Grep, 1010.0, &cfg);
         assert_eq!(d1, Decision::Silenced);
         assert_eq!(counter.n_grep, 0);
 
         // 15s 后调用离开静默窗口，正常放行并更新计数
-        let d2 = decide(&mut counter, ToolKind::Grep, 1015.0);
+        let d2 = decide_with(&mut counter, ToolKind::Grep, 1015.0, &cfg);
         assert_eq!(d2, Decision::Allow);
         assert_eq!(counter.n_grep, 1);
     }
 
     #[test]
     fn test_7_interval_greater_than_1000s_resets_counter() {
+        let cfg = strict_cfg();
         let mut counter = CounterState::default();
         assert_eq!(
-            decide(&mut counter, ToolKind::Grep, 1000.0),
+            decide_with(&mut counter, ToolKind::Grep, 1000.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_grep, 1);
 
         // 超过 1000s（GREP_RESET_PERIOD_SECONDS）后再次 grep，计数重置为 1 而非递增至 2
         assert_eq!(
-            decide(&mut counter, ToolKind::Grep, 2001.0),
+            decide_with(&mut counter, ToolKind::Grep, 2001.0, &cfg),
             Decision::Allow
         );
         assert_eq!(counter.n_grep, 1);
@@ -3712,7 +4463,7 @@ mod tests {
             );
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload.as_bytes(),
                 &mut out,
@@ -3805,7 +4556,7 @@ mod tests {
         let mut err = Vec::new();
 
         // 1st grep
-        let code1 = run_remind_impl(
+        let code1 = run_remind_strict(
             "claude-code",
             payload_grep.as_bytes(),
             &mut out,
@@ -3818,7 +4569,7 @@ mod tests {
 
         // 2nd grep
         out.clear();
-        let code2 = run_remind_impl(
+        let code2 = run_remind_strict(
             "claude-code",
             payload_grep.as_bytes(),
             &mut out,
@@ -3831,7 +4582,7 @@ mod tests {
 
         // 3rd grep -> Deny
         out.clear();
-        let code3 = run_remind_impl(
+        let code3 = run_remind_strict(
             "claude-code",
             payload_grep.as_bytes(),
             &mut out,
@@ -3846,7 +4597,7 @@ mod tests {
         // 4th grep at 110.0 (8s after the deny at 102.0, inside the 15s silent window)
         // -> Silenced (no output, no counter update)
         out.clear();
-        let code4 = run_remind_impl(
+        let code4 = run_remind_strict(
             "claude-code",
             payload_grep.as_bytes(),
             &mut out,
@@ -3889,7 +4640,7 @@ mod tests {
         let mut err = Vec::new();
 
         // 1st call
-        let c1 = run_remind_impl(
+        let c1 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -3902,7 +4653,7 @@ mod tests {
 
         // 2nd call
         out.clear();
-        let c2 = run_remind_impl(
+        let c2 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -3915,7 +4666,7 @@ mod tests {
 
         // 3rd call -> deny
         out.clear();
-        let c3 = run_remind_impl(
+        let c3 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -3953,7 +4704,7 @@ mod tests {
         let mut err = Vec::new();
 
         // 1st call
-        let c1 = run_remind_impl(
+        let c1 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -3966,7 +4717,7 @@ mod tests {
 
         // 2nd call
         out.clear();
-        let c2 = run_remind_impl(
+        let c2 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -3979,7 +4730,7 @@ mod tests {
 
         // 3rd call -> deny
         out.clear();
-        let c3 = run_remind_impl(
+        let c3 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -4061,7 +4812,7 @@ mod tests {
 
         for i in 0..2 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 code_payload.as_bytes(),
                 &mut out,
@@ -4075,7 +4826,7 @@ mod tests {
 
         // 第 3 次触发 read deny
         out.clear();
-        let code3 = run_remind_impl(
+        let code3 = run_remind_strict(
             "claude-code",
             code_payload.as_bytes(),
             &mut out,
@@ -4100,7 +4851,7 @@ mod tests {
 
         for i in 0..3 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 doc_payload.as_bytes(),
                 &mut out,
@@ -4142,7 +4893,7 @@ mod tests {
         for i in 0..2 {
             out.clear();
             assert_eq!(
-                run_remind_impl(
+                run_remind_strict(
                     "codex",
                     codex_payload.as_bytes(),
                     &mut out,
@@ -4157,7 +4908,7 @@ mod tests {
 
         out.clear();
         assert_eq!(
-            run_remind_impl(
+            run_remind_strict(
                 "codex",
                 codex_payload.as_bytes(),
                 &mut out,
@@ -4190,7 +4941,7 @@ mod tests {
         for i in 0..2 {
             out.clear();
             assert_eq!(
-                run_remind_impl(
+                run_remind_strict(
                     "grok",
                     grok_payload.as_bytes(),
                     &mut out,
@@ -4205,7 +4956,7 @@ mod tests {
 
         out.clear();
         assert_eq!(
-            run_remind_impl(
+            run_remind_strict(
                 "grok",
                 grok_payload.as_bytes(),
                 &mut out,
@@ -4361,7 +5112,7 @@ mod tests {
 
         for i in 0..2 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload.as_bytes(),
                 &mut out,
@@ -4375,7 +5126,7 @@ mod tests {
 
         // 第 3 次输入重定向 cat 读取代码文件 -> 触发 read deny
         out.clear();
-        let code3 = run_remind_impl(
+        let code3 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -4470,7 +5221,7 @@ mod tests {
 
         for i in 0..2 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 sed_read_payload.as_bytes(),
                 &mut out,
@@ -4483,7 +5234,7 @@ mod tests {
         }
 
         out.clear();
-        let code3 = run_remind_impl(
+        let code3 = run_remind_strict(
             "claude-code",
             sed_read_payload.as_bytes(),
             &mut out,
@@ -4522,7 +5273,7 @@ mod tests {
 
         for i in 0..2 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload.as_bytes(),
                 &mut out,
@@ -4536,7 +5287,7 @@ mod tests {
 
         // 第 3 次 grep（即使命令行含重定向 > out.txt）仍照常触发 grep deny
         out.clear();
-        let code3 = run_remind_impl(
+        let code3 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -4607,7 +5358,7 @@ mod tests {
 
         for i in 0..9 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload.as_bytes(),
                 &mut out,
@@ -4624,7 +5375,7 @@ mod tests {
         }
 
         out.clear();
-        let code10 = run_remind_impl(
+        let code10 = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -4679,7 +5430,7 @@ mod tests {
         // 前 9 次切片读：无输出
         for i in 0..9 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 slice_payload.as_bytes(),
                 &mut out,
@@ -4698,7 +5449,7 @@ mod tests {
 
         // 第 10 次：触发 Slice deny
         out.clear();
-        let code10 = run_remind_impl(
+        let code10 = run_remind_strict(
             "claude-code",
             slice_payload.as_bytes(),
             &mut out,
@@ -4721,7 +5472,7 @@ mod tests {
         // 累计 5 次切片读（额度=5，未达阈值）
         for i in 0..5 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 slice_payload.as_bytes(),
                 &mut out,
@@ -4740,7 +5491,7 @@ mod tests {
 
         // 1 次 mcp__astrolabe__search_code（AstrolabeNonSymbolic）→ 切片额度清零
         out.clear();
-        let code_search = run_remind_impl(
+        let code_search = run_remind_strict(
             "claude-code",
             search_payload.as_bytes(),
             &mut out,
@@ -4767,7 +5518,7 @@ mod tests {
         // 再 9 次切片读：无输出（若额度未清零，其中第 5 次即达 10 阈值触发 deny）
         for i in 0..9 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 slice_payload.as_bytes(),
                 &mut out,
@@ -4786,7 +5537,7 @@ mod tests {
 
         // 清零后的第 10 次：再次触发 Slice deny
         out.clear();
-        let code_again = run_remind_impl(
+        let code_again = run_remind_strict(
             "claude-code",
             slice_payload.as_bytes(),
             &mut out,
@@ -4892,24 +5643,15 @@ mod tests {
 
     #[test]
     fn test_slice_threshold_env_override() {
-        // 只测 HooksConfig::from_env 解析；全局 CONFIG OnceLock 已在其它测试中初始化，
-        // 环境变量覆盖对 config() 不生效，故不做依赖新阈值的 e2e 断言
-        let orig = std::env::var(ENV_SLICE_READ_THRESHOLD).ok();
-
-        std::env::set_var(ENV_SLICE_READ_THRESHOLD, "3");
-        let cfg = HooksConfig::from_env();
+        let cfg =
+            HooksConfig::from_lookup(|k| (k == ENV_SLICE_READ_THRESHOLD).then(|| "3".to_string()));
         assert_eq!(cfg.slice_read_threshold, 3);
 
         // 无效值回退默认
-        std::env::set_var(ENV_SLICE_READ_THRESHOLD, "not_a_number");
-        let cfg2 = HooksConfig::from_env();
+        let cfg2 = HooksConfig::from_lookup(|k| {
+            (k == ENV_SLICE_READ_THRESHOLD).then(|| "not_a_number".to_string())
+        });
         assert_eq!(cfg2.slice_read_threshold, DEFAULT_SLICE_READ_THRESHOLD);
-
-        // 恢复原始环境变量
-        match orig {
-            Some(v) => std::env::set_var(ENV_SLICE_READ_THRESHOLD, v),
-            None => std::env::remove_var(ENV_SLICE_READ_THRESHOLD),
-        }
     }
 
     #[test]
@@ -5106,7 +5848,7 @@ mod tests {
 
         for i in 0..2 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload_full.as_bytes(),
                 &mut out,
@@ -5119,7 +5861,7 @@ mod tests {
         }
 
         out.clear();
-        let code3 = run_remind_impl(
+        let code3 = run_remind_strict(
             "claude-code",
             payload_full.as_bytes(),
             &mut out,
@@ -5146,7 +5888,7 @@ mod tests {
 
         for i in 0..2 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload_big.as_bytes(),
                 &mut out,
@@ -5159,7 +5901,7 @@ mod tests {
         }
 
         out.clear();
-        let code6 = run_remind_impl(
+        let code6 = run_remind_strict(
             "claude-code",
             payload_big.as_bytes(),
             &mut out,
@@ -5374,54 +6116,66 @@ mod tests {
         assert_eq!(default_cfg.grep_threshold, 3);
         assert!(!default_cfg.deny_text_search);
         assert_eq!(default_cfg.min_deny_interval_seconds, 15.0);
+        assert_eq!(default_cfg.hook_mode, HookMode::SoftFirst);
+        assert_eq!(default_cfg.cold_deny_threshold, DEFAULT_COLD_DENY_THRESHOLD);
+        assert_eq!(default_cfg.hard_extra, DEFAULT_HARD_EXTRA);
     }
 
     #[test]
     fn test_hooks_config_from_env_parsing() {
-        // 测试 HooksConfig 的环境变量解析逻辑
-        // 注意：这里不能修改全局 CONFIG 单例，只测试 from_env 的解析行为
-
-        // 保存原始环境变量
-        let orig_slice = std::env::var(ENV_SLICE_READ_MAX).ok();
-        let orig_threshold = std::env::var(ENV_READ_THRESHOLD).ok();
-        let orig_silence = std::env::var(ENV_DENY_SILENCE_SECS).ok();
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(kk, _)| *kk == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
 
         // 设置自定义值
-        std::env::set_var(ENV_SLICE_READ_MAX, "300");
-        std::env::set_var(ENV_READ_THRESHOLD, "5");
-        std::env::set_var(ENV_DENY_SILENCE_SECS, "60");
-
-        let cfg = HooksConfig::from_env();
+        let cfg = HooksConfig::from_lookup(lookup(&[
+            (ENV_SLICE_READ_MAX, "300"),
+            (ENV_READ_THRESHOLD, "5"),
+            (ENV_DENY_SILENCE_SECS, "60"),
+            (ENV_HOOK_MODE, "Strict"),
+            (ENV_COLD_DENY_THRESHOLD, "4"),
+            (ENV_HARD_EXTRA, "3"),
+        ]));
         assert_eq!(cfg.slice_read_max_limit, 300);
         assert_eq!(cfg.read_threshold, 5);
         assert_eq!(cfg.min_deny_interval_seconds, 60.0);
+        assert_eq!(cfg.hook_mode, HookMode::Strict);
+        assert_eq!(cfg.cold_deny_threshold, 4);
+        assert_eq!(cfg.hard_extra, 3);
+
+        // 测试 0 值被钳制到最小 1
+        let cfg_clamped = HooksConfig::from_lookup(lookup(&[
+            (ENV_COLD_DENY_THRESHOLD, "0"),
+            (ENV_HARD_EXTRA, "0"),
+            (ENV_HOOK_MODE, "advisory"),
+        ]));
+        assert_eq!(cfg_clamped.cold_deny_threshold, 1);
+        assert_eq!(cfg_clamped.hard_extra, 1);
+        assert_eq!(cfg_clamped.hook_mode, HookMode::Advisory);
 
         // 测试无效值回退默认
-        std::env::set_var(ENV_SLICE_READ_MAX, "invalid");
-        std::env::set_var(ENV_READ_THRESHOLD, "not_a_number");
-        std::env::set_var(ENV_DENY_SILENCE_SECS, "bad");
-
-        let cfg2 = HooksConfig::from_env();
+        let cfg2 = HooksConfig::from_lookup(lookup(&[
+            (ENV_SLICE_READ_MAX, "invalid"),
+            (ENV_READ_THRESHOLD, "not_a_number"),
+            (ENV_DENY_SILENCE_SECS, "bad"),
+            (ENV_HOOK_MODE, "unknown-mode"),
+            (ENV_COLD_DENY_THRESHOLD, "bad"),
+            (ENV_HARD_EXTRA, "bad"),
+        ]));
         assert_eq!(cfg2.slice_read_max_limit, DEFAULT_SLICE_READ_MAX_LIMIT);
         assert_eq!(cfg2.read_threshold, DEFAULT_READ_THRESHOLD);
         assert_eq!(
             cfg2.min_deny_interval_seconds,
             DEFAULT_MIN_DENY_INTERVAL_SECONDS
         );
-
-        // 恢复原始环境变量
-        match orig_slice {
-            Some(v) => std::env::set_var(ENV_SLICE_READ_MAX, v),
-            None => std::env::remove_var(ENV_SLICE_READ_MAX),
-        }
-        match orig_threshold {
-            Some(v) => std::env::set_var(ENV_READ_THRESHOLD, v),
-            None => std::env::remove_var(ENV_READ_THRESHOLD),
-        }
-        match orig_silence {
-            Some(v) => std::env::set_var(ENV_DENY_SILENCE_SECS, v),
-            None => std::env::remove_var(ENV_DENY_SILENCE_SECS),
-        }
+        assert_eq!(cfg2.hook_mode, HookMode::SoftFirst);
+        assert_eq!(cfg2.cold_deny_threshold, DEFAULT_COLD_DENY_THRESHOLD);
+        assert_eq!(cfg2.hard_extra, DEFAULT_HARD_EXTRA);
     }
 
     #[test]
@@ -5540,7 +6294,7 @@ mod tests {
         // agent-a：3 次 grep（100/101/102）-> 第 3 次触发自己的 deny
         for (i, now) in [100.0, 101.0, 102.0].iter().enumerate() {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload_a.as_bytes(),
                 &mut out,
@@ -5561,7 +6315,7 @@ mod tests {
 
         // agent-b：同会话第 1 次 grep（now=103）不受 agent-a 计数影响，无 deny 输出
         out.clear();
-        let code_b1 = run_remind_impl(
+        let code_b1 = run_remind_strict(
             "claude-code",
             payload_b.as_bytes(),
             &mut out,
@@ -5580,7 +6334,7 @@ mod tests {
         // 三次全部 Silenced 无输出——该断言可区分两种实现。
         for now in [104.0, 105.0] {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload_b.as_bytes(),
                 &mut out,
@@ -5627,7 +6381,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_remind_impl(
+        let code = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -5680,7 +6434,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_remind_impl(
+        let code = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -5774,7 +6528,7 @@ mod tests {
         // 穿越型 agent_id：3 次 grep 触发自己分片内的 deny
         for (i, now) in [100.0, 101.0, 102.0].iter().enumerate() {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload_evil.as_bytes(),
                 &mut out,
@@ -5794,7 +6548,7 @@ mod tests {
         //   该 deny 断言即可区分"真隔离"与"被共享静默窗消音"）
         for (i, now) in [103.0, 104.0, 105.0].iter().enumerate() {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "claude-code",
                 payload_long.as_bytes(),
                 &mut out,
@@ -5811,7 +6565,7 @@ mod tests {
 
         // 会话级（无 agent_id）第 1 次 grep 不受穿越型/超长 agent 的 deny 静默窗影响
         out.clear();
-        let code_flat = run_remind_impl(
+        let code_flat = run_remind_strict(
             "claude-code",
             payload_flat.as_bytes(),
             &mut out,
@@ -6007,9 +6761,9 @@ mod tests {
             .unwrap()
             .as_nanos();
         let temp_home = std::env::temp_dir().join(format!("astrolabe_cursor_path_{rand_id}"));
-        // 本用例验证旧的强制拦截输出；显式 enforce，避免受 auto 可用性探测影响。
         let cfg = HooksConfig {
             cursor_mode: CursorMode::Enforce,
+            hook_mode: HookMode::Strict,
             ..Default::default()
         };
         let mut err = Vec::new();
@@ -6091,7 +6845,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_remind_impl(
+        let code = run_remind_strict(
             "claude-code",
             payload.as_bytes(),
             &mut out,
@@ -6334,7 +7088,7 @@ mod tests {
         .to_string();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_remind_impl(
+        let code = run_remind_strict(
             "cursor",
             payload_str.as_bytes(),
             &mut out,
@@ -6357,7 +7111,7 @@ mod tests {
         })
         .to_string();
         out.clear();
-        let code_num = run_remind_impl(
+        let code_num = run_remind_strict(
             "cursor",
             payload_num.as_bytes(),
             &mut out,
@@ -6392,9 +7146,10 @@ mod tests {
             .unwrap()
             .as_nanos();
         let temp_home = std::env::temp_dir().join(format!("astrolabe_cursor_e2e_{rand_id}"));
-        // 该用例验证旧的强制拦截输出；显式选 enforce，避免受 auto 可用性探测影响。
+        // 该用例验证旧的强制拦截输出；显式选 enforce + strict，避免受 auto 可用性探测与 soft-first 影响。
         let cfg = HooksConfig {
             cursor_mode: CursorMode::Enforce,
+            hook_mode: HookMode::Strict,
             ..Default::default()
         };
 
@@ -6461,8 +7216,11 @@ mod tests {
             "workspace_roots": ["/Users/zhoulei/Project/not-approved-project"],
         })
         .to_string();
-        // auto 是默认值；临时 HOME 下没有 mcp-approvals.json → 未批准 → 降级放行。
-        let cfg = HooksConfig::default();
+        // auto 是默认值；临时 HOME 下没有 mcp-approvals.json → 未批准 → 降级放行（显式 strict 测试第 3 次触发降级）。
+        let cfg = HooksConfig {
+            hook_mode: HookMode::Strict,
+            ..Default::default()
+        };
         assert_eq!(cfg.cursor_mode, CursorMode::Auto);
 
         let mut out = Vec::new();
@@ -6574,6 +7332,7 @@ mod tests {
         let temp_home = std::env::temp_dir().join(format!("astrolabe_cursor_adv_{rand_id}"));
         let cfg = HooksConfig {
             cursor_mode: CursorMode::Advisory,
+            hook_mode: HookMode::Strict,
             ..Default::default()
         };
         let payload = serde_json::json!({
@@ -6624,6 +7383,7 @@ mod tests {
         let temp_home = std::env::temp_dir().join(format!("astrolabe_cc_cursor_mode_{rand_id}"));
         let cfg = HooksConfig {
             cursor_mode: CursorMode::Advisory,
+            hook_mode: HookMode::Strict,
             ..Default::default()
         };
         let payload = serde_json::json!({
@@ -6822,6 +7582,258 @@ mod tests {
         assert!(cursor_mcp_approved(&home, &workspace));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn cursor_config_dir_with_precedence_whitespace_and_tilde() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(kk, _)| *kk == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+
+        // CURSOR_CONFIG_DIR 优先于 CURSOR_HOME 优先于 <home>/.cursor
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", "/cfg/cursor"),
+                ("CURSOR_HOME", "/home/cursor"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/cfg/cursor"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_HOME", "/home/cursor"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/home/cursor"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[("HOME", "/u/home"), ("USERPROFILE", "/u/home")])),
+            Some(PathBuf::from("/u/home").join(".cursor"))
+        );
+
+        // 空白字符串回退
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", "  \t "),
+                ("CURSOR_HOME", "  /home/cursor  "),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/home/cursor"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", ""),
+                ("CURSOR_HOME", "   "),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home").join(".cursor"))
+        );
+        assert_eq!(cursor_config_dir_with(env(&[])), None);
+        assert_eq!(
+            cursor_config_dir_with(env(&[("CURSOR_CONFIG_DIR", "  "), ("CURSOR_HOME", "")])),
+            None
+        );
+
+        // ~、~/、~\ 在 CURSOR_CONFIG_DIR 下的展开
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", "~"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", "~/.cursor-alt"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home").join(".cursor-alt"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", "~/sub/dir"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home").join("sub").join("dir"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", r"~\.cursor-win"),
+                ("USERPROFILE", "/u/win"),
+            ])),
+            Some(PathBuf::from("/u/win").join(".cursor-win"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", r"~\sub\dir"),
+                ("USERPROFILE", "/u/win"),
+            ])),
+            Some(PathBuf::from("/u/win").join("sub").join("dir"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", "~/"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_CONFIG_DIR", r"~\"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home"))
+        );
+
+        // ~、~/、~\ 在 CURSOR_HOME 下的展开
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_HOME", "~"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_HOME", "~/.cursor-home"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home").join(".cursor-home"))
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[
+                ("CURSOR_HOME", r"~\.cursor-home\sub"),
+                ("HOME", "/u/home"),
+                ("USERPROFILE", "/u/home"),
+            ])),
+            Some(PathBuf::from("/u/home").join(".cursor-home").join("sub"))
+        );
+
+        // 含 ~ 但无 home 时返回 None；非前导 ~/~\/~\ 不展开
+        assert_eq!(
+            cursor_config_dir_with(env(&[("CURSOR_CONFIG_DIR", "~")])),
+            None
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[("CURSOR_CONFIG_DIR", "~/.cursor")])),
+            None
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[("CURSOR_CONFIG_DIR", r"~\.cursor")])),
+            None
+        );
+        assert_eq!(cursor_config_dir_with(env(&[("CURSOR_HOME", "~")])), None);
+        assert_eq!(
+            cursor_config_dir_with(env(&[("CURSOR_HOME", "~/.cursor")])),
+            None
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[("CURSOR_HOME", r"~\.cursor")])),
+            None
+        );
+        assert_eq!(
+            cursor_config_dir_with(env(&[("CURSOR_CONFIG_DIR", "~other/cursor")])),
+            Some(PathBuf::from("~other/cursor"))
+        );
+    }
+
+    #[test]
+    fn cursor_mcp_approved_with_reads_custom_config_dir() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("astrolabe_cursor_cfg_dir_{rand_id}"));
+        let home = root.join("home");
+        let default_cursor = home.join(".cursor");
+        let custom_cursor = root.join("custom-cursor");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let project_dir = cursor_project_dir_name(&workspace).unwrap();
+        let default_base = default_cursor.join("projects").join(&project_dir);
+        let custom_base = custom_cursor.join("projects").join(&project_dir);
+        std::fs::create_dir_all(&default_base).unwrap();
+        std::fs::create_dir_all(&custom_base).unwrap();
+
+        let home_str = home.to_string_lossy().into_owned();
+        let custom_str = custom_cursor.to_string_lossy().into_owned();
+        let custom_env = |k: &str| match k {
+            "CURSOR_CONFIG_DIR" => Some(custom_str.clone()),
+            "HOME" | "USERPROFILE" => Some(home_str.clone()),
+            _ => None,
+        };
+        let cursor_home_env = |k: &str| match k {
+            "CURSOR_CONFIG_DIR" => Some("   ".to_string()),
+            "CURSOR_HOME" => Some(custom_str.clone()),
+            "HOME" | "USERPROFILE" => Some(home_str.clone()),
+            _ => None,
+        };
+
+        let real_approval = r#"["astrolabe-def52bf6dc098bc5"]"#;
+        let mcp_json_body = r#"{"mcpServers":{"astrolabe":{"command":"astrolabe"}}}"#;
+
+        // 1. 仅 <home>/.cursor/mcp.json 声明 astrolabe，自定义目录无配置 → 不读取 <home>/.cursor
+        std::fs::write(default_cursor.join("mcp.json"), mcp_json_body).unwrap();
+        assert!(cursor_mcp_approved(&home, &workspace));
+        assert!(!cursor_mcp_approved_with(&workspace, custom_env));
+
+        // 2. 自定义目录 mcp.json 声明 astrolabe，且删除默认目录配置 → 从自定义目录启用
+        std::fs::remove_file(default_cursor.join("mcp.json")).unwrap();
+        std::fs::write(custom_cursor.join("mcp.json"), mcp_json_body).unwrap();
+        assert!(!cursor_mcp_approved(&home, &workspace));
+        assert!(cursor_mcp_approved_with(&workspace, custom_env));
+        assert!(cursor_mcp_approved_with(&workspace, cursor_home_env));
+
+        // 3. mcp-disabled.json 只看自定义目录（默认目录放 "[]"，自定义目录禁用 → 未启用）
+        std::fs::write(default_base.join("mcp-disabled.json"), "[]").unwrap();
+        std::fs::write(custom_base.join("mcp-disabled.json"), real_approval).unwrap();
+        assert!(!cursor_mcp_approved_with(&workspace, custom_env));
+
+        // 4. 默认目录禁用、自定义目录未禁用 → 已启用
+        std::fs::write(custom_base.join("mcp-disabled.json"), "[]").unwrap();
+        std::fs::write(default_base.join("mcp-disabled.json"), real_approval).unwrap();
+        assert!(cursor_mcp_approved_with(&workspace, custom_env));
+
+        // 5. 项目级 .cursor/mcp.json 下 mcp-approvals.json 只看自定义目录
+        std::fs::remove_file(custom_cursor.join("mcp.json")).unwrap();
+        let project_mcp = workspace.join(".cursor").join("mcp.json");
+        std::fs::create_dir_all(project_mcp.parent().unwrap()).unwrap();
+        std::fs::write(&project_mcp, mcp_json_body).unwrap();
+        std::fs::write(default_base.join("mcp-approvals.json"), real_approval).unwrap();
+        assert!(!cursor_mcp_approved_with(&workspace, custom_env));
+
+        std::fs::write(custom_base.join("mcp-approvals.json"), real_approval).unwrap();
+        assert!(cursor_mcp_approved_with(&workspace, custom_env));
+
+        // 6. CURSOR_CONFIG_DIR 使用 ~/ 展开时也能正确读取
+        let tilde_dir = home.join("tilde-cursor");
+        let tilde_base = tilde_dir.join("projects").join(&project_dir);
+        std::fs::create_dir_all(&tilde_base).unwrap();
+        std::fs::write(tilde_base.join("mcp-approvals.json"), real_approval).unwrap();
+        let tilde_env = |k: &str| match k {
+            "CURSOR_CONFIG_DIR" => Some("~/tilde-cursor".to_string()),
+            "HOME" | "USERPROFILE" => Some(home_str.clone()),
+            _ => None,
+        };
+        assert!(cursor_mcp_approved_with(&workspace, tilde_env));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
@@ -7047,7 +8059,7 @@ mod tests {
 
         for i in 0..2 {
             out.clear();
-            let code = run_remind_impl(
+            let code = run_remind_strict(
                 "opencode",
                 payload.as_bytes(),
                 &mut out,
@@ -7060,7 +8072,7 @@ mod tests {
         }
 
         out.clear();
-        let code3 = run_remind_impl(
+        let code3 = run_remind_strict(
             "opencode",
             payload.as_bytes(),
             &mut out,
@@ -7389,7 +8401,7 @@ mod tests {
 
     #[test]
     fn decide_soft_mode_unchanged_needs_three_greps() {
-        let cfg = HooksConfig::default();
+        let cfg = strict_cfg();
         assert!(!cfg.deny_text_search);
         let mut counter = CounterState::default();
         assert_eq!(
@@ -7410,6 +8422,7 @@ mod tests {
     fn decide_hard_allows_non_search_bash_kinds() {
         let cfg = HooksConfig {
             deny_text_search: true,
+            hook_mode: HookMode::Strict,
             ..Default::default()
         };
         let mut counter = CounterState::default();
@@ -7555,7 +8568,7 @@ mod tests {
         assert_eq!(code, 0);
         assert!(out.is_empty());
 
-        let soft = HooksConfig::default();
+        let soft = strict_cfg();
         let soft_payload = serde_json::json!({
             "session_id": "sess_soft_grep",
             "tool_name": "Grep",
@@ -7573,7 +8586,7 @@ mod tests {
             &soft,
         );
         assert_eq!(code, 0);
-        assert!(out.is_empty(), "soft first grep must allow");
+        assert!(out.is_empty(), "strict mode first grep must allow silently");
 
         let _ = std::fs::remove_dir_all(&temp_home);
     }
@@ -7582,6 +8595,7 @@ mod tests {
     fn grep_threshold_env_tunable_via_decide_with() {
         let cfg = HooksConfig {
             grep_threshold: 1,
+            hook_mode: HookMode::Strict,
             ..Default::default()
         };
         let mut counter = CounterState::default();
@@ -7736,14 +8750,13 @@ mod tests {
             for n in 0..3 {
                 let mut out = Vec::new();
                 let mut err = Vec::new();
-                let code = run_remind_impl_with(
+                let code = run_remind_strict(
                     "claude-code",
                     payload.as_bytes(),
                     &mut out,
                     &mut err,
                     Some(1000.0 + n as f64),
                     Some(&tmp),
-                    &HooksConfig::default(),
                 );
                 assert_eq!(code, 0);
                 if !out.is_empty() && denied_at.is_none() {
@@ -7845,8 +8858,30 @@ mod tests {
         let path = get_hook_data_dir(&home, "noop1", None)
             .unwrap()
             .join("counter.json");
-        // 状态本就是零：不应创建 counter.json
-        assert!(!path.exists(), "no-op reset must not write counter.json");
+        // 首次 Astrolabe 调用必须落盘 astrolabe_seen=true，确保冷态切热态持久化
+        assert!(
+            path.exists(),
+            "first astrolabe call must persist astrolabe_seen=true"
+        );
+        assert!(load_counter(&path).astrolabe_seen);
+
+        // 已有 astrolabe_seen=true 且 burst 为零时，再次调用属于冗余重置：不得重写 counter.json
+        let sentinel = br#"{"astrolabe_seen":true}"#;
+        std::fs::write(&path, sentinel).unwrap();
+        let code2 = run_remind_impl(
+            "claude-code",
+            &payload[..],
+            &mut out,
+            &mut err,
+            Some(11.0),
+            Some(&home),
+        );
+        assert_eq!(code2, 0);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            sentinel,
+            "redundant no-op reset must not rewrite counter.json"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -7888,5 +8923,778 @@ mod tests {
             (0, 0, 0, 0)
         );
         let _ = cfg;
+    }
+
+    #[test]
+    fn hook_mode_from_env_variants() {
+        assert_eq!(HookMode::from_env(None), HookMode::SoftFirst);
+        assert_eq!(HookMode::from_env(Some("")), HookMode::SoftFirst);
+        assert_eq!(HookMode::from_env(Some("  ")), HookMode::SoftFirst);
+        assert_eq!(HookMode::from_env(Some("soft-first")), HookMode::SoftFirst);
+        assert_eq!(HookMode::from_env(Some("SOFT_FIRST")), HookMode::SoftFirst);
+        assert_eq!(HookMode::from_env(Some("Soft")), HookMode::SoftFirst);
+        assert_eq!(HookMode::from_env(Some("STRICT")), HookMode::Strict);
+        assert_eq!(HookMode::from_env(Some("Advisory")), HookMode::Advisory);
+        assert_eq!(HookMode::from_env(Some("bogus")), HookMode::SoftFirst);
+    }
+
+    #[test]
+    fn session_start_emits_static_constant_json() {
+        let mut out1 = Vec::new();
+        let mut out2 = Vec::new();
+        assert_eq!(run_session_start_impl(&mut out1), 0);
+        assert_eq!(run_session_start_impl(&mut out2), 0);
+        assert_eq!(out1, out2);
+
+        let s = String::from_utf8(out1).unwrap();
+        let val: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(val["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        let ctx = val["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("select:mcp__astrolabe__resolve_contx,mcp__astrolabe__search_code,mcp__astrolabe__find_symbol,mcp__astrolabe__find_refs,mcp__astrolabe__goto_def,mcp__astrolabe__get_diag,mcp__astrolabe__get_lang"));
+    }
+
+    #[test]
+    fn counter_state_backward_compat_and_reset_burst_semantics() {
+        let legacy_json = r#"{"n_grep":2,"n_read":1,"n_non_symbolic":3,"last_deny_ts":50.0}"#;
+        let mut c: CounterState = serde_json::from_str(legacy_json).unwrap();
+        assert!(!c.astrolabe_seen);
+        assert!(!c.soft_nudged);
+
+        c.astrolabe_seen = true;
+        c.soft_nudged = true;
+        c.reset_burst();
+        assert_eq!(c.n_grep, 0);
+        assert_eq!(c.n_read, 0);
+        assert_eq!(c.n_non_symbolic, 0);
+        assert_eq!(c.n_slice, 0);
+        assert!(!c.soft_nudged, "soft_nudged must clear on reset_burst");
+        assert!(c.astrolabe_seen, "astrolabe_seen must survive reset_burst");
+        assert_eq!(c.last_deny_ts, Some(50.0));
+    }
+
+    #[test]
+    fn soft_first_end_to_end_cold_to_warm_lifecycle() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_soft_first_{rand_id}"));
+        let cfg = HooksConfig::default();
+        assert_eq!(cfg.hook_mode, HookMode::SoftFirst);
+
+        let grep_payload = serde_json::json!({
+            "session_id": "sf_sess",
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "foo" }
+        })
+        .to_string();
+        let astro_payload = serde_json::json!({
+            "session_id": "sf_sess",
+            "tool_name": "mcp__astrolabe__find_symbol",
+            "tool_input": { "query": "Foo" }
+        })
+        .to_string();
+
+        let call = |payload: &str, ts: f64| -> (i32, String) {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_remind_impl_with(
+                "claude-code",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(ts),
+                Some(&temp_home),
+                &cfg,
+            );
+            (code, String::from_utf8_lossy(&out).trim().to_string())
+        };
+
+        // 1. 冷态第 1 次 Grep -> allow + additionalContext（带 ToolSearch 7 工具提示）
+        let (code1, out1) = call(&grep_payload, 100.0);
+        assert_eq!(code1, 0);
+        let v1: serde_json::Value = serde_json::from_str(&out1).unwrap();
+        assert_eq!(v1["hookSpecificOutput"]["permissionDecision"], "allow");
+        let ctx1 = v1["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx1.contains("select:mcp__astrolabe__resolve_contx"));
+        assert!(ctx1.contains("mcp__astrolabe__get_lang"));
+
+        // 2. 冷态第 2 次 Grep -> deny（带原子 7 工具 ToolSearch 提示）
+        let (code2, out2) = call(&grep_payload, 101.0);
+        assert_eq!(code2, 0);
+        let v2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(v2["hookSpecificOutput"]["permissionDecision"], "deny");
+        let ctx2 = v2["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx2.contains("select:mcp__astrolabe__resolve_contx"));
+
+        // 3. 15s 静默窗内 -> Silenced（无输出）
+        let (code_sil, out_sil) = call(&grep_payload, 105.0);
+        assert_eq!(code_sil, 0);
+        assert!(out_sil.is_empty());
+
+        // 4. 调用 Astrolabe -> 置 astrolabe_seen=true，清零 burst & 静默窗
+        let (code_astro, out_astro) = call(&astro_payload, 106.0);
+        assert_eq!(code_astro, 0);
+        assert!(out_astro.is_empty());
+        let counter_path = get_hook_data_dir(&temp_home, "sf_sess", None)
+            .unwrap()
+            .join("counter.json");
+        assert!(load_counter(&counter_path).astrolabe_seen);
+
+        // 5. 热态第 1、2 次 Grep -> 静默放行
+        let (c1, o1) = call(&grep_payload, 107.0);
+        assert_eq!(c1, 0);
+        assert!(o1.is_empty());
+        let (c2, o2) = call(&grep_payload, 108.0);
+        assert_eq!(c2, 0);
+        assert!(o2.is_empty());
+
+        // 6. 热态第 3 次 Grep -> SoftNudge（allow + additionalContext，不清零计数）
+        let (c3, o3) = call(&grep_payload, 109.0);
+        assert_eq!(c3, 0);
+        let v3: serde_json::Value = serde_json::from_str(&o3).unwrap();
+        assert_eq!(v3["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert!(v3["hookSpecificOutput"]["additionalContext"].is_string());
+        let st = load_counter(&counter_path);
+        assert_eq!(st.n_grep, 3);
+        assert!(st.soft_nudged);
+
+        // 7. 热态第 4 次 Grep -> 静默放行（3 < 4 < 3 + 2）
+        let (c4, o4) = call(&grep_payload, 110.0);
+        assert_eq!(c4, 0);
+        assert!(o4.is_empty());
+
+        // 8. 热态第 5 次 Grep -> deny（3 + hard_extra(2) = 5）
+        let (c5, o5) = call(&grep_payload, 111.0);
+        assert_eq!(c5, 0);
+        let v5: serde_json::Value = serde_json::from_str(&o5).unwrap();
+        assert_eq!(v5["hookSpecificOutput"]["permissionDecision"], "deny");
+
+        // 9. deny 后进入 15s 静默窗
+        let (c6, o6) = call(&grep_payload, 120.0);
+        assert_eq!(c6, 0);
+        assert!(o6.is_empty());
+
+        // 10. 离开静默窗且 astrolabe_seen 仍为 true -> 按热态重新计数（第 1 次静默放行）
+        let (c7, o7) = call(&grep_payload, 127.0);
+        assert_eq!(c7, 0);
+        assert!(o7.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn soft_first_read_and_slice_and_strict_cold_toolsearch() {
+        let cfg = HooksConfig::default();
+
+        // 冷态 Read：1st SoftNudge, 2nd Deny
+        let mut c_read = CounterState::default();
+        assert_eq!(
+            decide_with(
+                &mut c_read,
+                ToolKind::Read { is_code_file: true },
+                10.0,
+                &cfg
+            ),
+            Decision::SoftNudge {
+                kind: DenyKind::Read,
+                cold: true
+            }
+        );
+        assert_eq!(
+            decide_with(
+                &mut c_read,
+                ToolKind::Read { is_code_file: true },
+                11.0,
+                &cfg
+            ),
+            Decision::Deny(DenyKind::Read)
+        );
+
+        // SliceRead 在 SoftFirst：第 10 次 SoftNudge，第 11 次 Allow，第 12 次 Deny
+        let mut c_slice = CounterState::default();
+        for i in 0..9 {
+            assert_eq!(
+                decide_with(&mut c_slice, ToolKind::SliceRead, 100.0 + i as f64, &cfg),
+                Decision::Allow
+            );
+        }
+        assert_eq!(
+            decide_with(&mut c_slice, ToolKind::SliceRead, 109.0, &cfg),
+            Decision::SoftNudge {
+                kind: DenyKind::Slice,
+                cold: true
+            }
+        );
+        assert_eq!(
+            decide_with(&mut c_slice, ToolKind::SliceRead, 110.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut c_slice, ToolKind::SliceRead, 111.0, &cfg),
+            Decision::Deny(DenyKind::Slice)
+        );
+
+        // Strict 模式冷态 Deny 仅 Claude Code 系列附带原子 7 工具 ToolSearch 提示
+        for client in [
+            Client::ClaudeCode,
+            Client::Codebuddy,
+            Client::Vscode,
+            Client::KimiCode,
+            Client::ZCode,
+            Client::Other,
+        ] {
+            let cold_deny_out = build_output_for_state(client, DenyKind::Grep, true);
+            assert!(
+                cold_deny_out.contains("select:mcp__astrolabe__resolve_contx"),
+                "{client:?} should include ToolSearch hint"
+            );
+        }
+        for client in [
+            Client::Codex,
+            Client::Grok,
+            Client::OpenCode,
+            Client::Cursor,
+        ] {
+            let cold_deny_out = build_output_for_state(client, DenyKind::Grep, true);
+            assert!(
+                !cold_deny_out.contains("select:mcp__astrolabe__resolve_contx"),
+                "{client:?} must NOT include Claude-only ToolSearch hint"
+            );
+        }
+        let cursor_cold_nudge =
+            build_soft_nudge_output(Client::Cursor, DenyKind::Grep, true).unwrap();
+        assert!(cursor_cold_nudge.contains("Astrolabe reminder:"));
+        assert!(!cursor_cold_nudge.contains("select:mcp__astrolabe__resolve_contx"));
+    }
+
+    #[test]
+    fn advisory_mode_never_denies_and_throttles_by_silence_window() {
+        let cfg = HooksConfig {
+            hook_mode: HookMode::Advisory,
+            ..Default::default()
+        };
+        let mut c = CounterState::default();
+        assert_eq!(
+            decide_with(&mut c, ToolKind::Grep, 10.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut c, ToolKind::Grep, 11.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut c, ToolKind::Grep, 12.0, &cfg),
+            Decision::SoftNudge {
+                kind: DenyKind::Grep,
+                cold: true
+            }
+        );
+        // 15s 静默窗内节流
+        assert_eq!(
+            decide_with(&mut c, ToolKind::Grep, 20.0, &cfg),
+            Decision::Silenced
+        );
+        // 离开静默窗后重新累计
+        assert_eq!(
+            decide_with(&mut c, ToolKind::Grep, 28.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut c, ToolKind::Grep, 29.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut c, ToolKind::Grep, 30.0, &cfg),
+            Decision::SoftNudge {
+                kind: DenyKind::Grep,
+                cold: true
+            }
+        );
+    }
+
+    #[test]
+    fn soft_nudge_client_protocol_outputs() {
+        for client in [
+            Client::ClaudeCode,
+            Client::Codebuddy,
+            Client::Vscode,
+            Client::KimiCode,
+            Client::ZCode,
+            Client::Other,
+        ] {
+            let out = build_soft_nudge_output(client, DenyKind::Grep, true).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+            assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+            assert!(v["hookSpecificOutput"]["additionalContext"].is_string());
+        }
+
+        let cursor_out = build_soft_nudge_output(Client::Cursor, DenyKind::Read, false).unwrap();
+        let cv: serde_json::Value = serde_json::from_str(&cursor_out).unwrap();
+        assert_eq!(cv["permission"], "allow");
+        assert!(cv["agent_message"].is_string());
+
+        for client in [Client::Codex, Client::Grok, Client::OpenCode] {
+            assert!(
+                build_soft_nudge_output(client, DenyKind::Grep, true).is_none(),
+                "{client:?} must stay silent on SoftNudge"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_home_priority_and_temp_diagnostic_paths() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(kk, _)| *kk == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        // Windows 顺序：USERPROFILE -> HOMEDRIVE+HOMEPATH -> HOME
+        assert_eq!(
+            home_from_lookup_for(true, env(&[("HOME", "/h"), ("USERPROFILE", r"C:\u")])),
+            Some(PathBuf::from(r"C:\u"))
+        );
+        assert_eq!(
+            home_from_lookup_for(
+                true,
+                env(&[
+                    ("HOME", "/h"),
+                    ("HOMEDRIVE", "C:"),
+                    ("HOMEPATH", r"\Users\b")
+                ])
+            ),
+            Some(PathBuf::from(r"C:\Users\b"))
+        );
+        assert_eq!(
+            home_from_lookup_for(true, env(&[("HOME", "/h")])),
+            Some(PathBuf::from("/h"))
+        );
+        // Unix 顺序：HOME -> USERPROFILE -> HOMEDRIVE+HOMEPATH
+        assert_eq!(
+            home_from_lookup_for(false, env(&[("HOME", "/h"), ("USERPROFILE", r"C:\u")])),
+            Some(PathBuf::from("/h"))
+        );
+
+        let extras = vec![PathBuf::from(r"C:\Users\alice\AppData\Local\Temp")];
+        assert!(is_temporary_diagnostic_path_with(
+            r"C:\Users\alice\AppData\Local\Temp\build.log",
+            &extras
+        ));
+        assert!(is_temporary_diagnostic_path_with(
+            r"\\?\c:\users\alice\appdata\local\temp\out.txt",
+            &extras
+        ));
+        // 反斜杠/正斜杠路径穿越必须拦截
+        assert!(!is_temporary_diagnostic_path_with(
+            r"C:\Users\alice\AppData\Local\Temp\..\secret\a.log",
+            &extras
+        ));
+        assert!(!is_temporary_diagnostic_path_with(
+            r"/tmp/..\secret\a.log",
+            &extras
+        ));
+        assert!(!is_temporary_diagnostic_path_with(r"/tmp/./a.log", &extras));
+        // 边界与源码双扩展名拦截
+        assert!(!is_temporary_diagnostic_path_with(
+            r"C:\Users\alice\AppData\Local\Temp2\a.log",
+            &extras
+        ));
+        assert!(!is_temporary_diagnostic_path_with(
+            r"C:\Users\alice\AppData\Local\Temp\main.rs.log",
+            &extras
+        ));
+
+        // paths_equivalent 归一化对比
+        assert!(paths_equivalent(
+            Path::new(r"\\?\C:\NonExistent\Repo"),
+            Path::new(r"c:/nonexistent/repo/")
+        ));
+    }
+
+    #[test]
+    fn save_counter_rename_retry_handles_transient_errors() {
+        let mut attempts = 0usize;
+        let res = rename_with_retry_op(Path::new("a"), Path::new("b"), |_, _| {
+            attempts += 1;
+            if attempts < 4 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(res.is_ok());
+        assert_eq!(attempts, 4);
+
+        // Windows ERROR_SHARING_VIOLATION (32) 重试满 5 次（共 6 次尝试）后失败
+        let mut attempts2 = 0usize;
+        let res2 = rename_with_retry_op(Path::new("a"), Path::new("b"), |_, _| {
+            attempts2 += 1;
+            Err(std::io::Error::from_raw_os_error(32))
+        });
+        assert!(res2.is_err());
+        assert_eq!(attempts2, 6);
+
+        // 非瞬态错误（NotFound）不重试
+        let mut attempts3 = 0usize;
+        let res3 = rename_with_retry_op(Path::new("a"), Path::new("b"), |_, _| {
+            attempts3 += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert!(res3.is_err());
+        assert_eq!(attempts3, 1);
+
+        // save_counter 不留存 .tmp 文件
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("astrolabe_save_retry_{rand_id}"));
+        let path = dir.join("counter.json");
+        save_counter(
+            &path,
+            &CounterState {
+                astrolabe_seen: true,
+                n_grep: 2,
+                ..Default::default()
+            },
+        );
+        let tmp_count = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(tmp_count, 0);
+        assert!(load_counter(&path).astrolabe_seen);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_live_lock_lifecycle_and_enforcement() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("astrolabe_cursor_lock_{rand_id}"));
+        let ws = home.join("repo");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        std::fs::write(
+            home.join(".cursor/mcp.json"),
+            r#"{"mcpServers":{"astrolabe":{"command":"astrolabe"}}}"#,
+        )
+        .unwrap();
+
+        // Windows 形式等价路径应映射到同一把锁
+        assert_eq!(
+            cursor_live_lock_path_in(&home, Path::new(r"C:\Work\Repo")),
+            cursor_live_lock_path_in(&home, Path::new(r"\\?\c:/work/repo/"))
+        );
+
+        let payload = serde_json::json!({
+            "conversation_id": "cursor_lock_sess",
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "foo" },
+            "workspace_roots": [&ws],
+        });
+
+        // 1. 锁文件不存在 -> None，Auto 不强制拦截
+        assert_eq!(is_cursor_live_lock_held_in(&home, &ws), None);
+        assert!(!cursor_enforcement_for_payload(
+            CursorMode::Auto,
+            &payload,
+            Some(&home)
+        ));
+
+        // 2. 持有锁期间 -> Some(true)，Auto 强制拦截
+        let guard = acquire_cursor_live_lock_in(&home, &ws).expect("acquire cursor live lock");
+        assert_eq!(is_cursor_live_lock_held_in(&home, &ws), Some(true));
+        assert!(astrolabe_cursor_process_alive_in(Some(&home), Some(&ws)));
+        assert!(cursor_enforcement_for_payload(
+            CursorMode::Auto,
+            &payload,
+            Some(&home)
+        ));
+
+        // 3. 释放锁后 -> Some(false)
+        drop(guard);
+        assert_cursor_live_lock_released(&home, &ws);
+        assert!(!cursor_enforcement_for_payload(
+            CursorMode::Auto,
+            &payload,
+            Some(&home)
+        ));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn assert_cursor_live_lock_released(home: &Path, ws: &Path) {
+        // Another test thread may transiently fork() while this test holds an O_CLOEXEC flock fd;
+        // wait briefly for that pre-drop fork to reach exec() and close the inherited fd.
+        for _ in 0..40 {
+            if is_cursor_live_lock_held_in(home, ws) == Some(false) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(is_cursor_live_lock_held_in(home, ws), Some(false));
+    }
+
+    #[test]
+    fn cursor_live_lock_shared_dual_instances() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("astrolabe_cursor_dual_lock_{rand_id}"));
+        let ws = home.join("repo");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let lock_a = acquire_cursor_live_lock_in(&home, &ws).expect("instance A lock");
+        let lock_b = acquire_cursor_live_lock_in(&home, &ws).expect("instance B shared lock");
+        assert_eq!(is_cursor_live_lock_held_in(&home, &ws), Some(true));
+
+        drop(lock_a);
+        assert_eq!(is_cursor_live_lock_held_in(&home, &ws), Some(true));
+
+        drop(lock_b);
+        assert_cursor_live_lock_released(&home, &ws);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn soft_first_cold_non_code_read_does_not_hard_deny() {
+        let cfg = HooksConfig::default();
+
+        // 1. Read("README.md") -> Grep("foo") => SoftNudge (not Deny)
+        let mut c1 = CounterState::default();
+        let read_readme = classify_tool(
+            "read",
+            Client::ClaudeCode,
+            Some("README.md"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(read_readme, ToolKind::Neutral);
+        assert_eq!(
+            decide_with(&mut c1, read_readme, 10.0, &cfg),
+            Decision::NeutralAllow
+        );
+        assert_eq!(
+            decide_with(&mut c1, ToolKind::Grep, 11.0, &cfg),
+            Decision::SoftNudge {
+                kind: DenyKind::Grep,
+                cold: true
+            }
+        );
+
+        // 1b. Read("Cargo.toml") (increments n_non_symbolic, not n_read) -> Grep("foo") => SoftNudge (not Deny)
+        let mut c1b = CounterState::default();
+        let read_toml_first = classify_tool(
+            "read",
+            Client::ClaudeCode,
+            Some("Cargo.toml"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            read_toml_first,
+            ToolKind::Read {
+                is_code_file: false
+            }
+        );
+        assert_eq!(
+            decide_with(&mut c1b, read_toml_first, 12.0, &cfg),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide_with(&mut c1b, ToolKind::Grep, 13.0, &cfg),
+            Decision::SoftNudge {
+                kind: DenyKind::Grep,
+                cold: true
+            }
+        );
+
+        // 2. Grep("foo") -> Read("Cargo.toml") => Allow (not Deny)
+        let mut c2 = CounterState::default();
+        assert_eq!(
+            decide_with(&mut c2, ToolKind::Grep, 20.0, &cfg),
+            Decision::SoftNudge {
+                kind: DenyKind::Grep,
+                cold: true
+            }
+        );
+        let read_toml = classify_tool(
+            "read",
+            Client::ClaudeCode,
+            Some("Cargo.toml"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            read_toml,
+            ToolKind::Read {
+                is_code_file: false
+            }
+        );
+        assert_eq!(decide_with(&mut c2, read_toml, 21.0, &cfg), Decision::Allow);
+    }
+
+    #[test]
+    fn soft_first_cold_non_nudge_clients_keep_strict_thresholds() {
+        let cfg = HooksConfig::default();
+        assert_eq!(cfg.hook_mode, HookMode::SoftFirst);
+
+        for client in [Client::Codex, Client::Grok, Client::OpenCode] {
+            // Grep: 第 1、2 次 Allow，第 3 次 Deny（不缩至 cold_deny=2，不发 SoftNudge）
+            let mut c_grep = CounterState::default();
+            assert_eq!(
+                decide_with_client(&mut c_grep, ToolKind::Grep, 10.0, &cfg, client),
+                Decision::Allow
+            );
+            assert_eq!(
+                decide_with_client(&mut c_grep, ToolKind::Grep, 11.0, &cfg, client),
+                Decision::Allow
+            );
+            assert!(!c_grep.soft_nudged);
+            assert_eq!(
+                decide_with_client(&mut c_grep, ToolKind::Grep, 12.0, &cfg, client),
+                Decision::Deny(DenyKind::Grep)
+            );
+            assert!(!c_grep.soft_nudged);
+
+            // Code Read: 第 1、2 次 Allow，第 3 次 Deny
+            let mut c_read = CounterState::default();
+            let code_read = ToolKind::Read { is_code_file: true };
+            assert_eq!(
+                decide_with_client(&mut c_read, code_read, 20.0, &cfg, client),
+                Decision::Allow
+            );
+            assert_eq!(
+                decide_with_client(&mut c_read, code_read, 21.0, &cfg, client),
+                Decision::Allow
+            );
+            assert_eq!(
+                decide_with_client(&mut c_read, code_read, 22.0, &cfg, client),
+                Decision::Deny(DenyKind::Read)
+            );
+            assert!(!c_read.soft_nudged);
+
+            // Mixed non-symbolic: 第 1..3 次 Allow，第 4 次 (NON_SYMBOLIC_THRESHOLD) Deny(Mixed)
+            let mut c_mix = CounterState::default();
+            let non_code_read = ToolKind::Read {
+                is_code_file: false,
+            };
+            assert_eq!(
+                decide_with_client(&mut c_mix, non_code_read, 30.0, &cfg, client),
+                Decision::Allow
+            );
+            assert_eq!(
+                decide_with_client(&mut c_mix, ToolKind::Grep, 31.0, &cfg, client),
+                Decision::Allow
+            );
+            assert_eq!(
+                decide_with_client(&mut c_mix, non_code_read, 32.0, &cfg, client),
+                Decision::Allow
+            );
+            assert_eq!(
+                decide_with_client(&mut c_mix, ToolKind::Grep, 33.0, &cfg, client),
+                Decision::Deny(DenyKind::Mixed)
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_unapproved_advisory_silences_within_min_deny_interval() {
+        let rand_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!("astrolabe_cursor_adv_sil_{rand_id}"));
+        let cfg = HooksConfig::default();
+        assert_eq!(cfg.hook_mode, HookMode::SoftFirst);
+        assert_eq!(cfg.cursor_mode, CursorMode::Auto);
+
+        let payload = serde_json::json!({
+            "conversation_id": "cursor_adv_silence_sess",
+            "tool_name": "Shell",
+            "tool_input": { "command": "grep -rn foo src/" },
+            "workspace_roots": ["/Users/zhoulei/Project/not-approved-project"],
+        })
+        .to_string();
+
+        let call = |ts: f64| -> (i32, String) {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_remind_impl_with(
+                "cursor",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(ts),
+                Some(&temp_home),
+                &cfg,
+            );
+            (code, String::from_utf8_lossy(&out).trim().to_string())
+        };
+
+        // Call 1: SoftNudge downgraded to advisory -> permission=allow + agent_message, enters silence window
+        let (c1, o1) = call(100.0);
+        assert_eq!(c1, 0);
+        let v1: serde_json::Value = serde_json::from_str(&o1).unwrap();
+        assert_eq!(v1["permission"], "allow");
+        assert!(v1["agent_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not available")));
+
+        // Call 2 within 15s -> Silenced (empty output, no spam)
+        let (c2, o2) = call(101.0);
+        assert_eq!(c2, 0);
+        assert!(o2.is_empty(), "expected silenced call 2, got: {o2}");
+
+        // Call 3 after 15s -> advisory again
+        let (c3, o3) = call(116.0);
+        assert_eq!(c3, 0);
+        let v3: serde_json::Value = serde_json::from_str(&o3).unwrap();
+        assert_eq!(v3["permission"], "allow");
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn temp_diagnostic_path_rejects_relative_and_root_extra_dirs() {
+        let extras = vec![
+            PathBuf::from(r"C:\"),
+            PathBuf::from("logs"),
+            PathBuf::from("/"),
+        ];
+        assert!(!is_temporary_diagnostic_path_with(
+            r"C:\app\debug.log",
+            &extras
+        ));
+        assert!(!is_temporary_diagnostic_path_with(
+            "logs/debug.log",
+            &extras
+        ));
+        assert!(!is_temporary_diagnostic_path_with(
+            "/var/app/debug.log",
+            &extras
+        ));
     }
 }
