@@ -6,6 +6,8 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.11] - 2026-11-27
+
 ### 中文
 
 #### 根治 Prompt Cache 坍塌（Claude Code `alwaysLoad` + Soft-First Hook + 索引首调缓冲）
