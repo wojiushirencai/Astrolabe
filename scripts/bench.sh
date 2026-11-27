@@ -132,7 +132,9 @@ for spec in "${corpora[@]}"; do
   cmd+=("$check")
 
   # Capture stdout; leave worker progress on stderr.
-  if ! output="$("${cmd[@]}" 2>"$OUT_DIR/${name}.err")"; then
+  if output="$("${cmd[@]}" 2>"$OUT_DIR/${name}.err")"; then
+    :
+  else
     status=$?
     printf '%-16s | %-14s | %8s | %10s | %10s | %8s | %10s | %s\n' \
       "$name" "$note" "-" "-" "-" "-" "-" "FAIL"

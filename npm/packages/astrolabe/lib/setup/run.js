@@ -3,6 +3,7 @@
 const path = require('path');
 const os = require('os');
 const clientsMod = require('./clients');
+const cursorMod = require('./cursor');
 const {
   CLIENTS,
   getClient,
@@ -160,6 +161,15 @@ async function runAsync(argv = process.argv.slice(2)) {
   }
 
   const home = resolveHome(opts.home);
+  if (opts.checkConfig) {
+    const root = cursorMod.resolveProjectRoot(opts.project ? path.resolve(opts.project) : process.cwd());
+    const report = cursorMod.inspectCursorConfig(home, root, process.env, {
+      configDir: opts.configDir || null,
+      mcpConfigPath: opts.mcpConfig || null,
+    });
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    return report.valid ? 0 : 1;
+  }
   const rows = detectAll(home, process.env);
   const detectedById = new Map(rows.map((row) => [row.id, row.detected]));
 
@@ -385,6 +395,19 @@ async function runAsync(argv = process.argv.slice(2)) {
     process.stdout.write(
       '      default: short catalog names only; tools/call still accepts legacy aliases\n',
     );
+  }
+
+  // A successful global write does not replace an existing project server.
+  // Surface the actual source before best-effort approval can obscure that fact.
+  if (cursorApplied && projectRoot && opts.scope !== 'project') {
+    const effective = cursorMod.inspectCursorConfig(home, projectRoot);
+    if (effective.source === 'project') {
+      process.stdout.write(
+        `\nWarning: project configuration ${effective.filePath} overrides the global Astrolabe entry.\n` +
+        '  Global setup does not migrate that project. Keep the intended scope; review it with ' +
+        '`astrolabe setup --check-config --project <dir>` before changing it.\n',
+      );
+    }
   }
 
   if (opts.dryRun) {

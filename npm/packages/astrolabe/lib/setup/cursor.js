@@ -201,29 +201,27 @@ function mergeCursorHooksFile(
   const hooks = doc.hooks;
   let replaced = false;
 
-  if (!Array.isArray(hooks.preToolUse)) hooks.preToolUse = [];
-  const remindIdx = hooks.preToolUse.findIndex((entry) =>
-    isAstrolabeHook(entry, 'remind', binPath, platform),
-  );
+  // Collapse only standalone entries owned by Astrolabe. Mixed legacy groups
+  // remain untouched, so unrelated hooks are never silently removed.
+  function migrate(entries, subcommand, replacement) {
+    const out = [];
+    let inserted = false;
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (!isAstrolabeHook(entry, subcommand, binPath, platform)) {
+        out.push(entry);
+      } else {
+        replaced = true;
+        if (!inserted) out.push(replacement);
+        inserted = true;
+      }
+    }
+    if (!inserted) out.push(replacement);
+    return out;
+  }
   const nextRemind = remindEntry(binPath, platform);
-  if (remindIdx >= 0) {
-    hooks.preToolUse[remindIdx] = nextRemind;
-    replaced = true;
-  } else {
-    hooks.preToolUse.push(nextRemind);
-  }
-
-  if (!Array.isArray(hooks.sessionEnd)) hooks.sessionEnd = [];
-  const cleanupIdx = hooks.sessionEnd.findIndex((entry) =>
-    isAstrolabeHook(entry, 'cleanup', binPath, platform),
-  );
   const nextCleanup = cleanupEntry(binPath, platform);
-  if (cleanupIdx >= 0) {
-    hooks.sessionEnd[cleanupIdx] = nextCleanup;
-    replaced = true;
-  } else {
-    hooks.sessionEnd.push(nextCleanup);
-  }
+  hooks.preToolUse = migrate(hooks.preToolUse, 'remind', nextRemind);
+  hooks.sessionEnd = migrate(hooks.sessionEnd, 'cleanup', nextCleanup);
 
   return {
     filePath,
@@ -465,22 +463,99 @@ function readJsonArray(filePath) {
   }
 }
 
-/** Cursor hashes the project root and its normalized stdio server config. */
-function approvalKey(projectRoot, server, serverName = SERVER_NAME) {
-  if (!projectRoot || !server || typeof server.command !== 'string') return null;
-  // Cursor's stdio schema strips fields such as type/cwd before hashing.
-  const normalized = { command: server.command, args: server.args || [], env: server.env || {} };
+/** Match Cursor CLI's effective stdio object, not the raw registration.
+ * Optional fields stay absent; type/envFile/enabledTools are stripped. cwd and
+ * startupTimeoutSec participate in approvals. Keep field order in sync with
+ * Cursor's command/args/env/cwd/startupTimeoutSec normalization.
+ */
+function normalizeCursorServer(server, env = process.env) {
+  if (!server || typeof server.command !== 'string' || (server.type !== undefined && server.type !== 'stdio')) return null;
+  const rawEnv = server.env;
+  if (rawEnv !== undefined && (!rawEnv || typeof rawEnv !== 'object' || Array.isArray(rawEnv) ||
+      Object.values(rawEnv).some((v) => typeof v !== 'string'))) return null;
+  const expand = (text, lookup) => text.replace(
+    /\$\{(?:env:([A-Za-z_][A-Za-z0-9_]*)|([^:}]+)(?::-([^}]*))?)\}/g,
+    (original, explicit, name, fallback) => lookup(explicit || name) ?? (explicit ? original : fallback ?? original),
+  );
+  const effectiveEnv = Object.fromEntries(Object.entries(rawEnv || {}).map(([key, value]) => [
+    key, expand(value, (name) => name === key ? env[name] : rawEnv[name] ?? env[name]),
+  ]));
+  const lookup = (name) => effectiveEnv[name] ?? env[name];
+  const out = { command: expand(server.command, lookup) };
+  if (server.args !== undefined) {
+    if (!Array.isArray(server.args) || server.args.some((v) => typeof v !== 'string')) return null;
+    out.args = server.args.map((v) => expand(v, lookup));
+  }
+  if (rawEnv !== undefined) out.env = effectiveEnv;
+  if (server.cwd !== undefined) {
+    if (typeof server.cwd !== 'string') return null;
+    out.cwd = expand(server.cwd, lookup);
+  }
+  if (server.startupTimeoutSec !== undefined && Number.isInteger(server.startupTimeoutSec) &&
+      server.startupTimeoutSec >= 0) out.startupTimeoutSec = server.startupTimeoutSec;
+  return out;
+}
+
+function approvalKey(projectRoot, server, serverName = SERVER_NAME, env = process.env) {
+  const normalized = normalizeCursorServer(server, env);
+  if (!projectRoot || !normalized) return null;
   const hash = createHash('sha256')
     .update(JSON.stringify({ path: canonicalizePath(projectRoot), server: normalized }))
     .digest('hex').slice(0, 16);
   return `${serverName}-${hash}`;
 }
 
-function checkApprovalFile(filePath, { projectRoot, server, serverName = SERVER_NAME } = {}) {
+function checkApprovalFile(filePath, { projectRoot, server, serverName = SERVER_NAME, env = process.env } = {}) {
   const entries = readJsonArray(filePath);
-  const expectedKey = approvalKey(projectRoot, server, serverName);
+  const expectedKey = approvalKey(projectRoot, server, serverName, env);
   const approved = Boolean(expectedKey && entries && entries.includes(expectedKey));
   return { filePath, exists: entries !== null, approved, expectedKey, entries: entries || [] };
+}
+
+function effectiveCursorConfig(home, projectRoot, { env = process.env, configDir = null, mcpConfigPath = null } = {}) {
+  const projectPath = path.join(projectRoot, '.cursor', 'mcp.json');
+  const globalPath = path.join(resolveCursorConfigDir(home, env, configDir), 'mcp.json');
+  const read = (filePath) => {
+    try {
+      const doc = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
+      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return { error: 'invalid JSON object' };
+      const found = doc.mcpServers && Object.hasOwn(doc.mcpServers, SERVER_NAME);
+      return { found: Boolean(found), server: found ? doc.mcpServers[SERVER_NAME] : null };
+    } catch (error) {
+      return error.code === 'ENOENT' ? { found: false } : { error: 'unreadable or invalid JSON' };
+    }
+  };
+  // Invalid project configuration must not turn a global approval into a successful check.
+  if (mcpConfigPath) {
+    const overridePath = expandHome(mcpConfigPath, home);
+    const override = read(overridePath);
+    if (override.error) {
+      return { source: 'mcp-config', filePath: overridePath, error: override.error, server: null };
+    }
+    if (override.found) {
+      const project = read(projectPath);
+      const global = read(globalPath);
+      return {
+        source: 'mcp-config',
+        filePath: overridePath,
+        server: override.server,
+        shadowsGlobal: Boolean(project.found || global.found),
+      };
+    }
+  }
+  const project = read(projectPath);
+  const global = read(globalPath);
+  if (project.error) return { source: 'project', filePath: projectPath, error: project.error, server: null };
+  if (project.found) return {
+    source: 'project', filePath: projectPath, server: project.server,
+    shadowsGlobal: Boolean(global.found),
+  };
+  return {
+    source: global.found ? 'global' : null,
+    filePath: globalPath,
+    server: global.server || null,
+    ...(global.error ? { error: global.error } : {}),
+  };
 }
 
 function currentServer(
@@ -488,23 +563,31 @@ function currentServer(
   projectRoot,
   { env = process.env, configDir = null, mcpConfigPath = null } = {},
 ) {
-  // Project entries override global entries, as in Cursor. Invalid project
-  // configuration must not turn a global approval into a successful check.
-  const candidates = [];
-  if (mcpConfigPath) candidates.push(expandHome(mcpConfigPath, home));
-  candidates.push(path.join(projectRoot, '.cursor', 'mcp.json'));
-  candidates.push(path.join(resolveCursorConfigDir(home, env, configDir), 'mcp.json'));
-  for (const filePath of [...new Set(candidates.filter(Boolean))]) {
-    try {
-      const doc = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
-      if (doc.mcpServers && Object.hasOwn(doc.mcpServers, SERVER_NAME)) {
-        return doc.mcpServers[SERVER_NAME];
-      }
-    } catch (error) {
-      if (error.code !== 'ENOENT') return null;
-    }
-  }
-  return null;
+  return effectiveCursorConfig(home, projectRoot, { env, configDir, mcpConfigPath }).server;
+}
+
+/** Read only: no binary resolution/download, subprocesses or approval writes.
+ * Never return the server env (it can contain credentials).
+ */
+function inspectCursorConfig(home, projectRoot, env = process.env, { configDir = null, mcpConfigPath = null } = {}) {
+  const root = canonicalizePath(projectRoot);
+  const effective = effectiveCursorConfig(home, root, { env, configDir, mcpConfigPath });
+  const normalized = normalizeCursorServer(effective.server, env);
+  const approval = checkApprovalFile(resolveApprovalPath(home, root), {
+    projectRoot: root, server: effective.server, env,
+  });
+  const disabled = readJsonArray(resolveDisabledPath(home, root));
+  const disabledMatch = Boolean(disabled && (disabled.includes(SERVER_NAME) ||
+    (approval.expectedKey && disabled.includes(approval.expectedKey))));
+  return {
+    projectRoot: root, source: effective.source, filePath: effective.filePath,
+    shadowsGlobal: Boolean(effective.shadowsGlobal), valid: Boolean(normalized && !effective.error),
+    command: normalized ? normalized.command : null, args: normalized ? normalized.args || [] : [],
+    approval: approval.approved ? 'current-config-approved' : 'current-config-not-approved',
+    disabled: disabledMatch,
+    ...(effective.error ? { error: effective.error } : {}),
+    note: 'Reads standard project/global MCP files only; managed/enterprise and session overrides are not inspected. Approval state is reported, never changed.',
+  };
 }
 
 function removeAstrolabeFromDisabled(
@@ -607,6 +690,7 @@ function enableCursorApproval({
       approval: checkApprovalFile(approvalPath, {
         projectRoot: root,
         server: currentServer(home, root, { env, configDir, mcpConfigPath }),
+        env,
       }),
       disabled,
       root,
@@ -624,6 +708,7 @@ function enableCursorApproval({
   const approval = checkApprovalFile(approvalPath, {
     projectRoot: root,
     server: currentServer(home, root, { env, configDir, mcpConfigPath }),
+    env,
   });
   if (result.status !== 0 || result.error || result.signal) approval.approved = false;
   return {
@@ -675,6 +760,9 @@ module.exports = {
   loadL1Template,
   renderCursorRules,
   mergeRulesFile,
+  normalizeCursorServer,
+  effectiveCursorConfig,
+  inspectCursorConfig,
   approvalKey,
   checkApprovalFile,
   removeAstrolabeFromDisabled,

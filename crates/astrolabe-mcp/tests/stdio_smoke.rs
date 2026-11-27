@@ -229,12 +229,16 @@ fn stdio_get_lang_returns_nonempty_text() {
             text.contains("index_root:"),
             "tool text must declare the absolute index root: {text}"
         );
+        // get_lang prints `display_path`, which strips a Windows `\\?\`
+        // prefix. `canonicalize()` keeps it, so comparing the raw display
+        // string fails on Windows even when the reported root is correct.
         let root = server
             .root
             .canonicalize()
             .unwrap_or_else(|_| server.root.clone());
+        let root_disp = astrolabe_core::paths::display_path(&root);
         assert!(
-            text.contains(&root.display().to_string()),
+            text.contains(&root_disp),
             "index_root should be the temp project root (unique_temp_dir creates .git): {text}"
         );
         assert!(

@@ -16,6 +16,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   fmt:
@@ -54,8 +55,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --workspace
         run: cargo build --workspace
+      # Exercise the real Linux backend, including Linux-only selective-watch
+      # delete/re-create coverage; a macOS or cross-build result cannot cover it.
+      - name: Linux native watcher regressions
+        run: |
+          cargo test -p astrolabe-core --lib watch::tests:: -- --test-threads=2
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=2
 
   deny:
     name: cargo-deny
@@ -94,3 +100,65 @@ jobs:
         run: bash scripts/fetch-corpora.sh
       - name: Five-language import-resolution gate
         run: bash scripts/verify.sh
+
+  harness:
+    name: installation harness regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Bounded RPC and graceful shutdown contracts
+        run: node --test npm/scripts/verify-install.test.js
+      - name: Benchmark harness error propagation
+        run: node --test scripts/bench.test.js
+      - name: Benchmark shell syntax
+        run: bash -n scripts/bench.sh
+
+  native:
+    name: native watcher and lifecycle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [macos-15, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-${{ runner.os }}
+      - name: Real native watcher lifetime, events, acknowledgements and fallback
+        run: |
+          cargo test -p astrolabe-core --lib watch::tests:: -- --test-threads=2
+      - name: Index lifecycle, cancellation, hibernation and concurrent wake
+        run: |
+          cargo test -p astrolabe-mcp --lib session::tests:: -- --test-threads=2
+      - name: MCP freshness barrier and wake routing
+        run: |
+          cargo test -p astrolabe-mcp --lib barrier_ -- --test-threads=2
+          cargo test -p astrolabe-mcp --lib concurrent_tool_gates_wait_for_wake -- --test-threads=2
+          cargo test -p astrolabe-mcp --lib hibernated_primary_wakes_on_the_next_tool_call -- --test-threads=2
+      - name: Real stdio subprocess protocol
+        run: cargo test -p astrolabe-mcp --test stdio_smoke -- --test-threads=2
+      - name: Installation harness regression tests
+        run: node --test npm/scripts/verify-install.test.js
+      - name: Native binary EOF and shutdown acceptance
+        run: |
+          mkdir -p "$RUNNER_TEMP/install-smoke/.git"
+          printf 'def smoke_marker():\n    return 1\n' > "$RUNNER_TEMP/install-smoke/hello.py"
+          binary="$PWD/target/debug/astrolabe"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
+          node npm/scripts/verify-install.js --bin "$binary" --root "$RUNNER_TEMP/install-smoke" --timeout-ms 30000

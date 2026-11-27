@@ -28,14 +28,11 @@ use crate::refs_render;
 
 const DEFAULT_BUDGET: usize = 2_500;
 
-const SEARCH_CODE_FALLBACK: &str =
-    "You can use search_code for a literal search, but that is syntactic: same-name identifiers, strings, and comments all count as hits — both false positives and misses via aliases/re-exports. It cannot replace precise references.";
+const SEARCH_CODE_FALLBACK: &str = "You can use search_code for a literal search, but that is syntactic: same-name identifiers, strings, and comments all count as hits — both false positives and misses via aliases/re-exports. It cannot replace precise references.";
 
-const DEFINITION_FALLBACK: &str =
-    "You can use find_symbol (syntactic/graph name match) or search_code (literal search), but neither replaces language-server binding resolution.";
+const DEFINITION_FALLBACK: &str = "You can use find_symbol (syntactic/graph name match) or search_code (literal search), but neither replaces language-server binding resolution.";
 
-const NOT_WIRED: &str =
-    "This capability is not wired yet: the language-server query layer and rewrite engine are still being connected; no precise result is available.";
+const NOT_WIRED: &str = "This capability is not wired yet: the language-server query layer and rewrite engine are still being connected; no precise result is available.";
 
 fn default_budget() -> usize {
     DEFAULT_BUDGET
@@ -55,8 +52,7 @@ fn effective_budget(raw: usize) -> usize {
 }
 
 /// Stated once per result that lists positions.
-pub(crate) const COORD_NOTE: &str =
-    "Coordinates: line and column are 1-based; columns are UTF-16 units. For line/character parameters use 0-based values (subtract 1 each).\n";
+pub(crate) const COORD_NOTE: &str = "Coordinates: line and column are 1-based; columns are UTF-16 units. For line/character parameters use 0-based values (subtract 1 each).\n";
 
 /// One page of `items` starting at `offset`, cut by `budget`. Always keeps at
 /// least one item when any remain, so `next_offset` advances. Returns the kept
@@ -164,6 +160,8 @@ pub(crate) struct GetDiagParams {
     /// Not advertised (`server.rs` UNADVERTISED_PARAMS); results name it.
     #[serde(default)]
     #[schemars(description = "true: ask the language server (slow, memory-heavy).")]
+    #[serde(deserialize_with = "crate::server::bool_compat::optional")]
+    #[schemars(with = "Option<bool>")]
     pub lsp: Option<bool>,
 }
 
@@ -172,8 +170,7 @@ pub(crate) struct GetDiagParams {
 pub(crate) const FIND_REFS_DESC: &str = "Precise references (index first, language-server fallback): call sites and usages — use for rename and caller analysis. Pass path (definition or use site) to disambiguate; when omitted, reuse this session's latest find_symbol/goto_def hit, else the unique index definition or a candidate list. Hits show source line, enclosing func, [declaration]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
 pub(crate) const GOTO_DEF_DESC: &str =
     "Jump to definition: return the definition anchor from the use-site file + symbol name.";
-pub(crate) const GET_DIAG_DESC: &str =
-    "File diagnostics (syntax and type errors) for checking after edits; skip if build/tests already pass.";
+pub(crate) const GET_DIAG_DESC: &str = "File diagnostics (syntax and type errors) for checking after edits; skip if build/tests already pass.";
 
 /// Backend for the precise MCP query tools.
 ///
@@ -339,10 +336,12 @@ pub(crate) fn run_find_refs(
         );
     }
 
-    let position = match (params.line, params.character) {
-        (Some(line), Some(character)) => Some(Position { line, character }),
-        _ => None,
-    };
+    // A line alone is sufficient to choose a declaration; snapping finds
+    // the identifier on that line. A missing column is not a missing line.
+    let position = params.line.map(|line| Position {
+        line,
+        character: params.character.unwrap_or(0),
+    });
     let result = backend.references(
         &params.symbol,
         params.path.as_deref(),
@@ -798,7 +797,9 @@ fn render_rename_preview(
             .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
     if !valid {
         return (
-            format!("Rename preview not generated:dry_run_rename=`{new_name}` is not a valid identifier.\n"),
+            format!(
+                "Rename preview not generated:dry_run_rename=`{new_name}` is not a valid identifier.\n"
+            ),
             0,
         );
     }
@@ -826,7 +827,9 @@ fn render_rename_preview(
     }
     if locations.is_empty() {
         return (
-            format!("Rename preview: language server returned no references for `{symbol}`; nothing to change.\n"),
+            format!(
+                "Rename preview: language server returned no references for `{symbol}`; nothing to change.\n"
+            ),
             0,
         );
     }

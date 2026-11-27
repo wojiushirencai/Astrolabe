@@ -1205,7 +1205,7 @@ test(
           "const dir = path.join(process.env.HOME, '.cursor', 'projects', slug);",
           "fs.mkdirSync(dir, { recursive: true });",
           "const server = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.cursor', 'mcp.json'), 'utf8')).mcpServers.astrolabe;",
-          "const normalized = { command: server.command, args: server.args || [], env: server.env || {} };",
+          "const normalized = { command: server.command, args: server.args, env: server.env, cwd: server.cwd, startupTimeoutSec: server.startupTimeoutSec };",
           "const key = 'astrolabe-' + require('crypto').createHash('sha256').update(JSON.stringify({ path: process.cwd(), server: normalized })).digest('hex').slice(0, 16);",
           "fs.writeFileSync(path.join(dir, 'mcp-approvals.json'), JSON.stringify([key]));",
           "process.exit(0);",
@@ -3410,4 +3410,96 @@ test('Regression 5: non-existent custom dirs do not skip and cursor.approvalEnv 
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+
+
+test('Cursor effective approval normalization matches client field order and optional fields', { skip: process.platform === 'win32' }, () => {
+  const fixtures = [
+    [{ command: '/bin/astrolabe' }, 'astrolabe-1a322119af84646d'],
+    [{ type: 'stdio', command: '/bin/astrolabe', args: ['.'], env: { Z: 'last', A: 'first' },
+      cwd: '/repo', startupTimeoutSec: 300 }, 'astrolabe-1ef03ba32e577c6d'],
+    [{ command: '${BIN}', args: ['${ROOT:-/repo}'], env: { BIN: '/bin/astrolabe', Z: '${env:EXTERNAL}' },
+      envFile: 'ignored' }, 'astrolabe-35958e626891138f'],
+  ];
+  for (const [server, key] of fixtures) {
+    assert.equal(cursorMod.approvalKey('/repo', server, 'astrolabe', { EXTERNAL: 'value' }), key);
+  }
+  const bare = { command: '/bin/astrolabe' };
+  assert.notEqual(cursorMod.approvalKey('/repo', bare), cursorMod.approvalKey('/repo', { ...bare, args: [] }));
+  assert.notEqual(cursorMod.approvalKey('/repo', bare), cursorMod.approvalKey('/repo', { ...bare, cwd: '/repo' }));
+  assert.equal(cursorMod.normalizeCursorServer({ command: 'x', env: null }), null);
+  assert.equal(cursorMod.normalizeCursorServer({ command: 'x', type: 'http' }), null);
+});
+
+test('Cursor hook migration collapses owned duplicates and preserves mixed groups', () => {
+  const home = tmpHome();
+  try {
+    const file = path.join(home, 'hooks.json');
+    const mixed = { hooks: [{ command: 'astrolabe hooks remind' }, { command: 'echo keep' }] };
+    const third = { command: '/third-party hooks remind' };
+    fs.writeFileSync(file, JSON.stringify({ hooks: {
+      preToolUse: [{ command: '/old/astrolabe hooks remind', matcher: 'mcp__astrolabe__.*' }, third,
+        { command: 'astrolabe hooks remind' }, mixed],
+      sessionEnd: [{ command: 'astrolabe hooks cleanup' }, { command: '/old/astrolabe hooks cleanup' }],
+    } }));
+    const result = cursorMod.mergeCursorHooksFile(file, { binPath: '/stable/astrolabe' });
+    assert.equal(result.doc.hooks.preToolUse.length, 3);
+    assert.deepEqual(result.doc.hooks.preToolUse.slice(1), [third, mixed]);
+    assert.match(result.doc.hooks.preToolUse[0].matcher, /astrolabe-\.\*/);
+    assert.match(result.doc.hooks.preToolUse[0].matcher, /mcp__astrolabe__/);
+    assert.equal(result.doc.hooks.sessionEnd.length, 1);
+    fs.writeFileSync(file, JSON.stringify(result.doc));
+    assert.deepEqual(cursorMod.mergeCursorHooksFile(file, { binPath: '/stable/astrolabe' }).doc, result.doc);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('--check-config is read-only, selects project over global, and does not print env', () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    fs.mkdirSync(path.join(home, '.cursor'));
+    fs.mkdirSync(path.join(project, '.cursor'));
+    const projectFile = path.join(project, '.cursor/mcp.json');
+    const globalFile = path.join(home, '.cursor/mcp.json');
+    fs.writeFileSync(globalFile, JSON.stringify({ mcpServers: { astrolabe: { command: '/new/astrolabe' } } }));
+    fs.writeFileSync(projectFile, JSON.stringify({ mcpServers: { astrolabe: {
+      command: '/old/astrolabe', args: ['.', '--context=cursor'], env: { PRIVATE_FIXTURE: 'must-not-be-printed' },
+    } } }));
+    const before = fs.readFileSync(projectFile, 'utf8');
+    const result = spawnSync(process.execPath, [BIN, 'setup', '--check-config', '--home', home,
+      '--project', project], { encoding: 'utf8', env: { ...process.env, PATH: '', HOME: home } });
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.source, 'project');
+    assert.equal(report.command, '/old/astrolabe');
+    assert.equal(report.shadowsGlobal, true);
+    assert.equal(report.approval, 'current-config-not-approved');
+    assert.doesNotMatch(result.stdout, /must-not-be-printed|PRIVATE_FIXTURE/);
+    assert.equal(fs.readFileSync(projectFile, 'utf8'), before);
+    assert.deepEqual(fs.readdirSync(path.join(home, '.cursor')), ['mcp.json']);
+    fs.writeFileSync(projectFile, '{broken');
+    const invalid = cursorMod.inspectCursorConfig(home, project);
+    assert.equal(invalid.source, 'project');
+    assert.equal(invalid.valid, false);
+    assert.equal(invalid.command, null);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('global setup warns when an existing project registration shadows it', { skip: process.platform === 'win32' }, () => {
+  const home = tmpHome();
+  try {
+    const project = tmpProject(home);
+    fs.mkdirSync(path.join(home, '.cursor'));
+    fs.mkdirSync(path.join(project, '.cursor'));
+    const file = path.join(project, '.cursor/mcp.json');
+    const old = JSON.stringify({ mcpServers: { astrolabe: { command: '/old/astrolabe' } } });
+    fs.writeFileSync(file, old);
+    const result = spawnSync(process.execPath, [BIN, 'setup', '--yes', '--clients=cursor', '--scope=global',
+      '--home', home, '--project', project, '--command=/new/astrolabe', '--no-cursor-permissions'],
+      { encoding: 'utf8', env: { ...process.env, PATH: '', HOME: home } });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /project configuration .* overrides the global Astrolabe entry/);
+    assert.equal(fs.readFileSync(file, 'utf8'), old);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });

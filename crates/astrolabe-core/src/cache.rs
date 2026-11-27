@@ -16,7 +16,12 @@
 //!   * The sum of all budgets is the process's steady-state ceiling, and that
 //!     number goes in the README as a promise.
 
-use std::{mem::size_of, ops::Index, sync::Arc, time::Duration};
+use std::{
+    mem::size_of,
+    ops::Index,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use moka::sync::Cache;
 
@@ -204,10 +209,18 @@ pub struct FileCache {
     cache: Cache<String, CachedFile>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachedMtime {
+    /// Compatibility for callers that only have a millisecond stamp.
+    Millis(u64),
+    /// Preserve the filesystem's full timestamp resolution.
+    Precise(SystemTime),
+}
+
 #[derive(Clone)]
 struct CachedFile {
     lines: Arc<CachedLines>,
-    mtime_ms: u64,
+    mtime: CachedMtime,
     /// On-disk byte length when the caller supplied one.
     len: Option<u64>,
 }
@@ -236,7 +249,7 @@ impl FileCache {
     /// Returns the cached lines when the file's mtime still matches.
     pub fn get(&self, path: &str, mtime_ms: u64) -> Option<Arc<CachedLines>> {
         let file = self.cache.get(path)?;
-        if file.mtime_ms == mtime_ms {
+        if file.mtime == CachedMtime::Millis(mtime_ms) {
             Some(file.lines)
         } else {
             self.cache.invalidate(path);
@@ -254,7 +267,7 @@ impl FileCache {
             path.to_owned(),
             CachedFile {
                 lines,
-                mtime_ms,
+                mtime: CachedMtime::Millis(mtime_ms),
                 len: None,
             },
         );
@@ -266,7 +279,7 @@ impl FileCache {
     /// An entry stored without a length never matches here.
     pub fn get_checked(&self, path: &str, mtime_ms: u64, len: u64) -> Option<Arc<CachedLines>> {
         let file = self.cache.get(path)?;
-        if file.mtime_ms == mtime_ms && file.len == Some(len) {
+        if file.mtime == CachedMtime::Millis(mtime_ms) && file.len == Some(len) {
             Some(file.lines)
         } else {
             self.cache.invalidate(path);
@@ -281,10 +294,50 @@ impl FileCache {
             path.to_owned(),
             CachedFile {
                 lines,
-                mtime_ms,
+                mtime: CachedMtime::Millis(mtime_ms),
                 len: Some(len),
             },
         );
+    }
+
+    /// Checked lookup using the full filesystem timestamp. Legacy millisecond
+    /// entries deliberately do not satisfy this stronger validation.
+    pub fn get_precise(
+        &self,
+        path: &str,
+        modified: SystemTime,
+        len: u64,
+    ) -> Option<Arc<CachedLines>> {
+        let file = self.cache.get(path)?;
+        if file.mtime == CachedMtime::Precise(modified) && file.len == Some(len) {
+            Some(file.lines)
+        } else {
+            self.invalidate(path);
+            None
+        }
+    }
+
+    pub fn insert_precise(
+        &self,
+        path: &str,
+        lines: Arc<CachedLines>,
+        modified: SystemTime,
+        len: u64,
+    ) {
+        self.cache.insert(
+            path.to_owned(),
+            CachedFile {
+                lines,
+                mtime: CachedMtime::Precise(modified),
+                len: Some(len),
+            },
+        );
+    }
+
+    /// Invalidate a known filesystem change, including same-size rewrites
+    /// whose timestamp was deliberately restored. Does not affect held Arcs.
+    pub fn invalidate(&self, path: &str) {
+        self.cache.invalidate(path);
     }
 
     /// Drop all cached file entries immediately (used during idle eviction /
@@ -445,6 +498,39 @@ mod tests {
         // Entries stored without a length never satisfy a checked read.
         cache.insert("b.rs", vec!["x".into()], 7);
         assert!(cache.get_checked("b.rs", 7, 1).is_none());
+    }
+
+    #[test]
+    fn precise_get_rejects_same_millisecond_same_length_rewrite() {
+        let cache = FileCache::new(CacheConfig::default());
+        let first =
+            std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_micros(100);
+        let second = first + Duration::from_micros(800);
+        let lines = Arc::new(CachedLines::from_text("old"));
+        cache.insert_precise("a.rs", Arc::clone(&lines), first, 3);
+        assert!(Arc::ptr_eq(
+            &cache.get_precise("a.rs", first, 3).unwrap(),
+            &lines
+        ));
+        assert!(cache.get_precise("a.rs", second, 3).is_none());
+        assert!(cache.get_precise("a.rs", first, 3).is_none());
+    }
+
+    #[test]
+    fn precise_get_rejects_legacy_stamp_and_known_change_invalidates() {
+        let cache = FileCache::new(CacheConfig::default());
+        let modified = std::time::UNIX_EPOCH + Duration::from_millis(1000);
+        cache.insert_checked("a.rs", Arc::new(CachedLines::from_text("old")), 1000, 3);
+        assert!(cache.get_precise("a.rs", modified, 3).is_none());
+        let held = Arc::new(CachedLines::from_text("new"));
+        cache.insert_precise("a.rs", Arc::clone(&held), modified, 3);
+        cache.invalidate("a.rs");
+        assert!(cache.get_precise("a.rs", modified, 3).is_none());
+        assert_eq!(
+            held.as_text(),
+            "new",
+            "invalidation must not invalidate a reader's Arc"
+        );
     }
 
     #[test]

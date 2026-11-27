@@ -210,10 +210,24 @@ pub struct FreshnessLog {
     poll_cycle_ms: AtomicU64,
 }
 
+/// One atomic observation of watcher health and work not yet acknowledged by
+/// the graph publisher. `watermark` is observation time, never an apply ack.
+#[derive(Clone, Debug)]
+pub struct FreshnessSnapshot {
+    pub watermark: Instant,
+    pub distrusted: bool,
+    pub suspects: Vec<RelPath>,
+}
+
 struct FreshnessInner {
     watermark: Instant,
     distrusted: bool,
-    /// Suspect paths accumulated after the current watermark, in note order.
+    distrusted_at: Option<Instant>,
+    /// Deltas emitted by checks but not yet acknowledged by a graph publisher.
+    /// Unlike event hints these survive every observation watermark.
+    unapplied: BTreeMap<RelPath, Instant>,
+    /// Raw event hints, in note order; completed scans may retire these.
+    /// Emitted deltas are tracked independently in `unapplied`.
     /// When `distrusted`, [`FreshnessLog::suspect_paths`] hides these and
     /// returns empty (callers look at [`FreshnessLog::distrusted`]).
     suspects: Vec<(Instant, RelPath)>,
@@ -233,6 +247,8 @@ impl FreshnessLog {
             inner: Mutex::new(FreshnessInner {
                 watermark: Instant::now(),
                 distrusted: false,
+                distrusted_at: None,
+                unapplied: BTreeMap::new(),
                 suspects: Vec::new(),
                 repaired: BTreeSet::new(),
             }),
@@ -292,7 +308,8 @@ impl FreshnessLog {
         self.lock().watermark
     }
 
-    /// Suspect paths noted after `since`.
+    /// Event hints noted after `since`, plus ALL unacknowledged deltas.
+    /// A newer filesystem observation cannot acknowledge graph publication.
     ///
     /// Includes event paths and the pending set as it stood before a storm
     /// expanded into a full check. When the log is distrusted this returns
@@ -307,10 +324,48 @@ impl FreshnessLog {
             .iter()
             .filter(|(t, _)| *t > since)
             .map(|(_, p)| p.clone())
+            .chain(g.unapplied.keys().cloned())
             .collect();
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Read watermark, distrust and pending paths under one lock. Prefer this
+    /// over separate getters when making a query-time freshness decision.
+    pub fn snapshot(&self) -> FreshnessSnapshot {
+        let g = self.lock();
+        let mut suspects: Vec<_> = if g.distrusted {
+            Vec::new()
+        } else {
+            g.suspects
+                .iter()
+                .filter(|(t, _)| *t > g.watermark)
+                .map(|(_, p)| p.clone())
+                .chain(g.unapplied.keys().cloned())
+                .collect()
+        };
+        suspects.sort();
+        suspects.dedup();
+        FreshnessSnapshot {
+            watermark: g.watermark,
+            distrusted: g.distrusted,
+            suspects,
+        }
+    }
+
+    /// Acknowledge these exact paths only AFTER successfully publishing a graph
+    /// that read them no earlier than `read_started`. Later events/deltas stay
+    /// pending. Capture the time before reading, not after queueing or applying.
+    pub fn acknowledge_applied(&self, paths: &[RelPath], read_started: Instant) {
+        let mut g = self.lock();
+        for path in paths {
+            if g.unapplied.get(path).is_some_and(|t| *t <= read_started) {
+                g.unapplied.remove(path);
+            }
+        }
+        g.suspects
+            .retain(|(t, p)| *t > read_started || !paths.contains(p));
     }
 
     /// Overflow or storm happened, and no clean full check has run since.
@@ -373,10 +428,13 @@ impl FreshnessLog {
     }
 
     pub(crate) fn note_distrust(&self) {
-        self.lock().distrusted = true;
+        let mut g = self.lock();
+        g.distrusted = true;
+        g.distrusted_at = Some(Instant::now());
     }
 
-    /// A completed full check: push watermark, clear distrust and suspects.
+    /// A completed full check: advance observation time and retire covered
+    /// event hints. Unacknowledged graph deltas survive, including older ones.
     ///
     /// `started` is when the scan began. Suspects noted after that (events
     /// that arrived while the scan ran off the watch thread) may or may not
@@ -385,7 +443,7 @@ impl FreshnessLog {
     ///
     /// `changes` is the delta this check just produced. It has been sent (or
     /// is about to be) to the reindex consumer but is not applied to the
-    /// index yet, so its paths stay suspects *after* the new watermark until
+    /// index yet, so its paths stay pending independently of the watermark until
     /// the query barrier repairs them or a rebuild covers them
     /// ([`Self::clear_suspects_through`]). Advancing the watermark alone would
     /// make the barrier report "fresh" for an index that does not yet contain
@@ -394,7 +452,11 @@ impl FreshnessLog {
         let mut g = self.lock();
         let watermark = Instant::now();
         g.watermark = watermark;
-        g.distrusted = false;
+        // A new overflow / tree invalidation during this scan is not covered.
+        g.distrusted = g.distrusted_at.is_some_and(|t| t > started);
+        if !g.distrusted {
+            g.distrusted_at = None;
+        }
         let after = watermark + Duration::from_nanos(1);
         let mut kept: Vec<(Instant, RelPath)> = std::mem::take(&mut g.suspects)
             .into_iter()
@@ -418,17 +480,19 @@ impl FreshnessLog {
         if changes.is_empty() {
             return;
         }
-        // Strictly after the watermark so `suspect_paths(watermark)` sees them.
+        // Keep a publication cutoff independent of observation watermarks.
         let t = Instant::now().max(g.watermark + Duration::from_nanos(1));
         for (_, p) in changes.iter() {
-            g.suspects.push((t, p.clone()));
+            g.unapplied.insert(p.clone(), t);
         }
     }
 
     /// Drop suspects noted at or before `through`: the caller has repaired
     /// (or rebuilt past) them. Later suspects are kept.
     pub fn clear_suspects_through(&self, through: Instant) {
-        self.lock().suspects.retain(|(t, _)| *t > through);
+        let mut g = self.lock();
+        g.suspects.retain(|(t, _)| *t > through);
+        g.unapplied.retain(|_, t| *t > through);
     }
 }
 
@@ -438,6 +502,7 @@ impl std::fmt::Debug for FreshnessLog {
         f.debug_struct("FreshnessLog")
             .field("distrusted", &g.distrusted)
             .field("suspects", &g.suspects.len())
+            .field("unapplied", &g.unapplied.len())
             .finish()
     }
 }
@@ -1057,6 +1122,8 @@ trait EventFeed {
 }
 
 struct NotifyFeed {
+    root: PathBuf,
+    scan: ScanOptions,
     rx: Receiver<Result<notify::Event, notify::Error>>,
     overflow: Arc<AtomicBool>,
     /// Keep the native backend alive in both recursive and selective modes.
@@ -1112,6 +1179,13 @@ impl Selective {
         Ok(())
     }
 
+    /// notify removes inotify registrations on delete / rename-from. Forget
+    /// the matching cached names too, so a same-name directory can be adopted.
+    fn invalidate(&mut self, paths: &[PathBuf]) {
+        self.dirs
+            .retain(|dir| !paths.iter().any(|p| dir.starts_with(p)));
+    }
+
     /// Register directories newly appearing among `paths`; returns the files
     /// found inside them (they may have been created before the watch).
     fn adopt(
@@ -1140,16 +1214,19 @@ impl EventFeed for NotifyFeed {
     fn recv_timeout(&mut self, timeout: Duration) -> Result<FeedWake, RecvTimeoutError> {
         match self.rx.recv_timeout(timeout) {
             Ok(Ok(ev)) => {
-                let overflow = self.overflow.swap(false, Ordering::SeqCst) || ev.need_rescan();
+                let tree_change = requires_full_verification(&ev, &self.root, &self.scan);
+                let overflow =
+                    self.overflow.swap(false, Ordering::SeqCst) || ev.need_rescan() || tree_change;
+                if let Some(sel) = self.selective.as_mut() {
+                    if invalidates_registration(&ev.kind) {
+                        sel.invalidate(&ev.paths);
+                    }
+                }
                 // Read-only access (open / close-nowrite / read) never changes
                 // content. Our own scans, rebuilds and search reads generate a
                 // constant stream of these on inotify; treating them as
                 // suspects kept untouched repos permanently "stale".
-                let mut paths = if is_content_event(&ev.kind) {
-                    ev.paths
-                } else {
-                    Vec::new()
-                };
+                let mut paths = intake_paths(&ev.kind, ev.paths, &self.root);
                 if let Some(sel) = self.selective.as_mut() {
                     let found = sel.adopt(&mut self.watcher, &paths, &self.overflow);
                     paths.extend(found);
@@ -1169,6 +1246,69 @@ impl EventFeed for NotifyFeed {
             }
         }
     }
+}
+
+/// Removed paths may no longer be stat-able as directories, and backends do
+/// not promise descendant events for renames. Conservatively verify the tree
+/// for these events rather than let the barrier repair a directory as a file.
+fn invalidates_registration(kind: &notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Remove(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+    )
+}
+
+fn requires_full_verification(event: &notify::Event, root: &Path, scan: &ScanOptions) -> bool {
+    // Access-only events (open / read / close-nowrite) are generated by our
+    // own scans and by ordinary file reads. They must not latch overflow:
+    // the watch root is a directory, so a blanket `p.is_dir()` treated
+    // read_dir / inotify access on the root as a tree invalidation, set
+    // distrust, and hid later genuine writes from `suspect_paths`.
+    if !is_content_event(&event.kind) {
+        return false;
+    }
+    event.paths.iter().any(|p| {
+        // The watch root itself only invalidates the tree when it is removed
+        // or renamed. FSEvents reports late Create / metadata events for a
+        // root that was created just before the stream started; latching
+        // distrust for those made every query right after startup Degrade.
+        if crate::paths::paths_eq_normalized(p, root) {
+            return invalidates_registration(&event.kind);
+        }
+        // Excluded build trees must not turn their deletes into full scans.
+        keep_event_path(root, scan, p).is_some()
+            && (invalidates_registration(&event.kind)
+                || matches!(
+                    event.kind,
+                    notify::EventKind::Create(notify::event::CreateKind::Folder)
+                )
+                // Some backends report a new directory as Create(Any). Only
+                // then is `is_dir()` meaningful; it is not a stand-in for
+                // every event whose path happens to exist as a directory.
+                || (matches!(
+                    event.kind,
+                    notify::EventKind::Create(notify::event::CreateKind::Any)
+                ) && p.is_dir()))
+    })
+}
+
+/// Paths of one native event that reach [`Intake::absorb`]. Access-only
+/// events contribute nothing. The watch root is forwarded only for remove /
+/// rename (where `absorb` must distrust the tree); any other event naming the
+/// root (directory metadata, a late create replay) says nothing about file
+/// contents and must not distrust the log.
+fn intake_paths(kind: &notify::EventKind, paths: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
+    if !is_content_event(kind) {
+        return Vec::new();
+    }
+    if invalidates_registration(kind) {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter(|p| !crate::paths::paths_eq_normalized(p, root))
+        .collect()
 }
 
 /// Whether a notify event can reflect a content / tree change. Pure
@@ -1217,6 +1357,8 @@ fn init_notify(root: &Path, scan: &ScanOptions, selective: bool) -> Option<(Noti
         }
         return Some((
             NotifyFeed {
+                root: root.to_path_buf(),
+                scan: scan.clone(),
                 rx,
                 overflow,
                 watcher,
@@ -1242,6 +1384,8 @@ fn init_notify(root: &Path, scan: &ScanOptions, selective: bool) -> Option<(Noti
     }
     Some((
         NotifyFeed {
+            root: root.to_path_buf(),
+            scan: scan.clone(),
             rx,
             overflow,
             watcher,
@@ -1370,7 +1514,7 @@ impl Intake {
         let mut kept = 0usize;
         let mut noted: Vec<RelPath> = Vec::new();
         let mut seen: HashSet<RelPath> = HashSet::new();
-        if overflow {
+        if overflow || paths.iter().any(|p| p == &self.root) {
             self.all_dirty = true;
             self.freshness.note_distrust();
         }
@@ -1402,6 +1546,7 @@ impl Intake {
             // a full scan can re-evaluate those.
             if noted.iter().any(is_ignore_rule_file) {
                 self.all_dirty = true;
+                self.freshness.note_distrust();
             }
             self.freshness.note_paths(&noted);
         }
@@ -2411,6 +2556,250 @@ mod tests {
     }
 
     #[test]
+    fn queued_delta_survives_unrelated_and_empty_observations() {
+        let dir = TestDir::new();
+        dir.write("a.rs", "fn a() {}");
+        dir.write("b.rs", "fn b() {}");
+        let mut w = watcher(&dir);
+        w.check();
+        rewrite_and_bump(&dir, "a.rs", "fn updated_a() {}");
+        assert!(!w.check_paths(&[dir.abs("a.rs")]).is_empty());
+        assert!(w.check_paths(&[dir.abs("b.rs")]).is_empty());
+        assert_eq!(w.freshness.snapshot().suspects, vec![RelPath::new("a.rs")]);
+        // A second full observation must not acknowledge a queued delta either.
+        assert!(w.check().is_empty());
+        assert_eq!(
+            w.freshness.suspect_paths(w.freshness.watermark()),
+            vec![RelPath::new("a.rs")]
+        );
+        let started = Instant::now();
+        w.freshness
+            .acknowledge_applied(&[RelPath::new("a.rs")], started);
+        assert!(w.freshness.snapshot().suspects.is_empty());
+    }
+
+    #[test]
+    fn applied_ack_is_path_scoped_and_preserves_later_work() {
+        let log = FreshnessLog::new();
+        let cutoff = Instant::now();
+        let later = cutoff + Duration::from_secs(1);
+        let a = RelPath::new("a.rs");
+        let b = RelPath::new("b.rs");
+        {
+            let mut g = log.lock();
+            g.unapplied.insert(a.clone(), cutoff);
+            g.unapplied.insert(b.clone(), cutoff);
+        }
+        log.acknowledge_applied(std::slice::from_ref(&a), cutoff);
+        assert_eq!(log.snapshot().suspects, vec![b.clone()]);
+        {
+            let mut g = log.lock();
+            g.unapplied.insert(a.clone(), later);
+            g.suspects.push((later, a.clone()));
+        }
+        log.acknowledge_applied(&[a.clone(), b], cutoff);
+        assert_eq!(log.snapshot().suspects, vec![a]);
+    }
+
+    #[test]
+    fn full_observation_preserves_invalidation_received_during_scan() {
+        let log = FreshnessLog::new();
+        let started = Instant::now();
+        log.note_distrust();
+        log.lock().distrusted_at = Some(started + Duration::from_nanos(1));
+        log.note_verified(&ChangeSet::default(), started);
+        assert!(log.snapshot().distrusted);
+        log.note_verified(
+            &ChangeSet::default(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(!log.snapshot().distrusted);
+    }
+
+    #[test]
+    fn ignore_and_root_events_distrust_before_debounce() {
+        let dir = TestDir::new();
+        let w = watcher(&dir);
+        let mut intake = Intake::new(&w);
+        intake.absorb(vec![dir.abs(".gitignore")], false);
+        assert!(w.freshness.snapshot().distrusted);
+        assert!(intake.all_dirty);
+        let w = watcher(&dir);
+        let mut intake = Intake::new(&w);
+        intake.absorb(vec![dir.path().to_path_buf()], false);
+        assert!(w.freshness.snapshot().distrusted);
+        assert!(intake.all_dirty);
+    }
+
+    #[test]
+    fn native_tree_events_require_verification_but_excluded_deletes_do_not() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
+        };
+        let dir = TestDir::new();
+        dir.write("f0.rs", "fn a() {}");
+        let scan = test_scan();
+        for kind in [
+            notify::EventKind::Remove(RemoveKind::Folder),
+            notify::EventKind::Remove(RemoveKind::Any),
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            notify::EventKind::Create(CreateKind::Folder),
+        ] {
+            let event = notify::Event::new(kind).add_path(dir.abs("deleted"));
+            assert!(requires_full_verification(&event, dir.path(), &scan));
+        }
+        let event = notify::Event::new(notify::EventKind::Remove(RemoveKind::Folder))
+            .add_path(dir.abs("node_modules/deleted"));
+        assert!(!requires_full_verification(&event, dir.path(), &scan));
+
+        // Reads and ordinary file / root metadata events must not latch
+        // overflow: that hid genuine writes behind distrust (Linux CI).
+        for kind in [
+            notify::EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            notify::EventKind::Access(AccessKind::Read),
+            notify::EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            notify::EventKind::Modify(ModifyKind::Any),
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+        ] {
+            let on_root = notify::Event::new(kind).add_path(dir.path().to_path_buf());
+            assert!(
+                !requires_full_verification(&on_root, dir.path(), &scan),
+                "kind {kind:?} on the watch root must not require full verification"
+            );
+            let on_file = notify::Event::new(kind).add_path(dir.abs("f0.rs"));
+            assert!(
+                !requires_full_verification(&on_file, dir.path(), &scan),
+                "kind {kind:?} on a file must not require full verification"
+            );
+        }
+        dir.write("sub/x.rs", "fn x() {}");
+        let create_any_dir =
+            notify::Event::new(notify::EventKind::Create(CreateKind::Any)).add_path(dir.abs("sub"));
+        assert!(requires_full_verification(
+            &create_any_dir,
+            dir.path(),
+            &scan
+        ));
+        // The root itself: only remove / rename invalidate the tree.
+        for kind in [
+            notify::EventKind::Create(CreateKind::Folder),
+            notify::EventKind::Create(CreateKind::Any),
+            notify::EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::Any)),
+        ] {
+            let ev = notify::Event::new(kind).add_path(dir.path().to_path_buf());
+            assert!(
+                !requires_full_verification(&ev, dir.path(), &scan),
+                "{kind:?} on the root must not require full verification"
+            );
+            assert!(intake_paths(&kind, ev.paths, dir.path()).is_empty());
+        }
+        for kind in [
+            notify::EventKind::Remove(RemoveKind::Folder),
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+        ] {
+            let ev = notify::Event::new(kind).add_path(dir.path().to_path_buf());
+            assert!(requires_full_verification(&ev, dir.path(), &scan));
+            assert_eq!(
+                intake_paths(&kind, ev.paths, dir.path()),
+                vec![dir.path().to_path_buf()]
+            );
+        }
+        let kind = notify::EventKind::Create(CreateKind::File);
+        assert_eq!(
+            intake_paths(
+                &kind,
+                vec![dir.path().to_path_buf(), dir.abs("f0.rs")],
+                dir.path()
+            ),
+            vec![dir.abs("f0.rs")]
+        );
+        let create_any_file = notify::Event::new(notify::EventKind::Create(CreateKind::Any))
+            .add_path(dir.abs("f0.rs"));
+        assert!(!requires_full_verification(
+            &create_any_file,
+            dir.path(),
+            &scan
+        ));
+    }
+
+    #[test]
+    fn selective_invalidation_forgets_deleted_directory_and_descendants() {
+        let root = PathBuf::from("/repo");
+        let mut sel = Selective {
+            root: root.clone(),
+            extra: Vec::new(),
+            dirs: [
+                root.clone(),
+                root.join("src"),
+                root.join("src/sub"),
+                root.join("src2"),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        sel.invalidate(&[root.join("src")]);
+        assert!(!sel.dirs.contains(&root.join("src")));
+        assert!(!sel.dirs.contains(&root.join("src/sub")));
+        assert!(sel.dirs.contains(&root.join("src2")));
+        assert!(sel.dirs.contains(&root));
+    }
+
+    // This exercises inotify, not the Mac backend. Keep each phase separate:
+    // a create event alone is not proof that the recreated directory is watched.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn selective_native_re_registers_same_name_directory_after_delete() {
+        let dir = TestDir::new();
+        dir.write("src/a.rs", "fn a() {}");
+        let (mut feed, ()) = init_notify(dir.path(), &test_scan(), true).expect("init");
+        fs::remove_dir_all(dir.abs("src")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while feed
+            .selective
+            .as_ref()
+            .unwrap()
+            .dirs
+            .contains(&dir.abs("src"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "delete did not invalidate registration"
+            );
+            let _ = feed.recv_timeout(Duration::from_millis(20));
+        }
+        dir.write("src/a.rs", "fn recreated() {}");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !feed
+            .selective
+            .as_ref()
+            .unwrap()
+            .dirs
+            .contains(&dir.abs("src"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "same-name directory was not adopted"
+            );
+            let _ = feed.recv_timeout(Duration::from_millis(20));
+        }
+        // Drain creation notifications before the distinguishing write.
+        while feed.recv_timeout(Duration::ZERO).is_ok() {}
+        dir.write("src/after.rs", "fn after_recreation() {}");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut observed = false;
+        while Instant::now() < deadline && !observed {
+            if let Ok(FeedWake::Events { paths, .. }) = feed.recv_timeout(Duration::from_millis(20))
+            {
+                observed = paths.iter().any(|p| p == &dir.abs("src/after.rs"));
+            }
+        }
+        assert!(
+            observed,
+            "no file event after same-name directory recreation"
+        );
+    }
+
+    #[test]
     fn directed_check_keeps_changed_paths_as_suspects_after_watermark() {
         let dir = TestDir::new();
         dir.write("a.rs", "fn a() {}");
@@ -2985,8 +3374,34 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "never seeded");
             thread::sleep(Duration::from_millis(5));
         }
-        let since = log.watermark();
-        thread::sleep(Duration::from_millis(100));
+        // Initial creates can lag past the seed watermark (especially
+        // FSEvents). Wait until the hint stream is quiet, then stamp
+        // `since` so leftover create hints are not blamed on the reads.
+        let seeded_at = log.watermark();
+        let mut last_change = Instant::now();
+        let mut prev = log.suspect_paths(seeded_at);
+        loop {
+            assert!(
+                !log.distrusted(),
+                "seed/create events latched distrust, hiding later writes; suspects={:?}",
+                log.suspect_paths(seeded_at)
+            );
+            thread::sleep(Duration::from_millis(10));
+            let now_paths = log.suspect_paths(seeded_at);
+            if now_paths != prev {
+                last_change = Instant::now();
+                prev = now_paths;
+            }
+            if last_change.elapsed() >= Duration::from_millis(300) {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "watcher did not go quiet after seed; suspects={prev:?}"
+            );
+        }
+        let since = Instant::now();
+        thread::sleep(Duration::from_millis(10));
         for _ in 0..3 {
             for i in 0..20 {
                 let _ = fs::read_to_string(dir.path().join(format!("f{i}.rs")));
@@ -2994,14 +3409,23 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(300));
         assert!(
+            !log.distrusted(),
+            "reads latched distrust; suspects={:?}",
+            log.suspect_paths(since)
+        );
+        assert!(
             log.suspect_paths(since).is_empty(),
             "reads produced suspects: {:?}",
             log.suspect_paths(since)
         );
-        // Sanity: a real write is still noted.
+        // Sanity: a real write is still noted (and not hidden by distrust).
         dir.write("f0.rs", "fn b() {}");
         let start = Instant::now();
         while log.suspect_paths(since).is_empty() {
+            assert!(
+                !log.distrusted(),
+                "write latched distrust, so the suspect is hidden"
+            );
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "write was not noted as a suspect"

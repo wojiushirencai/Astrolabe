@@ -34,6 +34,10 @@ use serde_json::{json, Value};
 
 use crate::loop_guard::{LoopGuard, Verdict};
 
+pub(crate) mod bool_compat;
+#[cfg(test)]
+mod query_contract_tests;
+pub(crate) mod query_scope;
 mod search_shape;
 mod shared;
 mod symbol_outline;
@@ -361,11 +365,18 @@ fn data_hits_outside(
     query: &str,
     sensitive: bool,
     excluded: &dyn Fn(&str) -> bool,
+    included: &dyn Fn(&str) -> bool,
 ) -> String {
     let rels: Vec<&str> = all_text_paths
         .iter()
         .map(|p| p.as_str())
-        .filter(|p| !p.contains(filter) && is_data_fixture(p) && !excluded(p))
+        .filter(|p| {
+            query_scope::allows(p)
+                && !p.contains(filter)
+                && is_data_fixture(p)
+                && !excluded(p)
+                && included(p)
+        })
         .collect();
     if rels.is_empty() {
         return String::new();
@@ -531,70 +542,74 @@ fn closest_symbols(
     // Word tokens that can count toward `shared` (len >= 3).
     let long_tokens: Vec<&String> = q_tokens.iter().filter(|t| t.len() >= 3).collect();
     let names = index.names();
-    let lower_names = names.lower();
     // The path filter only depends on the file, so check it once per file
     // and before any per-name scoring.
     let mut file_ok: HashMap<FileId, bool> = HashMap::new();
     let mut scored: Vec<(u32, String)> = Vec::new();
-    for (pos, sym) in index.graph().symbols.iter().enumerate() {
-        if let Some(f) = path_filter {
-            let ok = *file_ok.entry(sym.file).or_insert_with(|| {
-                index
-                    .file(sym.file)
-                    .is_some_and(|file| file.path.as_str().contains(f))
-            });
-            if !ok {
-                continue;
+    for (name, group) in names.name_path.names().expect("name table").named_groups() {
+        for &pos in group {
+            let sym = &index.graph().symbols[pos as usize];
+            if let Some(f) = path_filter {
+                let ok = *file_ok.entry(sym.file).or_insert_with(|| {
+                    index
+                        .file(sym.file)
+                        .is_some_and(|file| file.path.as_str().contains(f))
+                });
+                if !ok {
+                    continue;
+                }
             }
-        }
-        let name = lower_names[pos].as_str();
-        let score = if name == q {
-            0
-        } else if name.starts_with(&q) || q.starts_with(name) && name.len() >= 4 {
-            1
-        } else if name.contains(&q) || q.contains(name) && name.len() >= 4 {
-            2
-        } else if (if name.is_ascii() {
-            name.len()
-        } else {
-            name.chars().count()
-        })
-        .abs_diff(q_chars)
-            <= max_distance
-            && edit_distance(name, &q) <= max_distance
-        {
-            3
-        } else {
-            // An ASCII name's tokens are substrings of its lowercase form,
-            // so a name containing none of the query's long tokens cannot
-            // share one; skip tokenising it.
-            if sym.name.is_ascii() && !long_tokens.iter().any(|t| name.contains(t.as_str())) {
-                continue;
-            }
-            let shared = name_tokens(&sym.name)
-                .iter()
-                .filter(|t| t.len() >= 3 && q_tokens.contains(t))
-                .count();
-            if shared >= 1 && shared >= q_tokens.len().min(2) {
-                4
+            let score = if name == q {
+                0
+            } else if name.starts_with(&q) || q.starts_with(name) && name.len() >= 4 {
+                1
+            } else if name.contains(&q) || q.contains(name) && name.len() >= 4 {
+                2
+            } else if (if name.is_ascii() {
+                name.len()
             } else {
+                name.chars().count()
+            })
+            .abs_diff(q_chars)
+                <= max_distance
+                && edit_distance(name, &q) <= max_distance
+            {
+                3
+            } else {
+                // An ASCII name's tokens are substrings of its lowercase form,
+                // so a name containing none of the query's long tokens cannot
+                // share one; skip tokenising it.
+                if sym.name.is_ascii() && !long_tokens.iter().any(|t| name.contains(t.as_str())) {
+                    continue;
+                }
+                let shared = name_tokens(&sym.name)
+                    .iter()
+                    .filter(|t| t.len() >= 3 && q_tokens.contains(t))
+                    .count();
+                if shared >= 1 && shared >= q_tokens.len().min(2) {
+                    4
+                } else {
+                    continue;
+                }
+            };
+            let Some(file) = index.file(sym.file) else {
+                continue;
+            };
+            if !query_scope::allows(file.path.as_str()) {
                 continue;
             }
-        };
-        let Some(file) = index.file(sym.file) else {
-            continue;
-        };
-        if let Some(f) = path_filter {
-            if !file.path.as_str().contains(f) {
-                continue;
+            if let Some(f) = path_filter {
+                if !file.path.as_str().contains(f) {
+                    continue;
+                }
             }
+            let line = symbol_line(sym, &file.path);
+            let line = match line.rsplit_once("  @") {
+                Some((sig, loc)) => format!("{sig}  {loc}"),
+                None => line,
+            };
+            scored.push((score, line));
         }
-        let line = symbol_line(sym, &file.path);
-        let line = match line.rsplit_once("  @") {
-            Some((sig, loc)) => format!("{sig}  {loc}"),
-            None => line,
-        };
-        scored.push((score, line));
     }
     scored.sort();
     scored.dedup_by(|a, b| a.1 == b.1);
@@ -1187,10 +1202,18 @@ fn classify_task(task: &str) -> TaskKind {
 /// One-line pointer to the follow-up tool that fits the task wording.
 fn next_step_hint(task: &str) -> &'static str {
     match classify_task(task) {
-        TaskKind::Rename => "Next: find_refs(symbol, dry_run_rename=new_name) for a per-file rename checklist; then run build/tests to verify (use get_diag only if you cannot).\n",
-        TaskKind::Count => "Next: search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) for N lines / M files per dir/file (per line; multiple hits on one line count as 1); add count_only=true for totals only.\n",
-        TaskKind::Refs => "Next: find_refs(symbol) for precise call sites; use goto_def for the definition.\n",
-        TaskKind::Other => "Next: for a known name use find_symbol (include_body=true for source); for literals/copy use search_code; for callers use find_refs.\n",
+        TaskKind::Rename => {
+            "Next: find_refs(symbol, dry_run_rename=new_name) for a per-file rename checklist; then run build/tests to verify (use get_diag only if you cannot).\n"
+        }
+        TaskKind::Count => {
+            "Next: search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) for N lines / M files per dir/file (per line; multiple hits on one line count as 1); add count_only=true for totals only.\n"
+        }
+        TaskKind::Refs => {
+            "Next: find_refs(symbol) for precise call sites; use goto_def for the definition.\n"
+        }
+        TaskKind::Other => {
+            "Next: for a known name use find_symbol (include_body=true for source); for literals/copy use search_code; for callers use find_refs.\n"
+        }
     }
 }
 
@@ -1838,6 +1861,8 @@ pub(crate) struct ResolveContextParams {
     pub budget_tokens: usize,
     #[serde(default)]
     #[schemars(description = "false: resend a repeated call.")]
+    #[serde(deserialize_with = "crate::server::bool_compat::optional")]
+    #[schemars(with = "Option<bool>")]
     pub dedup: Option<bool>,
     /// Host / test agent identity for session result dedup isolation (unadvertised).
     #[serde(default)]
@@ -1870,6 +1895,8 @@ pub(crate) struct QueryParams {
     /// 默认 true：减少拿到 path:line 后整文件 Read。
     #[serde(default = "default_include_body")]
     #[schemars(description = "Return full bodies (default true; set false for anchors only).")]
+    #[serde(deserialize_with = "crate::server::bool_compat::required")]
+    #[schemars(with = "bool")]
     pub include_body: bool,
     /// 子串开关。名称查询：省略=子串匹配（精确名优先排序），false=只要精确名，
     /// true=子串；路径查询：最后段子串匹配（省略/false=精确）。
@@ -1877,6 +1904,8 @@ pub(crate) struct QueryParams {
     #[schemars(
         description = "Match mode: omitted=ranked prefix/substring, false=exact, true=substring."
     )]
+    #[serde(deserialize_with = "crate::server::bool_compat::optional")]
+    #[schemars(with = "Option<bool>")]
     pub substring: Option<bool>,
     /// kind 过滤（Function/Method/Class/Struct/Trait/...），名称与路径查询均生效。
     #[serde(default)]
@@ -1908,6 +1937,8 @@ pub(crate) struct QueryParams {
     #[schemars(
         description = "Default true: reference a definition body already returned this session for this agent; false to refetch. No-op when agent identity is missing."
     )]
+    #[serde(deserialize_with = "crate::server::bool_compat::optional")]
+    #[schemars(with = "Option<bool>")]
     pub dedup: Option<bool>,
     /// Host / test / hook-injected agent identity for session body dedup isolation.
     /// Prefer request `_meta` when the host provides one; this arg overrides.
@@ -1958,12 +1989,16 @@ pub(crate) struct SearchParams {
     pub query: String,
     #[serde(default)]
     #[schemars(description = "Default false. Set true to treat query as a regular expression.")]
+    #[serde(deserialize_with = "crate::server::bool_compat::required")]
+    #[schemars(with = "bool")]
     pub regex: bool,
     #[serde(default)]
     #[schemars(description = "index_root-relative substring (case-sensitive, not glob).")]
     pub path_filter: Option<String>,
     #[serde(default)]
     #[schemars(description = "Override case (default: sensitive iff query has uppercase).")]
+    #[serde(deserialize_with = "crate::server::bool_compat::optional")]
+    #[schemars(with = "Option<bool>")]
     pub case_sensitive: Option<bool>,
     #[serde(default = "default_budget")]
     #[schemars(description = "Token budget.")]
@@ -1978,14 +2013,20 @@ pub(crate) struct SearchParams {
     pub context_lines: Option<usize>,
     #[serde(default)]
     #[schemars(description = "Force match list on broad queries instead of summary counts.")]
+    #[serde(deserialize_with = "crate::server::bool_compat::required")]
+    #[schemars(with = "bool")]
     pub page: bool,
     #[serde(default)]
     #[schemars(
         description = "Group hits per file with test/assertion tags (default: auto for wide hits)."
     )]
+    #[serde(deserialize_with = "crate::server::bool_compat::optional")]
+    #[schemars(with = "Option<bool>")]
     pub group: Option<bool>,
     #[serde(default)]
     #[schemars(description = "Default true: reference repeated symbol bodies by location.")]
+    #[serde(deserialize_with = "crate::server::bool_compat::optional")]
+    #[schemars(with = "Option<bool>")]
     pub dedup: Option<bool>,
     /// Host / test agent identity for session body dedup isolation (unadvertised).
     #[serde(default)]
@@ -2002,10 +2043,53 @@ pub(crate) struct SearchParams {
     pub glob: Option<String>,
     #[serde(default)]
     #[schemars(description = "Only totals (hits, files).")]
+    #[serde(deserialize_with = "crate::server::bool_compat::required")]
+    #[schemars(with = "bool")]
     pub count_only: bool,
     #[serde(default)]
     #[schemars(description = "Ignore hits in comments and string literals.")]
+    #[serde(deserialize_with = "crate::server::bool_compat::required")]
+    #[schemars(with = "bool")]
     pub skip_comments: bool,
+}
+
+/// Common validation and path predicates for ready and building searches.
+struct SearchPlan {
+    matcher: regex::Regex,
+    sensitive: bool,
+    exclude: Option<globset::GlobSet>,
+    include: Option<globset::GlobSet>,
+}
+impl SearchPlan {
+    fn new(params: &SearchParams) -> Result<Self, String> {
+        if params.query.is_empty() {
+            return Err("query cannot be empty (empty string matches every line). Provide a literal to search; to match anything pass regex=true with an explicit pattern.".into());
+        }
+        if let Some(mode) = params.aggregate.as_deref() {
+            if !matches!(mode, "top" | "dir" | "file") {
+                return Err(format!(
+                    "aggregate must be top, dir, or file; got `{mode}`."
+                ));
+            }
+        }
+        let sensitive = search_shape::literal_case_sensitive(
+            &params.query,
+            params.regex,
+            params.case_sensitive,
+        );
+        Ok(Self {
+            matcher: build_search_matcher(&params.query, params.regex, Some(sensitive))
+                .map_err(invalid_regex_message)?,
+            sensitive,
+            exclude: build_exclude_set(params.exclude.as_deref())?,
+            include: build_include_set(params.glob.as_deref())?,
+        })
+    }
+}
+fn per_line_query_error(error: impl std::fmt::Display) -> String {
+    format!(
+        "Query cannot match per line: {error}. search_code searches line by line and does not support patterns with newlines (\\n, literal newlines) or cross-line matches; split into single-line queries."
+    )
 }
 
 /// Max offloaded results kept for `resources/read`.
@@ -2508,7 +2592,7 @@ impl AstrolabeServer {
                     return Err(self.finish(text_error(format!(
                         "{msg}
 confidence: unknown"
-                    ))))
+                    ))));
                 }
             };
             if let Some((session, rel_under)) = self.find_covering_session(&resolved) {
@@ -2640,6 +2724,13 @@ confidence: unknown"
         Ok(activate_absolute_root(&dispatch, resolved))
     }
 
+    fn recent_symbol_identity(&self) -> String {
+        if !dedup_agent::known() {
+            return String::new();
+        }
+        format!("{}|{}", dedup_agent::current(), query_scope::key())
+    }
+
     /// Remember a single unambiguous symbol hit for later find_refs.
     fn remember_symbol_anchor(
         &self,
@@ -2648,8 +2739,13 @@ confidence: unknown"
         path: &str,
         line_0based: Option<u32>,
     ) {
-        self.recent_symbols
-            .remember(root, symbol, path, line_0based);
+        self.recent_symbols.remember(
+            &self.recent_symbol_identity(),
+            root,
+            symbol,
+            path,
+            line_0based,
+        );
     }
 
     /// When find_symbol / path-query yields exactly one exact-name hit, remember it.
@@ -2671,6 +2767,8 @@ confidence: unknown"
             .filter(|s| s.name == typed || s.name.eq_ignore_ascii_case(typed))
             .collect();
         if exact.len() != 1 {
+            self.recent_symbols
+                .forget(&self.recent_symbol_identity(), root, typed);
             return;
         }
         let s = exact[0];
@@ -2774,41 +2872,50 @@ confidence: unknown"
         session: &RootSession,
         params: &SearchParams,
     ) -> CallToolResult {
-        const MAX_SHOWN: usize = 60;
         const MAX_SECONDS: u64 = 20;
         let mut params = params.clone();
         let regex_downgraded = apply_code_fragment_literal(&mut params);
         params.path_filter =
             normalize_filter_for_root(&session.root, params.path_filter.as_deref());
-        let sensitive = search_shape::literal_case_sensitive(
-            &params.query,
-            params.regex,
-            params.case_sensitive,
-        );
-        let matcher = match build_search_matcher(&params.query, params.regex, Some(sensitive)) {
-            Ok(matcher) => matcher,
-            Err(error) => return text_error(invalid_regex_message(error)),
+        let plan = match SearchPlan::new(&params) {
+            Ok(plan) => plan,
+            Err(error) => return self.finish_at(&session.root, text_error(error)),
         };
-        let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
-            Ok(set) => set,
-            Err(message) => return text_error(message),
-        };
+        // Use the same line-pattern validator as the text-only ready path.
+        if let Err(error) =
+            astrolabe_core::text_search::build_matcher(&params.query, params.regex, plan.sensitive)
+        {
+            return self.finish_at(&session.root, text_error(per_line_query_error(error)));
+        }
         let started = std::time::Instant::now();
         let scanned = astrolabe_core::scan::scan(
             &session.root,
             &astrolabe_core::scan::ScanOptions::default(),
         );
-        let mut total = 0usize;
-        let mut files_hit = 0usize;
-        let mut lines: Vec<String> = Vec::new();
+        if let Some(filter) = params.path_filter.as_deref() {
+            if !scanned
+                .files
+                .iter()
+                .any(|rel| query_scope::allows(rel.as_str()) && rel.as_str().contains(filter))
+            {
+                return self.finish_at(&session.root, text_error(format!("path_filter '{filter}' matches no scanned path (case-sensitive path substring, not a glob). Keep index_root unchanged; correct or omit path_filter.")));
+            }
+        }
+        let counting = params.count_only || params.aggregate.is_some();
+        let strings_are_code = params.query.contains(['"', '\'', '`']);
+        let mut matches = Vec::new();
+        let mut skipped = 0usize;
+        let mut unlexed = BTreeSet::new();
         let mut complete = true;
         for rel in &scanned.files {
             let path = rel.as_str();
-            if params
-                .path_filter
-                .as_deref()
-                .is_some_and(|f| !path.contains(f))
-                || exclude_set.as_ref().is_some_and(|set| set.is_match(path))
+            if !query_scope::allows(path)
+                || params
+                    .path_filter
+                    .as_deref()
+                    .is_some_and(|f| !path.contains(f))
+                || plan.exclude.as_ref().is_some_and(|set| set.is_match(path))
+                || !query_scope::matches_glob(plan.include.as_ref(), path)
             {
                 continue;
             }
@@ -2816,28 +2923,63 @@ confidence: unknown"
                 complete = false;
                 break;
             }
-            let Ok(text) = std::fs::read_to_string(session.root.join(path)) else {
+            let full = session.root.join(path);
+            if std::fs::metadata(&full).is_ok_and(|m| m.len() > TEXT_SEARCH_MAX_FILE_BYTES) {
+                continue;
+            }
+            let Ok(text) = astrolabe_core::text::read_source(&full) else {
                 continue;
             };
-            let mut file_hit = false;
-            for (idx, line) in text.lines().enumerate() {
-                if !matcher.is_match(line) {
+            if text.contains('\0') {
+                continue;
+            }
+            let lines: Vec<&str> = text.lines().collect();
+            let mask = if params.skip_comments {
+                crate::code_mask::code_mask(path, &lines, strings_are_code)
+            } else {
+                None
+            };
+            for (idx, line) in lines.iter().enumerate() {
+                if !plan.matcher.is_match(line) {
                     continue;
                 }
-                file_hit = true;
-                total += 1;
-                if total > params.offset && lines.len() < MAX_SHOWN && !params.count_only {
-                    lines.push(format!(
-                        "{path}:{}: {}",
-                        idx + 1,
-                        clip_match_line(line, &params.query, Some(&matcher))
-                    ));
+                if params.skip_comments {
+                    if astrolabe_core::Language::from_path(rel).is_none() && is_doc_path(path) {
+                        skipped += 1;
+                        continue;
+                    }
+                    if let Some(mask) = &mask {
+                        if !plan
+                            .matcher
+                            .find_iter(line)
+                            .any(|hit| mask[idx].get(hit.start()).copied().unwrap_or(true))
+                        {
+                            skipped += 1;
+                            continue;
+                        }
+                    } else {
+                        unlexed.insert(crate::code_mask::type_label(path));
+                    }
                 }
-            }
-            if file_hit {
-                files_hit += 1;
+                matches.push(SearchHit {
+                    path: path.to_owned(),
+                    line: idx + 1,
+                    text: if counting {
+                        String::new()
+                    } else {
+                        clip_match_line(line, &params.query, Some(&plan.matcher))
+                    },
+                    text_only: true,
+                });
             }
         }
+        let total = matches.len();
+        let files = matches
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let budget = clamp_budget(params.budget_tokens);
         let mut body = String::from(
             "confidence: exact (on-disk source literal scan; index still building in background; no symbol/role tags, [text-only])\n",
         );
@@ -2846,35 +2988,75 @@ confidence: unknown"
             &params.query,
             regex_downgraded,
         ));
-        if params.aggregate.is_some() {
-            body.push_str("aggregate grouping needs a ready index; totals only here.\n");
-        }
-        for line in &lines {
-            body.push_str(line);
-            body.push('\n');
-        }
-        let shown = lines.len();
-        if complete {
-            let hw = if total == 1 { "hit" } else { "hits" };
-            let fw = if files_hit == 1 { "file" } else { "files" };
+        let offset = params.offset.min(total);
+        let mut shown = 0;
+        let mut next_offset = None;
+        if counting {
+            body.push_str(&render_search_counts(
+                &matches,
+                params.aggregate.as_deref(),
+                params.offset,
+            ));
             body.push_str(&format!(
-                "{total} {hw} / {files_hit} {fw} (all scanned), showing {shown}{}. After the index is ready the same query will include symbol tags.\n",
-                if total > params.offset + shown && !params.count_only {
-                    "; page the rest with offset"
-                } else {
-                    ""
-                }
+                "{total} {} / {files} {} (all scanned={complete}).\n",
+                if total == 1 { "hit" } else { "hits" },
+                if files == 1 { "file" } else { "files" }
             ));
         } else {
-            let hw = if total == 1 { "hit" } else { "hits" };
-            let fw = if files_hit == 1 { "file" } else { "files" };
-            body.push_str(&format!(
-                "Stopped after scanning some files (timeout or cancel): at least {total} {hw} / {files_hit} {fw}; incomplete. Retry after the index is ready.\n"
-            ));
+            // Reserve the status/header before cutting a page; never emit 60
+            // unbudgeted lines just because the index is still building.
+            let available = budget.saturating_sub(estimate_tokens(&body) + SEARCH_HEADER_TOKENS);
+            let items: Vec<String> = matches[offset..]
+                .iter()
+                .map(|hit| format!("{}:{}: {} [text-only]", hit.path, hit.line, hit.text))
+                .collect();
+            let (kept, _) = truncate_ranked(&items, available, |line| format!("{line}\n"));
+            shown = kept.len();
+            for line in kept {
+                body.push_str(line);
+                body.push('\n');
+            }
+            if offset + shown < total {
+                next_offset = Some(offset + shown);
+            }
+            body.push_str(&format!("{total} hits / {files} files (all scanned={complete}), showing {shown}; offset={offset}\n"));
+            if let Some(next) = next_offset {
+                if shown > 0 {
+                    body.push_str(&format!(
+                        "next_offset={next}; pass offset={next} for more.\n"
+                    ));
+                } else {
+                    body.push_str(
+                        "No hit fits budget_tokens; increase budget_tokens or narrow the query.\n",
+                    );
+                }
+            }
         }
-        self.finish_at(
+        if params.skip_comments {
+            body.push_str(&format!(
+                "skip_comments=true; skipped {skipped} matching lines.\n"
+            ));
+            if !unlexed.is_empty() {
+                body.push_str(&format!(
+                    "Note: comments not skipped for {:?} (no lexer).\n",
+                    unlexed
+                ));
+            }
+        }
+        if !complete {
+            body.push_str("Stopped after scanning some files (timeout or cancel); incomplete.\n");
+        }
+        self.result_on(
             &session.root,
-            CallToolResult::success(vec![ContentBlock::text(body)]),
+            "search_code",
+            body,
+            json!({
+                "confidence":"exact", "building":true, "total":total, "files":files,
+                "offset":offset, "shown":shown, "next_offset":next_offset,
+                "truncated":!counting && offset + shown < total, "complete":complete,
+                "counts_only":counting, "budget_tokens":budget
+            }),
+            Some(budget),
         )
     }
 
@@ -3577,7 +3759,9 @@ fn custom_request_error(method: &str) -> ErrorData {
     ];
     if STANDARD.contains(&method) {
         ErrorData::invalid_params(
-            format!("Invalid params for `{method}`: params do not match the method's schema (e.g. `arguments` must be an object)"),
+            format!(
+                "Invalid params for `{method}`: params do not match the method's schema (e.g. `arguments` must be an object)"
+            ),
             None,
         )
     } else {
@@ -3767,6 +3951,7 @@ impl AstrolabeServer {
                 Err(err) => return err,
             };
             let mut params = params;
+            let _requested_scope = query_scope::enter(params.index_root.as_deref(), &route.hint);
             params.path_filter = route.path.clone();
             let result = self.resolve_contx_inner(params, &route.hint);
             Self::with_route_note(result, &route.note)
@@ -3896,6 +4081,7 @@ impl AstrolabeServer {
         &self,
         Parameters(mut params): Parameters<crate::precise_tools::FindRefsParams>,
     ) -> CallToolResult {
+        let omitted_path = params.path.is_none();
         let route = match self.resolve_call_root(
             params.index_root.as_deref(),
             params.root.as_deref(),
@@ -3905,16 +4091,22 @@ impl AstrolabeServer {
             Ok(route) => route,
             Err(err) => return err,
         };
-        params.path = route.path;
+        let _requested_scope = query_scope::enter(params.index_root.as_deref(), &route.hint);
+        params.path = if omitted_path && query_scope::active() {
+            None
+        } else {
+            route.path
+        };
         // Inherit path from this session's last unambiguous symbol hit when
         // the model omitted it (common after find_symbol / goto_def).
         let mut inherit_note: Option<String> = None;
         if params.path.is_none() {
             if let Ok(session) = self.session_for(&route.hint) {
-                if let Some(anchor) = self
-                    .recent_symbols
-                    .recall(&session.root, params.symbol.trim())
-                {
+                if let Some(anchor) = self.recent_symbols.recall(
+                    &self.recent_symbol_identity(),
+                    &session.root,
+                    params.symbol.trim(),
+                ) {
                     let line_disp = anchor
                         .line
                         .map(|l| format!(":{}", l + 1))
@@ -3958,6 +4150,7 @@ impl AstrolabeServer {
             Ok(route) => route,
             Err(err) => return err,
         };
+        let _requested_scope = query_scope::enter(params.index_root.as_deref(), &route.hint);
         params.path = route.path.unwrap_or_default();
         self.with_precise(&route.hint, true, move |session| {
             // Use site is enough for a later find_refs without path
@@ -3991,6 +4184,7 @@ impl AstrolabeServer {
             Ok(route) => route,
             Err(err) => return err,
         };
+        let _requested_scope = query_scope::enter(params.index_root.as_deref(), &route.hint);
         params.path = route.path.unwrap_or_default();
         self.with_precise(&route.hint, false, move |session| {
             crate::precise_tools::run_get_diag(params, session.precise.as_ref())
@@ -4024,6 +4218,7 @@ impl AstrolabeServer {
                 Ok(route) => route,
                 Err(err) => return err,
             };
+            let _requested_scope = query_scope::enter(params.index_root.as_deref(), &route.hint);
             params.path_filter = route.path.clone();
             params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
             let result = self.guarded("find_symbol", &route.hint, &signature, || {
@@ -4174,6 +4369,9 @@ impl AstrolabeServer {
                     return;
                 }
                 if let Some(file) = index.file(symbol.file) {
+                    if !query_scope::allows(file.path.as_str()) {
+                        return;
+                    }
                     if params
                         .path_filter
                         .as_deref()
@@ -4202,9 +4400,11 @@ impl AstrolabeServer {
                     consider(idx as usize, 0);
                 }
             } else {
-                for (idx, lower) in names.lower().iter().enumerate() {
+                for (lower, group) in names.name_path.names().expect("name table").named_groups() {
                     if let Some(tier) = name_match_tier(lower, &needle) {
-                        consider(idx, tier);
+                        for &idx in group {
+                            consider(idx as usize, tier);
+                        }
                     }
                 }
             }
@@ -4378,6 +4578,7 @@ impl AstrolabeServer {
                 Ok(route) => route,
                 Err(err) => return err,
             };
+            let _requested_scope = query_scope::enter(params.index_root.as_deref(), &route.hint);
             params.path_filter = route.path.clone();
             params.root = (!route.hint.is_empty()).then(|| route.hint.clone());
             if let Some(building) = self.building_session(&route.hint) {
@@ -4414,7 +4615,7 @@ impl AstrolabeServer {
                     .iter()
                     .copied()
                     .filter(|p| {
-                        params
+                        query_scope::allows(p.as_str()) && params
                             .path_filter
                             .as_deref()
                             .is_none_or(|f| p.as_str().contains(f))
@@ -4429,68 +4630,19 @@ impl AstrolabeServer {
                         return text_error(message);
                     }
                 }
-                // Smart case: a literal with an uppercase letter matches its
-                // case exactly; case-only variants are counted in a footnote.
-                let sensitive = search_shape::literal_case_sensitive(
-                    &params.query,
-                    params.regex,
-                    params.case_sensitive,
-                );
-                let variant_matcher = if search_shape::smart_case_applied(
-                    &params.query,
-                    params.regex,
-                    params.case_sensitive,
-                ) {
+                let SearchPlan { matcher, sensitive, exclude: exclude_set, include: include_set } = match SearchPlan::new(&params) {
+                    Ok(plan) => plan,
+                    Err(error) => return text_error(error),
+                };
+                let variant_matcher = if search_shape::smart_case_applied(&params.query, params.regex, params.case_sensitive) {
                     build_search_matcher(&params.query, false, Some(false)).ok()
-                } else {
-                    None
-                };
-                let matcher = match build_search_matcher(
-                    &params.query,
-                    params.regex,
-                    Some(sensitive),
-                ) {
+                } else { None };
+                let text_matcher = match astrolabe_core::text_search::build_matcher(&params.query, params.regex, sensitive) {
                     Ok(matcher) => matcher,
-                    Err(error) => return text_error(invalid_regex_message(error)),
-                };
-                if let Some(mode) = params.aggregate.as_deref() {
-                    if mode != "top" && mode != "dir" && mode != "file" {
-                        return text_error(format!(
-                            "aggregate must be top, dir, or file; got `{mode}`."
-                        ));
-                    }
-                }
-                if params.query.is_empty() {
-                    return text_error(
-                        "query cannot be empty (empty string matches every line). Provide a literal to search; to match anything pass regex=true with an explicit pattern.",
-                    );
-                }
-                // The text-only path uses grep-regex, which rejects patterns
-                // that can match a line terminator. Surface that instead of
-                // silently reporting "no match".
-                let text_matcher = match astrolabe_core::text_search::build_matcher(
-                    &params.query,
-                    params.regex,
-                    sensitive,
-                ) {
-                    Ok(m) => m,
-                    Err(error) => {
-                        return text_error(format!(
-                            "Query cannot match per line: {error}. search_code searches line by line and does not support patterns with newlines (\\n, literal newlines) or cross-line matches; split into single-line queries."
-                        ))
-                    }
-                };
-                let exclude_set = match build_exclude_set(params.exclude.as_deref()) {
-                    Ok(set) => set,
-                    Err(message) => return text_error(message),
+                    Err(error) => return text_error(per_line_query_error(error)),
                 };
                 let excluded = |path: &str| exclude_set.as_ref().is_some_and(|set| set.is_match(path));
-                let include_set = match build_include_set(params.glob.as_deref()) {
-                    Ok(set) => set,
-                    Err(message) => return text_error(message),
-                };
-                let included =
-                    |path: &str| include_set.as_ref().is_none_or(|set| set.is_match(path));
+                let included = |path: &str| query_scope::matches_glob(include_set.as_ref(), path);
                 let conf = if self.once("search_code.confidence") {
                     "confidence: exact (on-disk source literal match)\n"
                 } else {
@@ -4653,7 +4805,7 @@ impl AstrolabeServer {
                             .as_ref()
                             .is_none_or(|filter| path.contains(filter.as_str()))
                             && !excluded(path)
-                            && included(path)
+                            && query_scope::allows(path) && included(path)
                     })
                     .collect();
                 {
@@ -4698,8 +4850,7 @@ impl AstrolabeServer {
                                 continue;
                             }
                             if crate::code_mask::has_lexer(rels[idx]) {
-                                let text = std::fs::read(session.root.join(rels[idx]))
-                                    .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+                                let text = astrolabe_core::text::read_source(&session.root.join(rels[idx]))
                                     .unwrap_or_default();
                                 let lines: Vec<&str> = text.lines().collect();
                                 if let Some(mask) = crate::code_mask::code_mask(
@@ -4767,6 +4918,7 @@ impl AstrolabeServer {
                             &params.query,
                             sensitive,
                             &excluded,
+                            &included,
                         ))
                         .unwrap_or_default()
                 };
@@ -5039,7 +5191,7 @@ impl AstrolabeServer {
                             .files
                             .iter()
                             .map(|file| file.path.as_str())
-                            .filter(|path| !path.contains(filter) && !excluded(path))
+                            .filter(|path| query_scope::allows(path) && !path.contains(filter) && !excluded(path) && included(path))
                             .filter_map(&scan_file)
                             .flat_map(|scan| scan.hits)
                             .collect();
@@ -5374,6 +5526,9 @@ impl AstrolabeServer {
                 .map(|&idx| (idx, &symbols[idx]))
             {
                 if let Some(file) = index.file(symbol.file) {
+                    if !query_scope::allows(file.path.as_str()) {
+                        continue;
+                    }
                     if params
                         .path_filter
                         .as_deref()
@@ -6180,12 +6335,16 @@ fn symbol_suggestions(index: &RepoIndex, needle: &str) -> String {
     let mut scored: BTreeMap<(usize, String), ()> = BTreeMap::new();
     let symbols = &index.graph().symbols;
     let names = index.names();
-    let lower_names = names.lower();
     // One candidate per distinct lowercase name, named after its first
     // occurrence (as the old first-seen scan did).
-    for group in names.name_groups() {
-        let first = group[0] as usize;
-        let lower = &lower_names[first];
+    for (lower, group) in names.name_path.names().expect("name table").named_groups() {
+        let Some(first) = group.iter().map(|&i| i as usize).find(|&i| {
+            index
+                .file(symbols[i].file)
+                .is_some_and(|f| query_scope::allows(f.path.as_str()))
+        }) else {
+            continue;
+        };
         let distance = if prefix_ok && lower.starts_with(&prefix) {
             edit_distance(lower, needle)
         } else {
@@ -6241,7 +6400,10 @@ fn path_filter_error_at_root(
     let normalized = normalize_filter_for_root(&index.root, Some(raw));
     let filter = normalized.as_deref().unwrap_or(raw);
     let files = &index.graph().files;
-    if files.iter().any(|file| file.path.as_str().contains(filter)) {
+    if files
+        .iter()
+        .any(|file| query_scope::allows(file.path.as_str()) && file.path.as_str().contains(filter))
+    {
         return None;
     }
     if !index.unindexed_code_exts(Some(filter)).is_empty() {
@@ -7661,98 +7823,104 @@ mod tests {
 
     #[test]
     fn find_refs_inherits_path_from_unique_find_symbol() {
-        let (server, dir) = smart_server(&[(
-            "svc/channel.go",
-            "package svc\n\nfunc ShouldDisableChannel() bool { return false }\n".into(),
-        )]);
-        // Unique exact hit → remembered for this session.
-        let sym = text_of(&server.find_symbol(Parameters(find("ShouldDisableChannel"))));
-        assert!(
-            sym.contains("svc/channel.go"),
-            "find_symbol should hit the definition: {sym}"
-        );
-        let refs = text_of(
-            &server.find_refs(Parameters(crate::precise_tools::FindRefsParams {
-                root: None,
-                index_root: None,
-                symbol: "ShouldDisableChannel".into(),
-                path: None,
-                line: None,
-                character: None,
-                budget_tokens: 2500,
-                offset: None,
-                dry_run_rename: None,
-            })),
-        );
-        assert!(
-            refs.contains("reusing this session's latest") && refs.contains("svc/channel.go"),
-            "expected session inherit note: {refs}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        dedup_agent::scope("inherit-test".into(), || {
+            let (server, dir) = smart_server(&[(
+                "svc/channel.go",
+                "package svc\n\nfunc ShouldDisableChannel() bool { return false }\n".into(),
+            )]);
+            // Unique exact hit → remembered for this session.
+            let sym = text_of(&server.find_symbol(Parameters(find("ShouldDisableChannel"))));
+            assert!(
+                sym.contains("svc/channel.go"),
+                "find_symbol should hit the definition: {sym}"
+            );
+            let refs = text_of(&server.find_refs(Parameters(
+                crate::precise_tools::FindRefsParams {
+                    root: None,
+                    index_root: None,
+                    symbol: "ShouldDisableChannel".into(),
+                    path: None,
+                    line: None,
+                    character: None,
+                    budget_tokens: 2500,
+                    offset: None,
+                    dry_run_rename: None,
+                },
+            )));
+            assert!(
+                refs.contains("reusing this session's latest") && refs.contains("svc/channel.go"),
+                "expected session inherit note: {refs}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn find_refs_does_not_inherit_when_find_symbol_is_ambiguous() {
-        let (server, dir) = smart_server(&[
-            ("a/x.go", "package a\n\nfunc Dup() {}\n".into()),
-            ("b/y.go", "package b\n\nfunc Dup() {}\n".into()),
-        ]);
-        let sym = text_of(&server.find_symbol(Parameters(find("Dup"))));
-        assert!(sym.contains("a/x.go") && sym.contains("b/y.go"), "{sym}");
-        // Two exact hits → nothing remembered; missing path stays Ambiguous.
-        let refs = text_of(
-            &server.find_refs(Parameters(crate::precise_tools::FindRefsParams {
-                root: None,
-                index_root: None,
-                symbol: "Dup".into(),
-                path: None,
-                line: None,
-                character: None,
-                budget_tokens: 2500,
-                offset: None,
-                dry_run_rename: None,
-            })),
-        );
-        assert!(
-            !refs.contains("reusing this session's latest"),
-            "must not invent a path from an ambiguous find_symbol: {refs}"
-        );
-        assert!(
-            refs.contains("a/x.go") && refs.contains("b/y.go"),
-            "expected ranked candidates: {refs}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        dedup_agent::scope("inherit-test".into(), || {
+            let (server, dir) = smart_server(&[
+                ("a/x.go", "package a\n\nfunc Dup() {}\n".into()),
+                ("b/y.go", "package b\n\nfunc Dup() {}\n".into()),
+            ]);
+            let sym = text_of(&server.find_symbol(Parameters(find("Dup"))));
+            assert!(sym.contains("a/x.go") && sym.contains("b/y.go"), "{sym}");
+            // Two exact hits → nothing remembered; missing path stays Ambiguous.
+            let refs = text_of(&server.find_refs(Parameters(
+                crate::precise_tools::FindRefsParams {
+                    root: None,
+                    index_root: None,
+                    symbol: "Dup".into(),
+                    path: None,
+                    line: None,
+                    character: None,
+                    budget_tokens: 2500,
+                    offset: None,
+                    dry_run_rename: None,
+                },
+            )));
+            assert!(
+                !refs.contains("reusing this session's latest"),
+                "must not invent a path from an ambiguous find_symbol: {refs}"
+            );
+            assert!(
+                refs.contains("a/x.go") && refs.contains("b/y.go"),
+                "expected ranked candidates: {refs}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn find_refs_inherits_after_path_filter_narrows_to_one() {
-        let (server, dir) = smart_server(&[
-            ("a/x.go", "package a\n\nfunc Init() {}\n".into()),
-            ("b/y.go", "package b\n\nfunc Init() {}\n".into()),
-        ]);
-        let mut q = find("Init");
-        q.path_filter = Some("a/".into());
-        let sym = text_of(&server.find_symbol(Parameters(q)));
-        assert!(sym.contains("a/x.go"), "{sym}");
-        assert!(!sym.contains("b/y.go"), "{sym}");
-        let refs = text_of(
-            &server.find_refs(Parameters(crate::precise_tools::FindRefsParams {
-                root: None,
-                index_root: None,
-                symbol: "Init".into(),
-                path: None,
-                line: None,
-                character: None,
-                budget_tokens: 2500,
-                offset: None,
-                dry_run_rename: None,
-            })),
-        );
-        assert!(
-            refs.contains("reusing this session's latest") && refs.contains("a/x.go"),
-            "path_filter-narrowed find_symbol should be inherited: {refs}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        dedup_agent::scope("inherit-test".into(), || {
+            let (server, dir) = smart_server(&[
+                ("a/x.go", "package a\n\nfunc Init() {}\n".into()),
+                ("b/y.go", "package b\n\nfunc Init() {}\n".into()),
+            ]);
+            let mut q = find("Init");
+            q.path_filter = Some("a/".into());
+            let sym = text_of(&server.find_symbol(Parameters(q)));
+            assert!(sym.contains("a/x.go"), "{sym}");
+            assert!(!sym.contains("b/y.go"), "{sym}");
+            let refs = text_of(&server.find_refs(Parameters(
+                crate::precise_tools::FindRefsParams {
+                    root: None,
+                    index_root: None,
+                    symbol: "Init".into(),
+                    path: None,
+                    line: None,
+                    character: None,
+                    budget_tokens: 2500,
+                    offset: None,
+                    dry_run_rename: None,
+                },
+            )));
+            assert!(
+                refs.contains("reusing this session's latest") && refs.contains("a/x.go"),
+                "path_filter-narrowed find_symbol should be inherited: {refs}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

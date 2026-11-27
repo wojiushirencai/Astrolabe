@@ -787,10 +787,10 @@ fn parse_one(
     let language = Language::from_path_and_source(path, &source).or(by_path)?;
     let (sha, loc) = digest(&source);
     let mut cache_key = store::parse_cache_key(language, &sha);
-    // Path-dependent extractors must not share a content-addressed product:
-    // two identical `.vue` files at different paths get different component
-    // symbols (named after the file stem).
-    if let Some(salt) = crate::parse::path_cache_salt(language, path) {
+    // Content/language alone do not select the extractor: Razor, shell
+    // dialects and Vue component names also depend on the path/profile.
+    if let Some(salt) = crate::parse::ParseProfile::for_source(language, path, &source).cache_salt()
+    {
         cache_key.push(':');
         cache_key.push_str(&salt);
     }
@@ -2524,6 +2524,109 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Exercise both the content-addressed lookup and aged per-path stamps.
+    /// Comparing stored payloads also covers imports, calls and partial flags.
+    fn assert_profiles_survive_warm_cache(tag: &str, paths: &[&str], body: &str) {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = scratch(tag);
+        let pool = ParserPool::new();
+        let expected: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                write(&root, path, body);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(root.join(path))
+                    .unwrap()
+                    .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+                    .unwrap();
+                let rel = RelPath::new(*path);
+                let language = Language::from_path_and_source(&rel, body).unwrap();
+                pool.parse(language, &rel, body).unwrap()
+            })
+            .collect();
+        assert_ne!(
+            store::encode_parsed(&expected[0]).unwrap(),
+            store::encode_parsed(&expected[1]).unwrap(),
+            "fixture must select different extraction products"
+        );
+        let summarize = |symbols: &[CodeSymbol]| {
+            symbols
+                .iter()
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        s.kind,
+                        s.signature.clone(),
+                        s.start_line,
+                        s.end_line,
+                        s.exported,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for run in 0..3 {
+            let (graph, report) = index_repo(&root, &IndexOptions::default());
+            assert!(
+                report.parse_failures.is_empty(),
+                "run {run}: {:?}",
+                report.parse_failures
+            );
+            let store = Store::open_read_only(&store_path(&root)).unwrap().unwrap();
+            let mut keys = Vec::new();
+            for (path, expected) in paths.iter().zip(&expected) {
+                let file = graph
+                    .files
+                    .iter()
+                    .find(|f| f.path.as_str() == *path)
+                    .unwrap();
+                let actual: Vec<_> = graph
+                    .symbols
+                    .iter()
+                    .filter(|s| s.file == file.id)
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    summarize(&actual),
+                    summarize(&expected.symbols),
+                    "run {run}: {path}"
+                );
+                let stamp = store
+                    .file_stamp(path)
+                    .unwrap()
+                    .expect("aged file must have a stamp");
+                let payload = store.cached_parse(&stamp.key).unwrap().unwrap();
+                assert_eq!(
+                    payload,
+                    store::encode_parsed(expected).unwrap(),
+                    "run {run}: {path}"
+                );
+                keys.push(stamp.key);
+            }
+            assert_ne!(keys[0], keys[1], "profiles must not share the stored key");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn identical_csharp_and_razor_files_keep_distinct_products_across_cache() {
+        assert_profiles_survive_warm_cache(
+            "razor-profile",
+            &["Plain.cs", "Page.razor", "View.cshtml"],
+            "public class Visible {}\n",
+        );
+    }
+
+    #[test]
+    fn identical_sh_and_bats_files_keep_distinct_products_across_cache() {
+        // No bats shebang: only the .bats path selects the test rewrite.
+        assert_profiles_survive_warm_cache(
+            "bats-profile",
+            &["plain.sh", "tests.bats"],
+            "@test \"two words\" {\n true\n}\n",
+        );
+    }
+
     fn sym(name: &str, start: u32, end: u32) -> CodeSymbol {
         CodeSymbol {
             id: SymbolId(0),
@@ -2780,6 +2883,12 @@ mod tests {
     fn previous_extractor_version_cache_is_never_served() {
         let root = scratch("extractor-bump");
         write(&root, "a.py", "def real():\n    pass\n");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("a.py"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+            .unwrap();
         let (g1, _) = index_repo(&root, &IndexOptions::default());
         let file = &g1.files[0];
         let key = store::parse_cache_key(file.language.unwrap(), &file.sha);
@@ -2799,6 +2908,14 @@ mod tests {
             stale.symbols[0].name = "stale".into();
             store
                 .put_cached_parse(&old_key, &store::encode_parsed(&stale).unwrap())
+                .unwrap();
+            let mut stamp = store
+                .file_stamp("a.py")
+                .unwrap()
+                .expect("aged file has a stamp");
+            stamp.key = old_key.clone();
+            store
+                .put_file_stamps(&[("a.py".to_owned(), stamp)])
                 .unwrap();
             store
                 .prune_parse_cache(

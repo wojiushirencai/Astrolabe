@@ -94,20 +94,31 @@ pub(super) fn symbol_hits_outside_filter(
 ) -> String {
     let symbols = &index.graph().symbols;
     let mut outside: Vec<(u8, String, String)> = Vec::new();
-    for (idx, lower) in index.names().lower().iter().enumerate() {
+    for (lower, group) in index
+        .names()
+        .name_path
+        .names()
+        .expect("name table")
+        .named_groups()
+    {
         let Some(tier) = name_match_tier(lower, needle) else {
             continue;
         };
-        let s = &symbols[idx];
-        if kind.is_some_and(|k| s.kind != k) {
-            continue;
-        }
-        if let Some(file) = index.file(s.file) {
-            outside.push((
-                tier,
-                format!("{}:{}", file.path.as_str(), s.start_line),
-                file.path.as_str().to_string(),
-            ));
+        for &idx in group {
+            let s = &symbols[idx as usize];
+            if kind.is_some_and(|k| s.kind != k) {
+                continue;
+            }
+            if let Some(file) = index.file(s.file) {
+                if !super::query_scope::allows(file.path.as_str()) {
+                    continue;
+                }
+                outside.push((
+                    tier,
+                    format!("{}:{}", file.path.as_str(), s.start_line),
+                    file.path.as_str().to_string(),
+                ));
+            }
         }
     }
     let mut note = if outside.is_empty() {
@@ -220,8 +231,7 @@ pub(super) fn case_variant_note(variants: &[SearchHit]) -> String {
     };
     format!(
         "{n} more {noun} {verb} only by case (e.g. {}:{} {text}); literals with uppercase are case-sensitive by default — pass case_sensitive=false to include them.\n",
-        sample.path,
-        sample.line
+        sample.path, sample.line
     )
 }
 

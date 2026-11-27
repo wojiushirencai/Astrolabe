@@ -64,7 +64,7 @@ pub(super) fn outline_target(
     };
     let mut matched: Vec<(&str, FileId)> = files
         .iter()
-        .filter(|f| f.path.as_str().contains(filter))
+        .filter(|f| super::query_scope::allows(f.path.as_str()) && f.path.as_str().contains(filter))
         .map(|f| (f.path.as_str(), f.id))
         .collect();
     matched.sort();
@@ -77,7 +77,9 @@ pub(super) fn outline_target(
             id: *id,
             others: Vec::new(),
         }),
-        many => Ok(OutlineTarget::Files(many.iter().map(|(_, id)| *id).collect())),
+        many => Ok(OutlineTarget::Files(
+            many.iter().map(|(_, id)| *id).collect(),
+        )),
     })
 }
 
