@@ -9,7 +9,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock},
-    time::UNIX_EPOCH,
 };
 
 use astrolabe_core::cache::{CachedLines, FileCache};
@@ -110,11 +109,6 @@ impl NameIndex {
             .expect("NameIndex builds its NamePathIndex with names")
     }
 
-    /// `name.to_lowercase()` of every symbol, by position.
-    pub fn lower(&self) -> &[String] {
-        self.table().lower()
-    }
-
     /// Positions of the symbols whose lowercase name is `lower_name`.
     pub fn by_lower(&self, lower_name: &str) -> &[u32] {
         self.table().exact(lower_name)
@@ -125,12 +119,6 @@ impl NameIndex {
         self.by_lower(&name.to_lowercase())
             .iter()
             .any(|&i| symbols[i as usize].name == name)
-    }
-
-    /// One group of positions per distinct lowercase name; `group[0]` is
-    /// that name's first occurrence in `graph().symbols`.
-    pub fn name_groups(&self) -> impl Iterator<Item = &[u32]> {
-        self.table().groups()
     }
 }
 
@@ -424,9 +412,9 @@ impl RepoIndex {
         }
     }
 
-    /// Load source lines through the process-wide [`FileCache`].
+    /// Load source lines through the session's [`FileCache`].
     ///
-    /// The current mtime is always passed to [`FileCache::get`], so an edited
+    /// The full filesystem mtime and length are checked, so an edited
     /// file is a miss and the stale entry is invalidated. The `bool` is
     /// `true` on a cache hit.
     pub fn cached_lines(
@@ -543,29 +531,25 @@ pub(crate) fn load_source_lines(
     rel_path: &str,
 ) -> Option<(Arc<CachedLines>, bool)> {
     let disk = root.join(rel_path);
-    // Stat before reading: a write after this point changes mtime/len, so
-    // the entry inserted below is never served for the newer content.
+    // Stat before reading and retain its full timestamp precision. A write
+    // normally changes this stamp; known filesystem events should additionally
+    // invalidate the path to cover deliberately restored timestamps.
     let metadata = fs::metadata(&disk).ok();
-    let mtime_ms = metadata.as_ref().and_then(mtime_ms_of).unwrap_or(0);
-    let len = metadata.as_ref().map(fs::Metadata::len);
-    if let Some(len) = len {
-        if let Some(lines) = cache.get_checked(rel_path, mtime_ms, len) {
+    let stamp = metadata
+        .as_ref()
+        .and_then(|m| Some((m.modified().ok()?, m.len())));
+    if let Some((modified, len)) = stamp {
+        if let Some(lines) = cache.get_precise(rel_path, modified, len) {
             return Some((lines, true));
         }
     }
     let source = astrolabe_core::text::read_source(&disk).ok()?;
     // One String plus one offset table; no per-line `String` allocation.
     let lines = Arc::new(CachedLines::from_text(source));
-    if let Some(len) = len {
-        cache.insert_checked(rel_path, Arc::clone(&lines), mtime_ms, len);
+    if let Some((modified, len)) = stamp {
+        cache.insert_precise(rel_path, Arc::clone(&lines), modified, len);
     }
     Some((lines, false))
-}
-
-fn mtime_ms_of(metadata: &fs::Metadata) -> Option<u64> {
-    let modified = metadata.modified().ok()?;
-    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
-    Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -850,6 +834,49 @@ mod tests {
         assert_eq!(&lines[0], "line-two");
         assert_eq!(lines.len(), 1);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_read_misses_after_same_millisecond_equal_length_rewrite() {
+        use astrolabe_core::cache::{CacheConfig, FileCache};
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = unique_temp_dir();
+        let file = dir.join("hello.py");
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let set_modified = |time| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+            std::fs::metadata(&file).unwrap().modified().unwrap()
+        };
+        std::fs::write(&file, "def aa(): pass\n").unwrap();
+        let first = set_modified(base + Duration::from_micros(100));
+        let cache = FileCache::new(CacheConfig::default());
+        let (held, hit) = load_source_lines(&cache, &dir, "hello.py").unwrap();
+        assert!(!hit);
+        assert!(load_source_lines(&cache, &dir, "hello.py").unwrap().1);
+        std::fs::write(&file, "def bb(): pass\n").unwrap();
+        let second = set_modified(base + Duration::from_micros(900));
+        assert_ne!(
+            first, second,
+            "test filesystem must retain sub-ms mtime precision"
+        );
+        assert_eq!(
+            first.duration_since(UNIX_EPOCH).unwrap().as_millis(),
+            second.duration_since(UNIX_EPOCH).unwrap().as_millis()
+        );
+        let (lines, hit) = load_source_lines(&cache, &dir, "hello.py").unwrap();
+        assert!(
+            !hit,
+            "full timestamp must reject an equal-length rewrite within one millisecond"
+        );
+        assert_eq!(lines.as_text(), "def bb(): pass\n");
+        assert_eq!(held.as_text(), "def aa(): pass\n");
+        assert!(load_source_lines(&cache, &dir, "hello.py").unwrap().1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

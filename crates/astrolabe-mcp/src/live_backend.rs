@@ -184,7 +184,11 @@ impl LiveBackend {
         let partners: BTreeSet<&str> = extra.iter().map(|l| l.path.as_str()).collect();
         let note = format!(
             "{}language server only returned declarations in the header; the following {} hits are same-name definitions in paired source {} (syntactic: header/source basename pairing and symbol-name match).",
-            result.note.as_deref().map(|n| format!("{n} ")).unwrap_or_default(),
+            result
+                .note
+                .as_deref()
+                .map(|n| format!("{n} "))
+                .unwrap_or_default(),
             extra.len(),
             partners.into_iter().collect::<Vec<_>>().join(", ")
         );
@@ -496,7 +500,9 @@ fn warming_note(language: Language, n: usize, what: &str) -> String {
     if n == 0 {
         head
     } else {
-        format!("{head}. Showing {n} {what} from the tree-sitter syntactic index first (syntactic: name match; may include other same-name entities).")
+        format!(
+            "{head}. Showing {n} {what} from the tree-sitter syntactic index first (syntactic: name match; may include other same-name entities)."
+        )
     }
 }
 
@@ -506,18 +512,24 @@ fn warming_note(language: Language, n: usize, what: &str) -> String {
 fn empty_note(language: Language, what: &str) -> String {
     let server = astrolabe_core::lsp::router::primary_server_name(language);
     let why = match language {
-        Language::Kotlin => "This file may be outside the imported project model (e.g. Kotlin multiplatform / Android source set not imported, Android SDK missing)",
+        Language::Kotlin => {
+            "This file may be outside the imported project model (e.g. Kotlin multiplatform / Android source set not imported, Android SDK missing)"
+        }
         Language::Java => "This file may be outside the imported Maven / Gradle project",
         Language::Go => "This file may be outside the go.mod module or current build tags",
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Vue => {
             "This file may be outside tsconfig / jsconfig coverage"
         }
-        Language::Python => "This file may be outside pyright's analysis scope (interpreter / venv not configured)",
+        Language::Python => {
+            "This file may be outside pyright's analysis scope (interpreter / venv not configured)"
+        }
         Language::Rust => "This file may be outside a crate in the Cargo workspace",
         Language::C | Language::Cpp | Language::ObjC | Language::ObjCpp => {
             "This file may lack compile args (missing compile_commands.json)"
         }
-        Language::CSharp | Language::VisualBasic => "This file may be outside the loaded .csproj / .sln",
+        Language::CSharp | Language::VisualBasic => {
+            "This file may be outside the loaded .csproj / .sln"
+        }
         _ => "This file may be outside the loaded project",
     };
     format!("{server} returned no {what}: {why}, so an empty result is not a precise conclusion.")
@@ -597,7 +609,7 @@ impl PreciseCapability for LiveBackend {
         exact: bool,
     ) -> Precise<Vec<Location>> {
         refs_graph::with_file_cache(self.file_cache.as_ref(), || {
-            self.references_inner(symbol, path, position, exact)
+            self.limit_to_requested_scope(self.references_inner(symbol, path, position, exact))
         })
     }
 
@@ -651,7 +663,8 @@ impl PreciseCapability for LiveBackend {
             }
             other => (other.0, other.1),
         };
-        let mut result = self.definition_at(language, &rel, symbol, line, character);
+        let mut result = self
+            .limit_to_requested_scope(self.definition_at(language, &rel, symbol, line, character));
         if let Some(note) = snap_note {
             result.note = Some(match result.note.take().filter(|n| !n.is_empty()) {
                 Some(rest) => format!("{note}\n{rest}"),
@@ -695,6 +708,32 @@ impl PreciseCapability for LiveBackend {
 }
 
 impl LiveBackend {
+    fn limit_to_requested_scope(
+        &self,
+        mut result: Precise<Vec<Location>>,
+    ) -> Precise<Vec<Location>> {
+        if crate::server::query_scope::active() {
+            result
+                .value
+                .retain(|loc| crate::server::query_scope::allows(loc.path.as_str()));
+            // Grouped resolver notes may themselves enumerate other roots.
+            // Do not present those as candidates for this scoped request.
+            let outside_note = result.note.as_ref().is_some_and(|note| {
+                self.syntax.as_ref().and_then(|f| f()).is_some_and(|ix| {
+                    ix.graph().files.iter().any(|file| {
+                        !crate::server::query_scope::allows(file.path.as_str())
+                            && note.contains(file.path.as_str())
+                    })
+                })
+            });
+            if outside_note {
+                result.note = Some("Resolver inspected files outside requested index_root; their detailed notes and locations are omitted. Scoped results may be incomplete.".into());
+            }
+            result.note.get_or_insert_with(String::new).push_str("\nResults restricted to requested index_root; repo-wide coverage is incomplete by design (outside references are not included).\n");
+        }
+        result
+    }
+
     fn references_inner(
         &self,
         symbol: &str,
@@ -709,9 +748,51 @@ impl LiveBackend {
         // A missing / wrong path is fixed from the index when the symbol has
         // one declaring file; several candidates are listed instead.
         if let Some(ix) = index.as_deref() {
+            if crate::server::query_scope::active() && path.is_none() {
+                let mut candidates: Vec<&str> = ix
+                    .names()
+                    .by_lower(&symbol.trim().to_lowercase())
+                    .iter()
+                    .filter_map(|&i| {
+                        let sym = &ix.graph().symbols[i as usize];
+                        if sym.name != symbol.trim() {
+                            return None;
+                        }
+                        let file = ix.file(sym.file)?;
+                        crate::server::query_scope::allows(file.path.as_str())
+                            .then_some(file.path.as_str())
+                    })
+                    .collect();
+                candidates.sort_unstable();
+                candidates.dedup();
+                match candidates.as_slice() {
+                    [only] => path = Some((*only).to_owned()),
+                    [] => {
+                        return Precise::unknown(
+                            Vec::new(),
+                            "No definition found inside requested index_root; provide a definition/use-site path within that directory.",
+                        );
+                    }
+                    _ => {
+                        return Precise::unknown(
+                            Vec::new(),
+                            format!(
+                                "Several definition files inside requested index_root: {}. Pass path to choose one.",
+                                candidates.join(", ")
+                            ),
+                        );
+                    }
+                }
+            }
             match refs_graph::fix_path(ix, &self.root, symbol, path.as_deref()) {
                 PathFix::Keep => {}
                 PathFix::Use { path: fixed, note } => {
+                    if !crate::server::query_scope::allows(&fixed) {
+                        return Precise::unknown(
+                            Vec::new(),
+                            "No definition found inside requested index_root; provide a definition/use-site path within that directory.",
+                        );
+                    }
                     path = Some(fixed);
                     // The coordinates belonged to the other file.
                     position = None;
@@ -844,7 +925,11 @@ impl LiveBackend {
                 } else if busy {
                     warming_note(language, hits.len(), "same-name declarations")
                 } else {
-                    format!("{}Showing {1} same-name declarations from the tree-sitter syntactic index first (syntactic: name match; may include other same-name entities).", empty_note(language, "def"), hits.len())
+                    format!(
+                        "{}Showing {1} same-name declarations from the tree-sitter syntactic index first (syntactic: name match; may include other same-name entities).",
+                        empty_note(language, "def"),
+                        hits.len()
+                    )
                 };
                 Precise {
                     confidence: Confidence::Syntactic,

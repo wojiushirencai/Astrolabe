@@ -9,6 +9,7 @@ Options:
   --yes, -y              Configure all detected clients without prompts
   --clients=a,b,c        Configure only these client ids (comma-separated)
   --list                 Print detection results and exit
+  --check-config         Read-only Cursor effective config/approval check (no setup)
   --dry-run              Preview writes; do not modify files
   --native               Use command "astrolabe" on PATH instead of npx
   --command=<bin>        Override MCP command (default: npx, or astrolabe with --native)
@@ -49,6 +50,7 @@ function parseArgs(argv) {
     yes: false,
     list: false,
     dryRun: false,
+    checkConfig: false,
     native: false,
     help: false,
     home: null,
@@ -67,6 +69,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--yes' || arg === '-y') opts.yes = true;
     else if (arg === '--list') opts.list = true;
+    else if (arg === '--check-config') opts.checkConfig = true;
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--native') opts.native = true;
     else if (arg === '--help' || arg === '-h') opts.help = true;

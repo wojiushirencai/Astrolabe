@@ -634,12 +634,88 @@ fn language_index(lang: Language) -> Option<usize> {
     })
 }
 
-/// Extra parse-cache key material for extractors whose output depends on
-/// the path, not just the content (Vue SFC component name = file stem).
-pub(crate) fn path_cache_salt(lang: Language, path: &RelPath) -> Option<String> {
-    match lang {
-        Language::Vue => Some(vue::component_name(path)),
-        _ => None,
+/// Inputs beyond language/content that select a different extraction path.
+/// Keep these predicates shared with the parser entry points: identical bytes
+/// in `.cs`/`.razor` or `.sh`/`.bats` must not share a cached product.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParseProfile {
+    Standard,
+    Vue(String),
+    Razor,
+    Shell { zsh: bool, bats: bool },
+}
+
+impl ParseProfile {
+    pub(crate) fn for_source(lang: Language, path: &RelPath, source: &str) -> Self {
+        match lang {
+            Language::Vue => Self::Vue(vue::component_name(path)),
+            Language::CSharp if razor::is_razor_source(path.as_str()) => Self::Razor,
+            Language::Shell => Self::Shell {
+                zsh: shell::is_zsh(path.as_str(), source),
+                bats: shell::is_bats(path.as_str(), source),
+            },
+            _ => Self::Standard,
+        }
+    }
+
+    pub(crate) fn cache_salt(&self) -> Option<String> {
+        match self {
+            Self::Standard => None,
+            Self::Vue(name) => Some(format!("vue:{name}")),
+            Self::Razor => Some("razor".to_owned()),
+            Self::Shell { zsh, bats } => Some(format!("shell:zsh={zsh}:bats={bats}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn parse_profiles_follow_shared_path_and_source_predicates() {
+        let profile =
+            |lang, path: &str, source| ParseProfile::for_source(lang, &RelPath::new(path), source);
+        assert_ne!(
+            profile(Language::CSharp, "a.cs", ""),
+            profile(Language::CSharp, "a.razor", "")
+        );
+        assert_eq!(
+            profile(Language::CSharp, "a.cshtml", ""),
+            profile(Language::CSharp, "a.razor", "")
+        );
+        assert_ne!(
+            profile(Language::Shell, "a.sh", ""),
+            profile(Language::Shell, "a.bats", "")
+        );
+        assert_ne!(
+            profile(Language::Shell, "a.sh", ""),
+            profile(Language::Shell, "a.zsh", "")
+        );
+        assert_eq!(
+            profile(Language::Shell, "a.sh", ""),
+            profile(Language::Shell, "a.bash", "")
+        );
+        // Content-selected dialects share a product despite the extension.
+        for source in [
+            "#!/usr/bin/env bats\n",
+            "#!/usr/bin/env zsh\n",
+            "setopt nullglob\n",
+        ] {
+            let path = if source.contains("bats") {
+                "a.bats"
+            } else {
+                "a.zsh"
+            };
+            assert_eq!(
+                profile(Language::Shell, "a.sh", source),
+                profile(Language::Shell, path, source)
+            );
+        }
+        assert_ne!(
+            profile(Language::Vue, "A.vue", ""),
+            profile(Language::Vue, "B.vue", "")
+        );
     }
 }
 

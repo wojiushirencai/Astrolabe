@@ -226,19 +226,52 @@ pub(crate) fn coalesce_window(
 /// `on_batch` runs only for a non-empty filtered changeset. The callback is
 /// the rebuild; changes that arrive while it runs stay in `rx` and merge on
 /// the next iteration.
+#[cfg(test)]
 pub(crate) fn for_each_reindex_batch(
     root: &Path,
     rx: Receiver<ChangeSet>,
     throttle: Duration,
+    on_batch: impl FnMut(&ChangeSet),
+) {
+    for_each_reindex_batch_cancellable(
+        root,
+        rx,
+        throttle,
+        &std::sync::atomic::AtomicBool::new(false),
+        on_batch,
+    );
+}
+
+/// Queued/coalescing work remains unacknowledged in FreshnessLog until the
+/// publisher acknowledges it. Closing the session discards queued work rather
+/// than starting new applies or LSP notifications after shutdown.
+pub(crate) fn for_each_reindex_batch_cancellable(
+    root: &Path,
+    rx: Receiver<ChangeSet>,
+    throttle: Duration,
+    cancelled: &std::sync::atomic::AtomicBool,
     mut on_batch: impl FnMut(&ChangeSet),
 ) {
+    use std::sync::atomic::Ordering;
     let mut last_apply: Option<Instant> = None;
-    while let Ok(first) = rx.recv() {
+    while !cancelled.load(Ordering::SeqCst) {
+        let Ok(first) = rx.recv() else {
+            break;
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
         let wait = last_apply
             .map(|at| throttle.saturating_sub(at.elapsed()))
             .unwrap_or(Duration::ZERO);
         let merged = coalesce_window(&rx, first, wait);
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
         let filtered = filter_changeset(root, merged);
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
         if filtered.is_empty() {
             continue;
         }
@@ -578,5 +611,27 @@ mod tests {
         assert_eq!(after.modified().unwrap(), before_mtime);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_consumer_does_not_apply_queued_batches() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.rs"), "fn alpha() {}\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ChangeSet {
+            modified: vec![RelPath::new("a.rs")],
+            ..ChangeSet::default()
+        })
+        .unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let mut applied = false;
+        for_each_reindex_batch_cancellable(&dir, rx, Duration::ZERO, &cancelled, |_| {
+            applied = true
+        });
+        assert!(
+            !applied,
+            "closure must stop the consumer before queued work runs"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

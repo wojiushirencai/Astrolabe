@@ -467,13 +467,17 @@ pub(crate) fn is_zsh(path: &str, source: &str) -> bool {
             .any(|l| KEYWORDS.iter().any(|k| l.trim_start().starts_with(k)))
 }
 
-pub(super) fn preprocess(path: &str, source: &str) -> Pre {
-    let zsh = is_zsh(path, source);
-    let bats = path.to_ascii_lowercase().ends_with(".bats")
+pub(crate) fn is_bats(path: &str, source: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".bats")
         || matches!(
             Language::shebang_interpreter(source),
             Some("bats" | "zunit")
-        );
+        )
+}
+
+pub(super) fn preprocess(path: &str, source: &str) -> Pre {
+    let zsh = is_zsh(path, source);
+    let bats = is_bats(path, source);
     let mut out = source.as_bytes().to_vec();
     let mut tests = Vec::new();
     let mut multi_names = Vec::new();

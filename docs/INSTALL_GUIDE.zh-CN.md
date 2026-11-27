@@ -94,11 +94,11 @@ npx -y @zlnap/astrolabe setup --yes --with-hooks
 
 **只安装不跑 `setup`，等于客户端根本不会调用 Astrolabe。** `--with-hooks` 会写入防漂移 Hook，推动智能体少用 Grep/Read、多用 Astrolabe；只有你明确只要 MCP、不要 Hook 时才省略。
 
-会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--with-hooks`（安装 OpenCode 守卫插件，以及 Cursor / Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`、`--scope=global|project`（Cursor，默认 global）、`--project <dir>`（Cursor 项目根，默认取 cwd 的 git 根）。
+会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--check-config`（只读检查 Cursor 实际生效的配置和审批，0.17.10 及更早版本没有这个参数）、`--with-hooks`（安装 OpenCode 守卫插件，以及 Cursor / Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`、`--scope=global|project`（Cursor，默认 global）、`--project <dir>`（Cursor 项目根，默认取 cwd 的 git 根）。
 
 **MCP 工具短名**（`tools/list` 声明）：`resolve_contx`、`search_code`、`find_symbol`、`find_refs`、`goto_def`、`get_diag`、`get_lang`。旧长名在 `tools/call` 上仍是别名。
 
-- **Cursor（默认 `--scope=global`）：** 写 `~/.cursor/mcp.json`，command 用原生二进制绝对路径，`type: stdio`，`env` 带 `PATH`、`ASTROLABE_LSP_TIMEOUT=300`，探测到 `pyright-langserver` 时写 `ASTROLABE_LSP_PYTHON`。同时在当前项目目录尽力执行一次 `cursor-agent mcp enable astrolabe`，并把 `astrolabe` 从 `mcp-disabled.json` 移除。Cursor 没有基于文件的全局 rules 目录，L1 引导来自 MCP instructions 与全局 `~/.cursor/hooks.json` remind hook（用 `--with-hooks` 注册，命令为绝对路径，matcher `Shell|Read|Grep|astrolabe-.*`）。保留其它 `mcpServers`，可重复执行。
+- **Cursor（默认 `--scope=global`）：** 写 `~/.cursor/mcp.json`，command 用原生二进制绝对路径，`type: stdio`，`env` 带 `PATH`、`ASTROLABE_LSP_TIMEOUT=300`，探测到 `pyright-langserver` 时写 `ASTROLABE_LSP_PYTHON`。同时在当前项目目录尽力执行一次 `cursor-agent mcp enable astrolabe`，并把 `astrolabe` 从 `mcp-disabled.json` 移除。Cursor 没有基于文件的全局 rules 目录，L1 引导来自 MCP instructions 与全局 `~/.cursor/hooks.json` remind hook（用 `--with-hooks` 注册，命令为绝对路径，matcher 同时保留 `Shell|Read|Grep|astrolabe-.*` 和旧的 `mcp__astrolabe__.*`）。保留其它 `mcpServers`，可重复执行。
 - **Cursor 项目级（`--scope=project`）：** 对 git 根 / `--project` 写三件套：`<project>/.cursor/mcp.json`（绝对路径、`cwd` 固定项目根、同样的 `env`）、`<project>/.cursor/rules/astrolabe.mdc`（`alwaysApply: true`，正文与 MCP L1 instructions 同源），并对该目录执行 `cursor-agent mcp enable astrolabe` 完成审批。
 - **OpenCode：** 合并进 `~/.config/opencode/opencode.jsonc`（或已有的 `.json` / 旧版 `config.json`，或 `~/.opencode/…`）。自动识别 V1（`mcp.<name>` + `enabled`）、V2（`mcp.servers`）或类 Claude 的 `mcpServers`；在父对象已存在时尽量保留 JSONC 注释。可选 `--with-hooks` 写入 `~/.config/opencode/plugins/astrolabe-guard.ts`。
 - **DeepSeek Harness：** 把自带的 `astrolabe-dsh-guard` 装进 `~/.dsh/profiles/**/node_modules`，并合并写入 `~/.dsh/cordis.patch.yml` 的托管块（不碰 `orca-managed-dsh-hooks`）。DSH 的 MCP 是按仓库在 UI 里配的，setup 不会代写。
@@ -200,7 +200,17 @@ claude mcp add --scope project astrolabe -- astrolabe . --context=claude-code # 
 ```
 `cwd` 与 `.cursor/rules` 仅项目级写入。Cursor CLI 的审批按项目记录在 `~/.cursor/projects/<slug>/mcp-approvals.json`，全局配置无法预批准未来项目：默认 setup 会对当前项目尽力执行一次 `cursor-agent mcp enable astrolabe`，并在输出中提示新项目首次使用会弹审批（无头场景用 `--approve-mcps`，或在目标项目手动执行该命令）。`--scope=project` 会对目标目录执行并校验审批文件。修改 server 条目会改变配置哈希、需要重新审批，因此改完配置要重跑 setup。
 
-Cursor 没有基于文件的全局 rules 目录（User Rules 在 UI 中维护）。全局链路的 L1 引导由 MCP `instructions` 和全局 `~/.cursor/hooks.json` remind hook 共同提供；`--with-hooks` 会用绝对路径和 Cursor 原生 `astrolabe-.*` matcher 注册该 hook。
+**先看实际生效的是哪份。** 包含本次修复的版本提供下面的只读检查（0.17.10 及更早版本还没有这个参数）：
+
+```bash
+astrolabe setup --check-config --project "/path/to/my-project"
+```
+
+它只读取配置，列出实际使用的文件、Astrolabe 命令和参数、是否覆盖全局注册，以及当前配置的审批／禁用状态；不安装程序、不下载、不改文件，也不代替你批准 MCP。不会显示配置里的 `env`。这里只检查标准的全局和项目文件，企业托管或会话覆盖仍需在客户端里确认。`current-config-not-approved` 是“没找到当前配置对应的审批”，不是“已经证明这个会话不能用”。检查后再决定更新哪一份，不要只看终端里的版本号。
+
+setup 会更新它识别到的启动路径、工具免审批名单（短名 allowlist）和 Hook 命令，也会给 Cursor 的匹配规则同时保留 `astrolabe-.*` 和旧的 `mcp__astrolabe__.*`，合并它明确识别出的独立重复 Hook（含第三方命令的混合分组不动），并尝试审批当前项目、清理 Astrolabe 的禁用条目。
+
+Cursor 没有基于文件的全局 rules 目录（User Rules 在 UI 中维护）。全局链路的 L1 引导由 MCP `instructions` 和全局 `~/.cursor/hooks.json` remind hook 共同提供；`--with-hooks` 会用绝对路径，并同时保留 Cursor 原生 `astrolabe-.*` 和旧的 `mcp__astrolabe__.*` matcher 注册该 hook；它会合并明确识别出的独立重复 Hook，但不会改动含第三方命令的混合分组。
 
 #### 免 Cursor 原生 MCP 审批
 

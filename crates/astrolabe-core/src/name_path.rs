@@ -563,6 +563,12 @@ impl NameTable {
         (0..self.unique_len()).map(move |uniq| self.group(uniq))
     }
 
+    /// Borrowed lowercase name and ascending symbol positions per distinct
+    /// name. Unlike `lower()`, this never materializes per-symbol strings.
+    pub fn named_groups(&self) -> impl Iterator<Item = (&str, &[u32])> {
+        (0..self.unique_len()).map(move |uniq| (self.unique_name(uniq), self.group(uniq)))
+    }
+
     /// Number of distinct lowercase names.
     fn unique_len(&self) -> usize {
         self.group_offsets.len().saturating_sub(1)
@@ -1221,6 +1227,18 @@ mod tests {
         assert_eq!(
             table.groups().map(<[u32]>::to_vec).collect::<Vec<_>>(),
             vec![vec![1, 2, 4], vec![0, 3]]
+        );
+        let borrowed: Vec<(&str, Vec<u32>)> = table
+            .named_groups()
+            .map(|(name, positions)| (name, positions.to_vec()))
+            .collect();
+        assert_eq!(
+            borrowed,
+            vec![("alpha", vec![1, 2, 4]), ("beta", vec![0, 3])]
+        );
+        assert!(
+            table.legacy_lower.get().is_none(),
+            "borrowed distinct groups must not fill the per-symbol compatibility cache"
         );
         // The compatibility accessor still answers by symbol position.
         assert_eq!(table.lower()[0], "beta");

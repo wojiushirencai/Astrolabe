@@ -315,7 +315,7 @@ impl WordIndex {
         accept: &dyn Fn(&CodeSymbol) -> bool,
         limit: usize,
     ) -> Vec<WordHit> {
-        if query_words.is_empty() || symbols.is_empty() {
+        if limit == 0 || query_words.is_empty() || symbols.is_empty() {
             return Vec::new();
         }
         let n = symbols.len() as f32;
@@ -388,8 +388,12 @@ impl WordIndex {
                 score,
             });
         }
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.pos.cmp(&b.pos)));
-        hits.truncate(limit);
+        let order = |a: &WordHit, b: &WordHit| b.score.total_cmp(&a.score).then(a.pos.cmp(&b.pos));
+        if hits.len() > limit {
+            hits.select_nth_unstable_by(limit, order);
+            hits.truncate(limit);
+        }
+        hits.sort_unstable_by(order);
         hits
     }
 }
@@ -443,6 +447,33 @@ mod tests {
             .into_iter()
             .map(|h| g.symbols[h.pos].name.clone())
             .collect()
+    }
+
+    #[test]
+    fn deterministic_top_k_equals_full_sort_prefix() {
+        let mut g = graph();
+        // Identical scores exercise the symbol-position tie breaker.
+        for i in 6..106 {
+            g.symbols
+                .push(sym(i, 1, "update", SymbolKind::Function, (i, i)));
+        }
+        let index = WordIndex::build(&g);
+        let words = words_of("update");
+        let all = index.search(&g.symbols, &words, &|_| false, &|_| true, usize::MAX);
+        for k in [0, 1, 2, 7, 50, 105, 200] {
+            for _ in 0..4 {
+                let top = index.search(&g.symbols, &words, &|_| false, &|_| true, k);
+                assert_eq!(
+                    top.iter()
+                        .map(|h| (h.pos, h.score.to_bits()))
+                        .collect::<Vec<_>>(),
+                    all.iter()
+                        .take(k)
+                        .map(|h| (h.pos, h.score.to_bits()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

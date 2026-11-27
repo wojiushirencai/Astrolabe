@@ -36,6 +36,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// 阈值常量（照抄 Serena 数值）
 pub(crate) const DEFAULT_GREP_THRESHOLD: u32 = 3;
@@ -565,39 +566,257 @@ pub(crate) fn load_cursor_mcp_server_list(path: &Path) -> Option<Vec<String>> {
     }
 }
 
-/// Cursor 审批/禁用名单条目是否指向 astrolabe。
-///
-/// 真实条目格式是 `astrolabe-<16位hex>`（例如 `astrolabe-2a22896e4eeae815`），
-/// 同时兼容历史/手写的精确名 `astrolabe`。
-pub(crate) fn list_contains_astrolabe(names: Option<Vec<String>>) -> bool {
-    names.is_some_and(|names| {
-        names.iter().any(|name| {
-            let lower = name.trim().to_ascii_lowercase();
-            lower == "astrolabe" || lower.starts_with("astrolabe-")
-        })
-    })
+// Keep the original env key order: Cursor hashes JSON.stringify, not a sorted
+// serde_json::Value. Deserializing the whole registration into Value would lose it.
+#[derive(Clone, Debug, Default)]
+struct CursorEnv(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for CursorEnv {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EnvVisitor;
+        impl<'de> serde::de::Visitor<'de> for EnvVisitor {
+            type Value = CursorEnv;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object of string environment values")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if let Some(pair) = pairs.iter_mut().find(|(k, _)| k == &key) {
+                        pair.1 = value;
+                    } else {
+                        pairs.push((key, value));
+                    }
+                }
+                // JSON.stringify enumerates integer-index keys first.
+                pairs.sort_by_key(|(key, _)| {
+                    key.parse::<u32>()
+                        .ok()
+                        .filter(|n| *n != u32::MAX && n.to_string() == *key)
+                        .map(|n| (false, n))
+                        .unwrap_or((true, 0))
+                });
+                Ok(CursorEnv(pairs))
+            }
+        }
+        deserializer.deserialize_map(EnvVisitor)
+    }
 }
 
-/// 某个 `.cursor/mcp.json` 的 `mcpServers` 是否声明了 astrolabe。
-/// 缺失或损坏按「未声明」处理（只告警，不影响其它判定分支）。
-pub(crate) fn mcp_json_has_astrolabe_server(path: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(value) => value
-            .get("mcpServers")
-            .and_then(|servers| servers.as_object())
-            .is_some_and(|servers| servers.contains_key("astrolabe")),
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "cursor mcp.json is invalid JSON; ignoring"
-            );
-            false
+impl Serialize for CursorEnv {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
         }
+        map.end()
     }
+}
+
+fn cursor_present_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CursorStdioConfig {
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "cursor_present_value",
+        skip_serializing
+    )]
+    kind: Option<String>,
+    command: String,
+    #[serde(
+        default,
+        deserialize_with = "cursor_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    args: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "cursor_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    env: Option<CursorEnv>,
+    #[serde(
+        default,
+        deserialize_with = "cursor_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cwd: Option<String>,
+    #[serde(
+        rename = "startupTimeoutSec",
+        default,
+        deserialize_with = "cursor_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    startup_timeout_sec: Option<serde_json::Number>,
+}
+
+#[derive(Default)]
+struct CursorServers(Option<CursorStdioConfig>);
+
+impl<'de> Deserialize<'de> for CursorServers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ServersVisitor;
+        impl<'de> serde::de::Visitor<'de> for ServersVisitor {
+            type Value = CursorServers;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an MCP server object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut selected = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "astrolabe" {
+                        selected = Some(map.next_value::<CursorStdioConfig>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(CursorServers(selected))
+            }
+        }
+        deserializer.deserialize_map(ServersVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct CursorMcpDocument {
+    #[serde(rename = "mcpServers", default)]
+    servers: CursorServers,
+}
+
+fn read_cursor_registration(path: &Path) -> Result<Option<CursorStdioConfig>, ()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let doc: CursorMcpDocument =
+        serde_json::from_str(raw.trim_start_matches('\u{feff}')).map_err(|_| ())?;
+    Ok(doc.servers.0)
+}
+
+fn expand_cursor_config_value(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    static VARIABLES: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = VARIABLES.get_or_init(|| {
+        regex::Regex::new(r"\$\{(?:env:([A-Za-z_][A-Za-z0-9_]*)|([^:}]+)(?::-([^}]*))?)\}")
+            .expect("constant Cursor environment pattern")
+    });
+    pattern
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let explicit = captures.get(1);
+            let name = explicit
+                .or_else(|| captures.get(2))
+                .expect("variable name")
+                .as_str();
+            lookup(name)
+                .or_else(|| {
+                    if explicit.is_none() {
+                        captures.get(3).map(|m| m.as_str().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| captures[0].to_string())
+        })
+        .into_owned()
+}
+
+fn cursor_approval_key_with(
+    workspace_root: &Path,
+    server: &CursorStdioConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if server.kind.as_deref().is_some_and(|kind| kind != "stdio") {
+        return None;
+    }
+    let mut normalized = server.clone();
+    let raw_env = server.env.clone().unwrap_or_default();
+    let env_value = |name: &str| {
+        raw_env
+            .0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    let effective_env = CursorEnv(
+        raw_env
+            .0
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    expand_cursor_config_value(value, |name| {
+                        if name == key {
+                            lookup(name)
+                        } else {
+                            env_value(name).or_else(|| lookup(name))
+                        }
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let effective_lookup = |name: &str| {
+        effective_env
+            .0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| lookup(name))
+    };
+    normalized.command = expand_cursor_config_value(&server.command, effective_lookup);
+    normalized.args = server.args.as_ref().map(|args| {
+        args.iter()
+            .map(|arg| expand_cursor_config_value(arg, effective_lookup))
+            .collect()
+    });
+    normalized.cwd = server
+        .cwd
+        .as_ref()
+        .map(|cwd| expand_cursor_config_value(cwd, effective_lookup));
+    normalized.startup_timeout_sec = server.startup_timeout_sec.as_ref().and_then(|n| {
+        let value = n.as_f64()?;
+        (value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64)
+            .then(|| serde_json::Number::from(value as u64))
+    });
+    if server.env.is_some() {
+        normalized.env = Some(effective_env);
+    }
+    #[derive(Serialize)]
+    struct Approval<'a> {
+        path: &'a str,
+        server: &'a CursorStdioConfig,
+    }
+    let root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let root = root
+        .to_str()?
+        .strip_prefix(r"\\?\")
+        .unwrap_or(root.to_str()?);
+    let json = serde_json::to_vec(&Approval {
+        path: root,
+        server: &normalized,
+    })
+    .ok()?;
+    let digest = Sha256::digest(json);
+    Some(format!(
+        "astrolabe-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
+    ))
 }
 
 fn expand_leading_tilde(raw: &str, get: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -634,30 +853,52 @@ pub(crate) fn cursor_config_dir() -> Option<PathBuf> {
     cursor_config_dir_with(|k| std::env::var(k).ok())
 }
 
-/// 本项目在指定 Cursor 配置目录下是否视为已启用 astrolabe MCP。
-///
-/// 判定顺序（与 cursor-agent 的 ServerApprovalMiddleware 对齐）：
-/// 1. `<cursor_dir>/projects/<slug>/mcp-disabled.json` 命中 astrolabe → 未启用；
-/// 2. 项目级 `<workspace_root>/.cursor/mcp.json` 声明 astrolabe → 必须
-///    `<cursor_dir>/projects/<slug>/mcp-approvals.json` 命中（项目级 server 才走审批门禁）；
-/// 3. 否则全局 `<cursor_dir>/mcp.json` 声明 astrolabe → 已启用（全局 server 不走审批）；
-/// 4. 都没有 → 未启用。
+/// Standard project configuration takes precedence over global configuration.
+/// Unknown/invalid configuration is advisory, never evidence for a hard deny.
+/// Cursor hashes its effective stdio config; a stale hash is not an approval.
+/// Config dir follows `CURSOR_CONFIG_DIR` / `CURSOR_HOME` / `<home>/.cursor`.
+/// Managed/enterprise/session overrides are intentionally not inferred here.
 pub(crate) fn cursor_mcp_approved_in_dir(cursor_dir: &Path, workspace_root: &Path) -> bool {
+    cursor_mcp_approved_in_dir_with(cursor_dir, workspace_root, &|k| std::env::var(k).ok())
+}
+
+fn cursor_mcp_approved_in_dir_with(
+    cursor_dir: &Path,
+    workspace_root: &Path,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> bool {
     let Some(project_dir) = cursor_project_dir_name(workspace_root) else {
         return false;
     };
     let base = cursor_dir.join("projects").join(project_dir);
-    if list_contains_astrolabe(load_cursor_mcp_server_list(&base.join("mcp-disabled.json"))) {
+    let project = match read_cursor_registration(&workspace_root.join(".cursor/mcp.json")) {
+        Ok(project) => project,
+        Err(()) => return false,
+    };
+    let project_scoped = project.is_some();
+    let server = match project {
+        Some(server) => Some(server),
+        None => match read_cursor_registration(&cursor_dir.join("mcp.json")) {
+            Ok(server) => server,
+            Err(()) => return false,
+        },
+    };
+    let Some(server) = server else {
+        return false;
+    };
+    let Some(key) = cursor_approval_key_with(workspace_root, &server, lookup) else {
+        return false;
+    };
+    let disabled = load_cursor_mcp_server_list(&base.join("mcp-disabled.json")).unwrap_or_default();
+    if disabled
+        .iter()
+        .any(|name| name == "astrolabe" || name == &key)
+    {
         return false;
     }
-    let approved = list_contains_astrolabe(load_cursor_mcp_server_list(
-        &base.join("mcp-approvals.json"),
-    ));
-    let project_mcp = workspace_root.join(".cursor").join("mcp.json");
-    if mcp_json_has_astrolabe_server(&project_mcp) {
-        return approved;
-    }
-    mcp_json_has_astrolabe_server(&cursor_dir.join("mcp.json"))
+    !project_scoped
+        || load_cursor_mcp_server_list(&base.join("mcp-approvals.json"))
+            .is_some_and(|names| names.contains(&key))
 }
 
 /// 使用自定义环境变量查找函数判定本项目是否已启用 astrolabe MCP。
@@ -666,10 +907,10 @@ pub(crate) fn cursor_mcp_approved_with(
     workspace_root: &Path,
     get: impl Fn(&str) -> Option<String>,
 ) -> bool {
-    let Some(cursor_dir) = cursor_config_dir_with(get) else {
+    let Some(cursor_dir) = cursor_config_dir_with(&get) else {
         return false;
     };
-    cursor_mcp_approved_in_dir(&cursor_dir, workspace_root)
+    cursor_mcp_approved_in_dir_with(&cursor_dir, workspace_root, &get)
 }
 
 /// 测试兼容封装：在 `<home>/.cursor` 下判定本项目是否视为已启用 astrolabe MCP。
@@ -1513,6 +1754,154 @@ pub(crate) fn is_code_file_path(path: &str) -> bool {
     }
 }
 
+/// Claude uses both legacy PROJECT/tasks and current PROJECT/SESSION/tasks.
+/// SESSION is a UUID; only the current user's standard temporary tree qualifies.
+fn is_uuid_component(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn is_task_output_for_uid(path: &str, uid: u32) -> bool {
+    let rest = path
+        .strip_prefix("/private/tmp/")
+        .or_else(|| path.strip_prefix("/tmp/"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let parts: Vec<_> = rest.split('/').collect();
+    if !matches!(parts.len(), 4 | 5)
+        || parts[0] != format!("claude-{uid}")
+        || !parts[1].starts_with('-')
+        || parts[1].len() <= 1
+        || !parts[1]
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    let task_index = if parts.len() == 5 {
+        if !is_uuid_component(parts[2]) {
+            return false;
+        }
+        3
+    } else {
+        2
+    };
+    if parts[task_index] != "tasks" {
+        return false;
+    }
+    let Some(id) = parts[task_index + 1].strip_suffix(".output") else {
+        return false;
+    };
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn is_claude_subagent_transcript(target: &Path, projects: &Path) -> bool {
+    let Ok(relative) = target.strip_prefix(projects) else {
+        return false;
+    };
+    let parts: Vec<_> = relative.iter().filter_map(|part| part.to_str()).collect();
+    if parts.len() != 4
+        || !parts[0].starts_with('-')
+        || !is_uuid_component(parts[1])
+        || parts[2] != "subagents"
+    {
+        return false;
+    }
+    let Some(agent) = parts[3]
+        .strip_prefix("agent-")
+        .and_then(|name| name.strip_suffix(".jsonl"))
+    else {
+        return false;
+    };
+    !agent.is_empty()
+        && agent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn is_trusted_task_output(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !is_task_output_for_uid(path, uid) {
+            return false;
+        }
+        match std::fs::canonicalize(path) {
+            Ok(target) => {
+                if target
+                    .to_str()
+                    .is_some_and(|target| is_task_output_for_uid(target, uid))
+                {
+                    return true;
+                }
+                // Claude's task output links commonly point to its own subagent
+                // transcripts. Do not exempt links into arbitrary source files.
+                get_user_home()
+                    .map(|home| home.join(".claude/projects"))
+                    .and_then(|projects| std::fs::canonicalize(projects).ok())
+                    .is_some_and(|projects| is_claude_subagent_transcript(&target, &projects))
+            }
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Keep compound shell commands under normal classification. Only a single
+/// cat/head/tail with explicit trusted task files and numeric options is exempt.
+fn is_task_output_read_command(command: &str) -> bool {
+    if command.contains([';', '|', '&', '$', '`', '<', '>', '\n', '\r']) {
+        return false;
+    }
+    let invocations = shell_invocations(command);
+    if invocations.len() != 1 {
+        return false;
+    }
+    let inv = &invocations[0];
+    if !matches!(inv.command.as_str(), "cat" | "head" | "tail") {
+        return false;
+    }
+    let mut paths = 0;
+    let mut count_expected = false;
+    for token in inv.args.split_whitespace() {
+        let token = token.trim_matches(['\'', '"']);
+        if count_expected {
+            if token.is_empty() || !token.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            count_expected = false;
+        } else if matches!(token, "-n" | "-c") && inv.command != "cat" {
+            count_expected = true;
+        } else if token == "--"
+            || (token.starts_with('-')
+                && inv.command != "cat"
+                && token[1..].chars().all(|c| c.is_ascii_digit())
+                && token.len() > 1)
+        {
+        } else if is_trusted_task_output(token) {
+            paths += 1;
+        } else {
+            return false;
+        }
+    }
+    paths > 0 && !count_expected
+}
+
 /// Only positively identified resources/documents are neutral. Unknown extensions and
 /// unsupported programming languages must retain the existing mixed-read guard.
 fn is_non_code_resource(path: &str) -> bool {
@@ -1583,6 +1972,9 @@ fn is_temporary_diagnostic_path_with(path: &str, extra_temp_dirs: &[PathBuf]) ->
 }
 
 fn is_temporary_diagnostic_path(path: &str) -> bool {
+    if is_trusted_task_output(path) {
+        return true;
+    }
     let mut extras = Vec::with_capacity(3);
     extras.push(std::env::temp_dir());
     for key in ["TEMP", "TMP"] {
@@ -2333,6 +2725,13 @@ pub(crate) fn classify_tool_ex(
         return ToolKind::AstrolabeNonSymbolic;
     }
 
+    if full_command
+        .map(is_task_output_read_command)
+        .unwrap_or(false)
+    {
+        return ToolKind::Neutral;
+    }
+
     // 1.7 Hard text-search mode: Glob + shell token scan (pipelines / git grep)
     if deny_text_search {
         if is_glob_tool_name(tool_name) {
@@ -2439,7 +2838,11 @@ pub(crate) fn classify_tool_ex(
         // Resource reads must not inherit an unrelated code-discovery burst.
         // Shell commands are excluded here: their representative command can hide
         // another read/search in a compound command.
-        if full_command.is_none() && file_path.map(is_non_code_resource).unwrap_or(false) {
+        if full_command.is_none()
+            && file_path
+                .map(|path| is_non_code_resource(path) || is_trusted_task_output(path))
+                .unwrap_or(false)
+        {
             return ToolKind::Neutral;
         }
         // 切片精读（slice read）：Read 工具带合法 limit 的局部读取计入连续切片额度；
@@ -2970,12 +3373,13 @@ pub(crate) fn build_output_for_state_with(
 ) -> String {
     let max_limit = cfg.slice_read_max_limit;
     let slice_threshold = cfg.slice_read_threshold;
-    let readonly_note = format!(" Note: all Astrolabe tools are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD).");
+    let readonly_note = format!(
+        " Note: all Astrolabe tools are read-only and safe for exploration tasks. Also note: slice reads with limit <= {max_limit} are still permitted, but {slice_threshold} consecutive ones without any Astrolabe tool call trigger a reminder (tunable via ASTROLABE_SLICE_READ_THRESHOLD)."
+    );
     let unindexed_lang_note = " If your target files are in a language Astrolabe does not index (see the get_lang tool), grep is the correct tool for them — ignore this reminder.";
     // Prefer relevant symbolic tools for discovery; every recognized Astrolabe
     // tool, including search_code, resets the complete discovery burst.
-    let switch_instruction =
-        "Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset grep/read burst counters); mcp__astrolabe__search_code is for literal/regex text search and also resets the full grep/read/slice burst. Call a symbolic Astrolabe tool now (read-only, safe).";
+    let switch_instruction = "Stop using Grep/grep/rg/read for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (they reset grep/read burst counters); mcp__astrolabe__search_code is for literal/regex text search and also resets the full grep/read/slice burst. Call a symbolic Astrolabe tool now (read-only, safe).";
     let (reason, ctx) = match deny_kind {
         DenyKind::Grep => (
             "Too many consecutive grep/rg calls without using symbolic tools. Stop using Grep/grep/rg (including Bash rg/grep -rn) for code discovery. Prefer mcp__astrolabe__find_symbol or mcp__astrolabe__resolve_contx first (full burst reset); mcp__astrolabe__search_code also resets the full burst. Call a symbolic Astrolabe tool now (read-only, safe).",
@@ -3318,6 +3722,13 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
         .iter()
         .find_map(|k| json_nonempty_id(input_data.get(*k)));
 
+    if agent_id.is_none() {
+        tracing::debug!(
+            counter_scope = "session_shared_no_agent_id",
+            "hook payload has no agent identity; using the session counter, not a new-agent counter"
+        );
+    }
+
     // 提取 tool_name / toolName
     let raw_tool_name = input_data
         .get("tool_name")
@@ -3540,6 +3951,7 @@ pub(crate) fn run_remind_impl_with<R: Read, W: Write, E: Write>(
                     ?deny_kind,
                     cold = is_cold_deny,
                     client = %client_name,
+                    counter_scope = if agent_id.is_some() { "agent" } else { "session_shared_no_agent_id" },
                     "emitting anti-drift deny hint"
                 );
                 let _ = writeln!(stdout, "{output_str}");
@@ -7523,7 +7935,9 @@ mod tests {
         let disabled = base.join("mcp-disabled.json");
         let global_mcp = home.join(".cursor").join("mcp.json");
         let project_mcp = workspace.join(".cursor").join("mcp.json");
-        let real_approval = r#"["astrolabe-def52bf6dc098bc5"]"#;
+        let server: CursorStdioConfig = serde_json::from_str(r#"{"command":"x"}"#).unwrap();
+        let key = cursor_approval_key_with(&workspace, &server, |_| None).unwrap();
+        let real_approval = serde_json::to_string(&vec![key]).unwrap();
 
         // 1. 无全局/项目级 mcp.json → 未启用
         assert!(!cursor_mcp_approved(&home, &workspace));
@@ -7537,12 +7951,12 @@ mod tests {
         assert!(cursor_mcp_approved(&home, &workspace));
 
         // 3. 全局配置 + mcp-disabled 命中真实格式 → 未启用
-        std::fs::write(&disabled, real_approval).unwrap();
+        std::fs::write(&disabled, &real_approval).unwrap();
         assert!(!cursor_mcp_approved(&home, &workspace));
         std::fs::write(&disabled, "[]").unwrap();
 
         // 4. 真实审批格式 `astrolabe-<hex>` + 全局配置 → 已启用
-        std::fs::write(&approvals, real_approval).unwrap();
+        std::fs::write(&approvals, &real_approval).unwrap();
         assert!(cursor_mcp_approved(&home, &workspace));
 
         // 5. 项目级 mcp.json 含 astrolabe 时必须审批；审批缺失 → 未启用
@@ -7556,12 +7970,12 @@ mod tests {
         assert!(!cursor_mcp_approved(&home, &workspace));
 
         // 6. 项目级 + 真实审批格式 → 已启用
-        std::fs::write(&approvals, real_approval).unwrap();
+        std::fs::write(&approvals, &real_approval).unwrap();
         assert!(cursor_mcp_approved(&home, &workspace));
 
-        // 7. 兼容历史精确名
+        // 7. A bare legacy name does not prove current config approval.
         std::fs::write(&approvals, r#"["astrolabe"]"#).unwrap();
-        assert!(cursor_mcp_approved(&home, &workspace));
+        assert!(!cursor_mcp_approved(&home, &workspace));
 
         // 8. 项目级 + 审批 JSON 损坏 → 未启用
         std::fs::write(&approvals, "{not json").unwrap();
@@ -7572,7 +7986,7 @@ mod tests {
         assert!(!cursor_mcp_approved(&home, &workspace));
 
         // 10. 禁用文件损坏 → 视为未禁用
-        std::fs::write(&approvals, real_approval).unwrap();
+        std::fs::write(&approvals, &real_approval).unwrap();
         std::fs::write(&disabled, "[[[").unwrap();
         assert!(cursor_mcp_approved(&home, &workspace));
 
@@ -7785,8 +8199,20 @@ mod tests {
             _ => None,
         };
 
-        let real_approval = r#"["astrolabe-def52bf6dc098bc5"]"#;
         let mcp_json_body = r#"{"mcpServers":{"astrolabe":{"command":"astrolabe"}}}"#;
+        let server = CursorStdioConfig {
+            kind: None,
+            command: "astrolabe".into(),
+            args: None,
+            env: None,
+            cwd: None,
+            startup_timeout_sec: None,
+        };
+        // Approval / disabled lists use the current-config hash, which includes
+        // the workspace path. A fixture hash from another tree is not a match.
+        let approval_key = cursor_approval_key_with(&workspace, &server, custom_env)
+            .expect("approval hash for the test server");
+        let real_approval = format!(r#"["{approval_key}"]"#);
 
         // 1. 仅 <home>/.cursor/mcp.json 声明 astrolabe，自定义目录无配置 → 不读取 <home>/.cursor
         std::fs::write(default_cursor.join("mcp.json"), mcp_json_body).unwrap();
@@ -7802,12 +8228,12 @@ mod tests {
 
         // 3. mcp-disabled.json 只看自定义目录（默认目录放 "[]"，自定义目录禁用 → 未启用）
         std::fs::write(default_base.join("mcp-disabled.json"), "[]").unwrap();
-        std::fs::write(custom_base.join("mcp-disabled.json"), real_approval).unwrap();
+        std::fs::write(custom_base.join("mcp-disabled.json"), &real_approval).unwrap();
         assert!(!cursor_mcp_approved_with(&workspace, custom_env));
 
         // 4. 默认目录禁用、自定义目录未禁用 → 已启用
         std::fs::write(custom_base.join("mcp-disabled.json"), "[]").unwrap();
-        std::fs::write(default_base.join("mcp-disabled.json"), real_approval).unwrap();
+        std::fs::write(default_base.join("mcp-disabled.json"), &real_approval).unwrap();
         assert!(cursor_mcp_approved_with(&workspace, custom_env));
 
         // 5. 项目级 .cursor/mcp.json 下 mcp-approvals.json 只看自定义目录
@@ -7815,17 +8241,17 @@ mod tests {
         let project_mcp = workspace.join(".cursor").join("mcp.json");
         std::fs::create_dir_all(project_mcp.parent().unwrap()).unwrap();
         std::fs::write(&project_mcp, mcp_json_body).unwrap();
-        std::fs::write(default_base.join("mcp-approvals.json"), real_approval).unwrap();
+        std::fs::write(default_base.join("mcp-approvals.json"), &real_approval).unwrap();
         assert!(!cursor_mcp_approved_with(&workspace, custom_env));
 
-        std::fs::write(custom_base.join("mcp-approvals.json"), real_approval).unwrap();
+        std::fs::write(custom_base.join("mcp-approvals.json"), &real_approval).unwrap();
         assert!(cursor_mcp_approved_with(&workspace, custom_env));
 
         // 6. CURSOR_CONFIG_DIR 使用 ~/ 展开时也能正确读取
         let tilde_dir = home.join("tilde-cursor");
         let tilde_base = tilde_dir.join("projects").join(&project_dir);
         std::fs::create_dir_all(&tilde_base).unwrap();
-        std::fs::write(tilde_base.join("mcp-approvals.json"), real_approval).unwrap();
+        std::fs::write(tilde_base.join("mcp-approvals.json"), &real_approval).unwrap();
         let tilde_env = |k: &str| match k {
             "CURSOR_CONFIG_DIR" => Some("~/tilde-cursor".to_string()),
             "HOME" | "USERPROFILE" => Some(home_str.clone()),
@@ -9696,5 +10122,278 @@ mod tests {
             "/var/app/debug.log",
             &extras
         ));
+    }
+
+    #[test]
+    fn cursor_effective_approval_hash_matches_js_fixtures() {
+        // Generated independently with Node crypto and Cursor's normalized field order.
+        for (raw, expected) in [
+            (
+                r#"{"command":"/bin/astrolabe"}"#,
+                "astrolabe-1a322119af84646d",
+            ),
+            (
+                r#"{"type":"stdio","command":"/bin/astrolabe","args":["."],"env":{"Z":"last","A":"first"},"cwd":"/repo","startupTimeoutSec":300}"#,
+                "astrolabe-1ef03ba32e577c6d",
+            ),
+            (
+                r#"{"command":"${BIN}","args":["${ROOT:-/repo}"],"env":{"BIN":"/bin/astrolabe","Z":"${env:EXTERNAL}"},"envFile":"ignored"}"#,
+                "astrolabe-35958e626891138f",
+            ),
+        ] {
+            let server: CursorStdioConfig = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                cursor_approval_key_with(Path::new("/repo"), &server, |name| (name == "EXTERNAL")
+                    .then(|| "value".to_string()))
+                .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_effective_approval_rejects_stale_hash_and_invalid_project() {
+        let id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("astrolabe_exact_approval_{id}"));
+        let root = home.join("repo");
+        std::fs::create_dir_all(root.join(".cursor")).unwrap();
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        let project_file = root.join(".cursor/mcp.json");
+        let old = r#"{"command":"/old/astrolabe","args":["."]}"#;
+        let new =
+            r#"{"command":"/new/astrolabe","args":["."],"env":{"Z":"z","A":"a"},"cwd":"/repo"}"#;
+        let old_server: CursorStdioConfig = serde_json::from_str(old).unwrap();
+        let new_server: CursorStdioConfig = serde_json::from_str(new).unwrap();
+        let old_key = cursor_approval_key_with(&root, &old_server, |_| None).unwrap();
+        let new_key = cursor_approval_key_with(&root, &new_server, |_| None).unwrap();
+        std::fs::write(
+            home.join(".cursor/mcp.json"),
+            format!("{{\"mcpServers\":{{\"astrolabe\":{old}}}}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            &project_file,
+            format!("{{\"mcpServers\":{{\"astrolabe\":{new}}}}}"),
+        )
+        .unwrap();
+        let base = home
+            .join(".cursor/projects")
+            .join(cursor_project_dir_name(&root).unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("mcp-approvals.json"),
+            serde_json::to_string(&vec![old_key.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert!(!cursor_mcp_approved(&home, &root));
+        std::fs::write(
+            base.join("mcp-approvals.json"),
+            serde_json::to_string(&vec![new_key.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert!(cursor_mcp_approved(&home, &root));
+        std::fs::write(
+            base.join("mcp-disabled.json"),
+            serde_json::to_string(&vec![old_key]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cursor_mcp_approved(&home, &root),
+            "stale disabled hash must not disable the new config"
+        );
+        std::fs::write(
+            base.join("mcp-disabled.json"),
+            serde_json::to_string(&vec![new_key]).unwrap(),
+        )
+        .unwrap();
+        assert!(!cursor_mcp_approved(&home, &root));
+        std::fs::write(base.join("mcp-disabled.json"), "[]").unwrap();
+        std::fs::write(&project_file, r#"{"mcpServers":{"astrolabe":null}}"#).unwrap();
+        assert!(
+            !cursor_mcp_approved(&home, &root),
+            "invalid project must not inherit global enablement"
+        );
+        std::fs::write(
+            &project_file,
+            r#"{"mcpServers":{"astrolabe":{"command":"x","env":null}}}"#,
+        )
+        .unwrap();
+        assert!(!cursor_mcp_approved(&home, &root));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_task_output_is_neutral_but_arbitrary_output_is_not() {
+        let uid = unsafe { libc::geteuid() };
+        let output = format!(
+            "/tmp/claude-{uid}/-astrolabe-hook-fixture/12345678-1234-1234-1234-123456789abc/tasks/task_123.output"
+        );
+        assert!(is_task_output_for_uid(&output, uid));
+        assert!(is_task_output_for_uid(
+            &format!("/tmp/claude-{uid}/-repo/tasks/legacy.output"),
+            uid
+        ));
+        let projects = Path::new("/home/test/.claude/projects");
+        assert!(is_claude_subagent_transcript(
+            Path::new(
+                "/home/test/.claude/projects/-repo/12345678-1234-1234-1234-123456789abc/subagents/agent-abc.jsonl"
+            ),
+            projects
+        ));
+        assert!(!is_claude_subagent_transcript(
+            Path::new(
+                "/home/test/.claude/projects/-repo/12345678-1234-1234-1234-123456789abc/subagents/source.rs"
+            ),
+            projects
+        ));
+        for bad in [
+            "/repo/tasks/task.output",
+            "/tmp/task.output",
+            "/tmp/claude-0/-repo/tasks/x.output",
+            "/tmp/claude-502/-repo/tasks/../x.output",
+            "/tmp/claude-502/-repo/tasks/code.rs.output",
+        ] {
+            assert!(!is_task_output_for_uid(bad, 502), "{bad}");
+        }
+        let id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("astrolabe_task_log_{id}"));
+        let counter_dir = get_hook_data_dir(&home, "task_log", None).unwrap();
+        let seeded = CounterState {
+            n_grep: 2,
+            n_read: 2,
+            n_non_symbolic: 3,
+            last_grep_ts: Some(99.0),
+            last_read_ts: Some(99.0),
+            last_non_symbolic_ts: Some(99.0),
+            ..Default::default()
+        };
+        let cfg = HooksConfig::default();
+        for (tool, input, neutral) in [
+            ("Read", serde_json::json!({"file_path": output}), true),
+            (
+                "Bash",
+                serde_json::json!({"command": format!("cat {output}")}),
+                true,
+            ),
+            (
+                "Bash",
+                serde_json::json!({"command": format!("tail -n 50 {output}")}),
+                true,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/repo/tasks/x.output"}),
+                false,
+            ),
+            (
+                "Bash",
+                serde_json::json!({"command": format!("cat {output}; cat /repo/source.rs")}),
+                false,
+            ),
+        ] {
+            save_counter(&counter_dir.join("counter.json"), &seeded);
+            let payload =
+                serde_json::json!({"session_id":"task_log","tool_name":tool,"tool_input":input})
+                    .to_string();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run_remind_impl_with(
+                    "claude-code",
+                    payload.as_bytes(),
+                    &mut out,
+                    &mut err,
+                    Some(100.0),
+                    Some(&home),
+                    &cfg
+                ),
+                0
+            );
+            assert_eq!(
+                out.is_empty(),
+                neutral,
+                "{payload}: {}",
+                String::from_utf8_lossy(&out)
+            );
+            if neutral {
+                assert_eq!(load_counter(&counter_dir.join("counter.json")), seeded);
+            }
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn first_read_new_session_and_subagent_have_fresh_counters() {
+        let id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("astrolabe_first_read_{id}"));
+        let cfg = HooksConfig::default();
+        // Seed the parent's unsilenced burst. A child with identity must not inherit it.
+        save_counter(
+            &get_hook_data_dir(&home, "parent", None)
+                .unwrap()
+                .join("counter.json"),
+            &CounterState {
+                n_read: 2,
+                n_non_symbolic: 3,
+                last_read_ts: Some(99.0),
+                last_non_symbolic_ts: Some(99.0),
+                ..Default::default()
+            },
+        );
+        for (session, agent, path, limit) in [
+            ("new-session", None, "/repo/status.go", None),
+            ("parent", Some("child-go"), "/repo/status.go", None),
+            ("parent", Some("child-sh"), "/repo/package-mac-pkg.sh", None),
+            ("parent", Some("child-slice"), "/repo/status.go", Some(100)),
+        ] {
+            let mut payload = serde_json::json!({"session_id":session,"tool_name":"Read","tool_input":{"file_path":path}});
+            if let Some(agent) = agent {
+                payload["agent_id"] = agent.into();
+            }
+            if let Some(limit) = limit {
+                payload["tool_input"]["limit"] = limit.into();
+            }
+            let payload = payload.to_string();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            run_remind_impl_with(
+                "claude-code",
+                payload.as_bytes(),
+                &mut out,
+                &mut err,
+                Some(100.0),
+                Some(&home),
+                &cfg,
+            );
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                out.is_empty()
+                    || (text.contains(r#""permissionDecision":"allow""#)
+                        && !text.contains(r#""permissionDecision":"deny""#)),
+                "fresh first Read must not deny: {text}"
+            );
+        }
+        // Missing identity intentionally means the shared session, not a guessed child.
+        let payload = br#"{"session_id":"parent","tool_name":"Read","tool_input":{"file_path":"/repo/status.go"}}"#;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run_remind_impl_with(
+            "claude-code",
+            &payload[..],
+            &mut out,
+            &mut err,
+            Some(100.0),
+            Some(&home),
+            &cfg,
+        );
+        assert!(String::from_utf8_lossy(&out).contains("permissionDecision"));
+        let _ = std::fs::remove_dir_all(home);
     }
 }

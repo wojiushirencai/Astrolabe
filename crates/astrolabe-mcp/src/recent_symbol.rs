@@ -1,4 +1,4 @@
-//! Per-MCP-session memory of the last unambiguous symbol → path[:line].
+//! Per-known-agent, per-MCP-session memory of the last unambiguous symbol → path[:line].
 //!
 //! Agents often call `find_symbol` / `goto_definition`, then `find_references`
 //! without `path`. Ambiguous names (e.g. many `Init`s) then get a weak unique-
@@ -21,14 +21,19 @@ pub(crate) struct RecentSymbolAnchor {
     pub line: Option<u32>,
 }
 
-/// Process-local map keyed by `root\0symbol`.
+/// Session-local map keyed by `agent\0root\0symbol`. Unknown agents never store anchors.
 #[derive(Debug, Default)]
 pub(crate) struct RecentSymbols {
     inner: Mutex<HashMap<String, RecentSymbolAnchor>>,
 }
 
-fn key(root: &Path, symbol: &str) -> String {
-    format!("{}\0{}", astrolabe_core::paths::path_norm_key(root), symbol)
+fn key(agent: &str, root: &Path, symbol: &str) -> String {
+    format!(
+        "{}\0{}\0{}",
+        agent,
+        astrolabe_core::paths::path_norm_key(root),
+        symbol
+    )
 }
 
 impl RecentSymbols {
@@ -37,13 +42,20 @@ impl RecentSymbols {
     }
 
     /// Remember only when the caller has a single unambiguous hit.
-    pub(crate) fn remember(&self, root: &Path, symbol: &str, path: &str, line: Option<u32>) {
+    pub(crate) fn remember(
+        &self,
+        agent: &str,
+        root: &Path,
+        symbol: &str,
+        path: &str,
+        line: Option<u32>,
+    ) {
         let symbol = symbol.trim();
         let path = path.trim();
-        if symbol.is_empty() || path.is_empty() {
+        if agent.is_empty() || symbol.is_empty() || path.is_empty() {
             return;
         }
-        let k = key(root, symbol);
+        let k = key(agent, root, symbol);
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_ENTRIES && !map.contains_key(&k) {
             // Drop an arbitrary entry; order is not part of the contract.
@@ -60,15 +72,29 @@ impl RecentSymbols {
         );
     }
 
-    pub(crate) fn recall(&self, root: &Path, symbol: &str) -> Option<RecentSymbolAnchor> {
+    pub(crate) fn forget(&self, agent: &str, root: &Path, symbol: &str) {
+        if !agent.is_empty() {
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key(agent, root, symbol.trim()));
+        }
+    }
+
+    pub(crate) fn recall(
+        &self,
+        agent: &str,
+        root: &Path,
+        symbol: &str,
+    ) -> Option<RecentSymbolAnchor> {
         let symbol = symbol.trim();
-        if symbol.is_empty() {
+        if agent.is_empty() || symbol.is_empty() {
             return None;
         }
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&key(root, symbol))
+            .get(&key(agent, root, symbol))
             .cloned()
     }
 }
@@ -82,24 +108,26 @@ mod tests {
     fn remember_and_recall_round_trip() {
         let store = RecentSymbols::new();
         let root = PathBuf::from("/tmp/repo");
-        assert!(store.recall(&root, "Init").is_none());
-        store.remember(&root, "Init", "pkg/a.go", Some(10));
-        let hit = store.recall(&root, "Init").expect("remembered");
+        assert!(store.recall("agent-a", &root, "Init").is_none());
+        store.remember("agent-a", &root, "Init", "pkg/a.go", Some(10));
+        let hit = store.recall("agent-a", &root, "Init").expect("remembered");
         assert_eq!(hit.path, "pkg/a.go");
         assert_eq!(hit.line, Some(10));
         // Other roots / names stay separate.
-        assert!(store.recall(&PathBuf::from("/tmp/other"), "Init").is_none());
-        assert!(store.recall(&root, "Other").is_none());
+        assert!(store
+            .recall("agent-a", &PathBuf::from("/tmp/other"), "Init")
+            .is_none());
+        assert!(store.recall("agent-a", &root, "Other").is_none());
     }
 
     #[test]
     fn empty_symbol_or_path_is_ignored() {
         let store = RecentSymbols::new();
         let root = PathBuf::from("/tmp/repo");
-        store.remember(&root, "  ", "a.go", None);
-        store.remember(&root, "Init", "", None);
-        assert!(store.recall(&root, "Init").is_none());
-        assert!(store.recall(&root, "  ").is_none());
+        store.remember("agent-a", &root, "  ", "a.go", None);
+        store.remember("agent-a", &root, "Init", "", None);
+        assert!(store.recall("agent-a", &root, "Init").is_none());
+        assert!(store.recall("agent-a", &root, "  ").is_none());
     }
 
     #[test]
@@ -109,16 +137,29 @@ mod tests {
         let plain = Path::new(r"C:\repo");
         let lower_slash = Path::new("c:/repo/");
 
-        assert_eq!(key(verbatim, "Init"), key(plain, "Init"));
-        assert_eq!(key(verbatim, "Init"), key(lower_slash, "Init"));
+        assert_eq!(
+            key("agent-a", verbatim, "Init"),
+            key("agent-a", plain, "Init")
+        );
+        assert_eq!(
+            key("agent-a", verbatim, "Init"),
+            key("agent-a", lower_slash, "Init")
+        );
+        assert_ne!(
+            key("agent-a", verbatim, "Init"),
+            key("agent-b", plain, "Init")
+        );
 
-        store.remember(verbatim, "Init", "src/lib.rs", Some(42));
-        let hit_plain = store.recall(plain, "Init").expect("recall via plain");
+        store.remember("agent-a", verbatim, "Init", "src/lib.rs", Some(42));
+        let hit_plain = store
+            .recall("agent-a", plain, "Init")
+            .expect("recall via plain");
         assert_eq!(hit_plain.path, "src/lib.rs");
         assert_eq!(hit_plain.line, Some(42));
+        assert!(store.recall("agent-b", plain, "Init").is_none());
 
         let hit_slash = store
-            .recall(lower_slash, "Init")
+            .recall("agent-a", lower_slash, "Init")
             .expect("recall via lower slash");
         assert_eq!(hit_slash.path, "src/lib.rs");
         assert_eq!(hit_slash.line, Some(42));

@@ -5,7 +5,7 @@
 //! cold build so edits during `IncrementalIndex::build` arrive as channel
 //! events instead of being folded into a post-build baseline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -182,11 +182,11 @@ pub(crate) struct RootSession {
     /// rebuilds: an evicted root or a shutting-down server stops parsing
     /// instead of finishing a build nobody will serve.
     pub closed: Arc<AtomicBool>,
-    /// Full builds (cold or background rebuild) currently running for this
-    /// session; [`RootSession::wait_builds_idle`] waits for it to reach 0.
+    /// Index writers (cold/warm builds, rebuilds and incremental applies),
+    /// counted through replay and publication, not just parsing.
     pub builds_active: Arc<std::sync::atomic::AtomicUsize>,
     /// Serializes shutdown with ownership acquisition and publication.
-    lifecycle: Mutex<()>,
+    lifecycle: Arc<Mutex<()>>,
     /// Last coverage note ("N 个文件有语法错误…") shown in full in this
     /// session. The note is repeated only when it changes, a result is
     /// empty, or a hit lands in an error file.
@@ -220,6 +220,10 @@ pub(crate) struct RootSession {
     pub(crate) wake_wait_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     pub(crate) wake_wait_override: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    writer_before_publish: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    fail_rebuild_spawn: AtomicBool,
 }
 
 impl fmt::Debug for RootSession {
@@ -277,7 +281,7 @@ impl RootSession {
             rebuild_journal: Arc::new(Mutex::new(ChangeSet::default())),
             closed: Arc::new(AtomicBool::new(false)),
             builds_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            lifecycle: Mutex::new(()),
+            lifecycle: Arc::new(Mutex::new(())),
             coverage_note_shown: Arc::new(Mutex::new(None)),
             apply_health: Arc::new(Mutex::new(ApplyHealth::default())),
             last_active: Arc::new(AtomicU64::new(current_time_secs())),
@@ -294,6 +298,10 @@ impl RootSession {
             wake_wait_started: Mutex::new(None),
             #[cfg(test)]
             wake_wait_override: Mutex::new(None),
+            #[cfg(test)]
+            writer_before_publish: Mutex::new(None),
+            #[cfg(test)]
+            fail_rebuild_spawn: AtomicBool::new(false),
         })
     }
 
@@ -341,7 +349,7 @@ impl RootSession {
         }
     }
 
-    /// Wait (bounded) until no full build of this session is running.
+    /// Wait (bounded) until all index writers finish, including publication.
     /// Returns `true` when idle. Used after [`Self::teardown`] at shutdown so
     /// a cancelled build reaches its safe point before the process exits.
     pub(crate) fn wait_builds_idle(&self, timeout: Duration) -> bool {
@@ -367,16 +375,65 @@ impl RootSession {
         self.dormant.load(Ordering::SeqCst)
     }
 
-    /// Stop the watcher and drop the indexer lock. Store files stay on disk.
+    /// Close admission and stop the watcher. An already admitted writer keeps
+    /// leadership until its final guard drops; shutdown waits for those guards.
     pub(crate) fn teardown(&self) {
-        let _lifecycle = self.lifecycle.lock_or_recover();
-        self.closed.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.watch.lock_or_recover().take() {
+        {
+            let _lifecycle = self.lifecycle.lock_or_recover();
+            self.closed.store(true, Ordering::SeqCst);
+            if self.builds_active.load(Ordering::SeqCst) == 0 {
+                *self.indexer_lock.lock_or_recover() = None;
+            }
+        }
+        // Never join an OS thread while holding the admission/publication gate.
+        let handle = self.watch.lock_or_recover().take();
+        if let Some(handle) = handle {
             handle.stop();
         }
-        *self.indexer_lock.lock_or_recover() = None;
         *self.freshness.lock_or_recover() = None;
         self.notify_state_change();
+    }
+
+    /// Acquire leadership only while open. Slow parsing/replay happens outside
+    /// this gate, with an active writer retaining ownership across cancellation.
+    fn writer_options(&self) -> Option<astrolabe_core::index::IndexOptions> {
+        let _lifecycle = self.lifecycle.lock_or_recover();
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let persist = crate::reindex::refresh_leader(&self.indexer_lock, &self.root);
+        Some(crate::reindex::mcp_index_options(
+            persist,
+            self.knobs.parse_cache_bytes,
+        ))
+    }
+
+    /// The only writer publication gate. Closing and swapping a snapshot are
+    /// mutually exclusive; neither operation holds the gate while parsing.
+    fn publish_if_open(&self, outcome: IndexState, reset_idle: bool) -> bool {
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.writer_before_publish.lock_or_recover().take() {
+            entered.wait();
+            resume.wait();
+        }
+        let _lifecycle = self.lifecycle.lock_or_recover();
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        if reset_idle {
+            self.last_active
+                .store(current_time_secs(), Ordering::Relaxed);
+            self.soft_evicted.store(false, Ordering::Relaxed);
+        }
+        let old = std::mem::replace(&mut *state, outcome);
+        drop(state);
+        drop(_lifecycle);
+        // Destructing a superseded graph can be slow; readers and shutdown
+        // must not queue behind its allocator work on either gate.
+        drop(old);
+        self.notify_state_change();
+        true
     }
 
     /// Record that a tool call routed to this session (idle-policy clock).
@@ -430,14 +487,16 @@ impl RootSession {
     /// takes tens of milliseconds.
     fn hibernate(&self, now_secs: u64, observed_activity: u64) -> bool {
         let idle_secs = now_secs.saturating_sub(observed_activity);
-        // Take the state write lock first, then re-check the rebuild flag:
-        // a rebuild publishes `Ready` and would resurrect the memory we just
-        // freed, so refusing while it is in flight is what keeps the swap
-        // win. The flag is atomic, so this lock order cannot deadlock.
+        // Inspect admitted writers under the state write lock. A writer
+        // registers before reading Ready: either it is already counted (we
+        // refuse), or it later observes Hibernated and buffers instead. This
+        // excludes incremental publication as well as full rebuilds without
+        // holding a gate throughout parsing.
         let old = {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
             if self.closed.load(Ordering::SeqCst)
                 || self.rebuild_inflight.load(Ordering::SeqCst)
+                || self.builds_active.load(Ordering::SeqCst) != 0
                 || self.last_active.load(Ordering::Relaxed) != observed_activity
                 || self.idle_secs(now_secs) < self.idle_policy.hibernate.as_secs()
             {
@@ -549,19 +608,12 @@ impl RootSession {
             return;
         };
         let session = Arc::clone(self);
+        let slot = RebuildSlot::new(self);
         let spawned = std::thread::Builder::new()
             .name("astrolabe-wake".into())
             .spawn(move || {
                 let _active = active;
-                // Reset the rebuild slot even if publishing panics: a stuck
-                // `true` would wedge every later barrier-triggered rebuild.
-                struct RebuildSlot(Arc<AtomicBool>);
-                impl Drop for RebuildSlot {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::SeqCst);
-                    }
-                }
-                let _slot = RebuildSlot(Arc::clone(&session.rebuild_inflight));
+                let mut slot = slot;
                 let persist = {
                     let _lifecycle = session.lifecycle.lock_or_recover();
                     if session.closed.load(Ordering::SeqCst) {
@@ -569,6 +621,7 @@ impl RootSession {
                     }
                     crate::reindex::refresh_leader(&session.indexer_lock, &session.root)
                 };
+                let read_started = Instant::now();
                 let outcome = build_session_index(&session, persist);
                 #[cfg(test)]
                 if let Some((entered, resume)) =
@@ -586,7 +639,12 @@ impl RootSession {
                             session.teardown();
                             return;
                         }
-                        publish_rebuilt(&session, outcome);
+                        slot.published = publish_rebuilt(&session, outcome);
+                        if slot.published {
+                            if let Some(log) = session.freshness.lock_or_recover().clone() {
+                                log.clear_suspects_through(read_started);
+                            }
+                        }
                         session.soft_evicted.store(false, Ordering::Relaxed);
                     }
                     Some(outcome @ IndexState::Failed(_)) => {
@@ -738,27 +796,71 @@ impl DispatchState {
 }
 
 /// Counts one running full build in [`RootSession::builds_active`].
-struct BuildActive(Arc<std::sync::atomic::AtomicUsize>);
+struct BuildActive {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    lifecycle: Arc<Mutex<()>>,
+    closed: Arc<AtomicBool>,
+    indexer_lock: Arc<Mutex<Option<astrolabe_core::elect::IndexerLock>>>,
+}
 
 impl BuildActive {
     fn enter_if_open(session: &RootSession) -> Option<Self> {
         let _lifecycle = session.lifecycle.lock_or_recover();
         if session.closed.load(Ordering::SeqCst) {
-            None
-        } else {
-            Some(Self::enter(session))
+            return None;
         }
-    }
-
-    fn enter(session: &RootSession) -> Self {
         session.builds_active.fetch_add(1, Ordering::SeqCst);
-        BuildActive(Arc::clone(&session.builds_active))
+        Some(Self {
+            count: Arc::clone(&session.builds_active),
+            lifecycle: Arc::clone(&session.lifecycle),
+            closed: Arc::clone(&session.closed),
+            indexer_lock: Arc::clone(&session.indexer_lock),
+        })
     }
 }
 
 impl Drop for BuildActive {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        let _lifecycle = self.lifecycle.lock_or_recover();
+        // Release leadership BEFORE publishing count=0. Shutdown's waiter must
+        // not observe idle while the cancelled writer still owns the store.
+        if self.count.load(Ordering::SeqCst) == 1 && self.closed.load(Ordering::SeqCst) {
+            *self.indexer_lock.lock_or_recover() = None;
+        }
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Owns a claimed rebuild slot even before its OS thread exists. Failure or
+/// unwind returns the failed paths to the retry queue instead of stranding them
+/// in `in_rebuild`. A successfully published full snapshot covers those paths.
+struct RebuildSlot {
+    inflight: Arc<AtomicBool>,
+    health: Arc<Mutex<ApplyHealth>>,
+    published: bool,
+}
+
+impl RebuildSlot {
+    fn new(session: &RootSession) -> Self {
+        Self {
+            inflight: Arc::clone(&session.rebuild_inflight),
+            health: Arc::clone(&session.apply_health),
+            published: false,
+        }
+    }
+}
+
+impl Drop for RebuildSlot {
+    fn drop(&mut self) {
+        let mut health = self.health.lock_or_recover();
+        let covered = std::mem::take(&mut health.in_rebuild);
+        if self.published {
+            health.rebuild_backoff_until = None;
+        } else {
+            health.unapplied.merge(covered);
+            health.rebuild_backoff_until = Some(Instant::now() + REBUILD_BACKOFF);
+        }
+        self.inflight.store(false, Ordering::SeqCst);
     }
 }
 
@@ -770,7 +872,7 @@ pub(crate) fn build_session_index(session: &RootSession, persist: bool) -> Optio
         tracing::warn!(root = %session.root.display(), "refusing to index a dormant non-git root");
         return None;
     }
-    let _active = BuildActive::enter(session);
+    // The caller owns an admitted writer guard through final publication.
     let started = Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         index::build_cancellable(
@@ -818,17 +920,25 @@ pub(crate) fn start_root_indexing(session: Arc<RootSession>) {
         tracing::warn!(root = %session.root.display(), "refusing to index a dormant non-git root");
         return;
     }
+    // Register before spawning, so shutdown cannot report idle between spawn
+    // and the new thread first being scheduled.
+    let Some(active) = BuildActive::enter_if_open(&session) else {
+        return;
+    };
     std::thread::Builder::new()
         .name("astrolabe-index".into())
-        .spawn(move || bootstrap_root(session))
+        .spawn(move || {
+            let _active = active;
+            bootstrap_root(session);
+        })
         .expect("failed to spawn index thread");
 }
 
 fn bootstrap_root(session: Arc<RootSession>) {
-    if session.closed.load(Ordering::SeqCst) {
+    let Some(opts) = session.writer_options() else {
         return;
-    }
-    let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
+    };
+    let persist = opts.persist;
 
     // Spawn the watcher (and take its baseline) BEFORE the cold build.
     // Edits during IncrementalIndex::build must arrive as channel events, not
@@ -850,11 +960,16 @@ fn bootstrap_root(session: Arc<RootSession>) {
         return;
     }
     // Cancelled when the session closes mid-build (eviction / shutdown).
+    let read_started = Instant::now();
     let Some(outcome) = build_session_index(&session, persist) else {
         session.teardown();
         return;
     };
-    publish_ready(&session, outcome);
+    if publish_ready(&session, outcome) {
+        if let Some(log) = session.freshness.lock_or_recover().clone() {
+            log.clear_suspects_through(read_started);
+        }
+    }
 }
 
 /// Block the cold build until the watcher thread has sealed its baseline.
@@ -871,6 +986,9 @@ fn wait_for_watcher_baseline(session: &RootSession) {
     };
     let deadline = Instant::now() + Duration::from_secs(60);
     while !log.is_seeded() {
+        if session.closed.load(Ordering::SeqCst) {
+            return;
+        }
         if Instant::now() >= deadline {
             tracing::warn!(
                 root = %session.root.display(),
@@ -929,64 +1047,107 @@ fn start_watching(session: &Arc<RootSession>, mode: WatchMode) {
     std::thread::Builder::new()
         .name("astrolabe-reindex".into())
         .spawn(move || {
-            crate::reindex::for_each_reindex_batch(&session.root, rx, throttle, |changes| {
-                tracing::info!(
-                    added = changes.added.len(),
-                    modified = changes.modified.len(),
-                    removed = changes.removed.len(),
-                    "reindexing after file changes"
-                );
-                // Before reindexing: the LSP sync is cheap and a query racing
-                // the rebuild should already see the new text.
-                session.precise.files_changed(changes);
-                apply_or_buffer(&session, changes);
-            });
+            crate::reindex::for_each_reindex_batch_cancellable(
+                &session.root,
+                rx,
+                throttle,
+                &session.closed,
+                |changes| {
+                    let Some(_active) = BuildActive::enter_if_open(&session) else {
+                        return;
+                    };
+                    invalidate_changed_files(&session, changes);
+                    tracing::info!(
+                        added = changes.added.len(),
+                        modified = changes.modified.len(),
+                        removed = changes.removed.len(),
+                        "reindexing after file changes"
+                    );
+                    // Before reindexing: the LSP sync is cheap and a query racing
+                    // the rebuild should already see the new text.
+                    session.precise.files_changed(changes);
+                    apply_or_buffer(&session, changes);
+                },
+            );
         })
         .expect("failed to spawn reindex thread");
 }
 
 /// Lock order: pending, then state. Matches [`publish_ready`] and [`inline_repair`].
 fn apply_or_buffer(session: &RootSession, changes: &ChangeSet) {
+    invalidate_changed_files(session, changes);
     let mut pending = session.pending.lock_or_recover();
     pending.merge(changes.clone());
     apply_pending(session, &mut pending);
 }
 
-fn publish_ready(session: &RootSession, mut outcome: IndexState) {
-    let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
-    let opts = crate::reindex::mcp_index_options(persist, session.knobs.parse_cache_bytes);
+/// Known changes invalidate even an entry with an identical restored mtime.
+/// Repeat after publication to evict fills that raced the index update. A read
+/// spanning both invalidations still needs a cache-generation/content protocol
+/// for strict identical-stamp replacement consistency; this is not that claim.
+fn invalidate_changed_files(session: &RootSession, changes: &ChangeSet) {
+    for (_, path) in changes.iter() {
+        session.file_cache.invalidate(path.as_str());
+    }
+}
 
+fn acknowledge_published(
+    session: &RootSession,
+    attempted: &ChangeSet,
+    left: &ChangeSet,
+    read_started: Instant,
+) {
+    let failed: HashSet<_> = left.iter().map(|(_, path)| path).collect();
+    let covered: Vec<_> = attempted
+        .iter()
+        .map(|(_, path)| path)
+        .filter(|path| !failed.contains(path))
+        .cloned()
+        .collect();
+    if let Some(log) = session.freshness.lock_or_recover().clone() {
+        log.acknowledge_applied(&covered, read_started);
+    }
+}
+
+fn publish_ready(session: &RootSession, mut outcome: IndexState) -> bool {
     let mut pending = session.pending.lock_or_recover();
-
+    let Some(opts) = session.writer_options() else {
+        return false;
+    };
+    let read_started = Instant::now();
+    let mut attempted = ChangeSet::default();
+    let mut left = ChangeSet::default();
     if let IndexState::Ready(index) = &outcome {
         let drained = std::mem::take(&mut *pending);
         let older = std::mem::take(&mut session.apply_health.lock_or_recover().unapplied);
-        let (inc, left) = apply_with_fallback(session, index.incremental(), older, drained, &opts);
+        attempted = older.clone();
+        attempted.merge(drained.clone());
+        invalidate_changed_files(session, &attempted);
+        let (inc, failed) =
+            apply_with_fallback(session, index.incremental(), older, drained, &opts);
+        left = failed;
         if let Some(inc) = inc {
             outcome = IndexState::Ready(Arc::new(index::RepoIndex::from_incremental(
                 session.root.clone(),
                 inc,
             )));
         }
-        note_unapplied(session, left);
+        note_unapplied(session, left.clone());
     }
-    if session.closed.load(Ordering::SeqCst) {
-        // Evicted during the cold build: do not publish into a dead session.
-        session.teardown();
-        return;
+    let prewarm = match &outcome {
+        IndexState::Ready(index) => Some(Arc::clone(index)),
+        _ => None,
+    };
+    let ready = prewarm.is_some();
+    let published = session.publish_if_open(outcome, true);
+    invalidate_changed_files(session, &attempted);
+    if published {
+        acknowledge_published(session, &attempted, &left, read_started);
+        if let Some(index) = prewarm {
+            index.prewarm(true);
+        }
     }
-    if let IndexState::Ready(index) = &outcome {
-        index.prewarm(true);
-        // Start the idle clock when the index starts serving: a cold build
-        // that took minutes must not look like minutes of idle time to the
-        // next patrol tick.
-        session
-            .last_active
-            .store(current_time_secs(), Ordering::Relaxed);
-        session.soft_evicted.store(false, Ordering::Relaxed);
-    }
-    *session.state.write().unwrap_or_else(|e| e.into_inner()) = outcome;
-    session.notify_state_change();
+    published && ready
 }
 
 /// Apply buffered changes when the index is Ready. The caller holds the
@@ -1000,28 +1161,45 @@ fn publish_ready(session: &RootSession, mut outcome: IndexState) {
 /// of being dropped, so the barrier can retry, rebuild, and say the answer
 /// may be stale. Returns `true` when nothing is left unapplied.
 fn apply_pending(session: &RootSession, pending: &mut ChangeSet) -> bool {
+    let Some(_active) = BuildActive::enter_if_open(session) else {
+        return false;
+    };
     let previous = match &*session.state.read().unwrap_or_else(|e| e.into_inner()) {
         IndexState::Ready(index) => Arc::clone(index),
-        _ => return true,
+        _ => {
+            return pending.is_empty()
+                && session.apply_health.lock_or_recover().unapplied.is_empty()
+        }
     };
     let changes = std::mem::take(pending);
     let older = std::mem::take(&mut session.apply_health.lock_or_recover().unapplied);
     if changes.is_empty() && older.is_empty() {
         return true;
     }
-    let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
-    let opts = crate::reindex::mcp_index_options(persist, session.knobs.parse_cache_bytes);
+    let Some(opts) = session.writer_options() else {
+        // Closure raced admission. Keep the paths available for diagnostics;
+        // the closed session will not perform any more index writes.
+        pending.merge(changes);
+        note_unapplied(session, older);
+        return false;
+    };
     let mut applied = older.clone();
     applied.merge(changes.clone());
+    let read_started = Instant::now();
+    invalidate_changed_files(session, &applied);
     let (inc, left) = apply_with_fallback(session, previous.incremental(), older, changes, &opts);
     if let Some(inc) = inc {
         let next = Arc::new(index::RepoIndex::from_incremental(
             session.root.clone(),
             inc,
         ));
+        if !session.publish_if_open(IndexState::Ready(Arc::clone(&next)), false) {
+            invalidate_changed_files(session, &applied);
+            return false;
+        }
+        invalidate_changed_files(session, &applied);
+        acknowledge_published(session, &applied, &left, read_started);
         next.prewarm(false);
-        *session.state.write().unwrap_or_else(|e| e.into_inner()) = IndexState::Ready(next);
-        session.notify_state_change();
         // Free the superseded graph (unless a reader still holds it) off this
         // thread: this may be a query waiting on its inline repair, and
         // tearing down a large repository's graph and parse products cost it
@@ -1033,9 +1211,13 @@ fn apply_pending(session: &RootSession, pending: &mut ChangeSet) -> bool {
         // off-thread, long after the drop above has finished).
         crate::alloc::release_free_memory_when_quiet();
         if session.rebuild_inflight.load(Ordering::SeqCst) {
-            session.rebuild_journal.lock_or_recover().merge(applied);
+            session
+                .rebuild_journal
+                .lock_or_recover()
+                .merge(applied.clone());
         }
     }
+    invalidate_changed_files(session, &applied);
     let clean = left.is_empty();
     note_unapplied(session, left);
     clean
@@ -1170,12 +1352,10 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
     };
 
     let started = Instant::now();
-    // Suspects noted up to here are covered by whatever repair this call does.
-    let observed_at = started;
-    let watermark = log.watermark();
-    let watermark_age = watermark.elapsed();
-    let suspects = log.suspect_paths(watermark);
-    let distrusted = log.distrusted();
+    let snapshot = log.snapshot();
+    let watermark_age = snapshot.watermark.elapsed();
+    let suspects = snapshot.suspects;
+    let distrusted = snapshot.distrusted;
     let max_inline = session.knobs.barrier_max;
     let decision = barrier_decision(
         watermark_age,
@@ -1199,17 +1379,18 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
             if wait_watermark_advance(&log, before, BARRIER_VERIFY_WAIT) {
                 // The verification may have found changes that are not in
                 // the index yet; they are suspects after the new watermark.
-                let observed = Instant::now();
-                let found = log.suspect_paths(log.watermark());
-                if log.distrusted() || found.len() > max_inline {
+                let verified = log.snapshot();
+                let found = verified.suspects;
+                if verified.distrusted || found.len() > max_inline {
                     trigger_background_rebuild_arc(session);
                     BarrierEffect::StaleNote(staleness_note(found.len()))
                 } else {
-                    if !found.is_empty() {
-                        inline_repair(session, found);
-                        log.clear_suspects_through(observed);
+                    let count = found.len();
+                    if !found.is_empty() && !inline_repair(session, found) {
+                        BarrierEffect::StaleNote(staleness_note(count))
+                    } else {
+                        BarrierEffect::None
                     }
-                    BarrierEffect::None
                 }
             } else {
                 // The verification scan did not finish in time: we answer
@@ -1218,14 +1399,31 @@ pub(crate) fn run_barrier(session: &Arc<RootSession>) -> BarrierEffect {
             }
         }
         BarrierDecision::Repair(paths) => {
-            inline_repair(session, paths);
-            log.clear_suspects_through(observed_at);
-            BarrierEffect::None
+            let count = paths.len();
+            if inline_repair(session, paths) {
+                BarrierEffect::None
+            } else {
+                BarrierEffect::StaleNote(staleness_note(count))
+            }
         }
         BarrierDecision::Degrade { suspects } => {
             trigger_background_rebuild_arc(session);
             BarrierEffect::StaleNote(staleness_note(suspects))
         }
+    };
+    // Do not label the current result fresh when a later observed delta
+    // arrived during repair. It remains pending for the next call; avoid an
+    // unbounded repair loop while files are actively changing.
+    let effect = match effect {
+        BarrierEffect::None => {
+            let remaining = log.snapshot();
+            if remaining.distrusted || !remaining.suspects.is_empty() {
+                BarrierEffect::StaleNote(staleness_note(remaining.suspects.len()))
+            } else {
+                BarrierEffect::None
+            }
+        }
+        stale => stale,
     };
     // A repair (or an earlier watcher batch) whose apply failed is tracked
     // in `apply_health`, not lost: retry it, and say so while it is missing.
@@ -1288,7 +1486,42 @@ fn wait_watermark_advance(log: &FreshnessLog, before: Instant, timeout: Duration
     }
 }
 
-fn inline_repair(session: &RootSession, paths: Vec<RelPath>) {
+/// Direct file repair must never pretend a directory/rule-file edit only
+/// affects that path. The watcher normally marks these distrusted at intake;
+/// this is also a conservative boundary for older/queued raw suspects.
+fn needs_tree_repair(session: &RootSession, paths: &[RelPath]) -> bool {
+    let snapshot = session.snapshot_ready();
+    paths.iter().any(|path| {
+        let name = Path::new(path.as_str())
+            .file_name()
+            .and_then(|s| s.to_str());
+        if matches!(name, Some(".gitignore" | ".ignore"))
+            || path.as_str() == ".git/info/exclude"
+            || session.root.join(path.as_str()).is_dir()
+        {
+            return true;
+        }
+        let prefix = format!("{}/", path.as_str().trim_end_matches('/'));
+        snapshot
+            .as_ref()
+            .and_then(|index| index.incremental())
+            .is_some_and(|index| {
+                index
+                    .admitted_paths()
+                    .iter()
+                    .any(|old| old.as_str().starts_with(&prefix))
+            })
+    })
+}
+
+fn inline_repair(session: &Arc<RootSession>, paths: Vec<RelPath>) -> bool {
+    if needs_tree_repair(session, &paths) {
+        if let Some(log) = session.freshness.lock_or_recover().clone() {
+            log.request_verification();
+        }
+        trigger_background_rebuild_arc(session);
+        return false;
+    }
     // Suspects are raw event paths: classify them with the scan gates so a
     // gitignored / deleted / oversized path is removed instead of being
     // blindly parsed into the index.
@@ -1302,7 +1535,7 @@ fn inline_repair(session: &RootSession, paths: Vec<RelPath>) {
     }
     let repair = crate::reindex::filter_changeset(&session.root, repair);
     if repair.is_empty() {
-        return;
+        return true;
     }
     // Tell the watcher before reading: the index is about to hold content
     // its snapshot may never see (edit, query, revert within the debounce).
@@ -1313,7 +1546,7 @@ fn inline_repair(session: &RootSession, paths: Vec<RelPath>) {
     }
     let mut pending = session.pending.lock_or_recover();
     pending.merge(repair);
-    apply_pending(session, &mut pending);
+    apply_pending(session, &mut pending)
 }
 
 /// Kick a full `IncrementalIndex::build` without dropping to `Building`.
@@ -1321,115 +1554,119 @@ pub(crate) fn trigger_background_rebuild_arc(session: &Arc<RootSession>) {
     let Some(active) = BuildActive::enter_if_open(session) else {
         return;
     };
-    if session
-        .rebuild_inflight
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
     {
-        return;
-    }
-    session
-        .rebuild_journal
-        .lock_or_recover()
-        .clone_from(&ChangeSet::default());
-    {
-        // The full build reads every file after this point, so it covers
-        // the failed changes recorded so far.
+        // Serialize the claim/journal reset with incremental publication. A
+        // running apply must not append a delta just before we clear it.
+        let _pending = session.pending.lock_or_recover();
+        if session
+            .apply_health
+            .lock_or_recover()
+            .rebuild_backoff_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        if session
+            .rebuild_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        session
+            .rebuild_journal
+            .lock_or_recover()
+            .clone_from(&ChangeSet::default());
         let mut health = session.apply_health.lock_or_recover();
         let taken = std::mem::take(&mut health.unapplied);
         health.in_rebuild.merge(taken);
     }
-    let session = Arc::clone(session);
+    let slot = RebuildSlot::new(session);
+    let worker_session = Arc::clone(session);
+    let work = move || {
+        let _active = active;
+        let mut slot = slot;
+        let session = worker_session;
+        let started = Instant::now();
+        let Some(opts) = session.writer_options() else {
+            return;
+        };
+        let outcome = build_session_index(&session, opts.persist);
+        match outcome {
+            Some(outcome @ IndexState::Ready(_)) => {
+                slot.published = publish_rebuilt(&session, outcome);
+                if slot.published {
+                    if let Some(log) = session.freshness.lock_or_recover().clone() {
+                        log.clear_suspects_through(started);
+                    }
+                }
+            }
+            Some(IndexState::Failed(error)) => {
+                tracing::warn!(%error, "background rebuild failed; backing off");
+            }
+            _ => {}
+        }
+    };
+    if let Err(error) = spawn_rebuild_thread(session, work) {
+        tracing::warn!(%error, "failed to spawn background rebuild thread; slot restored");
+    }
+}
+
+fn spawn_rebuild_thread(
+    _session: &RootSession,
+    work: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if _session.fail_rebuild_spawn.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other(
+            "injected rebuild thread creation failure",
+        ));
+    }
     std::thread::Builder::new()
         .name("astrolabe-rebuild".into())
-        .spawn(move || {
-            let _active = active;
-            let started = Instant::now();
-            let persist = {
-                let _lifecycle = session.lifecycle.lock_or_recover();
-                if session.closed.load(Ordering::SeqCst) {
-                    session.rebuild_inflight.store(false, Ordering::SeqCst);
-                    return;
-                }
-                crate::reindex::refresh_leader(&session.indexer_lock, &session.root)
-            };
-            let outcome = build_session_index(&session, persist);
-            let rebuilt = matches!(outcome, Some(IndexState::Ready(_)));
-            {
-                let mut health = session.apply_health.lock_or_recover();
-                let covered = std::mem::take(&mut health.in_rebuild);
-                if rebuilt {
-                    health.rebuild_backoff_until = None;
-                } else {
-                    if let Some(IndexState::Failed(error)) = &outcome {
-                        tracing::warn!(%error, "background rebuild failed; backing off");
-                    }
-                    health.unapplied.merge(covered);
-                    health.rebuild_backoff_until = Some(Instant::now() + REBUILD_BACKOFF);
-                }
-            }
-            if let Some(outcome @ IndexState::Ready(_)) = outcome {
-                publish_rebuilt(&session, outcome);
-                // The rebuilt index covers every suspect noted before it began.
-                let log = session.freshness.lock_or_recover().clone();
-                if let Some(log) = log {
-                    log.clear_suspects_through(started);
-                }
-            }
-            session.rebuild_inflight.store(false, Ordering::SeqCst);
-        })
-        .ok();
+        .spawn(work)
 }
 
 /// Publish a background rebuild without losing changes that were applied to
 /// the old index (journal) or buffered (pending) while it was building.
-fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) {
-    // Preserve pending-before-state lock ordering, and acquire the lifecycle
-    // gate only after pending: an older publisher may tear down on cancel.
-    // Closing and replay/publication are mutually exclusive, so ownership
-    // cannot be reacquired (or Ready published) after the session closes.
+fn publish_rebuilt(session: &RootSession, mut outcome: IndexState) -> bool {
     let mut pending = session.pending.lock_or_recover();
-    let _lifecycle = session.lifecycle.lock_or_recover();
-    if session.closed.load(Ordering::SeqCst) {
-        return;
-    }
-    let persist = crate::reindex::refresh_leader(&session.indexer_lock, &session.root);
-    let opts = crate::reindex::mcp_index_options(persist, session.knobs.parse_cache_bytes);
+    let Some(opts) = session.writer_options() else {
+        return false;
+    };
+    let read_started = Instant::now();
+    let mut attempted = ChangeSet::default();
+    let mut left = ChangeSet::default();
     let mut replay = std::mem::take(&mut *session.rebuild_journal.lock_or_recover());
     replay.merge(std::mem::take(&mut *pending));
     if let IndexState::Ready(index) = &outcome {
-        // Changes that failed while the rebuild ran are retried too; a replay
-        // that still fails is recorded instead of silently published away.
         let older = std::mem::take(&mut session.apply_health.lock_or_recover().unapplied);
-        let (inc, left) = apply_with_fallback(session, index.incremental(), older, replay, &opts);
+        attempted = older.clone();
+        attempted.merge(replay.clone());
+        invalidate_changed_files(session, &attempted);
+        let (inc, failed) = apply_with_fallback(session, index.incremental(), older, replay, &opts);
+        left = failed;
         if let Some(inc) = inc {
             outcome = IndexState::Ready(Arc::new(index::RepoIndex::from_incremental(
                 session.root.clone(),
                 inc,
             )));
         }
-        note_unapplied(session, left);
+        note_unapplied(session, left.clone());
     }
-    if let IndexState::Ready(index) = &outcome {
-        index.prewarm(true);
-        // A rebuild also (re)starts serving: reset the idle clock so a slow
-        // rebuild does not count as idle time against the new snapshot.
-        session
-            .last_active
-            .store(current_time_secs(), Ordering::Relaxed);
-    }
-    let published = {
-        let mut state = session.state.write().unwrap_or_else(|e| e.into_inner());
-        if !session.closed.load(Ordering::SeqCst) {
-            *state = outcome;
-            true
-        } else {
-            false
-        }
+    let prewarm = match &outcome {
+        IndexState::Ready(index) => Some(Arc::clone(index)),
+        _ => None,
     };
+    let published = session.publish_if_open(outcome, true);
+    invalidate_changed_files(session, &attempted);
     if published {
-        session.notify_state_change();
+        acknowledge_published(session, &attempted, &left, read_started);
+        if let Some(index) = prewarm {
+            index.prewarm(true);
+        }
     }
+    published
 }
 
 /// Append a staleness note to the first text block of an already-finished result.
@@ -2820,5 +3057,413 @@ mod tests {
         closer.join().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cold_shutdown_counts_publication_and_retains_ownership() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let session = RootSession::new(
+            dir.clone(),
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            1024 * 1024,
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *session.writer_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        start_root_indexing(Arc::clone(&session));
+        entered.wait();
+        session.teardown();
+        let still_active = !session.wait_builds_idle(Duration::ZERO);
+        let ownership_retained = session.indexer_lock.lock().unwrap().is_some();
+        let blocked_takeover = astrolabe_core::elect::IndexerLock::try_acquire(&dir)
+            .unwrap()
+            .is_none();
+        resume.wait();
+        assert!(session.wait_builds_idle(Duration::from_secs(5)));
+        assert!(
+            still_active,
+            "cold publication must remain registered after parsing"
+        );
+        assert!(
+            ownership_retained && blocked_takeover,
+            "cancelled writer must retain leadership until its final safe point"
+        );
+        assert!(
+            session.snapshot_ready().is_none(),
+            "closed cold build published Ready"
+        );
+        assert!(session.indexer_lock.lock().unwrap().is_none());
+        assert!(astrolabe_core::elect::IndexerLock::try_acquire(&dir)
+            .unwrap()
+            .is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn incremental_shutdown_rejects_late_publication() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let session = ready_session_with_policy(
+            &dir,
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            idle_policy(0, 1, 0),
+        );
+        let before = session.snapshot_ready().unwrap();
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *session.writer_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        let worker_session = Arc::clone(&session);
+        let worker = std::thread::spawn(move || {
+            apply_or_buffer(
+                &worker_session,
+                &ChangeSet {
+                    added: vec![RelPath::new("b.py")],
+                    ..ChangeSet::default()
+                },
+            )
+        });
+        entered.wait();
+        session.teardown();
+        let still_active = !session.wait_builds_idle(Duration::ZERO);
+        let ownership_retained = session.indexer_lock.lock().unwrap().is_some();
+        resume.wait();
+        worker.join().unwrap();
+        assert!(still_active && ownership_retained);
+        assert!(session.wait_builds_idle(Duration::ZERO));
+        assert!(
+            Arc::ptr_eq(&before, &session.snapshot_ready().unwrap()),
+            "closed incremental writer replaced the serving snapshot"
+        );
+        assert!(session.indexer_lock.lock().unwrap().is_none());
+        // A queued batch after closure must not reacquire ownership either.
+        apply_or_buffer(
+            &session,
+            &ChangeSet {
+                modified: vec![RelPath::new("a.py")],
+                ..ChangeSet::default()
+            },
+        );
+        assert!(session.indexer_lock.lock().unwrap().is_none());
+        assert!(session.wait_builds_idle(Duration::ZERO));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn incremental_writer_excludes_hard_hibernation() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let session = ready_session_with_policy(
+            &dir,
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            idle_policy(0, 1, 0),
+        );
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *session.writer_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        let worker_session = Arc::clone(&session);
+        let worker = std::thread::spawn(move || {
+            apply_or_buffer(
+                &worker_session,
+                &ChangeSet {
+                    added: vec![RelPath::new("b.py")],
+                    ..ChangeSet::default()
+                },
+            )
+        });
+        entered.wait();
+        let observed = session.last_active.load(Ordering::Relaxed);
+        let now = observed + 120;
+        let slept_during_apply = session.hibernate(now, observed);
+        resume.wait();
+        worker.join().unwrap();
+        assert!(
+            !slept_during_apply,
+            "an admitted incremental writer must exclude hibernation"
+        );
+        assert!(session
+            .snapshot_ready()
+            .unwrap()
+            .graph()
+            .symbols
+            .iter()
+            .any(|s| s.name == "beta"));
+        assert!(
+            session.hibernate(now, observed),
+            "idle may hibernate after the writer finishes"
+        );
+        assert!(session.snapshot_ready().is_none());
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebuild_spawn_failure_restores_retry_queue_and_slot() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let session = ready_session_with_policy(
+            &dir,
+            McpKnobs {
+                watch_mode: None,
+                ..McpKnobs::default()
+            },
+            idle_policy(0, 1, 0),
+        );
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        session
+            .apply_health
+            .lock()
+            .unwrap()
+            .unapplied
+            .added
+            .push(RelPath::new("b.py"));
+        session.fail_rebuild_spawn.store(true, Ordering::SeqCst);
+        trigger_background_rebuild_arc(&session);
+        assert!(!session.rebuild_inflight.load(Ordering::SeqCst));
+        assert!(session.wait_builds_idle(Duration::ZERO));
+        {
+            let health = session.apply_health.lock().unwrap();
+            assert!(health.in_rebuild.is_empty());
+            assert!(health.unapplied.iter().any(|(_, p)| p.as_str() == "b.py"));
+            assert!(health.rebuild_backoff_until.is_some());
+        }
+        // Advance the logical retry state without a wall-clock sleep.
+        session.apply_health.lock().unwrap().rebuild_backoff_until = None;
+        trigger_background_rebuild_arc(&session);
+        assert!(session.wait_builds_idle(Duration::from_secs(5)));
+        assert!(!session.rebuild_inflight.load(Ordering::SeqCst));
+        assert!(session.apply_health.lock().unwrap().in_rebuild.is_empty());
+        assert!(session.apply_health.lock().unwrap().unapplied.is_empty());
+        assert!(session
+            .snapshot_ready()
+            .unwrap()
+            .graph()
+            .symbols
+            .iter()
+            .any(|s| s.name == "beta"));
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The receiver is deliberately owned by the test rather than a reindex
+    /// worker. Receiving a batch proves observation completed, not publication.
+    fn session_with_manual_watch_consumer(
+        dir: &Path,
+    ) -> (
+        Arc<RootSession>,
+        std::sync::mpsc::Receiver<ChangeSet>,
+        WatchHandle,
+        Arc<FreshnessLog>,
+    ) {
+        let session = ready_session(dir);
+        let mut watcher = Watcher::new(dir.to_path_buf())
+            .events(false)
+            // This fixture observes batches directly, not debounce behavior.
+            // An initial background scan can win the explicit verification;
+            // emit that delta immediately instead of parking it for an hour.
+            .debounce(Duration::ZERO)
+            .poll_interval(Duration::from_secs(3600));
+        assert!(watcher.check().is_empty());
+        let (rx, handle, log) = watcher.spawn_with_log();
+        *session.freshness.lock().unwrap() = Some(Arc::clone(&log));
+        (session, rx, handle, log)
+    }
+
+    #[test]
+    fn queued_delta_survives_later_observation_until_repair() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let (session, rx, handle, log) = session_with_manual_watch_consumer(&dir);
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        log.request_verification();
+        let batch = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(batch.iter().any(|(_, p)| p.as_str() == "b.py"));
+        // An unchanged second scan must not hide the queued/coalescing batch.
+        let before = log.watermark();
+        log.request_verification();
+        assert!(wait_watermark_advance(&log, before, Duration::from_secs(5)));
+        assert!(log.snapshot().suspects.contains(&RelPath::new("b.py")));
+        assert!(!has_symbol(&session, "beta"));
+        assert!(matches!(run_barrier(&session), BarrierEffect::None));
+        assert!(has_symbol(&session, "beta"));
+        assert!(
+            log.snapshot().suspects.is_empty(),
+            "successful repair was never acknowledged"
+        );
+        handle.stop();
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn publication_ack_preserves_change_observed_during_apply() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let (session, rx, handle, log) = session_with_manual_watch_consumer(&dir);
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        log.request_verification();
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *session.writer_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        assert!(first.iter().any(|(_, p)| p.as_str() == "b.py"));
+        let worker_session = Arc::clone(&session);
+        let worker = std::thread::spawn(move || run_barrier(&worker_session));
+        entered.wait();
+        std::fs::write(dir.join("b.py"), "def gamma():\n    return 3\n").unwrap();
+        log.request_verification();
+        let second = rx.recv_timeout(Duration::from_secs(5));
+        handle.stop();
+        resume.wait();
+        let effect = worker.join().unwrap();
+        assert!(
+            matches!(effect, BarrierEffect::StaleNote(_)),
+            "a delta observed during repair must prevent a fresh result"
+        );
+        assert!(second.unwrap().iter().any(|(_, p)| p.as_str() == "b.py"));
+        assert!(has_symbol(&session, "beta"));
+        assert!(!has_symbol(&session, "gamma"));
+        assert!(
+            log.snapshot().suspects.contains(&RelPath::new("b.py")),
+            "publication acknowledged a change newer than its read cutoff"
+        );
+        assert!(matches!(run_barrier(&session), BarrierEffect::None));
+        assert!(has_symbol(&session, "gamma"));
+        assert!(!has_symbol(&session, "beta"));
+        assert!(log.snapshot().suspects.is_empty());
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_apply_does_not_ack_observed_delta() {
+        let dir = unique_temp_dir();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let (session, rx, handle, log) = session_with_manual_watch_consumer(&dir);
+        std::fs::write(dir.join("b.py"), "def beta():\n    return 2\n").unwrap();
+        log.request_verification();
+        let batch = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.stop();
+        session.fail_applies.store(1, Ordering::SeqCst);
+        apply_or_buffer(&session, &batch);
+        assert!(!has_symbol(&session, "beta"));
+        assert!(log.snapshot().suspects.contains(&RelPath::new("b.py")));
+        assert!(inline_repair(&session, vec![RelPath::new("b.py")]));
+        assert!(has_symbol(&session, "beta"));
+        assert!(log.snapshot().suspects.is_empty());
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn known_change_invalidates_restored_stamp_cache_and_racing_fill() {
+        use astrolabe_core::cache::CachedLines;
+        let dir = unique_temp_dir();
+        let path = dir.join("a.py");
+        let old_text = "def alpha():\n    return 1\n";
+        let new_text = "def bravo():\n    return 2\n";
+        std::fs::write(&path, old_text).unwrap();
+        let session = ready_session(&dir);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        let held = Arc::new(CachedLines::from_text(old_text));
+        session
+            .file_cache
+            .insert_precise("a.py", Arc::clone(&held), modified, metadata.len());
+        std::fs::write(&path, new_text).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *session.writer_before_publish.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&resume)));
+        let worker_session = Arc::clone(&session);
+        let worker = std::thread::spawn(move || {
+            apply_or_buffer(
+                &worker_session,
+                &ChangeSet {
+                    modified: vec![RelPath::new("a.py")],
+                    ..ChangeSet::default()
+                },
+            )
+        });
+        entered.wait();
+        let invalidated_before = session
+            .file_cache
+            .get_precise("a.py", modified, metadata.len())
+            .is_none();
+        // Model an old read filling the cache while this index write is in flight.
+        session
+            .file_cache
+            .insert_precise("a.py", Arc::clone(&held), modified, metadata.len());
+        resume.wait();
+        worker.join().unwrap();
+        assert!(invalidated_before);
+        assert!(session
+            .file_cache
+            .get_precise("a.py", modified, metadata.len())
+            .is_none());
+        assert_eq!(
+            held.as_text(),
+            old_text,
+            "existing readers keep valid Arc ownership"
+        );
+        assert!(has_symbol(&session, "bravo"));
+        assert!(!has_symbol(&session, "alpha"));
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn directory_and_ignore_repairs_require_full_rebuild() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.py"), "def nested():\n    return 1\n").unwrap();
+        std::fs::write(dir.join("other.py"), "def other():\n    return 2\n").unwrap();
+        let session = ready_session(&dir);
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
+        session.fail_rebuild_spawn.store(true, Ordering::SeqCst);
+        assert!(!inline_repair(&session, vec![RelPath::new("sub")]));
+        assert!(
+            has_symbol(&session, "nested"),
+            "direct repair must not pretend to remove a subtree"
+        );
+        session.apply_health.lock().unwrap().rebuild_backoff_until = None;
+        trigger_background_rebuild_arc(&session);
+        assert!(session.wait_builds_idle(Duration::from_secs(5)));
+        assert!(!has_symbol(&session, "nested"));
+        std::fs::write(dir.join(".gitignore"), "other.py\n").unwrap();
+        session.fail_rebuild_spawn.store(true, Ordering::SeqCst);
+        assert!(!inline_repair(&session, vec![RelPath::new(".gitignore")]));
+        assert!(has_symbol(&session, "other"));
+        session.apply_health.lock().unwrap().rebuild_backoff_until = None;
+        trigger_background_rebuild_arc(&session);
+        assert!(session.wait_builds_idle(Duration::from_secs(5)));
+        assert!(!has_symbol(&session, "other"));
+        session.teardown();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -6,6 +6,16 @@
 
 在支持 PreToolUse 钩子的客户端里，`astrolabe hooks remind` 会统计模型连续使用 grep / 整文件 Read 的次数，超过阈值时返回 deny 并提示改用 Astrolabe 工具。会话状态存在 `~/.astrolabe/hook_data/`。
 
+### 临时任务日志不是代码
+
+包含本次修复的版本会放行当前用户标准 Claude 临时目录里的任务输出：`/tmp/claude-<uid>/<项目>/[会话 UUID/]tasks/<任务 ID>.output`（macOS 也支持 `/private/tmp/`）。项目目录使用 Claude 的编码名称。直接 Read，以及单条 `cat`、`head`、`tail` 读取这些明确路径，不计代码探索次数；旧计数也不会让这次日志读取被拦。Claude 在这里创建、指向 `~/.claude/projects/<项目>/<会话 UUID>/subagents/agent-<ID>.jsonl` 的输出链接也按日志处理。
+
+这不是所有 `.output` 的豁免：仓库里的同名后缀、目录穿越、链接到源码或混合了源码读取的复合 Shell 命令，都不适用。硬禁用文本搜索的规则也没有因此全部放开。
+
+### 子 Agent 的计数怎么看
+
+只有 Hook payload 明确带 `agent_id`／`agentId`，才会使用独立的子 Agent 计数。没有身份时沿用当前 session 的计数，不会猜一个新身份。日志中的 `counter_scope=session_shared_no_agent_id` 就表示这一点；它不是“客户端一定丢了身份”或“已经证明串号”的结论。新 session 和有独立身份的新 Agent，默认首次 Read 不应被拦；排查首次可见调用被拒时，需要对照当时的 payload、计数和实际阈值，不能只看转录的第一条工具记录。
+
 ## 2. Claude Code 配方
 
 可选：将以下配置**合并进**（不要覆盖已有的 `hooks` 条目）项目 `.claude/settings.json`（或全局 `~/.claude/settings.json`）：
