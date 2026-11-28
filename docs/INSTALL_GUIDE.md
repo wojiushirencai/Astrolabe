@@ -44,12 +44,12 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 ```powershell
 # Prefer npm (pulls the matching platform package):
 npm i -g @zlnap/astrolabe
-# Then REQUIRED — wire MCP (+ hooks so agents actually use the tools):
-npx -y @zlnap/astrolabe setup --with-hooks
-# or: astrolabe setup --with-hooks
+# Then REQUIRED — wire MCP:
+npx -y @zlnap/astrolabe setup
+# or: astrolabe setup
 ```
 
-Or download `astrolabe-<version>-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/wojiushirencai/Astrolabe/releases), compare `Get-FileHash -Algorithm SHA256` with `SHA256SUMS`, unzip `astrolabe.exe` to a fixed folder, add it to `PATH`, then still run `astrolabe setup --with-hooks`.
+Or download `astrolabe-<version>-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/wojiushirencai/Astrolabe/releases), compare `Get-FileHash -Algorithm SHA256` with `SHA256SUMS`, unzip `astrolabe.exe` to a fixed folder, add it to `PATH`, then still run `astrolabe setup`.
 
 **Windows stability (tested on real machines, v0.17.4–v0.17.5):** `#117` normalizes `\?\` vs plain `C:\` for watcher membership / comparisons and strips `\?\` in status text; subdirectory `index_root` reuses a Ready parent index with a path filter (no second cold build). `#119` normalizes Windows `path_filter` (backslashes / absolute paths) to repo-relative `/` paths. Prefer omitting `index_root` or passing the **repo root**.
 
@@ -60,10 +60,10 @@ The npm package is **`@zlnap/astrolabe`** (binary name stays `astrolabe`), with 
 ```bash
 npm i -g @zlnap/astrolabe          # or: npx -y @zlnap/astrolabe --version
 # REQUIRED after every fresh install / upgrade:
-npx -y @zlnap/astrolabe setup --with-hooks
+npx -y @zlnap/astrolabe setup
 ```
 
-**Why `setup` is required:** `npm i` only places the binary shim. Without `astrolabe setup`, no client MCP entry is written. Without hooks (`--with-hooks` where supported), many agents keep Grep/Read and never call Astrolabe tools in practice. `setup` detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo, Continue, OpenCode, DeepSeek Harness, Codebuddy, Grok Build, Kimi Code, and ZCode and **merges** MCP config (it never wipes other servers).
+**Why `setup` is required:** `npm i` only places the binary shim. Without `astrolabe setup`, no client MCP entry is written. When upgrading from an older version, re-running `astrolabe setup` (or `astrolabe setup --remove-hooks`) automatically cleans up legacy Astrolabe hooks while keeping your other third-party hooks. `setup` detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo, Continue, OpenCode, DeepSeek Harness, Codebuddy, Grok Build, Kimi Code, and ZCode and **merges** MCP config (it never wipes other servers).
 
 ### Option 5 — build from source (Rust 1.90+)
 
@@ -72,7 +72,7 @@ git clone https://github.com/wojiushirencai/Astrolabe.git && cd Astrolabe
 cargo build --release --bin astrolabe      # target/release/astrolabe
 ```
 
-Verify with `astrolabe --version`, then run `npx -y @zlnap/astrolabe setup --with-hooks` (or `astrolabe setup --with-hooks`) and restart your client so it picks up MCP + hooks.
+Verify with `astrolabe --version`, then run `npx -y @zlnap/astrolabe setup` (or `astrolabe setup`) and restart your client so it picks up MCP.
 
 ## 2. Client configuration
 
@@ -81,25 +81,25 @@ Verify with `astrolabe --version`, then run `npx -y @zlnap/astrolabe setup --wit
 After installing the binary or npm package (or with `npx`), run:
 
 ```bash
-npx -y @zlnap/astrolabe setup --with-hooks
+npx -y @zlnap/astrolabe setup
 # non-interactive:
-npx -y @zlnap/astrolabe setup --yes --with-hooks
+npx -y @zlnap/astrolabe setup --yes
 ```
 
-**Install without `setup` leaves you with a binary that clients do not call.** Hooks (`--with-hooks`) nudge agents away from Grep/Read toward Astrolabe; skip them only if you intentionally want MCP-only wiring.
+**Install without `setup` leaves you with a binary that clients do not call.** Anti-drift PreToolUse hooks have been removed in favor of built-in prompt routing; re-running `setup` (or `astrolabe setup --remove-hooks`) strips legacy Astrolabe hooks from older installs without touching third-party hooks (see [HOOKS.md](HOOKS.md)).
 
-The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--check-config` (read-only Cursor effective config/approval report; not available in 0.17.10 or earlier), `--with-hooks` (OpenCode guard plugin plus Cursor / Codebuddy / Grok / Kimi / ZCode hook recipes), `--no-cursor-permissions`, `--scope=global|project` (Cursor; default global), `--project <dir>` (Cursor project root; default: cwd's git root).
+The command detects Claude Code, Cursor, Codex, Windsurf, Cline, Roo Code, Continue, **OpenCode**, **DeepSeek Harness (DSH)**, **Codebuddy**, **Grok Build**, **Kimi Code**, and **ZCode** on this machine, lets you multi-select which ones to configure, and **merges** Astrolabe into each client's config (it never wipes other servers). Defaults to `npx -y @zlnap/astrolabe` with the right `--context=` flag when the client has one (Codebuddy / Grok / Kimi / ZCode use the mild `default` context and omit `--context`). Useful flags: `--yes` (all detected), `--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`, `--dry-run`, `--native` (use `astrolabe` on PATH), `--list`, `--check-config` (read-only Cursor effective config/approval report; not available in 0.17.10 or earlier), `--remove-hooks` (strip legacy Astrolabe hooks only, preserving third-party hooks), `--no-cursor-permissions`, `--scope=global|project` (Cursor; default global), `--project <dir>` (Cursor project root; default: cwd's git root).
 
 **MCP tool short names** (what `tools/list` shows): `resolve_contx`, `search_code`, `find_symbol`, `find_refs`, `goto_def`, `get_diag`, `get_lang`. Legacy long names remain aliases on `tools/call`.
 
-- **Cursor (default `--scope=global`):** writes `~/.cursor/mcp.json` with the absolute native binary, `type: stdio`, and `env` containing `PATH`, `ASTROLABE_LSP_TIMEOUT=300`, plus `ASTROLABE_LSP_PYTHON` when `pyright-langserver` is found. Also runs `cursor-agent mcp enable astrolabe` in the current project directory as a best-effort step and removes a stale `astrolabe` entry from `mcp-disabled.json`. Cursor has no file-based global rules directory, so L1 guidance comes from the MCP instructions plus the global `~/.cursor/hooks.json` remind hook (enable with `--with-hooks`, absolute hook command, matchers `Shell|Read|Grep|astrolabe-.*` and the legacy `mcp__astrolabe__.*`). Existing other `mcpServers` entries are preserved; re-running is idempotent.
+- **Cursor (default `--scope=global`):** writes `~/.cursor/mcp.json` with the absolute native binary, `type: stdio`, and `env` containing `PATH`, `ASTROLABE_LSP_TIMEOUT=300`, plus `ASTROLABE_LSP_PYTHON` when `pyright-langserver` is found. Also runs `cursor-agent mcp enable astrolabe` in the current project directory as a best-effort step and removes a stale `astrolabe` entry from `mcp-disabled.json`. Cursor has no file-based global rules directory, so L1 guidance comes from the MCP instructions. Existing other `mcpServers` entries are preserved; re-running is idempotent.
 - **Cursor project scope (`--scope=project`):** writes the three-piece setup for the git root / `--project`: `<project>/.cursor/mcp.json` (absolute binary, `cwd` = project root, same `env`), `<project>/.cursor/rules/astrolabe.mdc` (`alwaysApply: true`, generated from the same L1 source as the MCP instructions), and approves that directory with `cursor-agent mcp enable astrolabe`.
-- **OpenCode:** merges into `~/.config/opencode/opencode.jsonc` (or `.json` / older `config.json`, or `~/.opencode/…` if that is what exists). Auto-detects V1 (`mcp.<name>` + `enabled`), V2 (`mcp.servers`), or Claude-like `mcpServers`. JSONC comments are preserved when the parent object already exists. Optional `--with-hooks` writes `~/.config/opencode/plugins/astrolabe-guard.ts`.
-- **DeepSeek Harness:** installs vendored `astrolabe-dsh-guard` into `~/.dsh/profiles/**/node_modules` and merges a managed block into `~/.dsh/cordis.patch.yml` without touching the `orca-managed-dsh-hooks` block. DSH MCP servers are per-repo in the UI — setup does not write them.
-- **Codebuddy:** MCP into `~/.codebuddy/.mcp.json` (or existing `mcp.json` / `~/.codebuddy.json`); optional `--with-hooks` merges CC-compatible hooks into `~/.codebuddy/settings.json` (PreToolUse + SessionEnd).
-- **Grok Build:** MCP into `~/.grok/config.toml` as `[mcp_servers.astrolabe]` (Codex-shaped); optional `--with-hooks` writes `~/.grok/hooks/astrolabe.json`.
-- **Kimi Code:** MCP into `~/.kimi-code/mcp.json`; optional `--with-hooks` appends managed `[[hooks]]` blocks in `~/.kimi-code/config.toml` (does not overwrite other hooks).
-- **ZCode:** MCP into `~/.zcode/cli/config.json` → `mcp.servers.astrolabe`; optional `--with-hooks` sets `hooks.enabled: true` and writes `hooks.events.PreToolUse` (**never** writes `SessionEnd`; **scrubs** any existing `Stop` → cleanup so counters are not zeroed each turn).
+- **OpenCode:** merges into `~/.config/opencode/opencode.jsonc` (or `.json` / older `config.json`, or `~/.opencode/…` if that is what exists). Auto-detects V1 (`mcp.<name>` + `enabled`), V2 (`mcp.servers`), or Claude-like `mcpServers`. JSONC comments are preserved when the parent object already exists.
+- **DeepSeek Harness:** DSH MCP servers are per-repo in the UI — `setup` does not write them, and removes any legacy `astrolabe-dsh-guard` entries from `~/.dsh/cordis.patch.yml` without touching `orca-managed-dsh-hooks`.
+- **Codebuddy:** MCP into `~/.codebuddy/.mcp.json` (or existing `mcp.json` / `~/.codebuddy.json`).
+- **Grok Build:** MCP into `~/.grok/config.toml` as `[mcp_servers.astrolabe]` (Codex-shaped).
+- **Kimi Code:** MCP into `~/.kimi-code/mcp.json`.
+- **ZCode:** MCP into `~/.zcode/cli/config.json` → `mcp.servers.astrolabe`.
 
 Cargo-only installs: `astrolabe setup` re-execs the same flow via `npx` when Node is available.
 
@@ -157,9 +157,9 @@ astrolabe setup --check-config --project "/path/to/my-project"
 
 It reports the effective file, Astrolabe command and arguments, project-over-global precedence, and current-config approval/disabled state. It does not install, download, write files, or approve MCP, and does not print the configuration's `env`. Only standard global/project files are inspected; managed or session overrides still need checking in the client. `current-config-not-approved` means no matching approval was found, not proof that a running session cannot use MCP. Check this before choosing which registration to update; a terminal version alone is not enough.
 
-Setup refreshes recognized launch paths, short tool-name allowlists, and hook commands, including both the `astrolabe-.*` and legacy `mcp__astrolabe__.*` Cursor matchers. It collapses recognized standalone Astrolabe hook duplicates, but leaves mixed groups containing third-party commands untouched.
+Setup refreshes recognized launch paths and short tool-name allowlists, and cleans up legacy Astrolabe hooks while leaving third-party hooks untouched.
 
-Cursor has no file-based global rules directory (User Rules live in the UI). Global L1 guidance therefore comes from the MCP `instructions` field plus the global `~/.cursor/hooks.json` remind hook, which `--with-hooks` registers with an absolute binary path and both the Cursor-native `astrolabe-.*` matcher and the legacy `mcp__astrolabe__.*` matcher. Recognized standalone Astrolabe hook duplicates are collapsed; mixed groups that also contain third-party commands are left untouched.
+Cursor has no file-based global rules directory (User Rules live in the UI). Global L1 guidance therefore comes from the MCP `instructions` field.
 
 To skip Cursor's per-tool MCP approval for the seven read-only tools, merge **short** entries `astrolabe:<tool>` into `~/.cursor/permissions.json` → `mcpAllowlist` (do not write `astrolabe:*`; Cursor Run Mode must be enabled). `astrolabe setup` and `node scripts/setup-cursor-permissions.mjs` write short catalog names only and **migrate** any leftover legacy long names in the allowlist to short ones (`--dry-run` to preview, `--cli` for `~/.cursor/cli-config.json`). Allowlist tools: `search_code`, `find_symbol`, `resolve_contx`, `get_diag`, `find_refs`, `goto_def`, `get_lang`. Legacy long names remain **call-time** aliases on `tools/call` only (forgotten client configs still work).
 
@@ -183,15 +183,15 @@ args = [".", "--context=codex"]
 
 One-shot setup above covers these. Manual path summary:
 
-| Client | MCP config | Hooks (optional; effect not benchmarked — see [HOOKS.md](HOOKS.md)) |
-|---|---|---|
-| Codebuddy | `~/.codebuddy/.mcp.json` (`mcpServers`) | `~/.codebuddy/settings.json` → `hooks` |
-| Grok Build | `~/.grok/config.toml` → `[mcp_servers.astrolabe]` | `~/.grok/hooks/astrolabe.json` |
-| Kimi Code | `~/.kimi-code/mcp.json` (`mcpServers`) | `~/.kimi-code/config.toml` → `[[hooks]]` |
-| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` | same file: `hooks.enabled` + `hooks.events` (no `SessionEnd`) |
-| OpenCode | `~/.config/opencode/opencode.jsonc` (V1/V2) | `--with-hooks` → `plugins/astrolabe-guard.ts` |
+| Client | MCP config |
+|---|---|
+| Codebuddy | `~/.codebuddy/.mcp.json` (`mcpServers`) |
+| Grok Build | `~/.grok/config.toml` → `[mcp_servers.astrolabe]` |
+| Kimi Code | `~/.kimi-code/mcp.json` (`mcpServers`) |
+| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` |
+| OpenCode | `~/.config/opencode/opencode.jsonc` (V1/V2) |
 
-Stdio server args are `["."]` with the mild `default` context (no `--context` unless the client needs one).
+Stdio server args are `["."]` with the mild `default` context (no `--context` unless the client needs one). Upgrading from an older version? Run `astrolabe setup --remove-hooks` (or `astrolabe setup`) to strip legacy Astrolabe hooks from these clients without affecting third-party hooks; see [HOOKS.md](HOOKS.md).
 
 ## 3. Environment variables and language servers
 

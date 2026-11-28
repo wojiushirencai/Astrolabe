@@ -5,12 +5,8 @@ const path = require('path');
 const {
   expandHome,
   readEnvDir,
-  hookCommand,
   isAstrolabeHookCommand,
 } = require('./cursor');
-
-const REMIND_ARGS = ['hooks', 'remind', '--client=zcode'];
-const REMIND_CMD = 'astrolabe hooks remind --client=zcode';
 
 function resolveZcodeConfigDir(home, env = process.env, configDir = null) {
   const explicit = expandHome(configDir, home);
@@ -71,79 +67,15 @@ function zcodeServerEntry(launch) {
   };
 }
 
-function preToolUseEntry(binPath = null, platform = process.platform) {
-  return {
-    matcher: '*',
-    hooks: [
-      {
-        type: 'command',
-        command: hookCommand(binPath, REMIND_ARGS, platform),
-        timeout: 10,
-      },
-    ],
-  };
-}
-
-function isAstrolabeRemindCommand(command, binPath = null, platform = process.platform) {
-  return isAstrolabeHookCommand(command, {
-    subcommands: ['remind'],
-    binPath,
-    platform,
-  });
-}
-
-function isAstrolabeCleanupCommand(command, binPath = null, platform = process.platform) {
-  return isAstrolabeHookCommand(command, {
-    subcommands: ['cleanup'],
-    binPath,
-    platform,
-  });
-}
-
-function entryIsSingleAstrolabeRemind(entry, binPath = null, platform = process.platform) {
-  if (!entry || typeof entry !== 'object') return false;
-  const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
-  if (hooks.length !== 1) return false;
-  return isAstrolabeRemindCommand(hooks[0] && hooks[0].command, binPath, platform);
-}
-
 /**
- * Strip cleanup hooks from a Stop entry; drop the entry if nothing remains.
- * Returns { entry | null, stripped }.
- */
-function scrubStopEntry(entry, binPath = null, platform = process.platform) {
-  if (!entry || typeof entry !== 'object') return { entry: null, stripped: false };
-  if (!entryHasCleanup(entry, binPath, platform)) return { entry, stripped: false };
-  const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
-  const kept = hooks.filter(
-    (h) => !isAstrolabeCleanupCommand(h && h.command, binPath, platform),
-  );
-  if (!kept.length) return { entry: null, stripped: true };
-  return { entry: { ...entry, hooks: kept }, stripped: true };
-}
-
-/**
- * True when a Stop (or similar) event entry hangs `astrolabe hooks cleanup`.
- * ZCode fires Stop at every turn end — cleanup there would wipe counters each turn.
- */
-function entryHasCleanup(entry, binPath = null, platform = process.platform) {
-  if (!entry || typeof entry !== 'object') return false;
-  const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
-  return hooks.some((h) => isAstrolabeCleanupCommand(h && h.command, binPath, platform));
-}
-
-/**
- * Merge mcp.servers.astrolabe and (optional) hooks.events.PreToolUse into
- * ~/.zcode/cli/config.json. Never writes SessionEnd; never hangs cleanup on Stop
- * (Stop is turn-end — use `astrolabe hooks gc`). Replaces any prior Astrolabe
- * remind (including wrong --client=claude-code).
+ * Merge mcp.servers.astrolabe into ~/.zcode/cli/config.json and always strip
+ * any legacy Astrolabe hooks from doc.hooks.events. Never installs hooks.
  */
 function mergeZcodeConfigFile(
   filePath,
   launch,
   {
     create = true,
-    withHooks = false,
     writeMcp = true,
     existsFn = fs.existsSync,
     binPath = null,
@@ -158,8 +90,8 @@ function mergeZcodeConfigFile(
     if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
       throw new Error(`${filePath} root must be a JSON object`);
     }
-  } else if (!create) {
-    return { skipped: true, reason: `missing ${filePath} (will not create)` };
+  } else if (!create || !writeMcp) {
+    return { skipped: true, reason: `missing ${filePath}` };
   } else {
     created = true;
   }
@@ -176,83 +108,81 @@ function mergeZcodeConfigFile(
     doc.mcp.servers.astrolabe = zcodeServerEntry(launch);
   }
 
-  let hooksReplaced = false;
-  if (withHooks) {
-    if (!doc.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) {
-      doc.hooks = {};
-    }
-    doc.hooks.enabled = true;
-    if (!doc.hooks.events || typeof doc.hooks.events !== 'object' || Array.isArray(doc.hooks.events)) {
-      doc.hooks.events = {};
-    }
-    // Hard rule: never SessionEnd (ZCode rejects unknown events).
-    if (Object.prototype.hasOwnProperty.call(doc.hooks.events, 'SessionEnd')) {
-      delete doc.hooks.events.SessionEnd;
-      hooksReplaced = true;
-    }
-    // Hard rule: never hang cleanup on Stop (fires every turn; would zero counters).
-    if (Array.isArray(doc.hooks.events.Stop)) {
-      const scrubbed = [];
-      for (const entry of doc.hooks.events.Stop) {
-        const { entry: next, stripped } = scrubStopEntry(entry, binPath, platform);
-        if (stripped) hooksReplaced = true;
-        if (next) scrubbed.push(next);
-      }
-      if (scrubbed.length) {
-        doc.hooks.events.Stop = scrubbed;
-      } else {
-        delete doc.hooks.events.Stop;
-      }
-    }
-    if (!Array.isArray(doc.hooks.events.PreToolUse)) {
-      doc.hooks.events.PreToolUse = [];
-    }
-    // Match any prior remind (wrong --client=claude-code, quoted, or .exe) and replace/dedupe.
-    const next = preToolUseEntry(binPath, platform);
-    let inserted = false;
-    const nextList = [];
-    for (const entry of doc.hooks.events.PreToolUse) {
-      if (entryIsSingleAstrolabeRemind(entry, binPath, platform)) {
-        if (!inserted) {
-          nextList.push(next);
-          inserted = true;
-        }
-        hooksReplaced = true;
-        continue;
-      }
-      if (entry && typeof entry === 'object' && Array.isArray(entry.hooks)) {
-        const filtered = entry.hooks.filter(
-          (h) => !isAstrolabeRemindCommand(h && h.command, binPath, platform),
-        );
-        if (filtered.length !== entry.hooks.length) {
-          hooksReplaced = true;
-          if (filtered.length > 0) {
-            nextList.push({ ...entry, hooks: filtered });
+  let hooksRemoved = false;
+  if (doc.hooks && typeof doc.hooks === 'object' && !Array.isArray(doc.hooks)) {
+    if (
+      doc.hooks.events &&
+      typeof doc.hooks.events === 'object' &&
+      !Array.isArray(doc.hooks.events)
+    ) {
+      for (const [eventName, entries] of Object.entries(doc.hooks.events)) {
+        if (!Array.isArray(entries)) continue;
+        const nextEntries = [];
+        let eventChanged = false;
+        for (const entry of entries) {
+          if (!entry || typeof entry !== 'object') {
+            nextEntries.push(entry);
+            continue;
           }
-          continue;
+          if (Array.isArray(entry.hooks)) {
+            const kept = entry.hooks.filter(
+              (h) => !(h && typeof h === 'object' && isAstrolabeHookCommand(h.command, { binPath, platform })),
+            );
+            if (kept.length !== entry.hooks.length) {
+              eventChanged = true;
+              hooksRemoved = true;
+              if (kept.length > 0) {
+                nextEntries.push({ ...entry, hooks: kept });
+              }
+              continue;
+            }
+          } else if (
+            typeof entry.command === 'string' &&
+            isAstrolabeHookCommand(entry.command, { binPath, platform })
+          ) {
+            eventChanged = true;
+            hooksRemoved = true;
+            continue;
+          }
+          nextEntries.push(entry);
+        }
+        if (eventChanged) {
+          if (nextEntries.length > 0) {
+            doc.hooks.events[eventName] = nextEntries;
+          } else {
+            delete doc.hooks.events[eventName];
+          }
         }
       }
-      nextList.push(entry);
+      if (hooksRemoved && Object.keys(doc.hooks.events).length === 0) {
+        delete doc.hooks.events;
+      }
     }
-    if (!inserted) {
-      nextList.push(next);
+    if (
+      hooksRemoved &&
+      !doc.hooks.events &&
+      (doc.hooks.enabled === undefined || doc.hooks.enabled === true) &&
+      Object.keys(doc.hooks).filter((k) => k !== 'enabled').length === 0
+    ) {
+      delete doc.hooks;
     }
-    doc.hooks.events.PreToolUse = nextList;
+  }
+
+  if (!writeMcp && !hooksRemoved) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
   }
 
   return {
     filePath,
     doc,
     created,
-    replaced: hadServer || hooksReplaced,
+    replaced: hadServer || hooksRemoved,
+    hooksRemoved,
     entry: writeMcp && doc.mcp && doc.mcp.servers ? doc.mcp.servers.astrolabe : undefined,
-    withHooks,
   };
 }
 
 module.exports = {
-  REMIND_ARGS,
-  REMIND_CMD,
   resolveZcodeConfigDir,
   detectZCode,
   resolveZcodeConfigPath,

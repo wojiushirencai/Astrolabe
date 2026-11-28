@@ -881,7 +881,7 @@ fn grouped_closure_line(hits: &[SearchHit], shown: usize, folded_tests: usize) -
         .unwrap_or_default();
     let fw = if files == 1 { "file" } else { "files" };
     format!(
-        "Summary: listed {shown}/{total} lines / {files} {fw}, incomplete: {narrow}or group=false then offset={shown} to page (grouped view cannot page via offset; or use exclude/aggregate).\n"
+        "Summary: listed {shown}/{total} lines / {files} {fw}, incomplete: {narrow}or page=true then offset={shown} to page (grouped view cannot page via offset; or use exclude/aggregate).\n"
     )
 }
 
@@ -1206,7 +1206,7 @@ fn next_step_hint(task: &str) -> &'static str {
             "Next: find_refs(symbol, dry_run_rename=new_name) for a per-file rename checklist; then run build/tests to verify (use get_diag only if you cannot).\n"
         }
         TaskKind::Count => {
-            "Next: search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) for N lines / M files per dir/file (per line; multiple hits on one line count as 1); add count_only=true for totals only.\n"
+            "Next: search_code(query, aggregate=top|dir|file, skip_comments=true, exclude=[…]) for N lines / M files per dir/file (per line; multiple hits on one line count as 1).\n"
         }
         TaskKind::Refs => {
             "Next: find_refs(symbol) for precise call sites; use goto_def for the definition.\n"
@@ -1386,7 +1386,7 @@ fn render_grouped_hits(
     }
     if stopped {
         out.push_str(
-            "(incomplete) remaining files omitted due to budget_tokens; narrow with path_filter/exclude or raise budget_tokens.\n",
+            "(incomplete) remaining files omitted due to budget_tokens; narrow with path_filter / exclude, or use page=true with offset.\n",
         );
     }
     (out, shown, folded_tests)
@@ -1691,7 +1691,7 @@ fn render_search_page_status_narrow(
         let next = offset + shown;
         if shown == 0 {
             status.push_str(&format!(
-                "Not the full set: of the remaining {omitted}, the first result alone exceeds budget_tokens={budget_tokens} and was omitted. Raise budget_tokens or tighten path_filter and retry.\n"
+                "Not the full set: of the remaining {omitted}, the first result alone exceeds budget_tokens={budget_tokens} and was omitted. Tighten path_filter / exclude or advance offset and retry.\n"
             ));
         } else {
             let lead = narrow
@@ -1825,10 +1825,6 @@ fn build_wait_budget_from_env() -> std::time::Duration {
     parse_build_wait_ms(std::env::var("ASTROLABE_BUILD_WAIT_MS").ok().as_deref())
 }
 
-fn is_cursor_context(name: &str) -> bool {
-    name == "cursor" || name.starts_with("cursor")
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct BudgetOnly {
     #[serde(default)]
@@ -1854,7 +1850,7 @@ pub(crate) struct ResolveContextParams {
         description = "Absolute or cwd-relative directory to index for this call; omit for the startup root."
     )]
     pub index_root: Option<String>,
-    #[schemars(description = "Task.")]
+    #[schemars(description = "Brief task summary or keywords to rank related files and symbols.")]
     pub task_description: String,
     #[serde(default = "default_budget")]
     #[schemars(description = "Token budget.")]
@@ -1928,14 +1924,14 @@ pub(crate) struct QueryParams {
     pub budget_tokens: usize,
     /// 0 起始的翻页偏移（与 search_code 一致）。
     #[serde(default)]
-    #[schemars(description = "0-based match offset for pagination (see next_offset in result).")]
+    #[schemars(description = "0-based match offset for pagination.")]
     pub offset: usize,
     /// Default true: reference a definition body already returned this session
     /// for the current *known* agent. Pass false to refetch the full body.
     /// When agent identity is missing, bodies are always resent (no shared shard).
     #[serde(default)]
     #[schemars(
-        description = "Default true: reference a definition body already returned this session for this agent; false to refetch. No-op when agent identity is missing."
+        description = "Default true: reference a body already returned this session; false to refetch."
     )]
     #[serde(deserialize_with = "crate::server::bool_compat::optional")]
     #[schemars(with = "Option<bool>")]
@@ -1988,7 +1984,7 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Search string (literal; regex when regex=true).")]
     pub query: String,
     #[serde(default)]
-    #[schemars(description = "Default false. Set true to treat query as a regular expression.")]
+    #[schemars(description = "Set true to treat query as a regex (default false).")]
     #[serde(deserialize_with = "crate::server::bool_compat::required")]
     #[schemars(with = "bool")]
     pub regex: bool,
@@ -2004,7 +2000,7 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
     #[serde(default)]
-    #[schemars(description = "0-based match offset for pagination (see next_offset in result).")]
+    #[schemars(description = "0-based match offset for pagination.")]
     pub offset: usize,
     #[serde(default)]
     #[schemars(
@@ -2036,7 +2032,7 @@ pub(crate) struct SearchParams {
     #[schemars(description = "top|dir|file: hit/file counts per dir or file + total.")]
     pub aggregate: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Skip paths; bare name=segment: [\"vendor\",\"_test.go\"]")]
+    #[schemars(description = "Skip paths; bare name=segment: [\"vendor\",\"_test.go\"].")]
     pub exclude: Option<Vec<String>>,
     #[serde(default)]
     #[schemars(description = "Include-only glob; e.g. `*.rs` matches at any depth.")]
@@ -2174,14 +2170,6 @@ type AgentSentRanges = HashMap<String, HashMap<String, (u64, u64)>>;
 /// Per-agent map of already-returned search/resolve digests (agent → result key → digest).
 type AgentSearchDigests = HashMap<String, HashMap<String, String>>;
 
-struct LiveLockGuard(#[allow(dead_code)] crate::hooks::CursorLiveLock);
-
-impl std::fmt::Debug for LiveLockGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveLockGuard").finish_non_exhaustive()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AstrolabeServer {
     /// Parent (multi) or the single index root. Memory tools use this;
@@ -2231,9 +2219,6 @@ pub struct AstrolabeServer {
     always_load: bool,
     /// Optional per-instance override for `ASTROLABE_BUILD_WAIT_MS` (tests).
     build_wait_budget: Option<std::time::Duration>,
-    /// Kernel live lock held while serving a Cursor MCP session so hooks can
-    /// verify the server process is alive; released automatically on drop.
-    _cursor_live_lock: Option<Arc<LiveLockGuard>>,
 }
 
 impl AstrolabeServer {
@@ -2259,18 +2244,10 @@ impl AstrolabeServer {
         budget_bytes: u64,
         context: ClientContext,
     ) -> Self {
-        Self::assemble(
-            root,
-            budget_bytes,
-            context,
-            McpKnobs::from_env(),
-            None,
-            true,
-        )
+        Self::assemble(root, budget_bytes, context, McpKnobs::from_env(), None)
     }
 
-    /// Catalog-only stand-in used by [`StartupFailedServer`]: never indexed
-    /// and never acquires a project live lock on `temp_dir()`.
+    /// Catalog-only stand-in used by [`StartupFailedServer`]: never indexed.
     fn new_placeholder(root: PathBuf, context: ClientContext) -> Self {
         Self::assemble(
             root,
@@ -2278,7 +2255,6 @@ impl AstrolabeServer {
             context,
             McpKnobs::from_env(),
             None,
-            false,
         )
     }
 
@@ -2304,7 +2280,7 @@ impl AstrolabeServer {
             tracing::info!(child = %child.display(), "multi-project child");
         }
         let dispatch = DispatchState::new(children, knobs.clone(), budget);
-        Self::assemble(root, budget, context, knobs, Some(dispatch), true)
+        Self::assemble(root, budget, context, knobs, Some(dispatch))
     }
 
     #[cfg(test)]
@@ -2325,7 +2301,6 @@ impl AstrolabeServer {
             ClientContext::default_builtin(),
             knobs,
             Some(dispatch),
-            true,
         )
     }
 
@@ -2337,7 +2312,6 @@ impl AstrolabeServer {
             ClientContext::default_builtin(),
             knobs,
             None,
-            true,
         )
     }
 
@@ -2359,22 +2333,15 @@ impl AstrolabeServer {
         context: ClientContext,
         knobs: McpKnobs,
         dispatch: Option<Arc<DispatchState>>,
-        acquire_live_lock: bool,
     ) -> Self {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let structured_output = structured_output_for(&context);
         let always_load = always_load_enabled();
-        let cursor_live_lock = if acquire_live_lock && is_cursor_context(&context.name) {
-            crate::hooks::acquire_cursor_live_lock(&root).map(|lock| Arc::new(LiveLockGuard(lock)))
-        } else {
-            None
-        };
         tracing::info!(
             root = %root.display(),
             context = %context.name,
             structured_output,
             always_load,
-            cursor_live_lock = cursor_live_lock.is_some(),
             cache_budget_bytes = budget_bytes,
             "configured bounded file cache"
         );
@@ -2409,7 +2376,6 @@ impl AstrolabeServer {
             recent_symbols: Arc::new(crate::recent_symbol::RecentSymbols::new()),
             always_load,
             build_wait_budget: None,
-            _cursor_live_lock: cursor_live_lock,
         }
     }
 
@@ -3448,22 +3414,13 @@ confidence: unknown"
 /// result's next_offset). `ASTROLABE_FULL_SCHEMA=1` advertises them all.
 const UNADVERTISED_PARAMS: &[&str] = &[
     "budget_tokens",
-    "offset",
-    "page",
     "depth",
-    "kind",
-    "substring",
-    "dedup",
     "agent_id",
     "context_lines",
     "count_only",
-    "exclude",
     "group",
-    "regex",
-    "dry_run_rename",
     "character",
     "severity",
-    "lsp",
 ];
 
 fn full_schema_requested() -> bool {
@@ -3929,7 +3886,9 @@ fn format_find_symbol_unindexed_hint(
 
 #[tool_router]
 impl AstrolabeServer {
-    #[tool(description = "When the task is unclear: task-ranked related files and symbols.")]
+    #[tool(
+        description = "Start here for unfamiliar areas or multi-file tasks: ranks entry files and key symbols via the import graph in one call, replacing blind Glob/Grep sweeps. Pass path_filter to scope to a directory."
+    )]
     pub(crate) fn resolve_contx(
         &self,
         Parameters(params): Parameters<ResolveContextParams>,
@@ -4192,7 +4151,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Locate symbols by name or hierarchical path; returns signatures, path:line anchors, and definition bodies (include_body defaults true; indexed languages). Put the symbol name (or Class/method) in query; use path_filter for file scope. Outline: query='*' + path_filter. Do not put file paths in query."
+        description = "Locate symbol definitions and read exact bodies in one call without full-file Read (returns signatures, path:line anchors, and source bodies; include_body defaults true; indexed languages). Put symbol name or 'Class/method' in query + path_filter for file scope; for a file outline use query='*' + path_filter (do not put file paths in query). Filter with kind or substring=true."
     )]
     pub(crate) fn find_symbol(
         &self,
@@ -4554,7 +4513,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Exhaustive code & text search: literal, case-sensitive only if query has uppercase (regex=true for regex); hits come with context, wide hits grouped per file; other text files tagged [text-only]. count: aggregate=top|dir|file gives matching lines / files per dir + total; add skip_comments, exclude=[\"_test.go\",\"vendor\"]."
+        description = "Exhaustive indexed code & text search with context and auto per-file grouping (prefer over Grep for literals, strings, config keys, and counts; other text files tagged [text-only]). Literal by default, case-sensitive only if query has uppercase (set regex=true for regex). Count with aggregate=top|dir|file; filter with path_filter, glob, skip_comments, exclude=[\"_test.go\",\"vendor\"]; page wide results with page=true and offset."
     )]
     pub(crate) fn search_code(
         &self,
@@ -5674,7 +5633,7 @@ impl AstrolabeServer {
     }
 
     #[tool(
-        description = "Language distribution, code size, LSP readiness (Ready/needs_install/AST-only), index gaps, and files with syntax errors."
+        description = "Language distribution, code size, unindexed file types, LSP readiness (Ready/needs_install/AST-only), index gaps, and files with syntax errors. Call when searches return unexpectedly empty or LSP tools report unavailable."
     )]
     pub(crate) fn get_lang(&self, Parameters(params): Parameters<BudgetOnly>) -> CallToolResult {
         let route = match self.resolve_call_root(
@@ -5906,7 +5865,7 @@ impl ServerHandler for AstrolabeServer {
                 let secs = timeout.map(|d| d.as_secs()).unwrap_or_default();
                 Ok(self
                     .finish(text_error(format!(
-                        "{tool_name} did not finish within {secs}s; gave up waiting. Narrow the scope (path_filter / aggregate / count_only) and retry;\
+                        "{tool_name} did not finish within {secs}s; gave up waiting. Narrow the scope (path_filter / aggregate) and retry;\
                          adjust ASTROLABE_TOOL_TIMEOUT_SECS if needed. confidence: unknown"
                     )))
                     .into())
@@ -7315,9 +7274,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.to_ascii_lowercase().contains("raise budget_tokens"),
+            !text.to_ascii_lowercase().contains("raise budget_tokens"),
             "{text}"
         );
+        assert!(text.contains("path_filter"), "{text}");
         // 一条都没展示时，正文绝不能出现匹配行内容本身。
         assert!(!text.contains("@hits.py:1 "), "{text}");
 
@@ -7626,7 +7586,7 @@ mod tests {
         assert!(text.contains("incomplete"), "{text}");
         assert!(text.contains("cannot page via offset"), "{text}");
         assert!(
-            !text.contains("offset=") || text.contains("group=false then offset="),
+            !text.contains("offset=") || text.contains("page=true then offset="),
             "{text}"
         );
         // offset > 0 with group=true falls back to ordinary paging.
@@ -9126,7 +9086,7 @@ mod tests {
         };
         let search_code = desc("search_code");
         assert!(
-            search_code.contains("Exhaustive code & text search"),
+            search_code.contains("Exhaustive indexed code & text search"),
             "{search_code}"
         );
         assert!(
@@ -10139,9 +10099,10 @@ mod tests {
         assert!(text.contains("truncated=true"), "{text}");
         assert!(text.contains("Not the full set"), "{text}");
         assert!(
-            text.to_ascii_lowercase().contains("raise budget_tokens"),
+            !text.to_ascii_lowercase().contains("raise budget_tokens"),
             "{text}"
         );
+        assert!(text.contains("path_filter"), "{text}");
         assert!(!text.contains("regex=false; searched literally"), "{text}");
         let structured = result.structured_content.expect("opt-in structured");
         assert_eq!(structured["truncated"], json!(true));
@@ -10166,16 +10127,15 @@ mod tests {
             .pointer("/properties/path_filter/description")
             .unwrap();
         let tool_desc = search.description.as_deref().unwrap_or("");
-        // `regex` is accepted but not advertised; query and tool descriptions
-        // still name it.
-        assert!(schema.pointer("/properties/regex").is_none());
+        // `regex` and `offset` are advertised; `budget_tokens` remains hidden.
+        assert!(schema.pointer("/properties/regex").is_some());
         assert!(query.as_str().unwrap().contains("regex=true"), "{query}");
         assert!(
             path_filter.as_str().unwrap().contains("case-sensitive"),
             "{path_filter}"
         );
         assert!(schema.pointer("/properties/budget_tokens").is_none());
-        assert!(schema.pointer("/properties/offset").is_none());
+        assert!(schema.pointer("/properties/offset").is_some());
         assert!(tool_desc.contains("regex=true"), "{tool_desc}");
         assert!(!tool_desc.contains("offset=next_offset"), "{tool_desc}");
     }
@@ -13098,27 +13058,29 @@ mod mcp_routing_tests {
             assert!(!required.iter().any(|r| r == "root"), "{}", tool.name);
         }
         // Compact JSON of the whole `tools` array. v0.13.0 shipped 7,535 B,
-        // v0.15.0 7,3xx B; hiding never-used parameters halves it.
+        // v0.15.0 7,3xx B; restoring 9 advertised params + upgraded L3
+        // descriptions puts it at ~7,656 B (still under 8,000 B).
         let bytes = serde_json::to_vec(&tools).unwrap().len();
         assert!(
             bytes <= TOOLS_LIST_MAX_BYTES,
             "tools/list is {bytes} B, limit {TOOLS_LIST_MAX_BYTES} B (v0.15.0: ~7,300 B)"
         );
-        // Strip `_meta` and guard the pure Schema + Description footprint at <= 5,200 B.
+        // Strip `_meta` and guard the pure Schema + Description footprint.
         let mut stripped = tools.clone();
         for tool in &mut stripped {
             tool.meta = None;
         }
         let stripped_bytes = serde_json::to_vec(&stripped).unwrap().len();
         assert!(
-            stripped_bytes <= 5_200,
-            "tools/list without _meta is {stripped_bytes} B, limit 5200 B"
+            stripped_bytes <= TOOLS_LIST_STRIPPED_MAX_BYTES,
+            "tools/list without _meta is {stripped_bytes} B, limit {TOOLS_LIST_STRIPPED_MAX_BYTES} B"
         );
     }
 
-    /// Upper bound for the compact `tools` array (+252 B from 7 × `_meta["anthropic/alwaysLoad"]`).
-    /// Raise only with a reason.
-    const TOOLS_LIST_MAX_BYTES: usize = 5_600;
+    /// Upper bound for the compact `tools` array (+266 B from 7 × `_meta["anthropic/alwaysLoad"]`),
+    /// raised from 5,600 B after restoring 9 advertised params and upgrading L3 descriptions.
+    const TOOLS_LIST_MAX_BYTES: usize = 8_000;
+    const TOOLS_LIST_STRIPPED_MAX_BYTES: usize = 7_700;
 
     /// Snapshot of the advertised parameters. Everything else is still
     /// accepted (see `unadvertised_params_are_still_accepted`); add a name
@@ -13156,28 +13118,50 @@ mod mcp_routing_tests {
         let want = vec![
             (
                 "find_refs".to_string(),
-                s(&["index_root", "line", "path", "symbol"]),
+                s(&[
+                    "dry_run_rename",
+                    "index_root",
+                    "line",
+                    "offset",
+                    "path",
+                    "symbol",
+                ]),
                 s(&["symbol"]),
             ),
             (
                 "find_symbol".to_string(),
-                s(&["include_body", "index_root", "path_filter", "query"]),
+                s(&[
+                    "dedup",
+                    "include_body",
+                    "index_root",
+                    "kind",
+                    "offset",
+                    "path_filter",
+                    "query",
+                    "substring",
+                ]),
                 s(&["query"]),
             ),
             (
                 "get_diag".to_string(),
-                s(&["index_root", "path"]),
+                s(&["index_root", "lsp", "path"]),
                 s(&["path"]),
             ),
             ("get_lang".to_string(), s(&["index_root"]), s(&[])),
             (
                 "goto_def".to_string(),
-                s(&["index_root", "line", "path", "symbol"]),
+                s(&["index_root", "line", "offset", "path", "symbol"]),
                 s(&["path"]),
             ),
             (
                 "resolve_contx".to_string(),
-                s(&["index_root", "path_filter", "task_description"]),
+                s(&[
+                    "dedup",
+                    "index_root",
+                    "offset",
+                    "path_filter",
+                    "task_description",
+                ]),
                 s(&["task_description"]),
             ),
             (
@@ -13185,10 +13169,15 @@ mod mcp_routing_tests {
                 s(&[
                     "aggregate",
                     "case_sensitive",
+                    "dedup",
+                    "exclude",
                     "glob",
                     "index_root",
+                    "offset",
+                    "page",
                     "path_filter",
                     "query",
+                    "regex",
                     "skip_comments",
                 ]),
                 s(&["query"]),
@@ -13216,6 +13205,230 @@ mod mcp_routing_tests {
             );
         }
         multi.stop_watching();
+    }
+
+    /// Schema 与提示词零分裂护栏单测：
+    /// 1) 默认模式 tools/list 不得暴露隐藏参数，且每个工具描述中的 `<ident>=`
+    ///    参数名必须存在于该工具实际 advertised 的 `input_schema["properties"]`。
+    /// 2) 工具描述、L1 `connection_instructions`（claude-code / cursor）、
+    ///    以及 `next_step_hint`（所有 TaskKind 样本）中不得以 `param=` 或独立
+    ///    标识符形式出现任何仍隐藏的 `UNADVERTISED_PARAMS` 名称。
+    #[test]
+    fn schema_and_prompts_have_zero_split() {
+        fn contains_ident_token(haystack: &str, needle: &str) -> bool {
+            let mut start = None;
+            for (i, ch) in haystack.char_indices() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                } else if let Some(s) = start.take() {
+                    if &haystack[s..i] == needle {
+                        return true;
+                    }
+                }
+            }
+            if let Some(s) = start {
+                if &haystack[s..] == needle {
+                    return true;
+                }
+            }
+            false
+        }
+
+        assert!(
+            !full_schema_requested(),
+            "schema_and_prompts_have_zero_split must run in default (non-ASTROLABE_FULL_SCHEMA) mode"
+        );
+        let root = tmp("zero_split");
+        let server = AstrolabeServer::new(root.clone());
+        let tools = server.listed_tools();
+        let ident_assign = regex::Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)=").unwrap();
+        let mut all_advertised_props: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+
+        for tool in &tools {
+            let prop_map = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object);
+            let props: std::collections::HashSet<&str> = prop_map
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            all_advertised_props.extend(props.iter().copied());
+            let desc = tool.description.as_deref().unwrap_or("");
+
+            for hidden in UNADVERTISED_PARAMS {
+                assert!(
+                    !props.contains(hidden),
+                    "tool `{}` unexpectedly advertises hidden param `{hidden}`",
+                    tool.name
+                );
+                assert!(
+                    !contains_ident_token(desc, hidden),
+                    "tool `{}` description mentions hidden param `{hidden}`: {desc}",
+                    tool.name
+                );
+                if let Some(map) = prop_map {
+                    for (prop_name, prop_schema) in map {
+                        if let Some(prop_desc) =
+                            prop_schema.get("description").and_then(Value::as_str)
+                        {
+                            let mentions_hidden = prop_desc.contains(&format!("{hidden}="))
+                                || prop_desc.contains(&format!("`{hidden}`"))
+                                || (hidden.contains('_')
+                                    && contains_ident_token(prop_desc, hidden));
+                            assert!(
+                                !mentions_hidden,
+                                "tool `{}` property `{prop_name}` description mentions hidden param `{hidden}`: {prop_desc}",
+                                tool.name
+                            );
+                        }
+                    }
+                }
+            }
+
+            for cap in ident_assign.captures_iter(desc) {
+                let m = cap.get(0).unwrap();
+                if desc[m.end()..].starts_with('=') {
+                    continue;
+                }
+                let ident = cap.get(1).unwrap().as_str();
+                assert!(
+                    props.contains(ident),
+                    "tool `{}` description references `{ident}=`, which is missing from advertised properties {:?}",
+                    tool.name,
+                    props
+                );
+            }
+        }
+
+        for ctx in ["claude-code", "cursor"] {
+            let l1 = crate::instructions::connection_instructions(ctx, &root);
+            for hidden in UNADVERTISED_PARAMS {
+                assert!(
+                    !contains_ident_token(&l1, hidden),
+                    "L1 connection_instructions({ctx}) mentions hidden param `{hidden}`: {l1}"
+                );
+            }
+        }
+
+        for (label, text) in [
+            (
+                "manual(claude-code)",
+                crate::instructions::manual("claude-code"),
+            ),
+            ("manual(default)", crate::instructions::manual("default")),
+            (
+                "cc_system_prompt_override",
+                crate::instructions::cc_system_prompt_override(),
+            ),
+        ] {
+            for hidden in UNADVERTISED_PARAMS {
+                assert!(
+                    !contains_ident_token(text, hidden),
+                    "L2 {label} mentions hidden param `{hidden}`"
+                );
+            }
+        }
+
+        let task_samples = [
+            ("rename Foo to Bar", TaskKind::Rename),
+            ("count calls per directory", TaskKind::Count),
+            ("who calls parse", TaskKind::Refs),
+            ("add a flag", TaskKind::Other),
+        ];
+        for (task, expected_kind) in task_samples {
+            assert_eq!(
+                classify_task(task),
+                expected_kind,
+                "classify_task({task:?}) mismatch"
+            );
+            let hint = next_step_hint(task);
+            for hidden in UNADVERTISED_PARAMS {
+                assert!(
+                    !contains_ident_token(hint, hidden),
+                    "next_step_hint({task:?}) mentions hidden param `{hidden}`: {hint}"
+                );
+            }
+            for cap in ident_assign.captures_iter(hint) {
+                let m = cap.get(0).unwrap();
+                if hint[m.end()..].starts_with('=') {
+                    continue;
+                }
+                let ident = cap.get(1).unwrap().as_str();
+                assert!(
+                    all_advertised_props.contains(ident),
+                    "next_step_hint({task:?}) references `{ident}=`, which is missing from advertised properties {all_advertised_props:?}"
+                );
+            }
+        }
+
+        let mut guard = crate::loop_guard::LoopGuard::new(crate::loop_guard::LoopGuardConfig {
+            repeat_max: 1,
+            rate_max: 1,
+            ..Default::default()
+        });
+        let now = std::time::Instant::now();
+        guard.record_at("search_code", "sig-a", 1, "res".to_string(), now);
+        let block_note = match guard.check_at("search_code", "sig-a", 1, now) {
+            crate::loop_guard::Verdict::Block { note, .. } => note,
+            other => panic!("expected Block verdict, got {other:?}"),
+        };
+        let rate_warn = match guard.check_at("search_code", "sig-b", 1, now) {
+            crate::loop_guard::Verdict::RunWithWarning(warn) => warn,
+            other => panic!("expected RunWithWarning verdict, got {other:?}"),
+        };
+
+        let synthetic_hits: Vec<SearchHit> = (1..=7)
+            .map(|i| SearchHit {
+                path: if i <= 4 {
+                    "src/a.rs".to_string()
+                } else {
+                    "src/b.rs".to_string()
+                },
+                line: i,
+                text: format!("hit {i}"),
+                text_only: false,
+            })
+            .collect();
+        let grouped_incomplete = grouped_closure_line(&synthetic_hits, 5, 0);
+        let grouped_folded = grouped_closure_line(&synthetic_hits, 5, 2);
+
+        for (label, text) in [
+            ("COORD_NOTE", crate::precise_tools::COORD_NOTE),
+            ("REF_COORD_NOTE", crate::precise_tools::REF_COORD_NOTE),
+            ("loop_guard_block_note", block_note.as_str()),
+            ("loop_guard_rate_warn", rate_warn.as_str()),
+            (
+                "grouped_closure_line(incomplete)",
+                grouped_incomplete.as_str(),
+            ),
+            (
+                "grouped_closure_line(folded_tests)",
+                grouped_folded.as_str(),
+            ),
+        ] {
+            for hidden in UNADVERTISED_PARAMS {
+                assert!(
+                    !contains_ident_token(text, hidden),
+                    "{label} mentions hidden param `{hidden}`: {text}"
+                );
+            }
+            for cap in ident_assign.captures_iter(text) {
+                let m = cap.get(0).unwrap();
+                if text[m.end()..].starts_with('=') {
+                    continue;
+                }
+                let ident = cap.get(1).unwrap().as_str();
+                assert!(
+                    all_advertised_props.contains(ident),
+                    "{label} references `{ident}=`, which is missing from advertised properties {all_advertised_props:?}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -13607,36 +13820,6 @@ mod mcp_routing_tests {
             elapsed < Duration::from_millis(500),
             "cancel did not interrupt with_index_barrier promptly: {elapsed:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cursor_context_acquires_live_lock_and_placeholder_skips_it() {
-        let dir = tmp("cursor_lock");
-        let cursor_ctx = crate::ClientContext::builtin("cursor").unwrap();
-
-        let default_server = AstrolabeServer::new(dir.clone());
-        assert!(default_server._cursor_live_lock.is_none());
-
-        let failed = StartupFailedServer::new("bad root", cursor_ctx.clone());
-        assert!(failed.inner._cursor_live_lock.is_none());
-
-        let cursor_server = AstrolabeServer::with_context(dir.clone(), cursor_ctx);
-        if let Some(lock_path) = crate::hooks::cursor_live_lock_path(&dir) {
-            assert!(cursor_server._cursor_live_lock.is_some());
-            assert_eq!(crate::hooks::is_cursor_live_lock_held(&dir), Some(true));
-            drop(cursor_server);
-            // A parallel test spawning a subprocess (`fork` before `exec`) may briefly
-            // retain an `O_CLOEXEC` fd copy across the drop; wait briefly for release.
-            let deadline = std::time::Instant::now() + Duration::from_millis(200);
-            let mut released = crate::hooks::is_cursor_live_lock_held(&dir);
-            while released == Some(true) && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-                released = crate::hooks::is_cursor_live_lock_held(&dir);
-            }
-            assert_eq!(released, Some(false));
-            let _ = std::fs::remove_file(lock_path);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

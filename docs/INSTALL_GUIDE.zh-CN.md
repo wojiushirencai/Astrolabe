@@ -48,12 +48,12 @@ tar -xzf astrolabe-$V-$T.tar.gz && install -m 0755 astrolabe ~/.local/bin/astrol
 ```powershell
 # 推荐 npm（自动拉对应平台包）：
 npm i -g @zlnap/astrolabe
-# 然后必须跑 setup（加 --with-hooks，否则智能体往往不会真正调用工具）：
-npx -y @zlnap/astrolabe setup --with-hooks
-# 或：astrolabe setup --with-hooks
+# 然后必须跑 setup（写入 MCP 配置）：
+npx -y @zlnap/astrolabe setup
+# 或：astrolabe setup
 ```
 
-也可从 [Releases](https://github.com/wojiushirencai/Astrolabe/releases) 下载 `astrolabe-<版本>-x86_64-pc-windows-msvc.zip`，用 `Get-FileHash -Algorithm SHA256` 对照 `SHA256SUMS`，解压 `astrolabe.exe` 到固定目录并加入 `PATH`，然后同样执行 `astrolabe setup --with-hooks`。
+也可从 [Releases](https://github.com/wojiushirencai/Astrolabe/releases) 下载 `astrolabe-<版本>-x86_64-pc-windows-msvc.zip`，用 `Get-FileHash -Algorithm SHA256` 对照 `SHA256SUMS`，解压 `astrolabe.exe` 到固定目录并加入 `PATH`，然后同样执行 `astrolabe setup`。
 
 **Windows 稳定性（真机验证，v0.17.4–v0.17.5）：** #117 统一 `\?\` 与普通 `C:\`（watcher 归属 / 比较），状态文案去掉 `\?\`；子目录 `index_root` 复用已 Ready 的父索引并带 path_filter（不再另开冷索引）。#119 把 Windows 的 `path_filter`（反斜杠 / 绝对路径）归一成仓库相对 `/` 路径。尽量不传 `index_root`，或只传**仓库根**。
 
@@ -64,10 +64,10 @@ npm 包名为 **`@zlnap/astrolabe`**（二进制名仍是 `astrolabe`），平�
 ```bash
 npm i -g @zlnap/astrolabe          # 或：npx -y @zlnap/astrolabe --version
 # 每次新装 / 升级后都必须：
-npx -y @zlnap/astrolabe setup --with-hooks
+npx -y @zlnap/astrolabe setup
 ```
 
-**为什么一定要 `setup`：** `npm i` 只放下二进制 shim。不跑 `astrolabe setup`，就不会写入任何客户端的 MCP 配置。不加 hooks（在支持的客户端上用 `--with-hooks`），很多智能体仍会用 Grep/Read，等于没用上 Astrolabe。`setup` 会探测 Claude Code、Cursor、Codex、Windsurf、Cline、Roo、Continue、OpenCode、DeepSeek Harness、Codebuddy、Grok Build、Kimi Code、ZCode，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。
+**为什么一定要 `setup`：** `npm i` 只放下二进制 shim。不跑 `astrolabe setup`，就不会写入任何客户端的 MCP 配置。从旧版升级时，重新运行 `astrolabe setup`（或 `astrolabe setup --remove-hooks`）会自动清理遗留的 Astrolabe hooks，并保留你的其它第三方 hooks。`setup` 会探测 Claude Code、Cursor、Codex、Windsurf、Cline、Roo、Continue、OpenCode、DeepSeek Harness、Codebuddy、Grok Build、Kimi Code、ZCode，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。
 
 ### 方式 5：从源码编译（Rust 1.90+）
 
@@ -76,7 +76,7 @@ git clone https://github.com/wojiushirencai/Astrolabe.git && cd Astrolabe
 cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 ```
 
-验证：`astrolabe --version`，然后执行 `npx -y @zlnap/astrolabe setup --with-hooks`（或 `astrolabe setup --with-hooks`），再重启客户端以加载 MCP + hooks。
+验证：`astrolabe --version`，然后执行 `npx -y @zlnap/astrolabe setup`（或 `astrolabe setup`），再重启客户端以加载 MCP。
 
 ---
 
@@ -87,25 +87,25 @@ cargo build --release --bin astrolabe     # 产物 target/release/astrolabe
 装好二进制或 npm 包后（或直接用 `npx`）运行：
 
 ```bash
-npx -y @zlnap/astrolabe setup --with-hooks
+npx -y @zlnap/astrolabe setup
 # 非交互：
-npx -y @zlnap/astrolabe setup --yes --with-hooks
+npx -y @zlnap/astrolabe setup --yes
 ```
 
-**只安装不跑 `setup`，等于客户端根本不会调用 Astrolabe。** `--with-hooks` 会写入防漂移 Hook，推动智能体少用 Grep/Read、多用 Astrolabe；只有你明确只要 MCP、不要 Hook 时才省略。
+**只安装不跑 `setup`，等于客户端根本不会调用 Astrolabe。** 防漂移 Hook 已移除，现通过内置意图路由提示词引导调用；旧版升级后运行 `setup`（或 `astrolabe setup --remove-hooks`）会自动清理遗留的 Astrolabe hooks，且不触碰第三方 hooks（详见 [HOOKS.md](HOOKS.md)）。
 
-会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--check-config`（只读检查 Cursor 实际生效的配置和审批，0.17.10 及更早版本没有这个参数）、`--with-hooks`（安装 OpenCode 守卫插件，以及 Cursor / Codebuddy / Grok / Kimi / ZCode 的 hooks 配方）、`--no-cursor-permissions`、`--scope=global|project`（Cursor，默认 global）、`--project <dir>`（Cursor 项目根，默认取 cwd 的 git 根）。
+会探测本机的 Claude Code、Cursor、Codex、Windsurf、Cline、Roo Code、Continue、**OpenCode**、**DeepSeek Harness（DSH）**、**Codebuddy**、**Grok Build**、**Kimi Code**、**ZCode**，交互多选要写入的客户端，并把 Astrolabe **合并**进各自配置（不会清空其它 server）。默认启动命令为 `npx -y @zlnap/astrolabe`，有 `--context=` 的客户端会带上（上述四者走 `default` 温和级，不写 `--context`）。常用参数：`--yes`、`--clients=cursor,claude-code,opencode,dsh,codebuddy,grok,kimicode,zcode`、`--dry-run`、`--native`、`--list`、`--check-config`（只读检查 Cursor 实际生效的配置和审批，0.17.10 及更早版本没有这个参数）、`--remove-hooks`（仅清理遗留的 Astrolabe hooks，保留其它第三方 hooks）、`--no-cursor-permissions`、`--scope=global|project`（Cursor，默认 global）、`--project <dir>`（Cursor 项目根，默认取 cwd 的 git 根）。
 
 **MCP 工具短名**（`tools/list` 声明）：`resolve_contx`、`search_code`、`find_symbol`、`find_refs`、`goto_def`、`get_diag`、`get_lang`。旧长名在 `tools/call` 上仍是别名。
 
-- **Cursor（默认 `--scope=global`）：** 写 `~/.cursor/mcp.json`，command 用原生二进制绝对路径，`type: stdio`，`env` 带 `PATH`、`ASTROLABE_LSP_TIMEOUT=300`，探测到 `pyright-langserver` 时写 `ASTROLABE_LSP_PYTHON`。同时在当前项目目录尽力执行一次 `cursor-agent mcp enable astrolabe`，并把 `astrolabe` 从 `mcp-disabled.json` 移除。Cursor 没有基于文件的全局 rules 目录，L1 引导来自 MCP instructions 与全局 `~/.cursor/hooks.json` remind hook（用 `--with-hooks` 注册，命令为绝对路径，matcher 同时保留 `Shell|Read|Grep|astrolabe-.*` 和旧的 `mcp__astrolabe__.*`）。保留其它 `mcpServers`，可重复执行。
+- **Cursor（默认 `--scope=global`）：** 写 `~/.cursor/mcp.json`，command 用原生二进制绝对路径，`type: stdio`，`env` 带 `PATH`、`ASTROLABE_LSP_TIMEOUT=300`，探测到 `pyright-langserver` 时写 `ASTROLABE_LSP_PYTHON`。同时在当前项目目录尽力执行一次 `cursor-agent mcp enable astrolabe`，并把 `astrolabe` 从 `mcp-disabled.json` 移除。Cursor 没有基于文件的全局 rules 目录，L1 引导来自 MCP instructions。保留其它 `mcpServers`，可重复执行。
 - **Cursor 项目级（`--scope=project`）：** 对 git 根 / `--project` 写三件套：`<project>/.cursor/mcp.json`（绝对路径、`cwd` 固定项目根、同样的 `env`）、`<project>/.cursor/rules/astrolabe.mdc`（`alwaysApply: true`，正文与 MCP L1 instructions 同源），并对该目录执行 `cursor-agent mcp enable astrolabe` 完成审批。
-- **OpenCode：** 合并进 `~/.config/opencode/opencode.jsonc`（或已有的 `.json` / 旧版 `config.json`，或 `~/.opencode/…`）。自动识别 V1（`mcp.<name>` + `enabled`）、V2（`mcp.servers`）或类 Claude 的 `mcpServers`；在父对象已存在时尽量保留 JSONC 注释。可选 `--with-hooks` 写入 `~/.config/opencode/plugins/astrolabe-guard.ts`。
-- **DeepSeek Harness：** 把自带的 `astrolabe-dsh-guard` 装进 `~/.dsh/profiles/**/node_modules`，并合并写入 `~/.dsh/cordis.patch.yml` 的托管块（不碰 `orca-managed-dsh-hooks`）。DSH 的 MCP 是按仓库在 UI 里配的，setup 不会代写。
-- **Codebuddy：** MCP 写入 `~/.codebuddy/.mcp.json`（若已有 `mcp.json` / `~/.codebuddy.json` 则合并进优先已存在的那个）；可选 `--with-hooks` 合并进 `~/.codebuddy/settings.json` 的 CC 兼容 `hooks`（PreToolUse + SessionEnd）。
-- **Grok Build：** MCP 合并进 `~/.grok/config.toml` 的 `[mcp_servers.astrolabe]`（与 Codex 同形）；可选 `--with-hooks` 写入 `~/.grok/hooks/astrolabe.json`。
-- **Kimi Code：** MCP 合并进 `~/.kimi-code/mcp.json`；可选 `--with-hooks` 在 `~/.kimi-code/config.toml` 追加托管 `[[hooks]]` 块（不覆盖其它 hooks）。
-- **ZCode：** 合并进 `~/.zcode/cli/config.json` 的 `mcp.servers.astrolabe`；可选 `--with-hooks` 设置 `hooks.enabled: true` 并写入 `hooks.events.PreToolUse`（**绝不**写 `SessionEnd`；并**清掉**已有的 `Stop` → cleanup，避免每轮清零计数）。
+- **OpenCode：** 合并进 `~/.config/opencode/opencode.jsonc`（或已有的 `.json` / 旧版 `config.json`，或 `~/.opencode/…`）。自动识别 V1（`mcp.<name>` + `enabled`）、V2（`mcp.servers`）或类 Claude 的 `mcpServers`；在父对象已存在时尽量保留 JSONC 注释。
+- **DeepSeek Harness：** DSH 的 MCP 是按仓库在 UI 里配的，setup 不会代写，并会从 `~/.dsh/cordis.patch.yml` 清理遗留的 `astrolabe-dsh-guard` 块（不碰 `orca-managed-dsh-hooks`）。
+- **Codebuddy：** MCP 写入 `~/.codebuddy/.mcp.json`（若已有 `mcp.json` / `~/.codebuddy.json` 则合并进优先已存在的那个）。
+- **Grok Build：** MCP 合并进 `~/.grok/config.toml` 的 `[mcp_servers.astrolabe]`（与 Codex 同形）。
+- **Kimi Code：** MCP 合并进 `~/.kimi-code/mcp.json`。
+- **ZCode：** 合并进 `~/.zcode/cli/config.json` 的 `mcp.servers.astrolabe`。
 
 若只用 cargo 安装：`astrolabe setup` 在本机有 Node 时会通过 `npx` 跑同一套流程。
 
@@ -208,9 +208,9 @@ astrolabe setup --check-config --project "/path/to/my-project"
 
 它只读取配置，列出实际使用的文件、Astrolabe 命令和参数、是否覆盖全局注册，以及当前配置的审批／禁用状态；不安装程序、不下载、不改文件，也不代替你批准 MCP。不会显示配置里的 `env`。这里只检查标准的全局和项目文件，企业托管或会话覆盖仍需在客户端里确认。`current-config-not-approved` 是“没找到当前配置对应的审批”，不是“已经证明这个会话不能用”。检查后再决定更新哪一份，不要只看终端里的版本号。
 
-setup 会更新它识别到的启动路径、工具免审批名单（短名 allowlist）和 Hook 命令，也会给 Cursor 的匹配规则同时保留 `astrolabe-.*` 和旧的 `mcp__astrolabe__.*`，合并它明确识别出的独立重复 Hook（含第三方命令的混合分组不动），并尝试审批当前项目、清理 Astrolabe 的禁用条目。
+setup 会更新它识别到的启动路径与工具免审批名单（短名 allowlist），清理遗留的 Astrolabe hooks（含第三方命令的混合分组不动），并尝试审批当前项目、清理 Astrolabe 的禁用条目。
 
-Cursor 没有基于文件的全局 rules 目录（User Rules 在 UI 中维护）。全局链路的 L1 引导由 MCP `instructions` 和全局 `~/.cursor/hooks.json` remind hook 共同提供；`--with-hooks` 会用绝对路径，并同时保留 Cursor 原生 `astrolabe-.*` 和旧的 `mcp__astrolabe__.*` matcher 注册该 hook；它会合并明确识别出的独立重复 Hook，但不会改动含第三方命令的混合分组。
+Cursor 没有基于文件的全局 rules 目录（User Rules 在 UI 中维护）。全局链路的 L1 引导由 MCP `instructions` 提供。
 
 #### 免 Cursor 原生 MCP 审批
 
@@ -289,16 +289,16 @@ command = "astrolabe"
 args = [".", "--context=codex"]
 ```
 
-### 4. Codebuddy / Grok / Kimi Code / ZCode 等 CLI 配置与 Hook
+### 4. Codebuddy / Grok / Kimi Code / ZCode 等 CLI 配置
 
-一键配置见上文 `astrolabe setup`（含 `--with-hooks`）。手动路径摘要：
+一键配置见上文 `astrolabe setup`。手动路径摘要：
 
-| 客户端 | MCP 配置 | Hooks（可选） |
-|---|---|---|
-| Codebuddy | `~/.codebuddy/.mcp.json`（`mcpServers`） | `~/.codebuddy/settings.json` → `hooks` |
-| Grok Build | `~/.grok/config.toml` → `[mcp_servers.astrolabe]` | `~/.grok/hooks/astrolabe.json` |
-| Kimi Code | `~/.kimi-code/mcp.json`（`mcpServers`） | `~/.kimi-code/config.toml` → `[[hooks]]` |
-| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` | 同文件 `hooks.enabled` + `hooks.events`（无 SessionEnd） |
+| 客户端 | MCP 配置 |
+|---|---|
+| Codebuddy | `~/.codebuddy/.mcp.json`（`mcpServers`） |
+| Grok Build | `~/.grok/config.toml` → `[mcp_servers.astrolabe]` |
+| Kimi Code | `~/.kimi-code/mcp.json`（`mcpServers`） |
+| ZCode | `~/.zcode/cli/config.json` → `mcp.servers` |
 
 - **MCP 服务接入**：作为标准 stdio MCP 启动，无需指定特殊 context 参数（默认回退 `default` 温和级）。JSON `mcpServers` 示例：
   ```json
@@ -311,7 +311,7 @@ args = [".", "--context=codex"]
     }
   }
   ```
-- **防漂移 Hook 接入（可选，效果未做基准，见 [HOOKS.md](HOOKS.md)）**：`--client=codebuddy` / `grok`（别名 `grokbuild`、`grok-build`）/ `kimicode`（别名 `kimi` 等）/ `zcode`（别名 `zai` 等）。
+- **旧版 Hook 升级清理**：从旧版升级时运行 `astrolabe setup --remove-hooks`（或 `astrolabe setup`）即可清理历史遗留的 Astrolabe hooks 并保留第三方 hooks，详见 [HOOKS.md](HOOKS.md)。
 
 ---
 
@@ -333,12 +333,8 @@ args = [".", "--context=codex"]
 | `ASTROLABE_WATCH_SECS` | 未设置 | 后台文件监听模式：未设置使用原生事件（空闲 0% CPU）；设为 `0` 关闭监听；正整数 `N` 强制 `N` 秒轮询兜底 |
 | `ASTROLABE_LSP_TIMEOUT` | `300` | LSP 语言服务器单次请求最大超时时间（秒） |
 | `ASTROLABE_CONTEXT` | `default` | 客户端上下文预设（`claude-code`, `cursor`, `codex`, `readonly` 等；codebuddy 与 grok 走 `default` 温和级） |
-| `ASTROLABE_SLICE_READ_MAX` | `200` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为切片读 |
-| `ASTROLABE_SLICE_READ_THRESHOLD` | `10` | 连续切片读提醒阈值：连续 N 次切片读且期间无任何 Astrolabe 工具调用时触发 deny（任何 Astrolabe 工具调用清零该额度） |
-| `ASTROLABE_READ_THRESHOLD` | `3` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） |
-| `ASTROLABE_GREP_THRESHOLD` | `3` | 连续 Grep/shell 文本搜索 deny 阈值（soft 模式） |
-| `ASTROLABE_DENY_TEXT_SEARCH` | 关闭 | 硬禁用宿主 Grep/Glob/shell 文本搜索（`true`/`1`/`yes`/`on`）；首次即 deny。多 Astrolabe 进程可在各自 mcp.json `env` 中分别配置；hooks 命令需同步设置或加 `--deny-text-search` / `--context=` |
-| `ASTROLABE_DENY_SILENCE_SECS` | `15` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） |
+
+> **旧版 Hook 升级清理**：防漂移 Hook 及 `ASTROLABE_SLICE_READ_*` / `ASTROLABE_READ_THRESHOLD` / `ASTROLABE_GREP_THRESHOLD` / `ASTROLABE_DENY_*` / `ASTROLABE_HOOK_*` 环境变量已移除；从旧版升级时运行 `astrolabe setup`（或 `astrolabe setup --remove-hooks`）即可清理遗留 hooks，详见 [HOOKS.md](HOOKS.md)。
 
 ### 语言服务器（可选）
 
@@ -363,19 +359,3 @@ args = [".", "--context=codex"]
 
 
 其余语言（Python、Go、Rust、Java、TS/JS、C/C++、PHP、Dart、C#/VB）见 [参考手册](REFERENCE.zh-CN.md) 的语言矩阵。
-
-Hook 的读源码拦截按 41 个受支持扩展名判断（含上表的 `.kt` / `.kts` / `.sh` / `.bash` / `.rb` / `.rake` / `.gemspec` / `.lua` / `.swift` / `.m` / `.mm` / `.vue`）；不在表里的语言正常读取，不拦截。
-
-### 客户端与 Hook 支持矩阵
-
-| 客户端 (`--client`) | 工具识别规则 | Deny 决策格式 | 上下文预设 (`--context`) | 状态与说明 |
-|---|---|---|---|---|
-| `claude-code` | CC 规范 `grep` / `read` / shell 命令 | 结构化 `hookSpecificOutput` | `claude-code` | 官方支持 |
-| `codebuddy` | CC 同构工具名识别（`grep`、`read`、`read_file` 等） | 结构化 `hookSpecificOutput` | `default`（温和级） | 内置支持（适用于支持 CC 兼容 hooks 的宿主） |
-| `grok` | `grep` / `read_file` / shell 命令 | 扁平 `{"decision":"deny","reason":...}` | `default`（温和级） | 内置支持（别名：`grokbuild`、`grok-build`） |
-| `cursor` | 原生 `Shell`/`Read`/`Grep`/`Task` 及 shell 命令 | 原生扁平 `{"permission":"deny",...}` | `default`（MCP 可选 `cursor`） | 内置支持（Cursor CLI hooks.json，别名 cursor-agent/cursor_agent/cursor-cli；兼容 conversation_id） |
-| `kimicode` | CC 同构识别（`Read` / `Grep` / `Bash` 及 shell 命令） | 结构化 `hookSpecificOutput` | `default`（温和级） | 内置支持（别名：kimi-code/kimi_code/kimi） |
-| `zcode` | CC 同构识别（`Read` / `Grep` / `Bash` 及 shell 命令） | 结构化 `hookSpecificOutput` | `default`（温和级） | 内置支持（别名：z-code/zai） |
-| `opencode` | 宿主传入 tool 名称及 shell 命令 | 扁平 `{"decision":"deny","reason":...}` | `default`（温和级） | 插件桥接（.opencode/plugins/astrolabe-guard.ts TS 插件拦截） |
-| `codex` | shell grep/read 命令 | 结构化 `permissionDecision` | `codex` | 官方支持 |
-| `vscode` / `other` | 通用子串包含匹配 | 结构化 `hookSpecificOutput` | `default` | 通用回退 |

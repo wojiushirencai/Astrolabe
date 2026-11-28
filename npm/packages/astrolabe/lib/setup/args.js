@@ -17,15 +17,13 @@ Options:
                          (requires --clients=<single-id>; overrides env defaults)
   --mcp-config <file>    Override the target client's MCP config file path
                          (requires --clients=<single-id>)
-  --hooks-config <file>  Override the target client's hooks/settings/plugin file path
+  --hooks-config <file>  Specify extra legacy hooks/settings/plugin file to clean
   --settings <file>      Alias for --hooks-config; repeatable (e.g. multiple profiles)
                          (requires --clients=<single-id>)
-  --with-hooks           Also install drift-guard hooks/plugins where supported
-                         (OpenCode guard plugin; Claude Code/Cursor/Codebuddy/Grok/
-                          Kimi/ZCode hook recipes; DSH always installs its native guard).
-                         Claude Code writes ~/.claude/settings.json (--client=claude-code).
-                         Cursor writes ~/.cursor/hooks.json (--client=cursor).
-                         ZCode: PreToolUse only — never SessionEnd, never Stop cleanup
+  --remove-hooks         Clean legacy Astrolabe hooks/plugins and ~/.astrolabe/hook_data
+                         only; do not modify MCP configs or Cursor permissions/rules
+  --with-hooks           Deprecated no-op (hooks have been removed; legacy hooks are
+                         cleaned automatically during setup)
   --no-always-load       Omit alwaysLoad: true from Claude Code ~/.claude.json entry
   --always-load          Set alwaysLoad: true in Claude Code ~/.claude.json entry (default on)
   --no-cursor-permissions
@@ -41,7 +39,8 @@ Options:
 
 Client ids:
   claude-code, cursor, codex, windsurf, cline, roo, continue, opencode,
-  deepseek-harness (alias: dsh), codebuddy, grok (aliases: grokbuild, grok-build),
+  deepseek-harness (aliases: dsh, dev-studio-cli), codebuddy,
+  grok (aliases: grokbuild, grok-build),
   kimicode (aliases: kimi-code, kimi_code, kimi), zcode (aliases: z-code, zai)
 `;
 
@@ -64,6 +63,8 @@ function parseArgs(argv) {
     alwaysLoad: true,
     cursorPermissions: true,
     withHooks: false,
+    deprecatedWithHooks: false,
+    removeHooks: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -73,7 +74,8 @@ function parseArgs(argv) {
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--native') opts.native = true;
     else if (arg === '--help' || arg === '-h') opts.help = true;
-    else if (arg === '--with-hooks') opts.withHooks = true;
+    else if (arg === '--with-hooks') opts.deprecatedWithHooks = true;
+    else if (arg === '--remove-hooks') opts.removeHooks = true;
     else if (arg === '--no-always-load') opts.alwaysLoad = false;
     else if (arg === '--always-load') opts.alwaysLoad = true;
     else if (arg === '--no-cursor-permissions') opts.cursorPermissions = false;

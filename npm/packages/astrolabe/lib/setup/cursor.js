@@ -16,13 +16,29 @@ const L1_PLACEHOLDER = '{{INDEX_ROOT}}';
  * remains crates/astrolabe-mcp/contexts/cursor-l1.md; this keeps
  * `setup --scope=project` from crashing in a standalone checkout.
  */
-const FALLBACK_L1_TEMPLATE = `CRITICAL: Prefer Astrolabe over Grep/Read for code. Tools: resolve_contx, search_code, find_symbol, find_refs, goto_def, get_diag, get_lang. All are read-only: batch independent calls in parallel in one turn.
+const FALLBACK_L1_TEMPLATE = `Astrolabe provides indexed, symbol-aware code navigation for index_root: {{INDEX_ROOT}} (all 7 tools are read-only — batch independent calls in parallel in one turn).
 
-Current index root index_root: {{INDEX_ROOT}}. The index_root in results is that path; if it is not the repo you are editing, do not Read those paths.
+Cursor exposes these MCP tools as \`astrolabe-resolve_contx\`, \`astrolabe-search_code\`, \`astrolabe-find_symbol\`, \`astrolabe-find_refs\`, \`astrolabe-goto_def\`, \`astrolabe-get_diag\`, and \`astrolabe-get_lang\`.
 
-Cursor exposes these MCP tools as \`astrolabe-resolve_contx\`, \`astrolabe-search_code\`, \`astrolabe-find_symbol\`, \`astrolabe-find_refs\`, \`astrolabe-goto_def\`, \`astrolabe-get_diag\`, and \`astrolabe-get_lang\`. Prefer them over the built-in Grep/Read/Glob for code discovery, references, and navigation; use the built-ins for non-code files and when Astrolabe is unavailable.
+Route by intent (1 Astrolabe call replaces multi-turn Grep + Read):
+- Unfamiliar area / multi-file task -> resolve_contx (import-graph ranked files & symbols)
+- Symbol definition, signature, body, or file outline (query="*" + path_filter) -> find_symbol (returns bodies without full-file Read)
+- Callers, usages, interface implementors, or rename checklist (dry_run_rename) -> find_refs (scope-aware; prefer over Grep for renames/refactors)
+- Jump from a call/use site to its exact definition -> goto_def
+- Literal/regex text search or counts (aggregate=top|dir|file, optional skip_comments/exclude; no scripts) -> search_code
+- File syntax/type check ONLY when you cannot run build/tests -> get_diag (skip if build/tests pass, e.g. go test, cargo test)
+- Check indexed languages, LSP readiness, or parse errors -> get_lang
 
-When the last line says “Fully listed”, the listing is complete — answer from it; do not re-check with grep or re-query with other words. When the task is unclear, start with resolve_contx. After edits, if build/tests already pass, skip get_diag. Source files in other languages are not indexed — use Grep/Read.`;
+Use built-in tools directly when appropriate:
+- Read / Edit / Write: right before editing a known target file (host requires Read before Edit), for config/docs (Markdown, JSON, YAML, TOML), or for unindexed languages (empty search_code/find_symbol does not cover them — check get_lang).
+- Grep / Glob: for unindexed file types or filename pattern matching.
+
+Rules:
+- When the last line says “Fully listed”, the listing is complete — answer from it; do not re-check with grep or re-query with other words.
+- The index_root in results is that path; if it is not the repo you are editing, pass index_root or do not Read those paths.
+- scoped comes from the import graph; syntactic from name matching.
+- When a language server is missing, precise tools say so and suggest alternatives — do not install one yourself (see get_lang).
+`;
 
 /**
  * Cursor's hook matcher is a regex over the internal tool name. Cursor CLI
@@ -134,28 +150,138 @@ function unquoteHookExecutable(executable) {
   return matched === executable.length ? out : null;
 }
 
+function tokenizeHookPrefix(prefix, platform = process.platform) {
+  if (typeof prefix !== 'string') return null;
+  const tokens = [];
+  let i = 0;
+  const len = prefix.length;
+  while (i < len) {
+    while (i < len && /\s/.test(prefix[i])) i += 1;
+    if (i >= len) break;
+    let token = '';
+    while (i < len && !/\s/.test(prefix[i])) {
+      const ch = prefix[i];
+      if (ch === "'") {
+        const close = prefix.indexOf("'", i + 1);
+        if (close === -1) return null;
+        token += prefix.slice(i + 1, close);
+        i = close + 1;
+      } else if (ch === '"') {
+        const close = prefix.indexOf('"', i + 1);
+        if (close === -1) return null;
+        token += prefix.slice(i + 1, close);
+        i = close + 1;
+      } else if (ch === '\\') {
+        if (platform !== 'win32' && i + 1 < len && /[\s'"\\;&|<>`]/.test(prefix[i + 1])) {
+          token += prefix[i + 1];
+          i += 2;
+        } else {
+          token += ch;
+          i += 1;
+        }
+      } else if (';&|<>`'.includes(ch)) {
+        return null;
+      } else {
+        token += ch;
+        i += 1;
+      }
+    }
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+function isAstrolabeNpxToken(token) {
+  if (typeof token !== 'string' || !token) return false;
+  if (token.startsWith('@')) {
+    return /^@zlnap\/astrolabe(?:@[^\s]+)?$/i.test(token);
+  }
+  return /^(?:.*[/\\])?astrolabe(?:\.(?:exe|cmd|bat))?(?:@[^\s]+)?$/i.test(token);
+}
+
+function matchesAstrolabeExecutable(unquoted, binPath, platform = process.platform) {
+  if (
+    binPath &&
+    (platform === 'win32'
+      ? unquoted.toLowerCase() === binPath.toLowerCase()
+      : unquoted === binPath)
+  ) {
+    return true;
+  }
+  return /^(?:.*[/\\])?astrolabe(?:\.(?:exe|cmd|bat))?$/i.test(unquoted);
+}
+
+function stripLeadingEnvTokens(tokens) {
+  let idx = 0;
+  while (idx < tokens.length) {
+    const token = tokens[idx];
+    if (token === 'env' || token === '/usr/bin/env' || /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      idx += 1;
+      continue;
+    }
+    break;
+  }
+  return tokens.slice(idx);
+}
+
 function isAstrolabeHookCommand(
   command,
   {
-    subcommands = ['session-start', 'remind', 'cleanup'],
+    subcommands = ['session-start', 'remind', 'cleanup', 'gc'],
     binPath = null,
     platform = process.platform,
   } = {},
 ) {
   if (typeof command !== 'string') return false;
-  const match = command.match(/^\s*(.*?)\s+hooks\s+(session-start|remind|cleanup)(?:\s|$)/);
+  const match = command.match(/^\s*(.*?)\s+hooks\s+(session-start|remind|cleanup|gc)(?:\s|$)/);
   if (!match) return false;
   const allowed = Array.isArray(subcommands) ? subcommands : [subcommands];
   if (!allowed.includes(match[2])) return false;
   const executable = match[1];
   // Explicit --command paths may have arbitrary names. Otherwise only claim
-  // the actual Astrolabe executable, not another program with similar args.
-  const unquoted = unquoteHookExecutable(executable);
-  if (binPath && (executable === quoteCommandPath(binPath, platform) || unquoted === binPath)) {
+  // the actual Astrolabe executable (or historical npx invocations), not another
+  // program with similar args.
+  if (binPath && executable === quoteCommandPath(binPath, platform)) {
     return true;
   }
-  if (!unquoted) return false;
-  return /^(?:.*[/\\])?astrolabe(?:\.(?:exe|cmd|bat))?$/i.test(unquoted);
+  const unquoted = unquoteHookExecutable(executable);
+  if (unquoted !== null) {
+    return matchesAstrolabeExecutable(unquoted, binPath, platform);
+  }
+  const rawTokens = tokenizeHookPrefix(executable, platform);
+  if (!rawTokens) return false;
+  const tokens = stripLeadingEnvTokens(rawTokens);
+  if (tokens.length === 0) return false;
+  if (tokens.length === 1) {
+    return matchesAstrolabeExecutable(tokens[0], binPath, platform);
+  }
+  if (!/^(?:.*[/\\])?npx(?:\.(?:exe|cmd|bat))?$/i.test(tokens[0])) return false;
+  let endOfFlags = false;
+  for (let i = 1; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!endOfFlags) {
+      if (token === '--') {
+        endOfFlags = true;
+        continue;
+      }
+      if (token === '-p' || token === '--package') {
+        if (i + 1 < tokens.length) {
+          if (isAstrolabeNpxToken(tokens[i + 1])) return true;
+          i += 1;
+        }
+        continue;
+      }
+      if (token.startsWith('--package=')) {
+        if (isAstrolabeNpxToken(token.slice('--package='.length))) return true;
+        continue;
+      }
+      if (token.startsWith('-')) {
+        continue;
+      }
+    }
+    return isAstrolabeNpxToken(token);
+  }
+  return false;
 }
 
 function isAstrolabeHook(entry, subcommand, binPath, platform = process.platform) {
@@ -234,6 +360,79 @@ function mergeCursorHooksFile(
       2,
     ),
   };
+}
+
+function stripCursorHooksFile(
+  filePath,
+  { existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
+) {
+  if (!existsFn(filePath)) {
+    return { skipped: true, reason: `missing ${filePath}` };
+  }
+  const text = fs.readFileSync(filePath, 'utf8');
+  const raw = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  const doc = JSON.parse(raw);
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error(`${filePath} root must be a JSON object`);
+  }
+  if (!doc.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
+  }
+
+  let changed = false;
+  for (const event of Object.keys(doc.hooks)) {
+    const entries = doc.hooks[event];
+    if (!Array.isArray(entries)) continue;
+    let eventChanged = false;
+    const nextList = [];
+    for (const entry of entries) {
+      if (entry && typeof entry === 'object' && typeof entry.command === 'string') {
+        if (isAstrolabeHookCommand(entry.command, { binPath, platform })) {
+          changed = true;
+          eventChanged = true;
+          continue;
+        }
+      } else if (entry && typeof entry === 'object' && Array.isArray(entry.hooks)) {
+        const remaining = entry.hooks.filter(
+          (h) =>
+            !isAstrolabeHookCommand(typeof h === 'string' ? h : h && h.command, {
+              binPath,
+              platform,
+            }),
+        );
+        if (remaining.length !== entry.hooks.length) {
+          changed = true;
+          eventChanged = true;
+          if (remaining.length > 0) {
+            nextList.push({ ...entry, hooks: remaining });
+          }
+          continue;
+        }
+      }
+      nextList.push(entry);
+    }
+    if (eventChanged) {
+      if (nextList.length === 0) {
+        delete doc.hooks[event];
+      } else {
+        doc.hooks[event] = nextList;
+      }
+    }
+  }
+
+  if (!changed) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
+  }
+
+  const remainingEvents = Object.keys(doc.hooks);
+  const otherKeys = Object.keys(doc).filter((k) => k !== 'version' && k !== 'hooks');
+  if (remainingEvents.length === 0 && otherKeys.length === 0) {
+    return { filePath, deleted: true, created: false, replaced: true, doc: null };
+  }
+  if (remainingEvents.length === 0) {
+    delete doc.hooks;
+  }
+  return { filePath, doc, deleted: false, created: false, replaced: true };
 }
 
 function gitTopLevel(dir, spawnFn) {
@@ -747,6 +946,7 @@ module.exports = {
   remindEntry,
   cleanupEntry,
   mergeCursorHooksFile,
+  stripCursorHooksFile,
   resolveProjectRoot,
   canonicalizePath,
   projectSlug,

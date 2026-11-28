@@ -189,7 +189,7 @@ impl<R: Clone> LoopGuard<R> {
                         "blocked: true\nloop guard: this exact {tool} query (identical params; index unchanged since last run)\
                          already ran {prior} times in the last {} seconds (limit {}); not re-executed — previous result attached below.\
                          That result is complete for this query (use it even if the original call was from another subtask or compressed context).\
-                         For different info, change query/path_filter/budget_tokens, or switch approach\
+                         For different info, change query/path_filter/offset, or switch approach\
                          (find_refs, goto_def, Read with a line range).",
                         cfg.repeat_window.as_secs(),
                         cfg.repeat_max

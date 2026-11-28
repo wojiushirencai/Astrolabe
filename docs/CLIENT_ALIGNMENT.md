@@ -22,13 +22,13 @@
 | `apply_rename` / 安全写入层 | **未做** | 仅 `plan_rename` |
 | 用户级 context 目录约定 | **未做** | 已支持路径加载，无 `~/.astrolabe/contexts` |
 | 同步回 Mac 主仓 | **待做** | 本 box 改动需另推/同步 |
-| prompt / mode / `single_project` | **有意不做** | 薄适配层；防漂移 hooks 已单独在 `hooks.rs` 落地 |
-| `codebuddy` 客户端对齐 | **已支持** | hook 枚举/classify（与 CC 同构）/输出格式已支持；context 走 `default` 温和级 |
-| `grok` 客户端对齐 | **已支持** | hook 枚举/classify（含 `grokbuild`/`grok-build` 别名）/输出格式（扁平 `{"decision":"deny","reason":...}`）已支持；context 走 `default` 温和级 |
-| `cursor` CLI hook 对齐 | **已支持** | hook 枚举（含 `cursor-agent` 等别名）/原生扁平 deny（`permission`/`agent_message`）/`conversation_id` fallback 已支持；context 保持 `cursor` |
-| `kimicode` 客户端对齐 | **已支持** | hook 枚举（含 `kimi-code`、`kimi` 等别名）/CC 同构三字段 deny 输出；context 走 `default` 温和级 |
-| `zcode` 客户端对齐 | **已支持** | hook 枚举（含 `z-code`、`zai` 等别名）/CC 同构三字段 deny 输出；context 走 `default` 温和级 |
-| `opencode` 客户端对齐 | **已支持** | hook 枚举/扁平 `decision: deny` 输出/TS 插件桥接拦截已支持；context 走 `default` 温和级 |
+| prompt / mode / `single_project` | **有意不做** | 薄适配层；[已移除 / 历史归档] 原 `hooks.rs` 防漂移 hook 已移除，详见 [HOOKS.md](HOOKS.md) |
+| `codebuddy` 客户端对齐 | **MCP 已支持** | context 走 `default` 温和级；[已移除 / 历史归档] 原 hook 枚举/classify/输出格式已移除 |
+| `grok` 客户端对齐 | **MCP 已支持** | context 走 `default` 温和级；[已移除 / 历史归档] 原 hook 枚举/classify/输出格式已移除 |
+| `cursor` CLI 客户端对齐 | **MCP 已支持** | context 保持 `cursor`；[已移除 / 历史归档] 原 hook 枚举/原生扁平 deny/`conversation_id` fallback 已移除 |
+| `kimicode` 客户端对齐 | **MCP 已支持** | context 走 `default` 温和级；[已移除 / 历史归档] 原 hook 枚举/CC 同构 deny 输出已移除 |
+| `zcode` 客户端对齐 | **MCP 已支持** | context 走 `default` 温和级；[已移除 / 历史归档] 原 hook 枚举/CC 同构 deny 输出已移除 |
+| `opencode` 客户端对齐 | **MCP 已支持** | context 走 `default` 温和级；[已移除 / 历史归档] 原 hook 枚举/TS 插件桥接拦截已移除 |
 
 ## 1. context 列表 + `structured_tool_output`
 
@@ -101,7 +101,7 @@ Astrolabe：**解析 + `tools/list` retain 已落地**（`server.rs` 单测 `exc
 4. ~~`excluded_tools` catalog 过滤~~ — retain 已测；yml 填值另议。
 5. ~~CHANGELOG / ARCHITECTURE Phase 2 表述~~ — LSP 三工具接线；明确无 `apply_rename`、MCP 无 `goto_definition`。
 6. ~~`openai_tool_compatible` schema sanitize~~ — `openai_schema.rs`；codex/`oaicompat*` 的 `listed_tools`。
-7. ~~**Codebuddy / Grok hook 接线**~~ — `hooks.rs` 中 client 枚举、classify 与对应 deny 决策输出已落地；context 走 `default`。
+7. ~~**Codebuddy / Grok hook 接线**~~ — `[已移除 / 历史归档]` 原 `hooks.rs` 中的 hook client 枚举、classify 与 deny 输出已移除；MCP context 保持走 `default`。
 
 ### 仍缺（按优先级）
 
@@ -154,47 +154,50 @@ listed_tools:
   sort + return
 ```
 
-## 8. Codebuddy / Grok 对齐现状
+## 8. Codebuddy / Grok 对齐现状（Hook 部分 `[已移除 / 历史归档]`）
 
-- **Codebuddy**：hook 层枚举 `Client::Codebuddy`，走与 Claude Code 同构的工具名识别规则（`grep` / `read` / `search_for_pattern` / `read_file` 及 shell 兜底），输出 CC 格式结构化 deny（`hookSpecificOutput`）；MCP context 走 `default` 温和级（无额外 schema 修改或工具过滤）。
-- **Grok**：hook 层枚举 `Client::Grok`（支持 `grokbuild`、`grok-build` 别名），识别 `grep` 与 `read_file` 及 shell 命令，输出扁平 `{"decision":"deny","reason":...}` 格式；MCP context 走 `default` 温和级。
+- **MCP 协议对齐（现行）**：
+  - **Codebuddy**：MCP context 走 `default` 温和级（无额外 schema 修改或工具过滤）。
+  - **Grok**：MCP context 走 `default` 温和级。
+- **历史 Hook 对齐（`[已移除 / 历史归档]`，见 [HOOKS.md](HOOKS.md)）**：
+  - **Codebuddy**：原 hook 层枚举 `Client::Codebuddy`，走与 Claude Code 同构的工具名识别规则（`grep` / `read` / `search_for_pattern` / `read_file` 及 shell 兜底），输出 CC 格式结构化 deny（`hookSpecificOutput`）。
+  - **Grok**：原 hook 层枚举 `Client::Grok`（支持 `grokbuild`、`grok-build` 别名），识别 `grep` 与 `read_file` 及 shell 命令，输出扁平 `{"decision":"deny","reason":...}` 格式。
 
-## 9. Cursor CLI / Grok Build / Kimi Code / ZCode / OpenCode 对齐现状
+## 9. Cursor CLI / Grok Build / Kimi Code / ZCode / OpenCode 对齐现状（Hook 部分 `[已移除 / 历史归档]`）
 
-- **Cursor CLI**：
-  - 枚举：`Client::Cursor`（别名 `cursor` / `cursor-agent` / `cursor_agent` / `cursor-cli`）；
-  - 工具分类：识别原生工具名 `Shell`、`Read`、`Write`、`Grep`、`Task` 及通用 shell 命令；
-  - 输出格式：输出 Cursor 原生扁平 JSON `{"permission":"deny","user_message":...,"agent_message":...}`，长引导文案进 `agent_message` 直达模型；
-  - 会话兼容：原生 hook payload 仅带 `conversation_id`，会话提取逻辑已支持 `conversation_id` / `conversationId` fallback；
-  - Context：MCP 模式可配置 `--context=cursor`，通用/hook 走 `default`；
-  - 接线方式：配置 `~/.cursor/hooks.json` 或项目 `.cursor/hooks.json`，在 `preToolUse` 执行 `astrolabe hooks remind --client=cursor`，在 `sessionEnd` 执行 `astrolabe hooks cleanup`。
-- **Grok Build**：
-  - 枚举：`Client::Grok`（别名 `grok` / `grokbuild` / `grok-build`）；
-  - 工具分类：snake_case 工具名（`run_terminal_command` / `read_file` / `grep`）与 PascalCase 别名；
-  - 输出格式：输出 Grok 一等公民原生扁平 JSON `{"decision":"deny","reason":...}`，退出码 2=阻断、1=放行；
-  - Context：走 `default` 温和级；
-  - 接线方式：配置 `~/.grok/hooks/astrolabe.json`（全局）或 `.grok/hooks/astrolabe.json`（项目级需 `/hooks-trust` 授信），PreToolUse 执行 `astrolabe hooks remind --client=grok`。
-- **Kimi Code CLI**：
-  - 枚举：`Client::KimiCode`（别名 `kimicode` / `kimi-code` / `kimi_code` / `kimi`）；
-  - 工具分类：走与 Claude Code 同构的工具名识别规则（覆盖 `Read` / `Grep` / `Bash` 及 shell 命令）；
-  - 输出格式：输出与 Claude Code 同构的 `hookSpecificOutput` 结构化决策（三字段）或 exit 2 阻断；
-  - Context：走 `default` 温和级；
-  - 接线方式：在 `~/.kimi-code/config.toml` 中配置 `[[hooks]]`（示意级，具体键名以官方文档为准），stdin 传入 JSON payload。
-- **ZCode**：
-  - 枚举：`Client::ZCode`（别名 `zcode` / `z-code` / `zai`）；
-  - 工具分类：走与 Claude Code 同构的工具名识别规则；
-  - 输出格式：输出与 Claude Code 同构的 `hookSpecificOutput` 结构化决策；
-  - Context：走 `default` 温和级；
-  - 接线方式：在 `~/.zcode/cli/config.json`（Windows：`%USERPROFILE%\.zcode\cli\config.json`）的 `hooks` 中配置，结构为 `{"enabled": true, "events": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "astrolabe hooks remind --client=zcode"}]}]}}`；`enabled: true` 与 `events` 包装层必需；
-  - 事件限制：ZCode 仅支持 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `PostToolUseFailure` / `Stop`，且严格校验，**不得配置 `SessionEnd`**（会令整段 hooks 加载失败，issue #30）；也**不要**在 `Stop` 上挂 cleanup（每轮触发会清零计数）；
-  - 状态清理：由 `hooks remind` 内置的过期会话 GC（默认 24h，`ASTROLABE_HOOK_GC_HOURS`）兜底，或手动 `astrolabe hooks gc`；
-  - 格式核实（ZCode 3.14.1 `Resources/glm/zcode.cjs`）：stdin 含 `session_id` / `hook_event_name` / `tool_name` / `tool_input` / `tool_use_id` / `transcript_path`（及 camelCase 副本）；内置工具 `Read`(`file_path`/`offset`/`limit`) / `Grep` / `Glob` / `Bash`(`command`)，MCP 工具 `mcp__<server>__<tool>`；`hookSpecificOutput.permissionDecision=deny` 与 exit 2 均为拦截；`Stop` 每轮回答结束触发（payload 带 `turnId`、`responseText`），非会话结束。
-- **OpenCode**：
-  - 枚举：`Client::OpenCode`（别名 `opencode`）；
-  - 工具分类：识别宿主传入的 tool 名称及 shell 命令；
-  - 输出格式：输出扁平 `{"decision":"deny","reason":...}` 决策格式；
-  - Context：走 `default` 温和级；
-  - 接线方式：宿主无原生 hooks 命令体系，在 `.opencode/plugins/astrolabe-guard.ts` 中编写 TS 插件挂载 `tool.execute.before` 钩子，通过 `Bun.spawnSync` 调用 `astrolabe hooks remind --client=opencode`，遇到 `decision === "deny"` 时抛出 `Error(reason)` 实现拦截。
+- **MCP 协议对齐（现行）**：
+  - **Cursor CLI**：MCP 模式可配置 `--context=cursor`（保证 `content[0]` 非空文本）；通用走 `default`。
+  - **Grok Build / Kimi Code CLI / ZCode / OpenCode**：MCP context 均走 `default` 温和级。
+- **历史 Hook 对齐（`[已移除 / 历史归档]`，见 [HOOKS.md](HOOKS.md)）**：
+  - **Cursor CLI**：
+    - 枚举：`Client::Cursor`（别名 `cursor` / `cursor-agent` / `cursor_agent` / `cursor-cli`）；
+    - 工具分类：识别原生工具名 `Shell`、`Read`、`Write`、`Grep`、`Task` 及通用 shell 命令；
+    - 输出格式：输出 Cursor 原生扁平 JSON `{"permission":"deny","user_message":...,"agent_message":...}`，长引导文案进 `agent_message` 直达模型；
+    - 会话兼容：原生 hook payload 仅带 `conversation_id`，会话提取逻辑支持 `conversation_id` / `conversationId` fallback；
+    - 接线方式：原配置 `~/.cursor/hooks.json` 或项目 `.cursor/hooks.json`，在 `preToolUse` 执行 `astrolabe hooks remind --client=cursor`，在 `sessionEnd` 执行 `astrolabe hooks cleanup`。
+  - **Grok Build**：
+    - 枚举：`Client::Grok`（别名 `grok` / `grokbuild` / `grok-build`）；
+    - 工具分类：snake_case 工具名（`run_terminal_command` / `read_file` / `grep`）与 PascalCase 别名；
+    - 输出格式：输出 Grok 一等公民原生扁平 JSON `{"decision":"deny","reason":...}`，退出码 2=阻断、1=放行；
+    - 接线方式：原配置 `~/.grok/hooks/astrolabe.json`（全局）或 `.grok/hooks/astrolabe.json`（项目级需 `/hooks-trust` 授信），PreToolUse 执行 `astrolabe hooks remind --client=grok`。
+  - **Kimi Code CLI**：
+    - 枚举：`Client::KimiCode`（别名 `kimicode` / `kimi-code` / `kimi_code` / `kimi`）；
+    - 工具分类：走与 Claude Code 同构的工具名识别规则（覆盖 `Read` / `Grep` / `Bash` 及 shell 命令）；
+    - 输出格式：输出与 Claude Code 同构的 `hookSpecificOutput` 结构化决策（三字段）或 exit 2 阻断；
+    - 接线方式：原在 `~/.kimi-code/config.toml` 中配置 `[[hooks]]`（示意级，具体键名以官方文档为准），stdin 传入 JSON payload。
+  - **ZCode**：
+    - 枚举：`Client::ZCode`（别名 `zcode` / `z-code` / `zai`）；
+    - 工具分类：走与 Claude Code 同构的工具名识别规则；
+    - 输出格式：输出与 Claude Code 同构的 `hookSpecificOutput` 结构化决策；
+    - 接线方式：原在 `~/.zcode/cli/config.json`（Windows：`%USERPROFILE%\.zcode\cli\config.json`）的 `hooks` 中配置，结构为 `{"enabled": true, "events": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "astrolabe hooks remind --client=zcode"}]}]}}`；`enabled: true` 与 `events` 包装层必需；
+    - 事件限制：ZCode 仅支持 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `PostToolUseFailure` / `Stop`，且严格校验，**不得配置 `SessionEnd`**（会令整段 hooks 加载失败，issue #30）；也**不要**在 `Stop` 上挂 cleanup（每轮触发会清零计数）；
+    - 状态清理：原由 `hooks remind` 内置的过期会话 GC（默认 24h，`ASTROLABE_HOOK_GC_HOURS`）兜底，或手动 `astrolabe hooks gc`；
+    - 格式核实（ZCode 3.14.1 `Resources/glm/zcode.cjs`）：stdin 含 `session_id` / `hook_event_name` / `tool_name` / `tool_input` / `tool_use_id` / `transcript_path`（及 camelCase 副本）；内置工具 `Read`(`file_path`/`offset`/`limit`) / `Grep` / `Glob` / `Bash`(`command`)，MCP 工具 `mcp__<server>__<tool>`；`hookSpecificOutput.permissionDecision=deny` 与 exit 2 均为拦截；`Stop` 每轮回答结束触发（payload 带 `turnId`、`responseText`），非会话结束。
+  - **OpenCode**：
+    - 枚举：`Client::OpenCode`（别名 `opencode`）；
+    - 工具分类：识别宿主传入的 tool 名称及 shell 命令；
+    - 输出格式：输出扁平 `{"decision":"deny","reason":...}` 决策格式；
+    - 接线方式：宿主无原生 hooks 命令体系，原在 `.opencode/plugins/astrolabe-guard.ts` 中编写 TS 插件挂载 `tool.execute.before` 钩子，通过 `Bun.spawnSync` 调用 `astrolabe hooks remind --client=opencode`，遇到 `decision === "deny"` 时抛出 `Error(reason)` 实现拦截。
 
 ## 参考路径
 

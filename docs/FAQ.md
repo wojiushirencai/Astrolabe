@@ -18,21 +18,21 @@ On 15 tasks of our own design, 95 simultaneous A/B pairs with v0.13.0 (5 pairs f
 All of them target the same problem (fewer blind greps for coding agents). We have **not** benchmarked Astrolabe against them, so we make no claim of being better. Factual differences we can state: Astrolabe is a single Rust binary with tree-sitter indexing, runs without an embedding model or API key, exposes only 7 tools, and has `search_code` aggregate counting (`aggregate=top|dir|file`, `skip_comments`, `exclude`). Claude Code's LSP plugins provide go-to-definition and find-references natively ([docs](https://code.claude.com/docs/en/plugins/code-intelligence)), which overlaps with our `goto_def` / `find_refs`.
 
 ## Is it the same as the npm package `astrolabe` or `astrolabe-ai`?
-No. Those are unrelated third-party packages (a 2014 Protractor library; a resume tool). This project publishes **`@zlnap/astrolabe`** (and platform packages `@zlnap/<platform>`) under the personal npm scope `zlnap` — live as of [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0). Install with `npm i -g @zlnap/astrolabe`, then **required** `npx -y @zlnap/astrolabe setup --with-hooks`, or use [GitHub Releases](https://github.com/wojiushirencai/Astrolabe/releases) / `install.sh` followed by `astrolabe setup --with-hooks`. Do not install the unscoped `astrolabe` or `astrolabe-ai` packages.
+No. Those are unrelated third-party packages (a 2014 Protractor library; a resume tool). This project publishes **`@zlnap/astrolabe`** (and platform packages `@zlnap/<platform>`) under the personal npm scope `zlnap` — live as of [v0.17.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.0). Install with `npm i -g @zlnap/astrolabe`, then **required** `npx -y @zlnap/astrolabe setup`, or use [GitHub Releases](https://github.com/wojiushirencai/Astrolabe/releases) / `install.sh` followed by `astrolabe setup`. Do not install the unscoped `astrolabe` or `astrolabe-ai` packages.
 
 ## Does it send my code anywhere?
 By reading the code: the server does not call an LLM and has no telemetry upload (the "root telemetry" function only writes one local log line). The only network code is the optional language-server installer, which is off by default (`ASTROLABE_AUTO_INSTALL=on` enables it, checksums are mandatory, `ASTROLABE_OFFLINE=1` blocks it). This is a code-reading statement, not an independent network audit. The model your client uses still receives whatever tool results it asks for.
 
 ## How do I install it?
 ```bash
-# npm: install binary, then REQUIRED setup (+ hooks so agents actually use tools)
+# npm: install binary, then REQUIRED setup
 npm i -g @zlnap/astrolabe
-npx -y @zlnap/astrolabe setup --with-hooks
+npx -y @zlnap/astrolabe setup
 # or pin a release binary, then still run setup:
 curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh
-astrolabe setup --with-hooks
+astrolabe setup
 ```
-`npm i` / `install.sh` alone does **not** wire MCP clients or hooks. Other clients and options: [INSTALL_GUIDE.md](INSTALL_GUIDE.md).
+`npm i` / `install.sh` alone does **not** wire MCP clients. Other clients and options: [INSTALL_GUIDE.md](INSTALL_GUIDE.md).
 
 ## How do I verify the benefit on my own repo?
 Use the paired harness in [bench/](../bench/README.md): it runs the same task with and without Astrolabe at the same moment and reports paired cost/time/turn differences with bootstrap intervals. It costs real API money; start with `--pairs 3`.
@@ -41,18 +41,18 @@ Use the paired harness in [bench/](../bench/README.md): it runs the same task wi
 Python, Go, Rust, Java, TypeScript/JavaScript, C/C++, Swift, Objective-C/C++, PHP, Vue, Dart, C#, VB.NET, Kotlin, Shell, Ruby and Lua. tree-sitter covers symbol search for all of them; `find_refs`, `goto_def` and `get_diag` (legacy long names still work) need the language's server on PATH. Matrix: [REFERENCE.zh-CN.md](REFERENCE.zh-CN.md).
 
 ## Why is `astrolabe setup` required?
-Install only drops the binary. `setup` writes each detected client's MCP config. Add `--with-hooks` so PreToolUse hooks nudge the model away from Grep/Read toward Astrolabe — without that, many agents never call the MCP tools in practice. Cost effect of hooks was **not** A/B-benchmarked; see [HOOKS.md](HOOKS.md).
+Install only drops the binary. `setup` writes each detected client's MCP config (merging without wiping other servers). When upgrading from an older version, re-running `astrolabe setup` (or `astrolabe setup --remove-hooks`) also strips legacy Astrolabe hooks while keeping your other third-party hooks; see [HOOKS.md](HOOKS.md).
 
 ## Does Windows work?
-Yes. v0.17.4–v0.17.5 fixed real Windows path issues (`\\?\` normalize + watcher membership, subdirectory `index_root` reuse, `path_filter` backslash/absolute normalize). Prefer repo-root indexing; then `npm i -g @zlnap/astrolabe` and `npx -y @zlnap/astrolabe setup --with-hooks`.
+Yes. v0.17.4–v0.17.5 fixed real Windows path issues (`\\?\` normalize + watcher membership, subdirectory `index_root` reuse, `path_filter` backslash/absolute normalize). Prefer repo-root indexing; then `npm i -g @zlnap/astrolabe` and `npx -y @zlnap/astrolabe setup`.
 
 ## What are paths relative to when I override `index_root`?
 `index_root` accepts any existing directory, either absolute or relative to the server process's working directory. With `index_root=/repo/ai-proxy`, pass `path_filter="relay/channel/antigravity"`, not `"ai-proxy/relay/channel/antigravity"`. The same rule applies to precise-tool `path` arguments. An absolute path within that directory is also accepted; outside paths and `..` components are rejected.
 
 A subdirectory may reuse an active parent index without a second cold build. This does not change the input base: missing-path correction suggestions stay relative to the requested directory and can be retried with the same `index_root`. Suggestions exclude sibling directories. Result file paths remain relative to the active index root reported in the response header/note; use that root when passing those result paths to a subsequent call. No repeated-prefix guessing is performed, since `/repo/ai-proxy/ai-proxy` can be a legitimate nested directory.
 
-## What are the anti-drift hooks? Should I use them?
-PreToolUse hooks that deny repeated grep/whole-file reads and remind the model to use Astrolabe. Their effect on cost/latency has **not** been benchmarked (our A/B runs did not use them). For day-to-day use we still recommend `setup --with-hooks`. See [HOOKS.md](HOOKS.md).
+## What happened to the anti-drift hooks?
+Anti-drift PreToolUse hooks have been **removed**. Our 95-pair A/B runs showed that the streamlined 7-tool catalog and built-in routing instructions achieve 96.8% tool adoption (92/95) without hooks, and removing hooks eliminates interruptions to native `Read` + `Edit` flows and concurrent tool calls. When upgrading, run `astrolabe setup` (or `astrolabe setup --remove-hooks`) to remove legacy Astrolabe hooks while keeping third-party hooks; `astrolabe hooks ...` remains a silent exit-0 no-op for backward compatibility. See [HOOKS.md](HOOKS.md).
 
 ## Why did the model not call Astrolabe in my session?
-Models sometimes prefer shell tools. In our v0.12.0 runs it used Astrolabe in 0/5 of N5 and 1/5 of N8; after v0.13.0's changes in 20/20 of those two tasks. First confirm you ran `astrolabe setup --with-hooks`. If it still ignores the tools, name the short names in your prompt (`search_code` with `aggregate=top`, or `resolve_contx`) or in your project instructions.
+Models sometimes prefer shell tools. In our v0.12.0 runs it used Astrolabe in 0/5 of N5 and 1/5 of N8; after v0.13.0's changes in 20/20 of those two tasks (without hooks). First confirm you ran `astrolabe setup` and restarted your client session. If it still ignores the tools, name the short names in your prompt (`search_code` with `aggregate=top`, or `resolve_contx`) or in your project instructions.

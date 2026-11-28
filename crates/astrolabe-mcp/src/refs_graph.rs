@@ -231,7 +231,7 @@ pub(crate) fn snap_position(root: &Path, path: &str, symbol: &str, pos: Position
         return Snap {
             position: Some(snapped),
             note: Some(format!(
-                "Coordinates corrected: line={} character={} was {was}; snapped to `{symbol}` at line={} character={} (0-based).",
+                "Coordinates corrected: line={} col={} was {was}; snapped to `{symbol}` at line={} col={} (0-based).",
                 pos.line, pos.character, snapped.line, snapped.character
             )),
         };
@@ -239,7 +239,7 @@ pub(crate) fn snap_position(root: &Path, path: &str, symbol: &str, pos: Position
     Snap {
         position: None,
         note: Some(format!(
-            "No `{symbol}` within ±{SNAP_RADIUS} lines of line={}; ignored line/character and queried by name.",
+            "No `{symbol}` within ±{SNAP_RADIUS} lines of line={}; ignored line and queried by name.",
             pos.line
         )),
     }

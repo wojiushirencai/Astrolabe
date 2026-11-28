@@ -2,31 +2,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const { expandHome, readEnvDir, hookCommand } = require('./cursor');
+const { expandHome, readEnvDir } = require('./cursor');
 
 const MANAGED_BEGIN = '# >>> astrolabe-managed-kimi-hooks >>>';
 const MANAGED_END = '# <<< astrolabe-managed-kimi-hooks <<<';
-
-const REMIND_ARGS = ['hooks', 'remind', '--client=kimicode'];
-const CLEANUP_ARGS = ['hooks', 'cleanup'];
-
-function renderKimiManagedBlock(binPath = null, platform = process.platform) {
-  const remindCmd = hookCommand(binPath, REMIND_ARGS, platform);
-  const cleanupCmd = hookCommand(binPath, CLEANUP_ARGS, platform);
-  return `${MANAGED_BEGIN}
-[[hooks]]
-event = "PreToolUse"
-matcher = "Read|Grep|Bash|mcp__astrolabe__.*"
-command = ${JSON.stringify(remindCmd)}
-
-[[hooks]]
-event = "SessionEnd"
-command = ${JSON.stringify(cleanupCmd)}
-${MANAGED_END}
-`;
-}
-
-const MANAGED_BLOCK = renderKimiManagedBlock();
 
 function resolveKimiConfigDir(home, env = process.env, configDir = null) {
   const explicit = expandHome(configDir, home);
@@ -60,61 +39,55 @@ function resolveKimiConfigToml(home, env = process.env, configDir = null) {
 }
 
 /**
- * Merge managed [[hooks]] into ~/.kimi-code/config.toml without touching other
- * tables or user hook blocks (same marker strategy as DSH cordis patch).
+ * Strip the astrolabe-managed-kimi-hooks block from ~/.kimi-code/config.toml
+ * while preserving all other TOML tables and user [[hooks]] blocks.
  */
-function mergeKimiHooksToml(
-  filePath,
-  { create = true, existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
-) {
-  let created = false;
-  let text = '';
-  if (existsFn(filePath)) {
-    text = fs.readFileSync(filePath, 'utf8');
-  } else if (!create) {
-    return { skipped: true, reason: `missing ${filePath} (will not create)` };
-  } else {
-    created = true;
-    text = '';
+function stripKimiHooksToml(filePath, { existsFn = fs.existsSync } = {}) {
+  if (!existsFn(filePath)) {
+    return { skipped: true, reason: `missing ${filePath}` };
   }
-
-  const block = renderKimiManagedBlock(binPath, platform);
+  const text = fs.readFileSync(filePath, 'utf8');
   const begin = text.indexOf(MANAGED_BEGIN);
   const end = text.indexOf(MANAGED_END);
-  let next;
-  let replaced = false;
-  if (begin >= 0 && end > begin) {
-    replaced = true;
-    const afterEnd = end + MANAGED_END.length;
-    let tail = text.slice(afterEnd);
-    if (tail.startsWith('\n')) tail = tail.slice(1);
-    next = `${text.slice(0, begin)}${block}${tail}`;
-  } else if (begin >= 0 || end >= 0) {
+  if (begin < 0 && end < 0) {
+    return { skipped: true, reason: `no astrolabe-managed-kimi-hooks block in ${filePath}` };
+  }
+  if (begin < 0 || end < 0 || end < begin) {
     throw new Error(
       `${filePath} has a broken astrolabe-managed-kimi-hooks marker; fix or remove it, then re-run setup`,
     );
-  } else {
-    const trimmed = text.replace(/\s*$/, '');
-    next = trimmed ? `${trimmed}\n\n${block}` : `${block}`;
   }
-  if (!next.endsWith('\n')) next += '\n';
+
+  const before = text.slice(0, begin).replace(/\s+$/, '');
+  let after = text.slice(end + MANAGED_END.length).replace(/^(?:[ \t]*\r?\n)+/, '');
+  if (after.trim() === '') after = '';
+  let next;
+  if (before && after) {
+    next = `${before}\n\n${after}`;
+    if (!next.endsWith('\n')) next += '\n';
+  } else if (before) {
+    next = `${before}\n`;
+  } else if (after) {
+    next = after.endsWith('\n') ? after : `${after}\n`;
+  } else {
+    next = '';
+  }
+
   return {
     filePath,
     text: next,
-    created,
-    replaced,
-    entryPreview: block.trim(),
+    created: false,
+    replaced: true,
+    removed: true,
   };
 }
 
 module.exports = {
   MANAGED_BEGIN,
   MANAGED_END,
-  MANAGED_BLOCK,
-  renderKimiManagedBlock,
   resolveKimiConfigDir,
   detectKimiCode,
   resolveKimiMcpPath,
   resolveKimiConfigToml,
-  mergeKimiHooksToml,
+  stripKimiHooksToml,
 };

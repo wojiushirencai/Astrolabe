@@ -52,7 +52,7 @@ fn effective_budget(raw: usize) -> usize {
 }
 
 /// Stated once per result that lists positions.
-pub(crate) const COORD_NOTE: &str = "Coordinates: line and column are 1-based; columns are UTF-16 units. For line/character parameters use 0-based values (subtract 1 each).\n";
+pub(crate) const COORD_NOTE: &str = "Coordinates: line and column are 1-based; columns are UTF-16 units. For the line parameter use 0-based values (subtract 1).\n";
 
 /// One page of `items` starting at `offset`, cut by `budget`. Always keeps at
 /// least one item when any remain, so `next_offset` advances. Returns the kept
@@ -157,7 +157,6 @@ pub(crate) struct GetDiagParams {
     #[serde(default = "default_budget")]
     #[schemars(description = "Token budget.")]
     pub budget_tokens: usize,
-    /// Not advertised (`server.rs` UNADVERTISED_PARAMS); results name it.
     #[serde(default)]
     #[schemars(description = "true: ask the language server (slow, memory-heavy).")]
     #[serde(deserialize_with = "crate::server::bool_compat::optional")]
@@ -167,10 +166,9 @@ pub(crate) struct GetDiagParams {
 
 /// Tool descriptions shared by `PreciseTools` and `AstrolabeServer`, so the
 /// two catalogs cannot drift apart.
-pub(crate) const FIND_REFS_DESC: &str = "Precise references (index first, language-server fallback): call sites and usages — use for rename and caller analysis. Pass path (definition or use site) to disambiguate; when omitted, reuse this session's latest find_symbol/goto_def hit, else the unique index definition or a candidate list. Hits show source line, enclosing func, [declaration]; interface → implementors. dry_run_rename=NewName: read-only per-file rename checklist.";
-pub(crate) const GOTO_DEF_DESC: &str =
-    "Jump to definition: return the definition anchor from the use-site file + symbol name.";
-pub(crate) const GET_DIAG_DESC: &str = "File diagnostics (syntax and type errors) for checking after edits; skip if build/tests already pass.";
+pub(crate) const FIND_REFS_DESC: &str = "Precise scope-aware references, call sites, and interface implementors (index first, language-server fallback) — use instead of Grep for refactoring, caller analysis, and renames. Pass path (definition or use site) to disambiguate; when omitted, reuse this session's latest find_symbol/goto_def hit, else unique index definition or candidates. Hits show source line, enclosing func, [declaration]. dry_run_rename=NewName: read-only per-file rename checklist.";
+pub(crate) const GOTO_DEF_DESC: &str = "Jump to definition: resolve the exact definition anchor from a call/use site (path + symbol, optional 0-based line). Prefer over find_symbol when a name is overloaded or imported across packages.";
+pub(crate) const GET_DIAG_DESC: &str = "File diagnostics (syntax and type errors; pass lsp=true for full language-server check) for checking after edits — use only when you cannot run build/tests; skip if build/tests already pass.";
 
 /// Backend for the precise MCP query tools.
 ///
@@ -530,7 +528,7 @@ const WIDE_REFERENCES: usize = 150;
 
 /// Coordinate legend for the reference list.
 pub(crate) const REF_COORD_NOTE: &str =
-    "Coords Lline:col 1-based (UTF-16); -1 for line/character params.\n";
+    "Coords Lline:col 1-based (UTF-16); -1 for the line param.\n";
 
 /// A reference list in display order: non-test hits first (backend order
 /// kept within each group), then test hits.
@@ -820,7 +818,7 @@ fn render_rename_preview(
     if ambiguous {
         return (
             format!(
-                "Rename preview not generated: `{symbol}` has multiple same-name definitions in this file; references were merged and are not a single-symbol rename list. Pass line/character to pick one, then preview again.\n"
+                "Rename preview not generated: `{symbol}` has multiple same-name definitions in this file; references were merged and are not a single-symbol rename list. Pass 0-based line to pick one, then preview again.\n"
             ),
             0,
         );
@@ -861,7 +859,7 @@ fn render_rename_preview(
     }
     if omitted > 0 {
         out.push_str(&format!(
-            "(incomplete) {omitted} more files omitted due to budget_tokens; raise budget_tokens for the full list.\n"
+            "(incomplete) {omitted} more files omitted due to budget_tokens; narrow with path or use find_refs with offset for remaining hits.\n"
         ));
     }
     if confidence == Confidence::Exact {
@@ -895,11 +893,7 @@ pub(crate) fn run_goto_def(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if !has_position && symbol.is_none() {
-        let hint = if params.line.is_some() ^ params.character.is_some() {
-            "Provide both line and character, or a non-empty symbol."
-        } else {
-            "Provide symbol, or both line and character."
-        };
+        let hint = "Provide a non-empty symbol (and optional 0-based line).";
         return text_result(
             unknown_preamble_definition(Some(hint), Some(params.path.as_str())),
             json!({
@@ -1861,6 +1855,19 @@ mod tests {
             800,
         );
         assert!(low.contains("below exact"), "{low}");
+        let (ambig, _) =
+            render_rename_preview("a", "b", &[loc("a.rs", 0, 0)], Confidence::Exact, true, 800);
+        assert!(ambig.contains("0-based line"), "{ambig}");
+        assert!(!ambig.contains("character"), "{ambig}");
+        let many_files: Vec<Location> = (0..10)
+            .map(|i| loc(&format!("src/file_{i}.rs"), i, 0))
+            .collect();
+        let (trunc, _) = render_rename_preview("a", "b", &many_files, Confidence::Exact, false, 30);
+        assert!(!trunc.contains("raise budget_tokens"), "{trunc}");
+        assert!(
+            trunc.contains("find_refs") && trunc.contains("offset"),
+            "{trunc}"
+        );
     }
 
     #[test]
@@ -1969,10 +1976,28 @@ mod tests {
         let text = first_text(&missing_locator);
         assert!(text.contains("confidence: Unknown"), "{text}");
         assert!(text.contains("symbol"), "{text}");
+        assert!(text.contains("line"), "{text}");
+        assert!(!text.contains("character"), "{text}");
         assert!(
             text.contains("find_symbol") || text.contains("search_code"),
             "{text}"
         );
+
+        let line_only = assert_first_text(tools.goto_def(Parameters(GotoDefParams {
+            root: None,
+            index_root: None,
+            path: "src/main.rs".into(),
+            symbol: None,
+            line: Some(3),
+            character: None,
+            budget_tokens: 100,
+            offset: None,
+        })));
+        let text = first_text(&line_only);
+        assert!(text.contains("confidence: Unknown"), "{text}");
+        assert!(text.contains("symbol"), "{text}");
+        assert!(text.contains("line"), "{text}");
+        assert!(!text.contains("character"), "{text}");
     }
 
     #[test]

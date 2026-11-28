@@ -7,7 +7,7 @@ Facts (as of 2026-11-01, version 0.17.5+):
 - License: MIT OR Apache-2.0
 - Tools (7): resolve_contx, search_code, find_symbol, find_refs, goto_def, get_diag, get_lang (legacy long names are still accepted on tools/call)
 - Platforms: macOS arm64/x64, Linux x64 (glibc/musl), Linux arm64, Windows x64
-- Install (npm): npm i -g @zlnap/astrolabe && npx -y @zlnap/astrolabe setup --with-hooks  (setup is required; without it there are no MCP entries/hooks). Or: curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh && astrolabe setup --with-hooks
+- Install (npm): npm i -g @zlnap/astrolabe && npx -y @zlnap/astrolabe setup  (setup is required; without it there are no MCP entries). Or: curl -fsSL https://raw.githubusercontent.com/wojiushirencai/Astrolabe/main/install.sh | sh && astrolabe setup
 - Claude Code: claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=claude-code
 - No API key needed; indexing and search do not call an LLM.
 - npm: @zlnap/astrolabe is published (https://www.npmjs.com/package/@zlnap/astrolabe); binary name stays astrolabe. Windows stability fixes landed in v0.17.4–v0.17.5 (#117/#119).
@@ -24,4 +24,4 @@ Facts (as of 2026-11-01, version 0.17.5+):
 ## Optional
 - [Architecture](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/ARCHITECTURE.md)
 - [Reference (Chinese)](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/REFERENCE.zh-CN.md): env vars, language matrix, quality gates
-- [Anti-drift hooks (recommended via `setup --with-hooks`; cost effect not A/B-benchmarked)](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/HOOKS.md)
+- [Legacy hooks migration (removed)](https://github.com/wojiushirencai/Astrolabe/blob/main/docs/HOOKS.md)

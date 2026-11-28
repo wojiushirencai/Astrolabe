@@ -6,6 +6,48 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-28
+
+### 中文
+
+#### 移除与迁移：防漂移 Hook 机制退役（Removed / Migration）
+- 移除防漂移 `PreToolUse` Hook 拦截机制与 `dsh-plugin`（95 对无 Hook A/B 基准中工具采用率已达 96.8%；移除后消除对原生 `Read`+`Edit` 及并发工具调用批次的阻断）。
+- `astrolabe hooks ...` CLI 子命令保留为静默 `exit 0` 空操作兼容桩，避免旧版客户端配置报错。
+- `astrolabe setup` 在更新 MCP 配置时默认自动剥离 8 类客户端（含 `~/.claude/settings-*.json` 多配置档、带环境变量前缀与 `npx` 历史写法）中遗留的 Astrolabe hooks，同时保留第三方 hooks；新增 `--remove-hooks` 纯清理模式，保留 `--with-hooks` 弃用提示以兼容旧脚本。
+
+#### 变更：按意图路由的提示词与零分裂工具 Schema（Changed）
+- 重写 L1（`connection_instructions` 与 `cursor-l1.md`）、L2 与全部 7 个工具的 L3 描述，改为按意图路由，并明确内置 `Read`/`Edit`/`Grep` 的合理使用边界。
+- 修复 `scan_go_modules` 忽略 `corpus`/`fixtures`/`examples` 目录，以及 `search_shape` 中文件大纲提示矛盾的问题。
+- 将 `regex`、`exclude`、`offset`、`page`、`dry_run_rename`、`kind`、`substring`、`dedup`、`lsp` 9 个高频参数恢复至默认 `tools/list` Schema 公开声明；清除动态返回提示中所有未公开参数引导，并新增 Schema-提示词零分裂单元测试护栏。
+- `shared_index` 跨进程共享索引协议版本升至 `PROTO = 3`。
+
+#### 安装与升级后 setup
+```bash
+npm i -g @zlnap/astrolabe@0.18.0
+astrolabe setup
+```
+只安装二进制不会写入 MCP 配置；从旧版升级后运行 `astrolabe setup`（或 `astrolabe setup --remove-hooks`）可自动清理遗留 Astrolabe hooks 并保留其它第三方 hooks。
+
+### English
+
+#### Removed / Migration (Anti-drift hooks retired)
+- Remove the anti-drift `PreToolUse` hook interception mechanism and `dsh-plugin` (96.8% tool adoption across 95 hookless A/B benchmark pairs; removing hooks eliminates blocks on native `Read`+`Edit` and concurrent tool batches).
+- Keep the `astrolabe hooks ...` CLI subcommands as silent `exit 0` no-op compatibility stubs so existing client configs do not fail.
+- `astrolabe setup` now strips legacy Astrolabe hooks across 8 client families (including `~/.claude/settings-*.json` profiles, env-var prefixed commands, and historical `npx` invocations) by default when updating MCP config while preserving third-party hooks; add `--remove-hooks` for cleanup-only runs and keep `--with-hooks` with a deprecation notice for legacy scripts.
+
+#### Changed (Intent-routed prompts & zero-split tool schemas)
+- Rewrite L1 (`connection_instructions` and `cursor-l1.md`), L2, and all 7 L3 tool descriptions around intent-based routing with explicit boundaries for built-in `Read`/`Edit`/`Grep`.
+- Fix `scan_go_modules` to ignore `corpus`/`fixtures`/`examples` directories and resolve contradictory file-outline hints in `search_shape`.
+- Restore 9 high-frequency parameters (`regex`, `exclude`, `offset`, `page`, `dry_run_rename`, `kind`, `substring`, `dedup`, `lsp`) to the default `tools/list` schema, strip all references to unadvertised parameters from dynamic response hints, and add unit-test gates enforcing schema-prompt zero split.
+- Bump the `shared_index` IPC protocol version to `PROTO = 3`.
+
+#### Setup after installation or upgrade
+```bash
+npm i -g @zlnap/astrolabe@0.18.0
+astrolabe setup
+```
+Installing the binary alone does not write MCP configuration. Re-running `astrolabe setup` (or `astrolabe setup --remove-hooks`) when upgrading cleans up legacy Astrolabe hooks while keeping third-party hooks intact.
+
 ## [0.17.12] - 2026-11-28
 
 ### 中文

@@ -11,7 +11,7 @@ It is a single Rust binary (`astrolabe`) that indexes your repo with tree-sitter
 
 | | |
 |---|---|
-| Latest release | [v0.17.12](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.12), published 2026-11-28 |
+| Latest release | [v0.18.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.18.0), published 2026-11-28 |
 | What it exposes | 7 MCP tools (short names): `resolve_contx`, `search_code`, `find_symbol`, `find_refs`, `goto_def`, `get_diag`, `get_lang` (legacy long names still work as aliases) |
 | `tools/list` size | about 3.6 KB compact JSON (3,607 B measured on Linux for v0.16.0; not re-measured on macOS) |
 | Binary | one executable, no runtime; release archives are 7.4–9.1 MB, the unpacked Linux x64 binary is about 50 MB |
@@ -47,17 +47,17 @@ npm i -g @zlnap/astrolabe
 
 Other ways (manual download, Windows zip, build from source): [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md).
 
-**2. Required — run `setup` (writes MCP config; use `--with-hooks` so agents actually call the tools).**  
-Installing the binary alone does **not** wire clients and does **not** install anti-drift hooks. Without `setup` (and hooks where the client supports them), many agents keep using Grep/Read and never exercise Astrolabe.
+**2. Required — run `setup` (writes MCP config).**  
+Installing the binary alone does **not** wire clients; without `setup`, clients cannot call Astrolabe's MCP tools. Upgrading from an older version? Re-running `astrolabe setup` (or `astrolabe setup --remove-hooks`) automatically cleans up legacy Astrolabe hooks while keeping your other third-party hooks.
 
 ```bash
-# recommended (npm / npx) — MCP + hooks
-npx -y @zlnap/astrolabe setup --with-hooks
+# recommended (npm / npx)
+npx -y @zlnap/astrolabe setup
 # after a global npm install / PATH binary:
-astrolabe setup --with-hooks
+astrolabe setup
 
 # non-interactive: configure every detected client
-npx -y @zlnap/astrolabe setup --yes --with-hooks
+npx -y @zlnap/astrolabe setup --yes
 ```
 
 Claude Code (manual MCP only, still prefer `setup` above):
@@ -67,7 +67,7 @@ claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=cla
 ```
 
 Cursor (`.cursor/mcp.json`): `{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`.  
-Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-client-configuration). Flags: `--yes`, `--clients=…`, `--dry-run`, `--native`, `--list`, `--with-hooks`, `--no-cursor-permissions`.
+Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/INSTALL_GUIDE.md](docs/INSTALL_GUIDE.md#2-client-configuration). Flags: `--yes`, `--clients=…`, `--dry-run`, `--native`, `--list`, `--remove-hooks`, `--no-cursor-permissions`.
 
 **3. Verify.** `astrolabe --version` prints the version; in your client, ask it to call `get_lang` or `search_code`. Restart the client session after `setup`.
 
@@ -85,9 +85,9 @@ Codex, Windsurf, OpenCode, DSH, Codebuddy, Grok, Kimi, ZCode and others: [docs/I
 | `get_diag` | Syntax and type errors for a file. (alias: `get_diagnostics`) |
 | `get_lang` | Languages, file counts, lines of code, language-server status, and index coverage (see below). (alias: `get_languages`) |
 
-`tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn), including optional per-call `index_root` on every tool (absolute or cwd-relative directory inside a git repository or a `.astrolabe/project.yml` project; omit to keep the process startup root). Astrolabe only indexes git repositories and directories declared by `.astrolabe/project.yml` (Serena's `.serena/project.yml` is accepted for compatibility); a directory that holds git repositories is never indexed itself. Any other startup directory or `index_root` is refused with its child repositories listed, unless `ASTROLABE_ALLOW_NON_GIT_ROOT=1` (see [REFERENCE](docs/REFERENCE.zh-CN.md)). The others — `regex`, `exclude`, `count_only`, `context_lines`, `group`, `dedup`, `kind`, `depth`, `substring`, `dry_run_rename`, `character`, `severity`, `offset`, `page`, `budget_tokens`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
+`tools/list` advertises only the parameters models actually use (about 3.3 KB smaller, resent on every API turn), including optional per-call `index_root` on every tool (absolute or cwd-relative directory inside a git repository or a `.astrolabe/project.yml` project; omit to keep the process startup root). Astrolabe only indexes git repositories and directories declared by `.astrolabe/project.yml` (Serena's `.serena/project.yml` is accepted for compatibility); a directory that holds git repositories is never indexed itself. Any other startup directory or `index_root` is refused with its child repositories listed, unless `ASTROLABE_ALLOW_NON_GIT_ROOT=1` (see [REFERENCE](docs/REFERENCE.zh-CN.md)). The others — `budget_tokens`, `depth`, `agent_id`, `context_lines`, `count_only`, `group`, `character`, `severity`, and `root` outside multi-repo workspaces — are still accepted. Set `ASTROLABE_FULL_SCHEMA=1` to advertise all of them.
 
-Tool descriptions and return text are **English-only** (schema copy, result bodies, hook reminders), so agents are not split across bilingual phrasing.
+Tool descriptions and return text are **English-only** (schema copy and result bodies), so agents are not split across bilingual phrasing.
 
 **Index coverage.** Every file of a supported language is indexed, including files with syntax or compile errors: the symbols that parse are kept, but symbols inside the broken region may be missing. `get_lang` reports:
 - files *not* in the index, as counts by reason (over the size cap, read failure, parser timeout);
@@ -141,7 +141,7 @@ Reproduce the public part: `bash bench/fetch_corpora.sh && bash bench/run_pairs.
 
 ## More documentation
 
-[Install & clients](docs/INSTALL_GUIDE.md) · [FAQ](docs/FAQ.md) · [Reference (Chinese): config, env vars, language matrix, quality gates](docs/REFERENCE.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Performance method](docs/PERFORMANCE.md) · [Anti-drift hooks (`setup --with-hooks`; cost effect not A/B-benchmarked)](docs/HOOKS.md) · [Releasing](.github/RELEASING.md) · [llms.txt](llms.txt)
+[Install & clients](docs/INSTALL_GUIDE.md) · [FAQ](docs/FAQ.md) · [Reference (Chinese): config, env vars, language matrix, quality gates](docs/REFERENCE.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Performance method](docs/PERFORMANCE.md) · [Legacy hooks migration (removed)](docs/HOOKS.md) · [Releasing](.github/RELEASING.md) · [llms.txt](llms.txt)
 
 Build from source: `cargo build --release --bin astrolabe` (Rust 1.90+). Tests: `cargo test --workspace`.
 
