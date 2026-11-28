@@ -3259,6 +3259,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Wait until the watch thread has sealed its baseline. Writing before
+    /// that can be folded into the seed (no delta) or observed by the first
+    /// background check, leaving a later request_verification queued and
+    /// racing run_barrier.
+    fn wait_until_seeded(log: &FreshnessLog, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if log.is_seeded() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// The receiver is deliberately owned by the test rather than a reindex
     /// worker. Receiving a batch proves observation completed, not publication.
     fn session_with_manual_watch_consumer(
@@ -3270,15 +3287,18 @@ mod tests {
         Arc<FreshnessLog>,
     ) {
         let session = ready_session(dir);
-        let mut watcher = Watcher::new(dir.to_path_buf())
+        let watcher = Watcher::new(dir.to_path_buf())
             .events(false)
             // This fixture observes batches directly, not debounce behavior.
-            // An initial background scan can win the explicit verification;
-            // emit that delta immediately instead of parking it for an hour.
+            // Emit a verification delta immediately instead of parking it
+            // for an hour.
             .debounce(Duration::ZERO)
             .poll_interval(Duration::from_secs(3600));
-        assert!(watcher.check().is_empty());
         let (rx, handle, log) = watcher.spawn_with_log();
+        assert!(
+            wait_until_seeded(&log, Duration::from_secs(5)),
+            "initial background baseline scan must finish before the test writes"
+        );
         *session.freshness.lock().unwrap() = Some(Arc::clone(&log));
         (session, rx, handle, log)
     }
