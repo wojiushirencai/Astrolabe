@@ -6,6 +6,74 @@ npm 已发布为 `@zlnap/astrolabe`；crates.io 尚未发布。tag 与 release �
 
 ## [Unreleased]
 
+## [0.17.12] - 2026-11-28
+
+### 中文
+
+本次版本在已发布的 0.17.11（PR #134）之上，纳入已合并到 main 的 PR #135。既有 Git 标签 `v0.17.11` 仍指向仅包含 #134 的提交 `7255c8b`，本版本不会移动该标签。
+
+#### 2026-11-23 本地正确性修复（#135）
+- 解析缓存按路径/profile 加盐（`EXTRACTOR_VERSION` 8），避免 Razor、shell 方言和 Vue 组件名等路径相关提取结果互相串用。
+- 源文件缓存提供精确时间戳的 get/insert/invalidate，避免同一毫秒、同等长度的改写命中旧缓存。
+- Watcher 增加未应用（unapplied）表；目录或 ignore 规则修复不得被误确认为已应用。
+- Linux 上同名目录重建会正确失效旧索引。
+- 仅有行号的引用默认 `character=0`。
+- 搜索使用共享 `SearchPlan`；`NameTable` 增加 `named_groups`，`WordIndex` 支持 `select_nth`。
+- MCP 布尔参数按严格兼容规则解析。
+- 会话 writer 生命周期/RAII（关闭、休眠、重建、`publish_if_open`）。
+- `recent_symbol` 按 agent、scope 与 root 隔离。
+- Hooks：Claude `.output` 信任路径白名单；审批哈希改为使用当前配置。
+- Setup：`--check-config`、审批哈希、hook matcher，以及不覆盖混有第三方 hook 的目录。
+- 安装与 bench 测试脚手架的退出码修复，以及配套测试与文档。
+
+#### Watcher 不信任条件收窄
+- 读取、元数据以及普通目录事件不再把监视日志标为 distrust，因此不会再掩盖真正的写入。
+- 监视根目录上的事件，只有该根被删除或重命名时才会让日志 distrust，避免刚创建根目录后迟到的 create/metadata 事件误触发降级。
+
+#### Windows 测试修复
+- `stdio_smoke` 改为与 `display_path` 比较，避免 Windows `canonicalize()` 的 `\\?\` 前缀导致误失败。
+- `verify-install` 在 Windows 上跳过 catalog failure 的 `eof` 夹具用例（该环境下活子进程的 stdout end 无法传到父进程）；`exit` 用例仍覆盖失败路径。
+
+#### 安装后必须 setup（含 hooks）
+```bash
+npm i -g @zlnap/astrolabe@0.17.12
+astrolabe setup --with-hooks
+```
+只安装二进制不会配置 MCP 或 hooks；请按客户端要求重新加载已有会话。
+
+### English
+
+This release sits on top of the already-published 0.17.11 (PR #134) and includes PR #135, now merged to main. The existing Git tag `v0.17.11` remains on `7255c8b` (the #134-only commit) and is not moved.
+
+#### 2026-11-23 local correctness fixes (#135)
+- Salt the parse cache by path/profile (`EXTRACTOR_VERSION` 8) so path-dependent extractors (Razor, shell dialects, Vue component names) do not share a content-addressed product.
+- Add precise-timestamp get/insert/invalidate on the source-file cache so a same-millisecond, same-length rewrite cannot hit a stale entry.
+- Track unapplied watcher updates; directory or ignore-rule repairs must not be false-acknowledged as applied.
+- Invalidate the old index when a same-name directory is rebuilt on Linux.
+- Line-only references default to `character=0`.
+- Share `SearchPlan` across searches; add `NameTable::named_groups` and `WordIndex::select_nth`.
+- Parse MCP boolean parameters with strict compatibility rules.
+- Session writer lifecycle/RAII (close, hibernate, rebuild, `publish_if_open`).
+- Isolate `recent_symbol` by agent, scope, and root.
+- Hooks: whitelist Claude `.output` trust paths; hash approvals against the current config.
+- Setup: `--check-config`, approval hashing, hook matchers, and no overwrite of hook directories that already contain third-party hooks.
+- Fix install and bench harness exit codes, plus related tests and docs.
+
+#### Narrower watcher distrust
+- Reads, metadata events, and ordinary directory events no longer mark the watch log as distrusted, so genuine writes are not hidden.
+- An event naming the watch root itself distrusts the log only on remove or rename of that root, so a late create/metadata event after the root is created cannot falsely degrade the first query.
+
+#### Windows test fixes
+- `stdio_smoke` compares against `display_path` rather than a raw `canonicalize()` path, avoiding false failures from the Windows `\\?\` prefix.
+- `verify-install` skips the catalog-failure `eof` fixture on Windows (a live child's `stdout` end never reached the parent there); the `exit` case still covers that failure path.
+
+#### Required setup after installation (including hooks)
+```bash
+npm i -g @zlnap/astrolabe@0.17.12
+astrolabe setup --with-hooks
+```
+Installing the binary alone does not configure MCP or hooks. Reload existing sessions as required by the client.
+
 ## [0.17.11] - 2026-11-27
 
 ### 中文
