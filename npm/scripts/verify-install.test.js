@@ -24,7 +24,10 @@ process.on('SIGTERM', () => {
   process.exit(ready ? 0 : 42);
 });
 if (mode === 'exit') process.exit(7);
-if (mode === 'eof') process.stdout.end();
+// Close the real stdout descriptor without touching process.stdout: on Windows
+// libuv duplicates the stdio pipe handle when process.stdout is created, so
+// process.stdout.end() never closes the pipe and the parent sees no EOF.
+if (mode === 'eof') require('fs').closeSync(1);
 if (mode === 'missing') {
   process.stderr.write('missing directory\\n');
   process.exit(2);
@@ -127,11 +130,7 @@ for (const [mode, expected] of [
   ['rpcerror', /fixture failure/],
   ['eofbad', /expected graceful EOF exit 0/],
 ]) {
-  // On windows-latest CI, process.stdout.end() in a still-running node child
-  // did not deliver EOF to the parent pipe, so the 'eof' fixture only timed
-  // out there. The exit path is still covered by 'exit' on every platform.
-  const opts = { skip: mode === 'eof' && process.platform === 'win32' };
-  test(`catalog failure (${mode}) rejects and reaps the child`, opts, async () => {
+  test(`catalog failure (${mode}) rejects and reaps the child`, async () => {
     const fixture = fixtureSpawner(mode);
     await assert.rejects(toolsList('', '.', 500, fixture.spawnImpl), expected);
     assertReaped(fixture.children);
