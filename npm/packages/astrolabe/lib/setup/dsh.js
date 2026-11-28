@@ -7,15 +7,6 @@ const { expandHome, readEnvDir } = require('./cursor');
 const MANAGED_BEGIN = '# >>> astrolabe-managed-dsh-guard >>>';
 const MANAGED_END = '# <<< astrolabe-managed-dsh-guard <<<';
 
-const MANAGED_BLOCK = `${MANAGED_BEGIN}
-- insert:
-    - id: astrolabe-guard
-      name: 'astrolabe-dsh-guard'
-      config:
-        client: claude-code
-${MANAGED_END}
-`;
-
 function resolveDshHome(home, env = process.env, configDir = null) {
   const explicit = expandHome(configDir, home);
   if (explicit) return explicit;
@@ -26,32 +17,40 @@ function resolveDshPatchPath(home, env = process.env, configDir = null) {
   return path.join(resolveDshHome(home, env, configDir), 'cordis.patch.yml');
 }
 
-function resolveDshPluginSource(existsFn, startDir = __dirname) {
-  const vendor = path.join(startDir, 'vendor', 'astrolabe-dsh-guard');
-  if (existsFn(path.join(vendor, 'package.json'))) return vendor;
-
-  let dir = startDir;
-  for (let i = 0; i < 10; i += 1) {
-    const cand = path.join(dir, 'dsh-plugin');
-    if (existsFn(path.join(cand, 'package.json'))) return cand;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+function statIsDir(dirPath) {
+  try {
+    return fs.statSync(dirPath).isDirectory();
+  } catch {
+    return false;
   }
-  return null;
+}
+
+function pathExistsOrSymlink(filePath, existsFn = fs.existsSync) {
+  if (existsFn(filePath)) return true;
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Prefer hoisted ~/.dsh/profiles/node_modules (seen on macOS installs), else
- * each profiles/<name>/node_modules, else create the hoisted path.
+ * Return existing astrolabe-dsh-guard install directories only (never invents
+ * non-existent directories).
  */
-function resolveDshPluginInstallDirs(home, existsFn, env = process.env, configDir = null) {
+function findExistingDshPluginInstallDirs(
+  home,
+  existsFn = fs.existsSync,
+  env = process.env,
+  configDir = null,
+) {
   const dshHome = resolveDshHome(home, env, configDir);
   const profiles = path.join(dshHome, 'profiles');
   const dirs = [];
-  const hoisted = path.join(profiles, 'node_modules');
-  if (existsFn(hoisted) || existsFn(profiles)) {
-    dirs.push(path.join(hoisted, 'astrolabe-dsh-guard'));
+  const hoistedTarget = path.join(profiles, 'node_modules', 'astrolabe-dsh-guard');
+  if (pathExistsOrSymlink(hoistedTarget, existsFn)) {
+    dirs.push(hoistedTarget);
   }
   if (existsFn(profiles)) {
     let entries = [];
@@ -61,80 +60,81 @@ function resolveDshPluginInstallDirs(home, existsFn, env = process.env, configDi
       entries = [];
     }
     for (const ent of entries) {
-      if (!ent.isDirectory()) continue;
+      if (
+        !ent.isDirectory() &&
+        !(ent.isSymbolicLink() && statIsDir(path.join(profiles, ent.name)))
+      ) {
+        continue;
+      }
       if (ent.name === 'node_modules') continue;
-      const nm = path.join(profiles, ent.name, 'node_modules');
-      // Only install into a profile that already has node_modules or a package.json
-      // (active profile), so we do not invent empty profile trees.
-      if (existsFn(nm) || existsFn(path.join(profiles, ent.name, 'package.json'))) {
-        const target = path.join(nm, 'astrolabe-dsh-guard');
-        if (!dirs.includes(target)) dirs.push(target);
+      const target = path.join(profiles, ent.name, 'node_modules', 'astrolabe-dsh-guard');
+      if (pathExistsOrSymlink(target, existsFn) && !dirs.includes(target)) {
+        dirs.push(target);
       }
     }
   }
-  if (!dirs.length) {
-    dirs.push(path.join(dshHome, 'profiles', 'node_modules', 'astrolabe-dsh-guard'));
-  }
-  // Dedupe while preferring hoisted first
-  return [...new Set(dirs)];
-}
-
-function copyDirRecursive(src, dest) {
-  fs.mkdirSync(dest, { recursive: true });
-  for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
-    const from = path.join(src, ent.name);
-    const to = path.join(dest, ent.name);
-    if (ent.isDirectory()) copyDirRecursive(from, to);
-    else fs.copyFileSync(from, to);
-  }
+  return dirs;
 }
 
 /**
- * Merge the managed astrolabe-guard insert into ~/.dsh/cordis.patch.yml without
- * touching the orca-managed-dsh-hooks block (or any other content).
+ * Strip the astrolabe-managed-dsh-guard block from ~/.dsh/cordis.patch.yml
+ * while 100% preserving orca-managed-dsh-hooks and all other content.
  */
-function mergeDshCordisPatch(filePath, { create = true, existsFn = fs.existsSync } = {}) {
-  let created = false;
-  let text = '';
-  if (existsFn(filePath)) {
-    text = fs.readFileSync(filePath, 'utf8');
-  } else if (!create) {
-    return { skipped: true, reason: `missing ${filePath} (will not create)` };
-  } else {
-    created = true;
-    text = '';
+function stripDshCordisPatch(filePath, { existsFn = fs.existsSync } = {}) {
+  if (!existsFn(filePath)) {
+    return { skipped: true, reason: `missing ${filePath}` };
   }
-
+  const text = fs.readFileSync(filePath, 'utf8');
   const begin = text.indexOf(MANAGED_BEGIN);
   const end = text.indexOf(MANAGED_END);
-  let next;
-  let replaced = false;
-  if (begin >= 0 && end > begin) {
-    replaced = true;
-    const afterEnd = end + MANAGED_END.length;
-    let tail = text.slice(afterEnd);
-    if (tail.startsWith('\n')) tail = tail.slice(1);
-    next = `${text.slice(0, begin)}${MANAGED_BLOCK}${tail}`;
-  } else if (begin >= 0 || end >= 0) {
+  if (begin < 0 && end < 0) {
+    return { skipped: true, reason: `no astrolabe-managed-dsh-guard block in ${filePath}` };
+  }
+  if (begin < 0 || end < 0 || end < begin) {
     throw new Error(
       `${filePath} has a broken astrolabe-managed-dsh-guard marker; fix or remove it, then re-run setup`,
     );
-  } else {
-    const trimmed = text.replace(/\s*$/, '');
-    next = trimmed ? `${trimmed}\n\n${MANAGED_BLOCK}` : `${MANAGED_BLOCK}`;
   }
-  if (!next.endsWith('\n')) next += '\n';
-  return { filePath, text: next, created, replaced };
+
+  const before = text.slice(0, begin).replace(/\s+$/, '');
+  let after = text.slice(end + MANAGED_END.length).replace(/^(?:[ \t]*\r?\n)+/, '');
+  if (after.trim() === '') after = '';
+  let next;
+  if (before && after) {
+    next = `${before}\n\n${after}`;
+    if (!next.endsWith('\n')) next += '\n';
+  } else if (before) {
+    next = `${before}\n`;
+  } else if (after) {
+    next = after.endsWith('\n') ? after : `${after}\n`;
+  } else {
+    next = '';
+  }
+
+  return { filePath, text: next, created: false, replaced: true, removed: true };
 }
 
-function detectDsh(home, env, { whichFn, existsFn }) {
+function detectDsh(home, env = process.env, { existsFn = fs.existsSync } = {}) {
   const evidence = [];
   const dshHome = resolveDshHome(home, env);
   const hasCustom = Boolean(readEnvDir(env, ['DSH_HOME'], home));
-  if (whichFn('dsh', env)) evidence.push('dsh on PATH');
-  if (existsFn(dshHome)) evidence.push(hasCustom ? dshHome : '~/.dsh/');
-  if (existsFn(path.join(dshHome, 'cordis.patch.yml'))) {
-    evidence.push(hasCustom ? path.join(dshHome, 'cordis.patch.yml') : '~/.dsh/cordis.patch.yml');
+  const patchPath = resolveDshPatchPath(home, env);
+  if (existsFn(patchPath)) {
+    try {
+      const text = fs.readFileSync(patchPath, 'utf8');
+      if (
+        text.includes(MANAGED_BEGIN) ||
+        text.includes(MANAGED_END) ||
+        text.includes('astrolabe-managed-dsh-guard')
+      ) {
+        evidence.push(hasCustom ? patchPath : '~/.dsh/cordis.patch.yml');
+      }
+    } catch {
+      // Ignore unreadable patch file
+    }
+  }
+  for (const dir of findExistingDshPluginInstallDirs(home, existsFn, env)) {
+    evidence.push(dir);
   }
   return { detected: evidence.length > 0, evidence };
 }
@@ -142,12 +142,9 @@ function detectDsh(home, env, { whichFn, existsFn }) {
 module.exports = {
   MANAGED_BEGIN,
   MANAGED_END,
-  MANAGED_BLOCK,
   resolveDshHome,
   resolveDshPatchPath,
-  resolveDshPluginSource,
-  resolveDshPluginInstallDirs,
-  copyDirRecursive,
-  mergeDshCordisPatch,
+  findExistingDshPluginInstallDirs,
   detectDsh,
+  stripDshCordisPatch,
 };

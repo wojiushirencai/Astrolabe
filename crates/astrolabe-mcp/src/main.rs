@@ -141,25 +141,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Launch::HooksRemind {
-            client,
-            deny_text_search,
-            context,
-        } => {
-            std::process::exit(astrolabe_mcp::hooks::run_remind(
-                &client,
-                deny_text_search,
-                context.as_deref(),
-            ));
-        }
-        Launch::HooksCleanup => {
-            std::process::exit(astrolabe_mcp::hooks::run_cleanup());
-        }
-        Launch::HooksGc => {
-            std::process::exit(astrolabe_mcp::hooks::run_gc());
-        }
-        Launch::HooksSessionStart => {
-            std::process::exit(astrolabe_mcp::hooks::run_session_start());
+        Launch::HooksNoop { drain_stdin } => {
+            std::process::exit(astrolabe_mcp::hooks::run_noop(drain_stdin))
         }
         Launch::PrintCcSystemPromptOverride => {
             print!(

@@ -211,7 +211,8 @@ function writeTextAtomic(filePath, contents) {
   const dir = path.dirname(dest);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.${path.basename(dest)}.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, contents.endsWith('\n') ? contents : `${contents}\n`, {
+  const payload = contents === '' || contents.endsWith('\n') ? contents : `${contents}\n`;
+  fs.writeFileSync(tmp, payload, {
     encoding: 'utf8',
     mode: mode ?? 0o600,
   });
@@ -442,7 +443,20 @@ function normalizeExplicitHooks(hooksConfigPaths, home) {
 
 function resolveHooksPaths(hooksConfigPaths, defaultPath, home) {
   const normalized = normalizeExplicitHooks(hooksConfigPaths, home);
-  return normalized.length > 0 ? normalized : [defaultPath];
+  return dedupePaths([defaultPath, ...normalized]);
+}
+
+function dedupePaths(paths, platform = process.platform) {
+  const seen = new Set();
+  const out = [];
+  for (const p of paths) {
+    if (!p) continue;
+    const key = normalizeComparablePath(p, platform);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return out;
 }
 
 function assertNoHooksConfigOverride(clientId, hooksConfigPaths) {
@@ -596,9 +610,12 @@ const CLIENTS = [
     plan({
       home,
       launch,
-      withHooks = false,
       alwaysLoad = true,
       binPath = null,
+      projectRoot = null,
+      explicitProject = false,
+      scope = 'global',
+      removeHooks = false,
       env = process.env,
       configDir = null,
       mcpConfigPath = null,
@@ -607,11 +624,14 @@ const CLIENTS = [
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
       const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
       const filePath = explicitMcp || claudeCodeMod.resolveClaudeMcpPath(home, env, explicitConfigDir);
-      const defaultSettingsPath = claudeCodeMod.resolveClaudeSettingsPath(home, env, explicitConfigDir);
-      const settingsPaths = resolveHooksPaths(hooksConfigPaths, defaultSettingsPath, home);
-      if (effectiveWithHooks) {
+      const discoveredSettings = claudeCodeMod.discoverClaudeSettingsPaths(home, {
+        existsFn: exists,
+        env,
+        configDir: explicitConfigDir,
+      });
+      const settingsPaths = dedupePaths([...discoveredSettings, ...explicitHooks]);
+      if (!removeHooks) {
         assertDistinctMcpAndHooksPaths('claude-code', filePath, settingsPaths);
       }
       const entry = jsonServerEntry(launch, { typed: true });
@@ -620,42 +640,41 @@ const CLIENTS = [
       }
       const hookBinPath = resolveHookBinPath({ binPath, launch, env });
       const steps = [];
-      steps.push({
-        kind: 'json-mcp',
-        filePath,
-        entry,
-        summary: `merge mcpServers.astrolabe into ${filePath}`,
-        apply() {
-          const result = mergeClaudeJson(filePath, entry);
-          if (result.skipped) return result;
-          return { ...result, entry, write: () => writeJsonAtomic(filePath, result.doc) };
-        },
-      });
-      if (effectiveWithHooks) {
-        for (const settingsPath of settingsPaths) {
-          steps.push({
-            kind: 'claude-code-hooks',
-            filePath: settingsPath,
-            summary: `merge SessionStart/PreToolUse/SessionEnd into ${settingsPath}`,
-            apply() {
-              const result = claudeCodeMod.mergeClaudeCodeHooksSettings(settingsPath, {
-                create: true,
-                existsFn: exists,
-                binPath: hookBinPath,
-              });
-              if (result.skipped) return result;
-              return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
-            },
-          });
-        }
+      if (!removeHooks) {
+        steps.push({
+          kind: 'json-mcp',
+          filePath,
+          entry,
+          summary: `merge mcpServers.astrolabe into ${filePath}`,
+          apply() {
+            const result = mergeClaudeJson(filePath, entry);
+            if (result.skipped) return result;
+            return { ...result, entry, write: () => writeJsonAtomic(filePath, result.doc) };
+          },
+        });
+      }
+      for (const settingsPath of settingsPaths) {
+        steps.push({
+          kind: 'claude-code-hooks-cleanup',
+          filePath: settingsPath,
+          summary: `strip legacy Astrolabe hooks from ${settingsPath}`,
+          apply() {
+            const result = claudeCodeMod.stripClaudeCodeHooksSettings(settingsPath, {
+              existsFn: exists,
+              binPath: hookBinPath,
+            });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
+          },
+        });
       }
       return {
-        kind: effectiveWithHooks ? 'claude-code' : 'json-mcp',
-        filePath,
-        entry,
-        summary:
-          steps[0].summary +
-          (effectiveWithHooks ? `; hooks → ${settingsPaths.join(', ')}` : ''),
+        kind: removeHooks ? 'claude-code-hooks-cleanup' : 'claude-code',
+        filePath: removeHooks ? settingsPaths[0] : filePath,
+        entry: removeHooks ? undefined : entry,
+        summary: removeHooks
+          ? `strip legacy Astrolabe hooks from ${settingsPaths.join(', ')}`
+          : `merge mcpServers.astrolabe into ${filePath} (and strip legacy hooks)`,
         steps,
         apply() {
           const results = [];
@@ -667,11 +686,38 @@ const CLIENTS = [
             }
             results.push(applied);
           }
-          const primary = results.find((r) => !r.skipped) || results[0];
+          const warnings = [];
+          if (
+            (scope === 'project' || explicitProject) &&
+            projectRoot &&
+            !sameComparablePath(projectRoot, home)
+          ) {
+            const findings = claudeCodeMod.inspectClaudeProjectHooks(projectRoot, {
+              existsFn: exists,
+              binPath: hookBinPath,
+            });
+            for (const f of findings) {
+              if (settingsPaths.some((sp) => sameComparablePath(sp, f.filePath))) continue;
+              warnings.push(
+                `Warning: ${f.filePath} contains legacy Astrolabe hooks (${f.events.join(', ')}) (read-only check; not modified). Run: astrolabe setup --clients=claude-code --settings ${JSON.stringify(f.filePath)} --yes`,
+              );
+            }
+          }
+          const nonSkipped = results.filter((r) => !r.skipped);
+          if (removeHooks && nonSkipped.length === 0) {
+            return {
+              skipped: true,
+              reason: 'no legacy Astrolabe hooks found',
+              results,
+              warnings,
+            };
+          }
+          const primary = nonSkipped[0] || results[0];
           return {
             ...primary,
-            entry,
+            entry: removeHooks ? undefined : entry,
             results,
+            warnings,
             write: () => {
               for (const r of results) {
                 if (!r.skipped && r.write) r.write();
@@ -700,13 +746,15 @@ const CLIENTS = [
     plan({
       home,
       launch,
-      withHooks = false,
       projectRoot = null,
       cursorBinPath = null,
+      binPath: hookBinOverride = null,
       env = process.env,
       pyrightPath = null,
       detected = true,
       scope = 'global',
+      explicitProject = false,
+      removeHooks = false,
       cursorCommandExplicit = false,
       configDir = null,
       mcpConfigPath = null,
@@ -714,19 +762,78 @@ const CLIENTS = [
     }) {
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
-      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
       const cursorDir = cursorMod.resolveCursorConfigDir(home, env, explicitConfigDir);
       const globalMcpPath = explicitMcp || path.join(cursorDir, 'mcp.json');
       const defaultHooksPath = cursorMod.resolveCursorHooksPath(home, env, explicitConfigDir);
-      const hooksPaths = resolveHooksPaths(hooksConfigPaths, defaultHooksPath, home);
+      const baseHooksPaths = resolveHooksPaths(hooksConfigPaths, defaultHooksPath, home);
+      const canonicalProjectRoot = projectRoot ? cursorMod.canonicalizePath(projectRoot) : null;
+      const hooksPathsList = [...baseHooksPaths];
+      if (
+        (scope === 'project' || explicitProject) &&
+        canonicalProjectRoot &&
+        !sameComparablePath(canonicalProjectRoot, home)
+      ) {
+        hooksPathsList.push(path.join(canonicalProjectRoot, '.cursor', 'hooks.json'));
+      }
+      const hooksPaths = dedupePaths(hooksPathsList);
       const projectScope = scope === 'project';
-      if (effectiveWithHooks) {
+
+      if (removeHooks) {
+        const stripBinPath =
+          cursorBinPath || resolveHookBinPath({ binPath: hookBinOverride, launch, env });
+        const steps = hooksPaths.map((hp) => ({
+          kind: 'cursor-hooks-cleanup',
+          filePath: hp,
+          summary: `strip legacy Astrolabe hooks from ${hp}`,
+          apply() {
+            const result = cursorMod.stripCursorHooksFile(hp, {
+              existsFn: exists,
+              binPath: stripBinPath,
+            });
+            if (result.skipped) return result;
+            return {
+              ...result,
+              write: result.deleted
+                ? () => fs.rmSync(hp, { force: true })
+                : () => writeJsonAtomic(hp, result.doc),
+            };
+          },
+        }));
+        return {
+          kind: 'cursor-hooks-cleanup',
+          filePath: hooksPaths[0],
+          summary: `strip legacy Astrolabe hooks from ${hooksPaths.join(', ')}`,
+          steps,
+          apply() {
+            const results = steps.map((s) => s.apply());
+            const nonSkipped = results.filter((r) => !r.skipped);
+            if (nonSkipped.length === 0) {
+              return {
+                skipped: true,
+                reason: 'no legacy Astrolabe hooks found',
+                results,
+              };
+            }
+            const primary = nonSkipped[0];
+            return {
+              ...primary,
+              results,
+              write: () => {
+                for (const r of results) {
+                  if (!r.skipped && r.write) r.write();
+                }
+              },
+            };
+          },
+        };
+      }
+
+      {
         const earlyMcpPath =
           explicitMcp ||
           (projectScope
-            ? projectRoot
-              ? path.join(cursorMod.canonicalizePath(projectRoot), '.cursor', 'mcp.json')
+            ? canonicalProjectRoot
+              ? path.join(canonicalProjectRoot, '.cursor', 'mcp.json')
               : null
             : globalMcpPath);
         if (earlyMcpPath) {
@@ -746,14 +853,10 @@ const CLIENTS = [
           },
         };
       }
-      const root = projectRoot
-        ? cursorMod.canonicalizePath(projectRoot)
-        : cursorMod.resolveProjectRoot(process.cwd());
+      const root = canonicalProjectRoot || cursorMod.resolveProjectRoot(process.cwd());
       const projectMcpPath = explicitMcp || path.join(root, '.cursor', 'mcp.json');
       const primaryPath = projectScope ? projectMcpPath : globalMcpPath;
-      if (effectiveWithHooks) {
-        assertDistinctMcpAndHooksPaths('cursor', primaryPath, hooksPaths);
-      }
+      assertDistinctMcpAndHooksPaths('cursor', primaryPath, hooksPaths);
       // Absolute native binary: a bare `astrolabe`/`npx` command depends on the
       // client's PATH and silently fails on hooks and on stdio spawn.
       const binPath =
@@ -828,23 +931,26 @@ const CLIENTS = [
           },
         });
       }
-      if (effectiveWithHooks) {
-        for (const hooksPath of hooksPaths) {
-          steps.push({
-            kind: 'cursor-hooks',
-            filePath: hooksPath,
-            summary: `merge preToolUse/sessionEnd into ${hooksPath} (--client=cursor, absolute hook command)`,
-            apply() {
-              const result = cursorMod.mergeCursorHooksFile(hooksPath, {
-                create: true,
-                existsFn: exists,
-                binPath,
-              });
-              if (result.skipped) return result;
-              return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
-            },
-          });
-        }
+      const stripBinPath = binPath || hookBinOverride;
+      for (const hp of hooksPaths) {
+        steps.push({
+          kind: 'cursor-hooks-cleanup',
+          filePath: hp,
+          summary: `strip legacy Astrolabe hooks from ${hp}`,
+          apply() {
+            const result = cursorMod.stripCursorHooksFile(hp, {
+              existsFn: exists,
+              binPath: stripBinPath,
+            });
+            if (result.skipped) return result;
+            return {
+              ...result,
+              write: result.deleted
+                ? () => fs.rmSync(hp, { force: true })
+                : () => writeJsonAtomic(hp, result.doc),
+            };
+          },
+        });
       }
       const primaryEntry = projectScope ? projectEntry : globalEntry;
       return {
@@ -853,14 +959,8 @@ const CLIENTS = [
         entry: primaryEntry,
         summary: projectScope
           ? `project ${projectMcpPath} (absolute binary, cwd=project root, env)` +
-            `; rules ${rulesPath} (explicit --scope=project)` +
-            (effectiveWithHooks
-              ? `; hooks → ${hooksPaths.join(', ')} (--client=cursor, matcher incl. astrolabe-.*)`
-              : '')
-          : `global ${globalMcpPath} (absolute binary, env)` +
-            (effectiveWithHooks
-              ? `; hooks → ${hooksPaths.join(', ')} (--client=cursor, matcher incl. astrolabe-.*)`
-              : ''),
+            `; rules ${rulesPath} (explicit --scope=project)`
+          : `global ${globalMcpPath} (absolute binary, env)`,
         steps,
         apply() {
           const results = [];
@@ -894,10 +994,20 @@ const CLIENTS = [
       if (exists(dir)) evidence.push(hasCustom ? dir : '~/.codex/');
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+    plan({ home, launch, removeHooks = false, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
       assertNoHooksConfigOverride('codex', hooksConfigPaths);
       const explicitMcp = expandHome(mcpConfigPath, home);
       const filePath = explicitMcp || path.join(resolveCodexDir(home, env, configDir), 'config.toml');
+      if (removeHooks) {
+        return {
+          kind: 'codex-toml',
+          filePath,
+          summary: 'MCP-only client (no legacy hooks)',
+          apply() {
+            return { skipped: true, reason: 'MCP-only client (no legacy hooks)' };
+          },
+        };
+      }
       return {
         kind: 'codex-toml',
         filePath,
@@ -926,11 +1036,21 @@ const CLIENTS = [
       }
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+    plan({ home, launch, removeHooks = false, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
       assertNoHooksConfigOverride('windsurf', hooksConfigPaths);
       const explicitMcp = expandHome(mcpConfigPath, home);
       const filePath =
         explicitMcp || path.join(resolveWindsurfDir(home, env, configDir), 'mcp_config.json');
+      if (removeHooks) {
+        return {
+          kind: 'json-mcp',
+          filePath,
+          summary: 'MCP-only client (no legacy hooks)',
+          apply() {
+            return { skipped: true, reason: 'MCP-only client (no legacy hooks)' };
+          },
+        };
+      }
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -955,11 +1075,21 @@ const CLIENTS = [
       else if (exists(path.dirname(settings))) evidence.push(path.dirname(settings));
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+    plan({ home, launch, removeHooks = false, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
       assertNoHooksConfigOverride('cline', hooksConfigPaths);
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
       const filePath = explicitMcp || clineSettingsPath(home, env, explicitConfigDir);
+      if (removeHooks) {
+        return {
+          kind: 'json-mcp',
+          filePath,
+          summary: 'MCP-only client (no legacy hooks)',
+          apply() {
+            return { skipped: true, reason: 'MCP-only client (no legacy hooks)' };
+          },
+        };
+      }
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -990,11 +1120,21 @@ const CLIENTS = [
       else if (exists(path.dirname(settings))) evidence.push(path.dirname(settings));
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+    plan({ home, launch, removeHooks = false, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
       assertNoHooksConfigOverride('roo', hooksConfigPaths);
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
       const filePath = explicitMcp || rooSettingsPath(home, env, explicitConfigDir);
+      if (removeHooks) {
+        return {
+          kind: 'json-mcp',
+          filePath,
+          summary: 'MCP-only client (no legacy hooks)',
+          apply() {
+            return { skipped: true, reason: 'MCP-only client (no legacy hooks)' };
+          },
+        };
+      }
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -1024,7 +1164,7 @@ const CLIENTS = [
       if (exists(dir)) evidence.push(hasCustom ? dir : '~/.continue/');
       return { detected: evidence.length > 0, evidence };
     },
-    plan({ home, launch, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
+    plan({ home, launch, removeHooks = false, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
       assertNoHooksConfigOverride('continue', hooksConfigPaths);
       // Continue's primary config is YAML; MCP servers for the IDE extension
       // commonly live in ~/.continue/mcpServers/astrolabe.yaml or mcp.json.
@@ -1034,6 +1174,16 @@ const CLIENTS = [
       const explicitMcp = expandHome(mcpConfigPath, home);
       const dir = resolveContinueDir(home, env, explicitConfigDir);
       const filePath = explicitMcp || path.join(dir, 'mcp.json');
+      if (removeHooks) {
+        return {
+          kind: 'json-mcp',
+          filePath,
+          summary: 'MCP-only client (no legacy hooks)',
+          apply() {
+            return { skipped: true, reason: 'MCP-only client (no legacy hooks)' };
+          },
+        };
+      }
       const entry = jsonServerEntry(launch);
       return {
         kind: 'json-mcp',
@@ -1060,8 +1210,10 @@ const CLIENTS = [
     plan({
       home,
       launch,
-      withHooks = false,
-      binPath = null,
+      removeHooks = false,
+      projectRoot = null,
+      explicitProject = false,
+      scope = 'global',
       env = process.env,
       configDir = null,
       mcpConfigPath = null,
@@ -1069,52 +1221,62 @@ const CLIENTS = [
     }) {
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
-      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
       const filePath = explicitMcp || opencodeMod.resolveOpenCodeConfigPath(home, exists, env, explicitConfigDir);
-      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
-      const pluginPaths = resolveHooksPaths(
+      const basePluginPaths = resolveHooksPaths(
         hooksConfigPaths,
         opencodeMod.resolveOpenCodePluginPath(home, env, explicitConfigDir),
         home,
       );
-      if (effectiveWithHooks) {
+      const pluginPathsList = [...basePluginPaths];
+      if (
+        (scope === 'project' || explicitProject) &&
+        projectRoot &&
+        !sameComparablePath(projectRoot, home)
+      ) {
+        pluginPathsList.push(path.join(projectRoot, '.opencode', 'plugins', 'astrolabe-guard.ts'));
+      }
+      const pluginPaths = dedupePaths(pluginPathsList);
+      if (!removeHooks) {
         assertDistinctMcpAndHooksPaths('opencode', filePath, pluginPaths);
       }
       const steps = [];
-      const mcpPlan = {
-        kind: 'opencode-mcp',
-        filePath,
-        summary: `merge mcp.astrolabe into ${filePath} (OpenCode V1/V2/mcpServers auto-detect)`,
-        apply() {
-          const result = opencodeMod.mergeOpenCodeMcpFile(filePath, launch, { create: true, existsFn: exists });
-          if (result.skipped) return result;
-          return {
-            ...result,
-            write: () => writeTextAtomic(filePath, result.text),
-          };
-        },
-      };
-      steps.push(mcpPlan);
-      if (effectiveWithHooks) {
-        for (const pluginFilePath of pluginPaths) {
-          steps.push(
-            opencodeMod.planOpenCodeGuardPlugin(home, exists, {
-              binPath: hookBinPath,
-              pluginFilePath,
-              env,
-              configDir: explicitConfigDir,
-            }),
-          );
-        }
+      if (!removeHooks) {
+        steps.push({
+          kind: 'opencode-mcp',
+          filePath,
+          summary: `merge mcp.astrolabe into ${filePath} (OpenCode V1/V2/mcpServers auto-detect)`,
+          apply() {
+            const result = opencodeMod.mergeOpenCodeMcpFile(filePath, launch, { create: true, existsFn: exists });
+            if (result.skipped) return result;
+            return {
+              ...result,
+              write: () => writeTextAtomic(filePath, result.text),
+            };
+          },
+        });
       }
-      // Primary plan surface remains the MCP file; hooks are optional extras applied by run.js
+      for (const pluginFilePath of pluginPaths) {
+        steps.push({
+          kind: 'opencode-plugin-cleanup',
+          filePath: pluginFilePath,
+          summary: `remove legacy guard plugin ${pluginFilePath}`,
+          apply() {
+            const result = opencodeMod.stripOpenCodeGuardPluginFile(pluginFilePath, { existsFn: exists });
+            if (result.skipped) return result;
+            return {
+              ...result,
+              write: () => fs.rmSync(pluginFilePath, { force: true }),
+            };
+          },
+        });
+      }
+      // Primary plan surface remains the MCP file; legacy plugins are cleaned automatically
       return {
-        kind: 'opencode',
-        filePath,
-        summary:
-          mcpPlan.summary +
-          (effectiveWithHooks ? `; optional guard plugin → ${pluginPaths.join(', ')}` : ''),
+        kind: removeHooks ? 'opencode-plugin-cleanup' : 'opencode',
+        filePath: removeHooks ? pluginPaths[0] : filePath,
+        summary: removeHooks
+          ? `remove legacy guard plugin ${pluginPaths.join(', ')}`
+          : `${steps[0].summary} (and clean legacy guard plugin)`,
         steps,
         apply() {
           const results = [];
@@ -1124,14 +1286,22 @@ const CLIENTS = [
               results.push(applied);
               continue;
             }
-            if (!applied.write) {
+            if (!applied.write && applied.text !== undefined) {
               const fp = applied.filePath;
               const contents = applied.text;
               applied.write = () => writeTextAtomic(fp, contents);
             }
             results.push(applied);
           }
-          const primary = results.find((r) => !r.skipped) || results[0];
+          const nonSkipped = results.filter((r) => !r.skipped);
+          if (removeHooks && nonSkipped.length === 0) {
+            return {
+              skipped: true,
+              reason: 'no legacy Astrolabe guard plugin found',
+              results,
+            };
+          }
+          const primary = nonSkipped[0] || results[0];
           return {
             ...primary,
             results,
@@ -1148,10 +1318,10 @@ const CLIENTS = [
   {
     id: 'deepseek-harness',
     label: 'DeepSeek Harness (DSH)',
-    aliases: ['dsh'],
+    aliases: ['dsh', 'dev-studio-cli'],
     context: null,
     detect(home, env = process.env) {
-      return dshMod.detectDsh(home, env, { whichFn: which, existsFn: exists });
+      return dshMod.detectDsh(home, env, { existsFn: exists });
     },
     plan({ home, env = process.env, configDir = null, mcpConfigPath = null, hooksConfigPaths = null }) {
       const explicitConfigDir = expandHome(configDir, home);
@@ -1161,56 +1331,62 @@ const CLIENTS = [
           '--mcp-config is not supported for deepseek-harness (MCP servers are configured per-repo in the DSH UI)',
         );
       }
-      const dshHome = dshMod.resolveDshHome(home, env, explicitConfigDir);
       const defaultPatchPath = dshMod.resolveDshPatchPath(home, env, explicitConfigDir);
       const patchPaths = resolveHooksPaths(hooksConfigPaths, defaultPatchPath, home);
       const patchPath = patchPaths[0];
-      const source = dshMod.resolveDshPluginSource(exists);
-      const installDirs = dshMod.resolveDshPluginInstallDirs(home, exists, env, explicitConfigDir);
-      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const hasExplicitOverride = Boolean(explicitConfigDir || explicitHooks.length > 0);
+      const installDirs = dshMod.findExistingDshPluginInstallDirs(home, exists, env, explicitConfigDir);
       return {
-        kind: 'dsh-guard',
+        kind: 'dsh-guard-cleanup',
         filePath: patchPath,
-        summary:
-          `install astrolabe-dsh-guard into DSH profile node_modules and merge ${patchPaths.join(', ')}` +
-          ' (MCP servers are per-repo in the DSH UI — setup does not write them)',
+        summary: `clean legacy astrolabe-dsh-guard from ${patchPaths.join(', ')} and profile node_modules`,
         apply() {
-          if (!source) {
+          const patchResults = [];
+          for (const pp of patchPaths) {
+            const patch = dshMod.stripDshCordisPatch(pp, { existsFn: exists });
+            if (patch.skipped) {
+              patchResults.push(patch);
+            } else {
+              patchResults.push({
+                ...patch,
+                write: () => writeTextAtomic(patch.filePath, patch.text),
+              });
+            }
+          }
+          const dirResults = installDirs.map((dir) => ({
+            filePath: null,
+            dirPath: dir,
+            isDirectory: true,
+            skipBackup: true,
+            deleted: true,
+            created: false,
+            replaced: true,
+            write: () => {
+              try {
+                if (fs.lstatSync(dir).isSymbolicLink()) {
+                  fs.unlinkSync(dir);
+                  return;
+                }
+              } catch {
+                // Missing path; fall through to force rmSync
+              }
+              fs.rmSync(dir, { recursive: true, force: true });
+            },
+          }));
+          const results = [...patchResults, ...dirResults];
+          const nonSkippedPatches = patchResults.filter((p) => !p.skipped);
+          if (nonSkippedPatches.length === 0 && installDirs.length === 0) {
             return {
               skipped: true,
-              reason:
-                'dsh-plugin sources not found (expected vendor/astrolabe-dsh-guard next to setup or repo dsh-plugin/)',
+              reason: 'no legacy astrolabe-dsh-guard found',
+              results,
             };
           }
-          const patches = [];
-          for (const pp of patchPaths) {
-            const patch = dshMod.mergeDshCordisPatch(pp, {
-              create: exists(dshHome) || exists(pp) || hasExplicitOverride,
-              existsFn: exists,
-            });
-            if (patch.skipped && patchPaths.length === 1) return patch;
-            patches.push(patch);
-          }
-          const primary = patches.find((p) => !p.skipped) || patches[0];
-          const results = patches.map((p) => ({
-            ...p,
-            write: p.skipped ? null : () => writeTextAtomic(p.filePath, p.text),
-          }));
+          const primary = nonSkippedPatches[0] || dirResults[0];
           return {
-            filePath: primary.filePath,
-            created: primary.created,
-            replaced: primary.replaced,
-            text: primary.text,
-            source,
-            installDirs,
-            results: patchPaths.length > 1 ? results : undefined,
-            entryPreview: dshMod.MANAGED_BLOCK.trim(),
+            ...primary,
+            removedDirs: installDirs,
+            results,
             write: () => {
-              for (const dest of installDirs) {
-                fs.rmSync(dest, { recursive: true, force: true });
-                dshMod.copyDirRecursive(source, dest);
-              }
               for (const r of results) {
                 if (!r.skipped && r.write) r.write();
               }
@@ -1231,7 +1407,7 @@ const CLIENTS = [
     plan({
       home,
       launch,
-      withHooks = false,
+      removeHooks = false,
       binPath = null,
       env = process.env,
       configDir = null,
@@ -1240,8 +1416,6 @@ const CLIENTS = [
     }) {
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
-      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
       const dir = codebuddyMod.resolveCodebuddyConfigDir(home, env, explicitConfigDir);
       const hasCustomDir = Boolean(
         explicitConfigDir ||
@@ -1253,54 +1427,51 @@ const CLIENTS = [
         codebuddyMod.resolveCodebuddySettingsPath(home, env, explicitConfigDir),
         home,
       );
-      if (effectiveWithHooks) {
+      if (!removeHooks) {
         assertDistinctMcpAndHooksPaths('codebuddy', mcpPath, settingsPaths);
       }
       const hookBinPath = resolveHookBinPath({ binPath, launch, env });
       const entry = jsonServerEntry(launch, { typed: true });
       const steps = [];
-      steps.push({
-        kind: 'json-mcp',
-        filePath: mcpPath,
-        summary: `merge mcpServers.astrolabe into ${mcpPath}`,
-        apply() {
-          const create =
-            exists(dir) ||
-            exists(mcpPath) ||
-            (!hasCustomDir && exists(path.join(home, '.codebuddy.json'))) ||
-            hasCustomDir ||
-            Boolean(explicitMcp);
-          const result = mergeJsonMcpFile(mcpPath, entry, { create });
-          if (result.skipped) return result;
-          return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
-        },
-      });
-      if (effectiveWithHooks) {
-        const hasExplicitHooks = Boolean(hasCustomDir || explicitHooks.length > 0);
-        for (const settingsPath of settingsPaths) {
-          steps.push({
-            kind: 'codebuddy-hooks',
-            filePath: settingsPath,
-            summary: `merge PreToolUse/SessionEnd into ${settingsPath}`,
-            apply() {
-              const create = exists(dir) || exists(settingsPath) || hasExplicitHooks;
-              const result = codebuddyMod.mergeCodebuddyHooksSettings(settingsPath, {
-                create,
-                existsFn: exists,
-                binPath: hookBinPath,
-              });
-              if (result.skipped) return result;
-              return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
-            },
-          });
-        }
+      if (!removeHooks) {
+        steps.push({
+          kind: 'json-mcp',
+          filePath: mcpPath,
+          summary: `merge mcpServers.astrolabe into ${mcpPath}`,
+          apply() {
+            const create =
+              exists(dir) ||
+              exists(mcpPath) ||
+              (!hasCustomDir && exists(path.join(home, '.codebuddy.json'))) ||
+              hasCustomDir ||
+              Boolean(explicitMcp);
+            const result = mergeJsonMcpFile(mcpPath, entry, { create });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
+          },
+        });
+      }
+      for (const settingsPath of settingsPaths) {
+        steps.push({
+          kind: 'codebuddy-hooks-cleanup',
+          filePath: settingsPath,
+          summary: `strip legacy Astrolabe hooks from ${settingsPath}`,
+          apply() {
+            const result = codebuddyMod.stripCodebuddyHooksSettings(settingsPath, {
+              existsFn: exists,
+              binPath: hookBinPath,
+            });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeJsonAtomic(settingsPath, result.doc) };
+          },
+        });
       }
       return {
-        kind: 'codebuddy',
-        filePath: mcpPath,
-        summary:
-          steps[0].summary +
-          (effectiveWithHooks ? `; hooks → ${settingsPaths.join(', ')}` : ''),
+        kind: removeHooks ? 'codebuddy-hooks-cleanup' : 'codebuddy',
+        filePath: removeHooks ? settingsPaths[0] : mcpPath,
+        summary: removeHooks
+          ? `strip legacy Astrolabe hooks from ${settingsPaths.join(', ')}`
+          : `${steps[0].summary} (and strip legacy hooks)`,
         steps,
         apply() {
           const results = [];
@@ -1312,7 +1483,15 @@ const CLIENTS = [
             }
             results.push(applied);
           }
-          const primary = results.find((r) => !r.skipped) || results[0];
+          const nonSkipped = results.filter((r) => !r.skipped);
+          if (removeHooks && nonSkipped.length === 0) {
+            return {
+              skipped: true,
+              reason: 'no legacy Astrolabe hooks found',
+              results,
+            };
+          }
+          const primary = nonSkipped[0] || results[0];
           return {
             ...primary,
             results,
@@ -1337,7 +1516,10 @@ const CLIENTS = [
     plan({
       home,
       launch,
-      withHooks = false,
+      removeHooks = false,
+      projectRoot = null,
+      explicitProject = false,
+      scope = 'global',
       binPath = null,
       env = process.env,
       configDir = null,
@@ -1346,63 +1528,72 @@ const CLIENTS = [
     }) {
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
-      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
       const dir = grokMod.resolveGrokConfigDir(home, env, explicitConfigDir);
       const hasCustomDir = Boolean(
         explicitConfigDir ||
           readEnvDir(env, ['GROK_CONFIG_DIR', 'GROK_HOME'], home),
       );
       const tomlPath = explicitMcp || grokMod.resolveGrokConfigToml(home, env, explicitConfigDir);
-      const hooksPaths = resolveHooksPaths(
+      const baseHooksPaths = resolveHooksPaths(
         hooksConfigPaths,
         grokMod.resolveGrokHooksPath(home, env, explicitConfigDir),
         home,
       );
-      if (effectiveWithHooks) {
+      const hooksPathsList = [...baseHooksPaths];
+      if (
+        (scope === 'project' || explicitProject) &&
+        projectRoot &&
+        !sameComparablePath(projectRoot, home)
+      ) {
+        hooksPathsList.push(path.join(projectRoot, '.grok', 'hooks', 'astrolabe.json'));
+      }
+      const hooksPaths = dedupePaths(hooksPathsList);
+      if (!removeHooks) {
         assertDistinctMcpAndHooksPaths('grok', tomlPath, hooksPaths);
       }
       const hookBinPath = resolveHookBinPath({ binPath, launch, env });
       const steps = [];
-      steps.push({
-        kind: 'grok-toml',
-        filePath: tomlPath,
-        summary: `merge [mcp_servers.astrolabe] into ${tomlPath}`,
-        apply() {
-          const create = exists(dir) || exists(tomlPath) || hasCustomDir || Boolean(explicitMcp);
-          if (!create) {
-            return { skipped: true, reason: `missing ${tomlPath} (will not create)` };
-          }
-          const result = mergeCodexToml(tomlPath, launch);
-          return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
-        },
-      });
-      if (effectiveWithHooks) {
-        const hasExplicitHooks = Boolean(hasCustomDir || explicitHooks.length > 0);
-        for (const hooksPath of hooksPaths) {
-          steps.push({
-            kind: 'grok-hooks',
-            filePath: hooksPath,
-            summary: `write ${hooksPath}`,
-            apply() {
-              const create = exists(dir) || exists(hooksPath) || hasExplicitHooks;
-              const result = grokMod.mergeGrokHooksFile(hooksPath, {
-                create,
-                existsFn: exists,
-                binPath: hookBinPath,
-              });
-              if (result.skipped) return result;
-              return { ...result, write: () => writeJsonAtomic(hooksPath, result.doc) };
-            },
-          });
-        }
+      if (!removeHooks) {
+        steps.push({
+          kind: 'grok-toml',
+          filePath: tomlPath,
+          summary: `merge [mcp_servers.astrolabe] into ${tomlPath}`,
+          apply() {
+            const create = exists(dir) || exists(tomlPath) || hasCustomDir || Boolean(explicitMcp);
+            if (!create) {
+              return { skipped: true, reason: `missing ${tomlPath} (will not create)` };
+            }
+            const result = mergeCodexToml(tomlPath, launch);
+            return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
+          },
+        });
+      }
+      for (const hooksPath of hooksPaths) {
+        steps.push({
+          kind: 'grok-hooks-cleanup',
+          filePath: hooksPath,
+          summary: `strip legacy Astrolabe hooks from ${hooksPath}`,
+          apply() {
+            const result = grokMod.stripGrokHooksFile(hooksPath, {
+              existsFn: exists,
+              binPath: hookBinPath,
+            });
+            if (result.skipped) return result;
+            return {
+              ...result,
+              write: result.deleted
+                ? () => fs.rmSync(hooksPath, { force: true })
+                : () => writeJsonAtomic(hooksPath, result.doc),
+            };
+          },
+        });
       }
       return {
-        kind: 'grok',
-        filePath: tomlPath,
-        summary:
-          steps[0].summary +
-          (effectiveWithHooks ? `; hooks → ${hooksPaths.join(', ')}` : ''),
+        kind: removeHooks ? 'grok-hooks-cleanup' : 'grok',
+        filePath: removeHooks ? hooksPaths[0] : tomlPath,
+        summary: removeHooks
+          ? `strip legacy Astrolabe hooks from ${hooksPaths.join(', ')}`
+          : `${steps[0].summary} (and strip legacy hooks)`,
         steps,
         apply() {
           const results = [];
@@ -1410,7 +1601,15 @@ const CLIENTS = [
             const applied = step.apply();
             results.push(applied);
           }
-          const primary = results.find((r) => !r.skipped) || results[0];
+          const nonSkipped = results.filter((r) => !r.skipped);
+          if (removeHooks && nonSkipped.length === 0) {
+            return {
+              skipped: true,
+              reason: 'no legacy Astrolabe hooks found',
+              results,
+            };
+          }
+          const primary = nonSkipped[0] || results[0];
           return {
             ...primary,
             results,
@@ -1435,8 +1634,7 @@ const CLIENTS = [
     plan({
       home,
       launch,
-      withHooks = false,
-      binPath = null,
+      removeHooks = false,
       env = process.env,
       configDir = null,
       mcpConfigPath = null,
@@ -1444,8 +1642,6 @@ const CLIENTS = [
     }) {
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
-      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const effectiveWithHooks = Boolean(withHooks || explicitHooks.length > 0);
       const dir = kimicodeMod.resolveKimiConfigDir(home, env, explicitConfigDir);
       const hasCustomDir = Boolean(
         explicitConfigDir ||
@@ -1457,56 +1653,57 @@ const CLIENTS = [
         kimicodeMod.resolveKimiConfigToml(home, env, explicitConfigDir),
         home,
       );
-      if (effectiveWithHooks) {
+      if (!removeHooks) {
         assertDistinctMcpAndHooksPaths('kimicode', mcpPath, tomlPaths);
       }
-      const hookBinPath = resolveHookBinPath({ binPath, launch, env });
       const entry = jsonServerEntry(launch);
       const steps = [];
-      steps.push({
-        kind: 'json-mcp',
-        filePath: mcpPath,
-        summary: `merge mcpServers.astrolabe into ${mcpPath}`,
-        apply() {
-          const create = exists(dir) || exists(mcpPath) || hasCustomDir || Boolean(explicitMcp);
-          const result = mergeJsonMcpFile(mcpPath, entry, { create });
-          if (result.skipped) return result;
-          return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
-        },
-      });
-      if (effectiveWithHooks) {
-        const hasExplicitHooks = Boolean(hasCustomDir || explicitHooks.length > 0);
-        for (const tomlPath of tomlPaths) {
-          steps.push({
-            kind: 'kimi-hooks',
-            filePath: tomlPath,
-            summary: `merge [[hooks]] into ${tomlPath}`,
-            apply() {
-              const create = exists(dir) || exists(tomlPath) || hasExplicitHooks;
-              const result = kimicodeMod.mergeKimiHooksToml(tomlPath, {
-                create,
-                existsFn: exists,
-                binPath: hookBinPath,
-              });
-              if (result.skipped) return result;
-              return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
-            },
-          });
-        }
+      if (!removeHooks) {
+        steps.push({
+          kind: 'json-mcp',
+          filePath: mcpPath,
+          summary: `merge mcpServers.astrolabe into ${mcpPath}`,
+          apply() {
+            const create = exists(dir) || exists(mcpPath) || hasCustomDir || Boolean(explicitMcp);
+            const result = mergeJsonMcpFile(mcpPath, entry, { create });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeJsonAtomic(mcpPath, result.doc) };
+          },
+        });
+      }
+      for (const tomlPath of tomlPaths) {
+        steps.push({
+          kind: 'kimi-hooks-cleanup',
+          filePath: tomlPath,
+          summary: `strip legacy Astrolabe hooks from ${tomlPath}`,
+          apply() {
+            const result = kimicodeMod.stripKimiHooksToml(tomlPath, { existsFn: exists });
+            if (result.skipped) return result;
+            return { ...result, write: () => writeTextAtomic(tomlPath, result.text) };
+          },
+        });
       }
       return {
-        kind: 'kimicode',
-        filePath: mcpPath,
-        summary:
-          steps[0].summary +
-          (effectiveWithHooks ? `; hooks → ${tomlPaths.join(', ')}` : ''),
+        kind: removeHooks ? 'kimi-hooks-cleanup' : 'kimicode',
+        filePath: removeHooks ? tomlPaths[0] : mcpPath,
+        summary: removeHooks
+          ? `strip legacy Astrolabe hooks from ${tomlPaths.join(', ')}`
+          : `${steps[0].summary} (and strip legacy hooks)`,
         steps,
         apply() {
           const results = [];
           for (const step of steps) {
             results.push(step.apply());
           }
-          const primary = results.find((r) => !r.skipped) || results[0];
+          const nonSkipped = results.filter((r) => !r.skipped);
+          if (removeHooks && nonSkipped.length === 0) {
+            return {
+              skipped: true,
+              reason: 'no legacy Astrolabe hooks found',
+              results,
+            };
+          }
+          const primary = nonSkipped[0] || results[0];
           return {
             ...primary,
             results,
@@ -1531,7 +1728,7 @@ const CLIENTS = [
     plan({
       home,
       launch,
-      withHooks = false,
+      removeHooks = false,
       binPath = null,
       env = process.env,
       configDir = null,
@@ -1540,9 +1737,7 @@ const CLIENTS = [
     }) {
       const explicitConfigDir = expandHome(configDir, home);
       const explicitMcp = expandHome(mcpConfigPath, home);
-      const normalizedHooks = normalizeExplicitHooks(hooksConfigPaths, home);
-      const explicitHooks = normalizedHooks.length > 0 ? normalizedHooks : null;
-      const effectiveWithHooks = Boolean(withHooks || explicitHooks);
+      const explicitHooks = normalizeExplicitHooks(hooksConfigPaths, home);
       const dir = zcodeMod.resolveZcodeConfigDir(home, env, explicitConfigDir);
       const hasCustomDir = Boolean(
         explicitConfigDir ||
@@ -1551,57 +1746,46 @@ const CLIENTS = [
       const hookBinPath = resolveHookBinPath({ binPath, launch, env });
 
       const stepSpecs = [];
-      if (!explicitMcp && !explicitHooks) {
-        stepSpecs.push({
-          filePath: zcodeMod.resolveZcodeConfigPath(home, exists, env, explicitConfigDir),
-          writeMcp: true,
-          withHooks: effectiveWithHooks,
-        });
-      } else if (explicitMcp && !explicitHooks) {
-        stepSpecs.push({
-          filePath: explicitMcp,
-          writeMcp: true,
-          withHooks: effectiveWithHooks,
-        });
-      } else if (!explicitMcp && explicitHooks) {
-        for (const fp of explicitHooks) {
+      if (removeHooks) {
+        const defaultPath = explicitMcp || zcodeMod.resolveZcodeConfigPath(home, exists, env, explicitConfigDir);
+        for (const fp of dedupePaths([defaultPath, ...explicitHooks])) {
           stepSpecs.push({
             filePath: fp,
-            writeMcp: true,
-            withHooks: true,
+            create: false,
+            writeMcp: false,
           });
         }
       } else {
-        const includesMcp = explicitHooks.some((fp) => sameComparablePath(fp, explicitMcp));
+        const primaryMcpPath =
+          explicitMcp || zcodeMod.resolveZcodeConfigPath(home, exists, env, explicitConfigDir);
+        const hasExplicitOverride = Boolean(hasCustomDir || explicitMcp || explicitHooks.length > 0);
+        const primaryCreate =
+          exists(dir) ||
+          exists(path.join(dir, 'cli')) ||
+          exists(primaryMcpPath) ||
+          hasExplicitOverride;
         stepSpecs.push({
-          filePath: explicitMcp,
+          filePath: primaryMcpPath,
+          create: primaryCreate,
           writeMcp: true,
-          withHooks: includesMcp,
         });
         for (const fp of explicitHooks) {
-          if (sameComparablePath(fp, explicitMcp)) continue;
+          if (sameComparablePath(fp, primaryMcpPath)) continue;
           stepSpecs.push({
             filePath: fp,
+            create: false,
             writeMcp: false,
-            withHooks: true,
           });
         }
       }
 
-      const hasExplicitOverride = Boolean(hasCustomDir || explicitMcp || explicitHooks);
       const primaryPath = stepSpecs[0].filePath;
       const steps = stepSpecs.map((spec) => ({
         kind: 'zcode',
         filePath: spec.filePath,
         apply() {
-          const create =
-            exists(dir) ||
-            exists(path.join(dir, 'cli')) ||
-            exists(spec.filePath) ||
-            hasExplicitOverride;
           const result = zcodeMod.mergeZcodeConfigFile(spec.filePath, launch, {
-            create,
-            withHooks: spec.withHooks,
+            create: spec.create,
             writeMcp: spec.writeMcp,
             existsFn: exists,
             binPath: hookBinPath,
@@ -1612,20 +1796,26 @@ const CLIENTS = [
       }));
 
       return {
-        kind: 'zcode',
+        kind: removeHooks ? 'zcode-hooks-cleanup' : 'zcode',
         filePath: primaryPath,
-        summary:
-          `merge mcp.servers.astrolabe into ${primaryPath}` +
-          (effectiveWithHooks
-            ? ` (+ hooks.events.PreToolUse${explicitHooks ? ` → ${explicitHooks.join(', ')}` : ''}; no SessionEnd; scrub Stop cleanup)`
-            : ''),
+        summary: removeHooks
+          ? `strip legacy Astrolabe hooks from ${stepSpecs.map((s) => s.filePath).join(', ')}`
+          : `merge mcp.servers.astrolabe into ${primaryPath} (and strip legacy hooks)`,
         steps,
         apply() {
           if (steps.length === 1) {
             return steps[0].apply();
           }
           const results = steps.map((s) => s.apply());
-          const primary = results.find((r) => !r.skipped) || results[0];
+          const nonSkipped = results.filter((r) => !r.skipped);
+          if (removeHooks && nonSkipped.length === 0) {
+            return {
+              skipped: true,
+              reason: 'no legacy Astrolabe hooks found',
+              results,
+            };
+          }
+          const primary = nonSkipped[0] || results[0];
           return {
             ...primary,
             results,
@@ -1664,6 +1854,7 @@ module.exports = {
   migrateIdeAllowlist,
   checkCursorAllowlist,
   which,
+  exists,
   resolveLaunch,
   jsonServerEntry,
   mergeJsonMcpFile,
@@ -1685,38 +1876,42 @@ module.exports = {
   resolveOpenCodeConfigDir: opencodeMod.resolveOpenCodeConfigDir,
   resolveOpenCodePluginPath: opencodeMod.resolveOpenCodePluginPath,
   resolveOpenCodeConfigPath: opencodeMod.resolveOpenCodeConfigPath,
-  mergeDshCordisPatch: dshMod.mergeDshCordisPatch,
+  stripOpenCodeGuardPluginFile: opencodeMod.stripOpenCodeGuardPluginFile,
+  stripOpenCodeGuardPlugin: opencodeMod.stripOpenCodeGuardPlugin,
   resolveDshHome: dshMod.resolveDshHome,
   resolveDshPatchPath: dshMod.resolveDshPatchPath,
-  resolveDshPluginSource: dshMod.resolveDshPluginSource,
-  resolveDshPluginInstallDirs: dshMod.resolveDshPluginInstallDirs,
-  OPENCODE_GUARD_TS: opencodeMod.OPENCODE_GUARD_TS,
-  renderOpenCodeGuardTs: opencodeMod.renderOpenCodeGuardTs,
+  findExistingDshPluginInstallDirs: dshMod.findExistingDshPluginInstallDirs,
+  detectDsh: dshMod.detectDsh,
+  stripDshCordisPatch: dshMod.stripDshCordisPatch,
   parseJsonc: require('./jsonc').parseJsonc,
   // Claude Code / Codebuddy / Grok / Kimi / ZCode / Cursor helpers (tests)
   resolveClaudeConfigDir: claudeCodeMod.resolveClaudeConfigDir,
   resolveClaudeMcpPath: claudeCodeMod.resolveClaudeMcpPath,
   resolveClaudeSettingsPath: claudeCodeMod.resolveClaudeSettingsPath,
+  discoverClaudeSettingsPaths: claudeCodeMod.discoverClaudeSettingsPaths,
   mergeClaudeCodeHooksSettings: claudeCodeMod.mergeClaudeCodeHooksSettings,
+  stripClaudeCodeHooksSettings: claudeCodeMod.stripClaudeCodeHooksSettings,
+  inspectClaudeProjectHooks: claudeCodeMod.inspectClaudeProjectHooks,
   CLAUDE_CODE_REMIND_MATCHER: claudeCodeMod.REMIND_MATCHER,
   resolveCodebuddyConfigDir: codebuddyMod.resolveCodebuddyConfigDir,
   resolveCodebuddyMcpPath: codebuddyMod.resolveCodebuddyMcpPath,
   resolveCodebuddySettingsPath: codebuddyMod.resolveCodebuddySettingsPath,
-  mergeCodebuddyHooksSettings: codebuddyMod.mergeCodebuddyHooksSettings,
+  stripCodebuddyHooksSettings: codebuddyMod.stripCodebuddyHooksSettings,
   resolveGrokConfigDir: grokMod.resolveGrokConfigDir,
   resolveGrokConfigToml: grokMod.resolveGrokConfigToml,
   resolveGrokHooksPath: grokMod.resolveGrokHooksPath,
-  mergeGrokHooksFile: grokMod.mergeGrokHooksFile,
+  stripGrokHooksFile: grokMod.stripGrokHooksFile,
   resolveKimiConfigDir: kimicodeMod.resolveKimiConfigDir,
   resolveKimiMcpPath: kimicodeMod.resolveKimiMcpPath,
   resolveKimiConfigToml: kimicodeMod.resolveKimiConfigToml,
-  mergeKimiHooksToml: kimicodeMod.mergeKimiHooksToml,
+  stripKimiHooksToml: kimicodeMod.stripKimiHooksToml,
   resolveZcodeConfigDir: zcodeMod.resolveZcodeConfigDir,
   resolveZcodeConfigPath: zcodeMod.resolveZcodeConfigPath,
   mergeZcodeConfigFile: zcodeMod.mergeZcodeConfigFile,
   resolveCursorConfigDir: cursorMod.resolveCursorConfigDir,
   resolveCursorHooksPath: cursorMod.resolveCursorHooksPath,
   mergeCursorHooksFile: cursorMod.mergeCursorHooksFile,
+  stripCursorHooksFile: cursorMod.stripCursorHooksFile,
   CURSOR_REMIND_MATCHER: cursorMod.REMIND_MATCHER,
   resolveCursorProjectRoot: cursorMod.resolveProjectRoot,
   canonicalizePath: cursorMod.canonicalizePath,

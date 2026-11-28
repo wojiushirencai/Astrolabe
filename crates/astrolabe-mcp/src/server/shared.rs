@@ -350,7 +350,7 @@ impl SessionView for View {
                 flag.store(true, Ordering::Relaxed);
                 let secs = limit.map(|d| d.as_secs()).unwrap_or_default();
                 to_json(Ok(self.0.finish(text_error(format!(
-                    "{name} did not finish within {secs}s; gave up waiting. Narrow the scope (path_filter / aggregate / count_only) and retry;\
+                    "{name} did not finish within {secs}s; gave up waiting. Narrow the scope (path_filter / aggregate) and retry;\
                      tune via ASTROLABE_TOOL_TIMEOUT_SECS. confidence: unknown"
                 )))))
             }

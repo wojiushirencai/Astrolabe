@@ -5,41 +5,6 @@ const path = require('path');
 const { parseJsonc, upsertJsoncProperty } = require('./jsonc');
 const { expandHome, readEnvDir } = require('./cursor');
 
-function renderOpenCodeGuardTs(binPath = null) {
-  const binLiteral = JSON.stringify(binPath || 'astrolabe');
-  return `import type { Plugin } from "@opencode-ai/plugin";
-
-const ASTROLABE_BIN = ${binLiteral};
-
-export const AstrolabeGuard: Plugin = async () => {
-  return {
-    "tool.execute.before": async (input, output) => {
-      const payload = JSON.stringify({
-        session_id: input.sessionID,
-        tool_name: input.tool,
-        tool_input: output.args ?? {},
-      });
-      const proc = Bun.spawnSync([ASTROLABE_BIN, "hooks", "remind", "--client=opencode"], {
-        stdin: payload,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const stdout = new TextDecoder().decode(proc.stdout).trim();
-      if (stdout) {
-        const decision = JSON.parse(stdout);
-        if (decision.decision === "deny") {
-          throw new Error(decision.reason);
-        }
-      }
-    },
-  };
-};
-export default AstrolabeGuard;
-`;
-}
-
-const OPENCODE_GUARD_TS = renderOpenCodeGuardTs();
-
 function resolveOpenCodeConfigDir(home, env = process.env, configDir = null) {
   const explicit = expandHome(configDir, home);
   if (explicit) return explicit;
@@ -196,35 +161,33 @@ function detectOpenCode(home, env, { whichFn, existsFn }) {
   return { detected: evidence.length > 0, evidence };
 }
 
-function planOpenCodeGuardPlugin(
+function stripOpenCodeGuardPluginFile(filePath, { existsFn = fs.existsSync } = {}) {
+  if (!existsFn(filePath)) {
+    return { skipped: true, reason: `missing ${filePath}` };
+  }
+  const content = fs.readFileSync(filePath, 'utf8');
+  const isAstrolabePlugin =
+    content.includes('AstrolabeGuard') ||
+    (content.includes('hooks') && content.includes('opencode') && /astrolabe/i.test(content));
+  if (!isAstrolabePlugin) {
+    return { skipped: true, reason: `${filePath} does not look like an Astrolabe guard plugin` };
+  }
+  return { filePath, deleted: true, created: false, replaced: true };
+}
+
+function stripOpenCodeGuardPlugin(
   home,
-  existsFn,
-  { binPath = null, pluginFilePath = null, env = process.env, configDir = null } = {},
+  existsFn = fs.existsSync,
+  { pluginFilePath = null, env = process.env, configDir = null } = {},
 ) {
+  const resolveExists = existsFn || fs.existsSync;
   const filePath = pluginFilePath
     ? expandHome(pluginFilePath, home)
     : resolveOpenCodePluginPath(home, env, configDir);
-  const text = renderOpenCodeGuardTs(binPath);
-  return {
-    kind: 'opencode-guard',
-    filePath,
-    summary: `write OpenCode guard plugin ${filePath}`,
-    apply() {
-      const created = !existsFn(filePath);
-      return {
-        filePath,
-        created,
-        replaced: !created,
-        text,
-        write: null,
-      };
-    },
-  };
+  return stripOpenCodeGuardPluginFile(filePath, { existsFn: resolveExists });
 }
 
 module.exports = {
-  OPENCODE_GUARD_TS,
-  renderOpenCodeGuardTs,
   resolveOpenCodeConfigDir,
   resolveOpenCodePluginPath,
   resolveOpenCodeConfigPath,
@@ -232,5 +195,6 @@ module.exports = {
   openCodeServerEntry,
   mergeOpenCodeMcpFile,
   detectOpenCode,
-  planOpenCodeGuardPlugin,
+  stripOpenCodeGuardPluginFile,
+  stripOpenCodeGuardPlugin,
 };

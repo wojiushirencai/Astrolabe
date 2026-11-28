@@ -11,7 +11,7 @@
 
 | | |
 |---|---|
-| 最新版本 | [v0.17.12](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.17.12)，2026-11-28 发布 |
+| 最新版本 | [v0.18.0](https://github.com/wojiushirencai/Astrolabe/releases/tag/v0.18.0)，2026-11-28 发布 |
 | 暴露的工具 | 7 个 MCP 工具（短名）：`resolve_contx`、`search_code`、`find_symbol`、`find_refs`、`goto_def`、`get_diag`、`get_lang`（旧长名仍可作为别名调用） |
 | `tools/list` 体积 | 紧凑 JSON 约 3.6 KB（v0.16.0 Linux 实测 3,607 B；macOS 未重测） |
 | 二进制 | 单文件、无运行时；Release 压缩包 7.4–9.1 MB，Linux x64 解压后约 50 MB |
@@ -47,17 +47,17 @@ npm i -g @zlnap/astrolabe
 
 其它方式（手动下载、Windows zip、源码编译）见 [安装指南](docs/INSTALL_GUIDE.zh-CN.md)。
 
-**2. 必须跑 `setup`（写入 MCP；建议加 `--with-hooks`，否则智能体往往不会真正调用这些工具）。**  
-只装二进制**不会**接入客户端，也**不会**装防漂移 Hook。不跑 `setup`（以及客户端支持时的 hooks），很多智能体仍会用 Grep/Read，等于没在用 Astrolabe。
+**2. 必须跑 `setup`（写入 MCP 配置）。**  
+只装二进制**不会**自动接入客户端，不跑 `setup` 客户端无法调用 Astrolabe 工具。从旧版升级时，重新运行 `astrolabe setup`（或 `astrolabe setup --remove-hooks`）会自动清理历史遗留的 Astrolabe hooks，并保留你的其它第三方 hooks。
 
 ```bash
-# 推荐（npm / npx）— MCP + hooks
-npx -y @zlnap/astrolabe setup --with-hooks
+# 推荐（npm / npx）
+npx -y @zlnap/astrolabe setup
 # 全局 npm / PATH 上已有二进制时：
-astrolabe setup --with-hooks
+astrolabe setup
 
 # 非交互：配置所有探测到的客户端
-npx -y @zlnap/astrolabe setup --yes --with-hooks
+npx -y @zlnap/astrolabe setup --yes
 ```
 
 Claude Code（仅手动写 MCP 时仍建议先跑上面的 `setup`）：
@@ -67,7 +67,7 @@ claude mcp add --scope user astrolabe -- npx -y @zlnap/astrolabe . --context=cla
 ```
 
 Cursor（`.cursor/mcp.json`）：`{"mcpServers":{"astrolabe":{"command":"astrolabe","args":[".","--context=cursor"]}}}`。  
-Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安装指南](docs/INSTALL_GUIDE.zh-CN.md)。常用参数：`--yes`、`--clients=…`、`--dry-run`、`--native`、`--list`、`--with-hooks`、`--no-cursor-permissions`。
+Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安装指南](docs/INSTALL_GUIDE.zh-CN.md)。常用参数：`--yes`、`--clients=…`、`--dry-run`、`--native`、`--list`、`--remove-hooks`、`--no-cursor-permissions`。
 
 **3. 验证。** `astrolabe --version` 输出版本；在客户端里让它调用 `get_lang` 或 `search_code`。跑完 `setup` 后请重启客户端会话。
 
@@ -85,9 +85,9 @@ Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安�
 | `get_diag` | 文件的语法与类型错误。（别名：`get_diagnostics`） |
 | `get_lang` | 语言、文件数、代码行数、语言服务器状态，以及索引覆盖情况（见下）。（别名：`get_languages`） |
 
-`tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发），其中包含每个工具上可选的按次 `index_root`（位于 git 仓库或 `.astrolabe/project.yml` 项目内的绝对路径或相对 cwd 的目录；省略则沿用进程启动时的索引根）。Astrolabe 只索引 git 仓库和用 `.astrolabe/project.yml` 声明的目录（兼容 Serena 的 `.serena/project.yml`），装着 git 仓库的目录本身永远不建索引；其他启动目录或 `index_root` 会被拒绝并列出其下的子仓库，除非设 `ASTROLABE_ALLOW_NON_GIT_ROOT=1`（见[参考手册](docs/REFERENCE.zh-CN.md)）。其余参数——`regex`、`exclude`、`count_only`、`context_lines`、`group`、`dedup`、`kind`、`depth`、`substring`、`dry_run_rename`、`character`、`severity`、`offset`、`page`、`budget_tokens`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
+`tools/list` 只声明模型实际会用的参数（小约 3.3 KB，这部分每轮 API 都会重发），其中包含每个工具上可选的按次 `index_root`（位于 git 仓库或 `.astrolabe/project.yml` 项目内的绝对路径或相对 cwd 的目录；省略则沿用进程启动时的索引根）。Astrolabe 只索引 git 仓库和用 `.astrolabe/project.yml` 声明的目录（兼容 Serena 的 `.serena/project.yml`），装着 git 仓库的目录本身永远不建索引；其他启动目录或 `index_root` 会被拒绝并列出其下的子仓库，除非设 `ASTROLABE_ALLOW_NON_GIT_ROOT=1`（见[参考手册](docs/REFERENCE.zh-CN.md)）。其余参数——`budget_tokens`、`depth`、`agent_id`、`context_lines`、`count_only`、`group`、`character`、`severity`，以及非多仓工作区下的 `root`——照常接受。设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。
 
-工具描述与返回文本为**纯英文**（schema 文案、结果正文、hook 提醒），避免中英双语让模型歧义。
+工具描述与返回文本为**纯英文**（schema 文案与结果正文），避免中英双语让模型歧义。
 
 **索引覆盖。** 支持语言的文件全部进入索引，包括有语法或编译错误的文件：能解析的符号会保留，出错区域里的符号可能缺失。`get_lang` 报告：
 - 未进入索引的文件：按原因计数（超过大小上限、读取失败、解析超时）；
@@ -141,7 +141,7 @@ Codex、Windsurf、OpenCode、DSH、Codebuddy、Grok、Kimi、ZCode 等见[安�
 
 ## 更多文档
 
-[安装与客户端](docs/INSTALL_GUIDE.zh-CN.md) · [FAQ](docs/FAQ.md) · [参考手册：配置、环境变量、语言矩阵、质量门禁](docs/REFERENCE.zh-CN.md) · [架构](docs/ARCHITECTURE.md) · [性能口径](docs/PERFORMANCE.md) · [防漂移 Hook（`setup --with-hooks`；成本效果未做 A/B 基准）](docs/HOOKS.md) · [发版流程](.github/RELEASING.md) · [llms.txt](llms.txt)
+[安装与客户端](docs/INSTALL_GUIDE.zh-CN.md) · [FAQ](docs/FAQ.md) · [参考手册：配置、环境变量、语言矩阵、质量门禁](docs/REFERENCE.zh-CN.md) · [架构](docs/ARCHITECTURE.md) · [性能口径](docs/PERFORMANCE.md) · [旧版 Hook 迁移说明（已移除）](docs/HOOKS.md) · [发版流程](.github/RELEASING.md) · [llms.txt](llms.txt)
 
 源码编译：`cargo build --release --bin astrolabe`（Rust 1.90+）；测试：`cargo test --workspace`。
 

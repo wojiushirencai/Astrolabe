@@ -5,7 +5,6 @@ const path = require('path');
 const {
   expandHome,
   readEnvDir,
-  hookCommand,
   isAstrolabeHookCommand,
 } = require('./cursor');
 
@@ -55,97 +54,76 @@ function detectCodebuddy(home, env, { whichFn, existsFn }) {
   return { detected: evidence.length > 0, evidence };
 }
 
-function commandHookEntry(command) {
-  return {
-    matcher: '',
-    hooks: [{ type: 'command', command }],
-  };
-}
-
-function entryIsAstrolabeHook(entry, subcommand, binPath, platform = process.platform) {
-  if (!entry || typeof entry !== 'object') return false;
-  const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
-  if (hooks.length !== 1) return false;
-  return isAstrolabeHookCommand(hooks[0] && hooks[0].command, {
-    subcommands: [subcommand],
-    binPath,
-    platform,
-  });
-}
-
-/**
- * Merge CC-compatible PreToolUse + SessionEnd into ~/.codebuddy/settings.json
- * without clobbering other hook entries.
- */
-function mergeCodebuddyHooksSettings(
+function stripCodebuddyHooksSettings(
   filePath,
-  { create = true, existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
+  { existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
 ) {
-  let created = false;
-  let doc = {};
-  if (existsFn(filePath)) {
-    const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
-    doc = JSON.parse(raw);
-    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-      throw new Error(`${filePath} root must be a JSON object`);
-    }
-  } else if (!create) {
-    return { skipped: true, reason: `missing ${filePath} (will not create)` };
-  } else {
-    created = true;
+  if (!existsFn(filePath)) {
+    return { skipped: true, reason: `missing ${filePath}` };
   }
-
+  const text = fs.readFileSync(filePath, 'utf8');
+  const raw = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  const doc = JSON.parse(raw);
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error(`${filePath} root must be a JSON object`);
+  }
   if (!doc.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) {
-    doc.hooks = {};
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
   }
-  const hooks = doc.hooks;
-  let replaced = false;
 
-  const nextRemind = commandHookEntry(hookCommand(binPath, REMIND_ARGS, platform));
-  const nextCleanup = commandHookEntry(hookCommand(binPath, CLEANUP_ARGS, platform));
-
-  for (const [event, subcommand, next] of [
-    ['PreToolUse', 'remind', nextRemind],
-    ['SessionEnd', 'cleanup', nextCleanup],
-  ]) {
-    if (!Array.isArray(hooks[event])) hooks[event] = [];
-    let inserted = false;
+  let changed = false;
+  for (const event of Object.keys(doc.hooks)) {
+    const entries = doc.hooks[event];
+    if (!Array.isArray(entries)) continue;
+    let eventChanged = false;
     const nextList = [];
-    for (const entry of hooks[event]) {
-      if (entryIsAstrolabeHook(entry, subcommand, binPath, platform)) {
-        if (!inserted) {
-          nextList.push(next);
-          inserted = true;
-        }
-        replaced = true;
-        continue;
-      }
+    for (const entry of entries) {
       if (entry && typeof entry === 'object' && Array.isArray(entry.hooks)) {
-        const filtered = entry.hooks.filter(
+        const remaining = entry.hooks.filter(
           (h) =>
-            !isAstrolabeHookCommand(h && h.command, {
-              subcommands: [subcommand],
+            !isAstrolabeHookCommand(typeof h === 'string' ? h : h && h.command, {
               binPath,
               platform,
             }),
         );
-        if (filtered.length !== entry.hooks.length) {
-          replaced = true;
-          if (filtered.length > 0) {
-            nextList.push({ ...entry, hooks: filtered });
+        if (remaining.length !== entry.hooks.length) {
+          changed = true;
+          eventChanged = true;
+          if (remaining.length > 0) {
+            nextList.push({ ...entry, hooks: remaining });
           }
           continue;
         }
+      } else if (
+        entry &&
+        typeof entry === 'object' &&
+        typeof entry.command === 'string' &&
+        isAstrolabeHookCommand(entry.command, { binPath, platform })
+      ) {
+        changed = true;
+        eventChanged = true;
+        continue;
       }
       nextList.push(entry);
     }
-    if (!inserted) {
-      nextList.push(next);
+    if (eventChanged) {
+      if (nextList.length === 0) {
+        delete doc.hooks[event];
+      } else {
+        doc.hooks[event] = nextList;
+      }
     }
-    hooks[event] = nextList;
   }
 
-  return { filePath, doc, created, replaced };
+  if (!changed) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
+  }
+
+  if (Object.keys(doc.hooks).length === 0) {
+    delete doc.hooks;
+  }
+
+  return { filePath, doc, created: false, replaced: true, removed: true };
 }
 
 module.exports = {
@@ -157,5 +135,5 @@ module.exports = {
   resolveCodebuddyMcpPath,
   resolveCodebuddySettingsPath,
   detectCodebuddy,
-  mergeCodebuddyHooksSettings,
+  stripCodebuddyHooksSettings,
 };

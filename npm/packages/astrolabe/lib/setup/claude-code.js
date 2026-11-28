@@ -51,8 +51,13 @@ function cleanupEntry(binPath, platform = process.platform) {
 }
 
 function isAstrolabeHookCommand(command, subcommand, binPath, platform = process.platform) {
+  const subcommands = Array.isArray(subcommand)
+    ? subcommand
+    : subcommand
+      ? [subcommand]
+      : ['session-start', 'remind', 'cleanup', 'gc'];
   return matchAstrolabeHookCommand(command, {
-    subcommands: subcommand ? [subcommand] : ['session-start', 'remind', 'cleanup'],
+    subcommands,
     binPath,
     platform,
   });
@@ -155,6 +160,172 @@ function mergeClaudeCodeHooksSettings(
   };
 }
 
+function isStatFile(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function discoverClaudeSettingsPaths(
+  home,
+  { existsFn = fs.existsSync, env = process.env, configDir = null } = {},
+) {
+  const primary = resolveClaudeSettingsPath(home, env, configDir);
+  const dir = path.dirname(primary);
+  const discovered = [];
+  if (existsFn(dir)) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const names = entries
+        .filter(
+          (entry) =>
+            /^settings-.*\.json$/i.test(entry.name) &&
+            (entry.isFile() ||
+              (entry.isSymbolicLink() && isStatFile(path.join(dir, entry.name)))),
+        )
+        .map((entry) => entry.name)
+        .sort();
+      for (const name of names) {
+        discovered.push(path.join(dir, name));
+      }
+    } catch {
+      // Ignore unreadable directories during discovery.
+    }
+  }
+  return Array.from(new Set([primary, ...discovered]));
+}
+
+function stripClaudeCodeHooksSettings(
+  filePath,
+  { existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
+) {
+  if (!existsFn(filePath)) {
+    return { skipped: true, reason: `missing ${filePath}` };
+  }
+  const text = fs.readFileSync(filePath, 'utf8');
+  const raw = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  const doc = JSON.parse(raw);
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error(`${filePath} root must be a JSON object`);
+  }
+  if (!doc.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
+  }
+
+  let changed = false;
+  for (const event of Object.keys(doc.hooks)) {
+    const entries = doc.hooks[event];
+    if (!Array.isArray(entries)) continue;
+    let eventChanged = false;
+    const nextList = [];
+    for (const entry of entries) {
+      if (entry && typeof entry === 'object' && Array.isArray(entry.hooks)) {
+        const remaining = entry.hooks.filter(
+          (h) =>
+            !isAstrolabeHookCommand(
+              typeof h === 'string' ? h : h && h.command,
+              null,
+              binPath,
+              platform,
+            ),
+        );
+        if (remaining.length !== entry.hooks.length) {
+          changed = true;
+          eventChanged = true;
+          if (remaining.length > 0) {
+            nextList.push({ ...entry, hooks: remaining });
+          }
+          continue;
+        }
+      } else if (
+        entry &&
+        typeof entry === 'object' &&
+        typeof entry.command === 'string' &&
+        isAstrolabeHookCommand(entry.command, null, binPath, platform)
+      ) {
+        changed = true;
+        eventChanged = true;
+        continue;
+      }
+      nextList.push(entry);
+    }
+    if (eventChanged) {
+      if (nextList.length === 0) {
+        delete doc.hooks[event];
+      } else {
+        doc.hooks[event] = nextList;
+      }
+    }
+  }
+
+  if (!changed) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
+  }
+
+  if (Object.keys(doc.hooks).length === 0) {
+    delete doc.hooks;
+  }
+
+  return { filePath, doc, created: false, replaced: true, removed: true };
+}
+
+function inspectClaudeProjectHooks(
+  projectRoot,
+  { existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
+) {
+  if (!projectRoot) return [];
+  const candidates = [
+    path.join(projectRoot, '.claude', 'settings.json'),
+    path.join(projectRoot, '.claude', 'settings.local.json'),
+  ];
+  const findings = [];
+  for (const filePath of candidates) {
+    if (!existsFn(filePath)) continue;
+    let doc;
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      const raw = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+      doc = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) continue;
+    if (!doc.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) continue;
+    const events = [];
+    for (const event of Object.keys(doc.hooks)) {
+      const entries = doc.hooks[event];
+      if (!Array.isArray(entries)) continue;
+      const found = entries.some((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        if (
+          typeof entry.command === 'string' &&
+          isAstrolabeHookCommand(entry.command, null, binPath, platform)
+        ) {
+          return true;
+        }
+        if (Array.isArray(entry.hooks)) {
+          return entry.hooks.some((h) =>
+            isAstrolabeHookCommand(
+              typeof h === 'string' ? h : h && h.command,
+              null,
+              binPath,
+              platform,
+            ),
+          );
+        }
+        return false;
+      });
+      if (found) events.push(event);
+    }
+    if (events.length > 0) {
+      findings.push({ filePath, events });
+    }
+  }
+  return findings;
+}
+
 module.exports = {
   SESSION_START_ARGS,
   REMIND_ARGS,
@@ -163,9 +334,12 @@ module.exports = {
   resolveClaudeConfigDir,
   resolveClaudeMcpPath,
   resolveClaudeSettingsPath,
+  discoverClaudeSettingsPaths,
   sessionStartEntry,
   remindEntry,
   cleanupEntry,
   isAstrolabeHookCommand,
   mergeClaudeCodeHooksSettings,
+  stripClaudeCodeHooksSettings,
+  inspectClaudeProjectHooks,
 };
