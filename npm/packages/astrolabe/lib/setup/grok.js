@@ -2,43 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { expandHome, readEnvDir, hookCommand } = require('./cursor');
-
-const REMIND_ARGS = ['hooks', 'remind', '--client=grok'];
-const CLEANUP_ARGS = ['hooks', 'cleanup'];
-
-function buildGrokHooksDoc(binPath = null, platform = process.platform) {
-  return {
-    hooks: {
-      PreToolUse: [
-        {
-          matcher: 'Bash|Read|Grep|run_terminal_command|read_file|grep|mcp__astrolabe__.*',
-          hooks: [
-            {
-              type: 'command',
-              command: hookCommand(binPath, REMIND_ARGS, platform),
-              timeout: 10,
-            },
-          ],
-        },
-      ],
-      SessionEnd: [
-        {
-          matcher: '',
-          hooks: [
-            {
-              type: 'command',
-              command: hookCommand(binPath, CLEANUP_ARGS, platform),
-              timeout: 10,
-            },
-          ],
-        },
-      ],
-    },
-  };
-}
-
-const GROK_HOOKS_DOC = buildGrokHooksDoc();
+const { expandHome, readEnvDir, isAstrolabeHookCommand } = require('./cursor');
 
 function resolveGrokConfigDir(home, env = process.env, configDir = null) {
   const explicit = expandHome(configDir, home);
@@ -67,39 +31,85 @@ function resolveGrokHooksPath(home, env = process.env, configDir = null) {
 }
 
 /**
- * Write/replace the dedicated Astrolabe hooks file (merge root.hooks keys only
- * when an existing file already has unrelated top-level fields).
+ * Strip legacy Astrolabe hook commands from a Grok hooks JSON file while
+ * preserving unrelated third-party hooks and top-level fields.
  */
-function mergeGrokHooksFile(
+function stripGrokHooksFile(
   filePath,
-  { create = true, existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
+  { existsFn = fs.existsSync, binPath = null, platform = process.platform } = {},
 ) {
-  let created = false;
-  let doc = {};
-  if (existsFn(filePath)) {
-    const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
-    doc = JSON.parse(raw);
-    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-      throw new Error(`${filePath} root must be a JSON object`);
-    }
-  } else if (!create) {
-    return { skipped: true, reason: `missing ${filePath} (will not create)` };
-  } else {
-    created = true;
+  if (!existsFn(filePath)) {
+    return { skipped: true, reason: `missing ${filePath}` };
+  }
+  const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+  const doc = JSON.parse(raw);
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error(`${filePath} root must be a JSON object`);
+  }
+  if (!doc.hooks || typeof doc.hooks !== 'object' || Array.isArray(doc.hooks)) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
   }
 
-  const hooksDoc = buildGrokHooksDoc(binPath, platform);
-  const replaced = Boolean(doc.hooks);
-  doc.hooks = hooksDoc.hooks;
-  return { filePath, doc, created, replaced, entryPreview: JSON.stringify(hooksDoc, null, 2) };
+  let changed = false;
+  for (const [eventName, entries] of Object.entries(doc.hooks)) {
+    if (!Array.isArray(entries)) continue;
+    const nextEntries = [];
+    let eventChanged = false;
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') {
+        nextEntries.push(entry);
+        continue;
+      }
+      if (Array.isArray(entry.hooks)) {
+        const remaining = entry.hooks.filter(
+          (h) => !(h && typeof h === 'object' && isAstrolabeHookCommand(h.command, { binPath, platform })),
+        );
+        if (remaining.length !== entry.hooks.length) {
+          eventChanged = true;
+          changed = true;
+          if (remaining.length > 0) {
+            nextEntries.push({ ...entry, hooks: remaining });
+          }
+          continue;
+        }
+      } else if (
+        typeof entry.command === 'string' &&
+        isAstrolabeHookCommand(entry.command, { binPath, platform })
+      ) {
+        eventChanged = true;
+        changed = true;
+        continue;
+      }
+      nextEntries.push(entry);
+    }
+    if (eventChanged) {
+      if (nextEntries.length > 0) {
+        doc.hooks[eventName] = nextEntries;
+      } else {
+        delete doc.hooks[eventName];
+      }
+    }
+  }
+
+  if (changed && Object.keys(doc.hooks).length === 0) {
+    delete doc.hooks;
+  }
+
+  if (!changed) {
+    return { skipped: true, reason: `no legacy Astrolabe hooks in ${filePath}` };
+  }
+
+  if (Object.keys(doc).length === 0) {
+    return { filePath, deleted: true, created: false, replaced: true, doc: null };
+  }
+
+  return { filePath, doc, deleted: false, created: false, replaced: true };
 }
 
 module.exports = {
-  GROK_HOOKS_DOC,
-  buildGrokHooksDoc,
   resolveGrokConfigDir,
   detectGrok,
   resolveGrokConfigToml,
   resolveGrokHooksPath,
-  mergeGrokHooksFile,
+  stripGrokHooksFile,
 };

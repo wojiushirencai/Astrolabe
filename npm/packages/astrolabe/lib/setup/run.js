@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const clientsMod = require('./clients');
@@ -16,16 +17,6 @@ const {
 } = clientsMod;
 const { parseArgs, USAGE } = require('./args');
 const { isTTY, confirm, selectClients } = require('./prompt');
-
-const HOOK_COMMAND_CLIENTS = new Set([
-  'claude-code',
-  'cursor',
-  'codebuddy',
-  'grok',
-  'kimicode',
-  'zcode',
-  'opencode',
-]);
 
 const PURE_MCP_CLIENTS = new Set(['codex', 'cline', 'roo', 'windsurf', 'continue']);
 
@@ -69,6 +60,7 @@ function chooseIds(rows, opts) {
   if (opts.yes) {
     const detected = rows.filter((r) => r.detected).map((r) => r.id);
     if (!detected.length) {
+      if (opts.removeHooks) return [];
       throw new Error('no clients detected; pass --clients=... or run interactively');
     }
     return detected;
@@ -82,6 +74,7 @@ function chooseIds(rows, opts) {
 }
 
 function formatEntryPreview(planResult) {
+  if (!planResult || planResult.removed || planResult.deleted) return '';
   if (planResult.entryPreview) return String(planResult.entryPreview).trimEnd();
   if (planResult.entry) {
     return JSON.stringify({ astrolabe: planResult.entry }, null, 2);
@@ -129,17 +122,32 @@ function resolveCommandBinary(command, env = process.env) {
  */
 function backupAppliedFiles(applied) {
   const targets = [
-    { filePath: applied.filePath, created: applied.created, skipped: applied.skipped },
+    {
+      filePath: applied.filePath,
+      created: applied.created,
+      skipped: applied.skipped,
+      isDirectory: applied.isDirectory,
+      skipBackup: applied.skipBackup,
+    },
     ...(Array.isArray(applied.results) ? applied.results : []).map((step) => ({
       filePath: step.filePath,
       created: step.created,
       skipped: step.skipped,
+      isDirectory: step.isDirectory,
+      skipBackup: step.skipBackup,
     })),
   ];
   const seen = new Set();
   const backups = [];
   for (const target of targets) {
-    if (!target.filePath || target.skipped || target.created || seen.has(target.filePath)) {
+    if (
+      !target.filePath ||
+      target.skipped ||
+      target.created ||
+      target.isDirectory ||
+      target.skipBackup ||
+      seen.has(target.filePath)
+    ) {
       continue;
     }
     seen.add(target.filePath);
@@ -178,6 +186,12 @@ async function runAsync(argv = process.argv.slice(2)) {
     return 0;
   }
 
+  if (opts.deprecatedWithHooks) {
+    process.stderr.write(
+      'Note: --with-hooks is deprecated (hooks have been removed); legacy Astrolabe hooks will be cleaned up automatically.\n',
+    );
+  }
+
   const hasExplicitPathOverride = Boolean(
     opts.configDir || opts.mcpConfig || (opts.hooksConfig && opts.hooksConfig.length > 0),
   );
@@ -194,7 +208,16 @@ async function runAsync(argv = process.argv.slice(2)) {
     process.stderr.write(`${error.message}\n`);
     return 1;
   }
-  if (!selectedIds.length) {
+
+  const hookDataDir = path.join(home, '.astrolabe', 'hook_data');
+  let hasHookDataDir = false;
+  try {
+    fs.lstatSync(hookDataDir);
+    hasHookDataDir = true;
+  } catch {
+    hasHookDataDir = false;
+  }
+  if (!selectedIds.length && !(opts.removeHooks && hasHookDataDir)) {
     process.stdout.write('Nothing selected; no files changed.\n');
     return 0;
   }
@@ -217,19 +240,21 @@ async function runAsync(argv = process.argv.slice(2)) {
     }
   }
 
-  const effectiveWithHooks = Boolean(
-    opts.withHooks || (opts.hooksConfig && opts.hooksConfig.length > 0),
-  );
   const cursorSelected = selectedIds.includes('cursor');
   const cursorDetected = cursorSelected && (detectedById.get('cursor') || hasExplicitPathOverride);
-  let projectRoot = null;
+  let projectRoot =
+    opts.project || opts.scope === 'project'
+      ? cursorMod.resolveProjectRoot(opts.project ? path.resolve(opts.project) : process.cwd())
+      : null;
   let cursorBinPath = null;
   let cursorBinError = null;
   let pyrightPath = null;
-  if (cursorDetected) {
-    projectRoot = clientsMod.resolveCursorProjectRoot(
-      opts.project ? path.resolve(opts.project) : process.cwd(),
-    );
+  if (!opts.removeHooks && cursorDetected) {
+    if (!projectRoot) {
+      projectRoot = clientsMod.resolveCursorProjectRoot(
+        opts.project ? path.resolve(opts.project) : process.cwd(),
+      );
+    }
     pyrightPath = clientsMod.detectPyright(process.env, {
       whichFn: clientsMod.which,
       home,
@@ -273,28 +298,9 @@ async function runAsync(argv = process.argv.slice(2)) {
   }
 
   const actions = [];
-  const commandBinPath = opts.command ? resolveCommandBinary(opts.command, process.env) : null;
-  let hookBinPath = commandBinPath;
-  const needsHookBinary =
-    effectiveWithHooks &&
-    selectedIds.some(
-      (id) => HOOK_COMMAND_CLIENTS.has(id) && (id !== 'cursor' || cursorDetected),
-    );
-  if (!opts.command && needsHookBinary) {
-    hookBinPath = resolveCommandBinary('astrolabe', process.env);
-    if (!hookBinPath && cursorBinPath) {
-      hookBinPath = cursorBinPath;
-    }
-    if (!hookBinPath && !cursorDetected) {
-      try {
-        const { resolveBinary } = require('../resolve');
-        const resolved = await resolveBinary();
-        if (resolved) hookBinPath = path.resolve(resolved);
-      } catch {
-        // Fall back to null (bare 'astrolabe') when the packaged binary is unavailable.
-      }
-    }
-  }
+  const hookBinPath = opts.command
+    ? resolveCommandBinary(opts.command, process.env)
+    : resolveCommandBinary('astrolabe', process.env);
   for (const id of selectedIds) {
     const client = getClient(id);
     const launch = resolveLaunch({
@@ -305,10 +311,11 @@ async function runAsync(argv = process.argv.slice(2)) {
     const plan = client.plan({
       home,
       launch,
-      withHooks: effectiveWithHooks,
       alwaysLoad: opts.alwaysLoad,
       binPath: hookBinPath,
       projectRoot,
+      explicitProject: Boolean(opts.project),
+      removeHooks: opts.removeHooks,
       cursorBinPath,
       pyrightPath,
       env: process.env,
@@ -330,11 +337,13 @@ async function runAsync(argv = process.argv.slice(2)) {
   }
 
   const cursorAction = actions.find((action) => action.id === 'cursor');
-  const cursorApplied = Boolean(cursorAction && !cursorAction.applied.skipped);
+  const cursorApplied = Boolean(
+    !opts.removeHooks && cursorAction && !cursorAction.applied.skipped,
+  );
 
   let permissionsPlan = null;
   let allowlistCheck = null;
-  if (opts.cursorPermissions && cursorApplied) {
+  if (!opts.removeHooks && opts.cursorPermissions && cursorApplied) {
     allowlistCheck = checkCursorAllowlist(home, { env: process.env, configDir: opts.configDir });
     process.stdout.write(`\nCursor MCP allowlist check: ${allowlistCheck.message}\n`);
     permissionsPlan = mergeCursorPermissions(home, {
@@ -349,25 +358,53 @@ async function runAsync(argv = process.argv.slice(2)) {
   for (const action of actions) {
     if (action.applied.skipped) {
       process.stdout.write(`  - ${action.label}: SKIP ${action.applied.reason}\n`);
+      if (Array.isArray(action.applied.warnings)) {
+        for (const warning of action.applied.warnings) {
+          process.stdout.write(`      ${warning}\n`);
+        }
+      }
       continue;
     }
-    const op = action.applied.created ? 'create' : action.applied.replaced ? 'update' : 'write';
-    process.stdout.write(`  - ${action.label}: ${op} ${action.applied.filePath}\n`);
-    if (action.applied.installDirs) {
-      for (const dir of action.applied.installDirs) {
-        process.stdout.write(`      plugin → ${dir}\n`);
+    const op = action.applied.deleted
+      ? 'remove'
+      : action.applied.created
+        ? 'create'
+        : action.applied.replaced
+          ? 'update'
+          : 'write';
+    if (action.applied.filePath) {
+      process.stdout.write(`  - ${action.label}: ${op} ${action.applied.filePath}\n`);
+    } else if (Array.isArray(action.applied.removedDirs) && action.applied.removedDirs.length > 0) {
+      process.stdout.write(`  - ${action.label}: remove legacy plugin\n`);
+    } else {
+      process.stdout.write(`  - ${action.label}: ${op}\n`);
+    }
+    if (Array.isArray(action.applied.removedDirs)) {
+      for (const dir of action.applied.removedDirs) {
+        process.stdout.write(`      remove plugin dir ${dir}\n`);
       }
     }
     if (Array.isArray(action.applied.results)) {
       for (const step of action.applied.results) {
         if (!step || step.skipped) continue;
         if (step.filePath && step.filePath !== action.applied.filePath) {
-          const sop = step.created ? 'create' : step.replaced ? 'update' : 'write';
+          const sop = step.deleted
+            ? 'remove'
+            : step.created
+              ? 'create'
+              : step.replaced
+                ? 'update'
+                : 'write';
           process.stdout.write(`      ${sop} ${step.filePath}\n`);
         }
       }
     }
-    if (action.id !== 'deepseek-harness') {
+    if (Array.isArray(action.applied.warnings)) {
+      for (const warning of action.applied.warnings) {
+        process.stdout.write(`      ${warning}\n`);
+      }
+    }
+    if (!opts.removeHooks && action.id !== 'deepseek-harness') {
       const launchCommand =
         action.id === 'cursor' && action.applied.entry
           ? action.applied.entry
@@ -376,12 +413,17 @@ async function runAsync(argv = process.argv.slice(2)) {
         `      command: ${launchCommand.command} ${(launchCommand.args || []).join(' ')}\n`,
       );
     }
-    const preview = formatEntryPreview(action.applied);
-    if (preview) {
-      for (const line of preview.split('\n')) {
-        process.stdout.write(`      ${line}\n`);
+    if (!opts.removeHooks) {
+      const preview = formatEntryPreview(action.applied);
+      if (preview) {
+        for (const line of preview.split('\n')) {
+          process.stdout.write(`      ${line}\n`);
+        }
       }
     }
+  }
+  if (hasHookDataDir) {
+    process.stdout.write(`  - Hook data cache: remove ${hookDataDir}\n`);
   }
   if (permissionsPlan) {
     const migrateBit =
@@ -399,7 +441,7 @@ async function runAsync(argv = process.argv.slice(2)) {
 
   // A successful global write does not replace an existing project server.
   // Surface the actual source before best-effort approval can obscure that fact.
-  if (cursorApplied && projectRoot && opts.scope !== 'project') {
+  if (!opts.removeHooks && cursorApplied && projectRoot && opts.scope !== 'project') {
     const effective = cursorMod.inspectCursorConfig(home, projectRoot);
     if (effective.source === 'project') {
       process.stdout.write(
@@ -415,7 +457,12 @@ async function runAsync(argv = process.argv.slice(2)) {
     return 0;
   }
 
+  const hasPendingChanges = actions.some((action) => !action.applied.skipped) || hasHookDataDir;
   if (!opts.yes && isTTY()) {
+    if (!hasPendingChanges) {
+      process.stdout.write('\nNothing to apply; no files changed.\n');
+      return 0;
+    }
     if (!confirm('Apply these changes?', { defaultYes: false })) {
       process.stdout.write('Cancelled; no files written.\n');
       return 1;
@@ -433,20 +480,52 @@ async function runAsync(argv = process.argv.slice(2)) {
     }
     const backups = backupAppliedFiles(action.applied);
     action.applied.write();
+    const targetLabel =
+      action.applied.filePath ||
+      (Array.isArray(action.applied.removedDirs) && action.applied.removedDirs.join(', ')) ||
+      action.label;
+    const verb = action.applied.deleted ? 'Removed' : 'Wrote';
     summary.push({
       id: action.id,
       status: 'written',
-      file: action.applied.filePath,
+      file: action.applied.filePath || null,
+      removedDirs: action.applied.removedDirs || undefined,
       backup: backups[0] || null,
       backups,
     });
     process.stdout.write(
-      `Wrote ${action.applied.filePath}${backups.length ? ` (backup ${backups.join(', ')})` : ''}\n`,
+      `${verb} ${targetLabel}${backups.length ? ` (backup ${backups.join(', ')})` : ''}\n`,
     );
+    if (action.applied.filePath && Array.isArray(action.applied.removedDirs)) {
+      for (const dir of action.applied.removedDirs) {
+        process.stdout.write(`Removed ${dir}\n`);
+      }
+    }
+    if (Array.isArray(action.applied.results)) {
+      for (const step of action.applied.results) {
+        if (!step || step.skipped) continue;
+        if (step.filePath && step.filePath !== action.applied.filePath) {
+          const stepVerb = step.deleted ? 'Removed' : 'Wrote';
+          process.stdout.write(`${stepVerb} ${step.filePath}\n`);
+        }
+      }
+    }
+  }
+  if (hasHookDataDir) {
+    try {
+      if (fs.lstatSync(hookDataDir).isSymbolicLink()) {
+        fs.unlinkSync(hookDataDir);
+      } else {
+        fs.rmSync(hookDataDir, { recursive: true, force: true });
+      }
+    } catch {
+      fs.rmSync(hookDataDir, { recursive: true, force: true });
+    }
+    process.stdout.write(`Removed ${hookDataDir}\n`);
   }
 
   let cursorApproval = null;
-  if (cursorDetected && projectRoot && cursorApplied) {
+  if (!opts.removeHooks && cursorDetected && projectRoot && cursorApplied) {
     cursorApproval = clientsMod.enableCursorApproval({
       home,
       projectRoot,
@@ -502,7 +581,7 @@ async function runAsync(argv = process.argv.slice(2)) {
     }
   }
 
-  if (permissionsPlan) {
+  if (!opts.removeHooks && permissionsPlan) {
     if (permissionsPlan.created && !opts.yes && isTTY()) {
       process.stdout.write(
         `\nNote: defining mcpAllowlist replaces the IDE MCP allowlist table. ` +
@@ -541,90 +620,70 @@ async function runAsync(argv = process.argv.slice(2)) {
   }
 
   process.stdout.write('\nDone. Next steps:\n');
-  process.stdout.write('  1. Restart each configured agent / IDE so it reloads MCP servers.\n');
-  process.stdout.write('  2. Verify: npx -y @zlnap/astrolabe --version\n');
-  if (selectedIds.includes('claude-code')) {
-    process.stdout.write('  3. Claude Code: claude mcp get astrolabe\n');
-    if (effectiveWithHooks) {
-      process.stdout.write(
-        '     Hooks: merged SessionStart, PreToolUse, SessionEnd into ~/.claude/settings.json.\n',
-      );
-    } else {
-      process.stdout.write(
-        '     Tip: re-run with --with-hooks to merge SessionStart/PreToolUse/SessionEnd into ~/.claude/settings.json.\n',
-      );
+  if (opts.removeHooks) {
+    process.stdout.write(
+      '  1. Restart each running agent / IDE so it stops invoking removed hooks or plugins.\n',
+    );
+    process.stdout.write('  2. MCP server configurations were left untouched.\n');
+  } else {
+    process.stdout.write('  1. Restart each configured agent / IDE so it reloads MCP servers.\n');
+    process.stdout.write('  2. Verify: npx -y @zlnap/astrolabe --version\n');
+    if (selectedIds.includes('claude-code')) {
+      process.stdout.write('  3. Claude Code: claude mcp get astrolabe\n');
     }
-  }
-  if (selectedIds.includes('cursor')) {
-    if (cursorDetected) {
-      if (opts.scope === 'project') {
-        process.stdout.write(
-          `  3. Cursor: project config ${path.join(projectRoot, '.cursor', 'mcp.json')} + ` +
-            `${path.join(projectRoot, '.cursor', 'rules', 'astrolabe.mdc')}; this directory ` +
-            'requires successful `cursor-agent mcp enable astrolabe` approval before use.\n',
-        );
+    if (selectedIds.includes('cursor')) {
+      if (cursorDetected) {
+        if (opts.scope === 'project') {
+          process.stdout.write(
+            `  3. Cursor: project config ${path.join(projectRoot, '.cursor', 'mcp.json')} + ` +
+              `${path.join(projectRoot, '.cursor', 'rules', 'astrolabe.mdc')}; this directory ` +
+              'requires successful `cursor-agent mcp enable astrolabe` approval before use.\n',
+          );
+        } else {
+          process.stdout.write(
+            `  3. Cursor: global config ${path.join(home, '.cursor', 'mcp.json')}. ` +
+              'Cursor has no file-based global rules directory; L1 guidance comes from the MCP ' +
+              'instructions; new projects still prompt for MCP approval on first use.\n',
+          );
+        }
       } else {
         process.stdout.write(
-          `  3. Cursor: global config ${path.join(home, '.cursor', 'mcp.json')}. Cursor has no ` +
-            'file-based global rules directory; the L1 guidance comes from the MCP instructions ' +
-            'and the global ~/.cursor/hooks.json remind hook (enable with --with-hooks). ' +
-            'New projects still prompt for MCP approval on first use.\n',
+          '  3. Cursor: not detected; skipped config, rules and MCP approval.\n',
         );
       }
-    } else {
+    }
+    if (selectedIds.includes('opencode')) {
       process.stdout.write(
-        '  3. Cursor: not detected; skipped config, rules and MCP approval.\n',
+        '  3. OpenCode: restart opencode; MCP is under mcp / mcp.servers in ~/.config/opencode/.\n',
       );
     }
-    if (effectiveWithHooks) {
+    if (selectedIds.includes('deepseek-harness')) {
       process.stdout.write(
-        '     Hooks: ~/.cursor/hooks.json uses an absolute binary path and --client=cursor ' +
-          '(matcher includes astrolabe-.*).\n',
+        '  3. DSH: legacy astrolabe-dsh-guard cleaned; add the Astrolabe MCP server per repo in the DSH UI.\n',
       );
-    } else {
+    }
+    if (selectedIds.includes('codebuddy')) {
       process.stdout.write(
-        '     Tip: re-run with --with-hooks to write ~/.cursor/hooks.json (absolute path, --client=cursor).\n',
+        '  3. Codebuddy: MCP in ~/.codebuddy/.mcp.json; restart codebuddy.\n',
+      );
+    }
+    if (selectedIds.includes('grok')) {
+      process.stdout.write(
+        '  3. Grok Build: MCP in ~/.grok/config.toml ([mcp_servers.astrolabe]).\n',
+      );
+    }
+    if (selectedIds.includes('kimicode')) {
+      process.stdout.write(
+        '  3. Kimi Code: MCP in ~/.kimi-code/mcp.json.\n',
+      );
+    }
+    if (selectedIds.includes('zcode')) {
+      process.stdout.write(
+        '  3. ZCode: MCP under mcp.servers in ~/.zcode/cli/config.json.\n',
       );
     }
   }
-  if (selectedIds.includes('opencode')) {
-    process.stdout.write(
-      '  3. OpenCode: restart opencode; MCP is under mcp / mcp.servers in ~/.config/opencode/.\n',
-    );
-    if (!effectiveWithHooks) {
-      process.stdout.write(
-        '     Tip: re-run with --with-hooks to install plugins/astrolabe-guard.ts\n',
-      );
-    }
-  }
-  if (selectedIds.includes('deepseek-harness')) {
-    process.stdout.write(
-      '  3. DSH: native guard is in cordis.patch.yml; add the Astrolabe MCP server per repo in the DSH UI.\n',
-    );
-  }
-  if (selectedIds.includes('codebuddy')) {
-    process.stdout.write(
-      '  3. Codebuddy: MCP in ~/.codebuddy/.mcp.json; restart codebuddy. Tip: --with-hooks merges ~/.codebuddy/settings.json.\n',
-    );
-  }
-  if (selectedIds.includes('grok')) {
-    process.stdout.write(
-      '  3. Grok Build: MCP in ~/.grok/config.toml ([mcp_servers.astrolabe]); tip: --with-hooks writes ~/.grok/hooks/astrolabe.json.\n',
-    );
-  }
-  if (selectedIds.includes('kimicode')) {
-    process.stdout.write(
-      '  3. Kimi Code: MCP in ~/.kimi-code/mcp.json; tip: --with-hooks merges [[hooks]] into config.toml.\n',
-    );
-  }
-  if (selectedIds.includes('zcode')) {
-    process.stdout.write(
-      '  3. ZCode: MCP under mcp.servers in ~/.zcode/cli/config.json; tip: --with-hooks adds hooks.events.PreToolUse (--client=zcode; no SessionEnd; scrub Stop cleanup).\n',
-    );
-  }
-  return summary.some((row) => row.status === 'written') || summary.every((row) => row.status === 'skipped')
-    ? 0
-    : 0;
+  return 0;
 }
 
 module.exports = { run, detectAll, resolveHome };

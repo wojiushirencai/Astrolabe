@@ -30,24 +30,8 @@ Options:
   -V, --version    print version
   -h, --help       print this help
 
-Subcommands (Serena-style anti-drift hooks and prompt output):
-  hooks remind --client=NAME   PreToolUse hook: read hook payload from stdin; count consecutive
-                               grep/read abuse; over threshold emit deny decision JSON.
-                               client: claude-code/codebuddy/vscode/codex/grok/
-                                       kimicode/zcode/cursor/opencode
-                               (grokbuild/grok-build also maps to grok;
-                                kimi-code/kimi_code/kimi→kimicode, z-code/zai→zcode, 
-                                cursor-agent/cursor_agent/cursor-cli→cursor)
-                               optional: --deny-text-search[=true|false]
-                                     hard-deny Grep/Glob/shell text search (deny on first use)
-                               optional: --context=NAME  load deny_text_search from context YAML
-                               priority: CLI > ASTROLABE_DENY_TEXT_SEARCH >
-                                       context YAML > default off
-  hooks cleanup                SessionEnd hook: clear state dir by stdin session_id
-  hooks gc                     remove session state dirs idle longer than 24h (ASTROLABE_HOOK_GC_HOURS tunable);
-                               remind also opportunistically runs once per hour
-                               (for hosts like ZCode without SessionEnd events)
-  hooks session-start          SessionStart hook: emit static ToolSearch batch-load guidance JSON
+Subcommands:
+  hooks ...                    (Deprecated no-op kept for backward compatibility)
   print-cc-system-prompt-override
                                emit Claude Code --system-prompt full replacement text
   setup                        detect local AI clients and write MCP config (implemented in the npm package;
@@ -58,18 +42,9 @@ Subcommands (Serena-style anti-drift hooks and prompt output):
 pub enum Launch {
     Help,
     Version,
-    HooksRemind {
-        client: String,
-        /// CLI `--deny-text-search` / `--deny-text-search=true|false`; None = unset
-        deny_text_search: Option<bool>,
-        /// Optional `--context=NAME` for YAML `deny_text_search`
-        context: Option<String>,
+    HooksNoop {
+        drain_stdin: bool,
     },
-    HooksCleanup,
-    /// `hooks gc`：清理过期会话状态目录
-    HooksGc,
-    /// `hooks session-start`：SessionStart hook 输出静态 ToolSearch 引导 JSON
-    HooksSessionStart,
     PrintCcSystemPromptOverride,
     /// npm-shipped interactive MCP client setup (cargo binary prints a hint).
     Setup {
@@ -189,93 +164,18 @@ where
     })
 }
 
-/// `astrolabe hooks <remind|cleanup|gc|session-start> [--client=NAME]`：hook 协议入口不索引仓库，
-/// 由 main 直接分发到 hooks 模块。
+/// `astrolabe hooks ...`：已废弃的 hook 子命令，仅保留向后兼容的静默空操作（`-h` / `--help` 仍输出帮助）。
 fn parse_hooks_subcommand(rest: &[OsString]) -> anyhow::Result<Launch> {
-    // `hooks -h` / `hooks remind --help` should show usage, not "unknown …".
-    for arg in rest {
-        let s = arg.to_string_lossy();
-        if s == "--help" || s == "-h" {
-            return Ok(Launch::Help);
-        }
+    if rest
+        .first()
+        .is_some_and(|arg| matches!(arg.to_string_lossy().as_ref(), "-h" | "--help"))
+    {
+        return Ok(Launch::Help);
     }
-    let Some(sub) = rest.first() else {
-        anyhow::bail!(
-            "hooks requires a subcommand: remind | cleanup | gc | session-start\n{USAGE}"
-        );
-    };
-    match sub.to_string_lossy().as_ref() {
-        "remind" => {
-            let mut client: Option<String> = None;
-            let mut deny_text_search: Option<bool> = None;
-            let mut context: Option<String> = None;
-            for arg in &rest[1..] {
-                let arg = arg.to_string_lossy();
-                if let Some(value) = arg.strip_prefix("--client=") {
-                    if value.trim().is_empty() {
-                        anyhow::bail!("--client requires a name\n{USAGE}");
-                    }
-                    client = Some(value.to_string());
-                } else if arg == "--client" {
-                    anyhow::bail!("--client requires =NAME in hook commands\n{USAGE}");
-                } else if arg == "--deny-text-search" {
-                    deny_text_search = Some(true);
-                } else if let Some(value) = arg.strip_prefix("--deny-text-search=") {
-                    let v = value.trim().to_ascii_lowercase();
-                    match v.as_str() {
-                        "1" | "true" | "yes" | "on" => deny_text_search = Some(true),
-                        "0" | "false" | "no" | "off" => deny_text_search = Some(false),
-                        _ => anyhow::bail!(
-                            "--deny-text-search expects true/false (got {value})\n{USAGE}"
-                        ),
-                    }
-                } else if let Some(value) = arg.strip_prefix("--context=") {
-                    if value.trim().is_empty() {
-                        anyhow::bail!("--context requires a name\n{USAGE}");
-                    }
-                    context = Some(value.to_string());
-                } else if arg == "--context" {
-                    anyhow::bail!("--context requires =NAME in hook commands\n{USAGE}");
-                } else {
-                    anyhow::bail!("unknown hooks remind argument: {arg}\n{USAGE}");
-                }
-            }
-            // 未指定 client 时按 claude-code 形态输出（最常见宿主，格式是其超集）。
-            Ok(Launch::HooksRemind {
-                client: client.unwrap_or_else(|| "claude-code".to_string()),
-                deny_text_search,
-                context,
-            })
-        }
-        "cleanup" => {
-            if rest.len() > 1 {
-                anyhow::bail!(
-                    "unexpected extra argument: {}\n{USAGE}",
-                    rest[1].to_string_lossy()
-                );
-            }
-            Ok(Launch::HooksCleanup)
-        }
-        "gc" => {
-            if rest.len() > 1 {
-                anyhow::bail!(
-                    "unexpected extra argument: {}\n{USAGE}",
-                    rest[1].to_string_lossy()
-                );
-            }
-            Ok(Launch::HooksGc)
-        }
-        "session-start" => {
-            if rest.len() > 1 {
-                anyhow::bail!(
-                    "unexpected extra argument: {}\n{USAGE}",
-                    rest[1].to_string_lossy()
-                );
-            }
-            Ok(Launch::HooksSessionStart)
-        }
-        other => anyhow::bail!("unknown hooks subcommand: {other}\n{USAGE}"),
-    }
+    let drain_stdin = rest
+        .first()
+        .is_some_and(|arg| matches!(arg.to_string_lossy().as_ref(), "remind" | "cleanup"));
+    Ok(Launch::HooksNoop { drain_stdin })
 }
 
 #[cfg(test)]
@@ -303,89 +203,41 @@ mod tests {
 
     #[test]
     fn hooks_subcommands() {
-        match parse(&["astrolabe", "hooks", "remind", "--client=codex"]) {
-            Launch::HooksRemind {
-                client,
-                deny_text_search,
-                context,
-            } => {
-                assert_eq!(client, "codex");
-                assert_eq!(deny_text_search, None);
-                assert_eq!(context, None);
-            }
-            other => panic!("expected HooksRemind, got {other:?}"),
+        for args in [
+            &["astrolabe", "hooks", "remind"][..],
+            &["astrolabe", "hooks", "remind", "--client=codex"],
+            &[
+                "astrolabe",
+                "hooks",
+                "remind",
+                "--client=claude-code",
+                "--deny-text-search",
+                "--context=cursor",
+            ],
+            &["astrolabe", "hooks", "remind", "--deny-text-search=false"],
+            &["astrolabe", "hooks", "cleanup"],
+            &["astrolabe", "hooks", "remind", "--client"],
+            &["astrolabe", "hooks", "remind", "--client="],
+            &["astrolabe", "hooks", "remind", "--help"],
+        ] {
+            assert!(
+                matches!(parse(args), Launch::HooksNoop { drain_stdin: true }),
+                "expected HooksNoop {{ drain_stdin: true }} for {args:?}"
+            );
         }
-        // 未指定 client 回落 claude-code（输出格式是其超集）
-        match parse(&["astrolabe", "hooks", "remind"]) {
-            Launch::HooksRemind { client, .. } => assert_eq!(client, "claude-code"),
-            other => panic!("expected HooksRemind, got {other:?}"),
-        }
-        match parse(&[
-            "astrolabe",
-            "hooks",
-            "remind",
-            "--client=cursor",
-            "--deny-text-search",
-            "--context=claude-code",
-        ]) {
-            Launch::HooksRemind {
-                client,
-                deny_text_search,
-                context,
-            } => {
-                assert_eq!(client, "cursor");
-                assert_eq!(deny_text_search, Some(true));
-                assert_eq!(context.as_deref(), Some("claude-code"));
-            }
-            other => panic!("expected HooksRemind, got {other:?}"),
-        }
-        match parse(&["astrolabe", "hooks", "remind", "--deny-text-search=false"]) {
-            Launch::HooksRemind {
-                deny_text_search, ..
-            } => assert_eq!(deny_text_search, Some(false)),
-            other => panic!("expected HooksRemind, got {other:?}"),
-        }
-        assert!(matches!(
-            parse(&["astrolabe", "hooks", "cleanup"]),
-            Launch::HooksCleanup
-        ));
-        assert!(matches!(
-            parse(&["astrolabe", "hooks", "gc"]),
-            Launch::HooksGc
-        ));
-        assert!(matches!(
-            parse(&["astrolabe", "hooks", "session-start"]),
-            Launch::HooksSessionStart
-        ));
-        assert!(parse_launch_from(
-            ["astrolabe", "hooks", "gc", "x"].iter().copied(),
-            None,
-            None
-        )
-        .is_err());
-        assert!(parse_launch_from(
-            ["astrolabe", "hooks", "session-start", "x"].iter().copied(),
-            None,
-            None
-        )
-        .is_err());
-    }
 
-    #[test]
-    fn hooks_subcommand_errors() {
-        assert!(parse_launch_from(["astrolabe", "hooks"].iter().copied(), None, None).is_err());
-        assert!(parse_launch_from(
-            ["astrolabe", "hooks", "frobnicate"].iter().copied(),
-            None,
-            None
-        )
-        .is_err());
-        assert!(parse_launch_from(
-            ["astrolabe", "hooks", "remind", "--client"].iter().copied(),
-            None,
-            None
-        )
-        .is_err());
+        for args in [
+            &["astrolabe", "hooks"][..],
+            &["astrolabe", "hooks", "gc"],
+            &["astrolabe", "hooks", "gc", "--max-age-hours=24"],
+            &["astrolabe", "hooks", "session-start"],
+            &["astrolabe", "hooks", "unknown", "--bad-flag"],
+        ] {
+            assert!(
+                matches!(parse(args), Launch::HooksNoop { drain_stdin: false }),
+                "expected HooksNoop {{ drain_stdin: false }} for {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -515,34 +367,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_client_flag_errors() {
-        let err = parse_launch_from(
-            ["astrolabe", "hooks", "remind", "--client="]
-                .iter()
-                .copied(),
-            None,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("--client requires a name"), "{err}");
-        let err = parse_launch_from(
-            ["astrolabe", "hooks", "remind", "--client=  "]
-                .iter()
-                .copied(),
-            None,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("--client requires a name"), "{err}");
-    }
-
-    #[test]
     fn hooks_help_flags() {
         assert!(matches!(parse(&["astrolabe", "hooks", "-h"]), Launch::Help));
         assert!(matches!(
-            parse(&["astrolabe", "hooks", "remind", "--help"]),
+            parse(&["astrolabe", "hooks", "--help"]),
             Launch::Help
         ));
         assert!(matches!(

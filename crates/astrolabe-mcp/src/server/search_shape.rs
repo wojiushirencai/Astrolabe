@@ -140,7 +140,7 @@ pub(super) fn symbol_hits_outside_filter(
     };
     if index.file_id(filter).is_some() {
         note.push_str(&format!(
-            "For this file's outline: query=\"{filter}\" (file path as query).\n"
+            "For this file's outline: find_symbol(query=\"*\", path_filter=\"{filter}\").\n"
         ));
     }
     note
@@ -568,7 +568,10 @@ mod behaviour {
             "{out}"
         );
         assert!(out.contains("still nothing without path_filter"), "{out}");
-        assert!(out.contains("query=\"oauth/github.go\""), "{out}");
+        assert!(
+            out.contains("find_symbol(query=\"*\", path_filter=\"oauth/github.go\")"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

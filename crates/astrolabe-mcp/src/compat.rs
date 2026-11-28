@@ -49,6 +49,7 @@ pub const TOOL_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// Names accepted on `tools/call` but never listed in `tools/list`.
+#[cfg(test)]
 pub const TOOL_ALIAS_NAMES: &[&str] = &[
     "resolve_context",
     "ast_resolve_contx",
@@ -80,10 +81,6 @@ pub fn canonical_tool_name(name: &str) -> Option<&'static str> {
         .find(|(alias, _)| *alias == name)
         .map(|(_, canonical)| *canonical)
 }
-
-/// Compat tool names recognized by hooks (counter reset) but not listed in
-/// `tools/list`.
-pub const COMPAT_TOOL_NAMES: &[&str] = &[EXPLAIN_SYMBOL];
 
 const COMPAT_NOTE: &str = "\
 [compat] explain_symbol → find_symbol(include_body=true, substring=false). \

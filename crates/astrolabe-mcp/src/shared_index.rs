@@ -50,7 +50,7 @@ use serde_json::Value;
 use crate::context::ClientContext;
 
 /// Wire protocol version; bump on any frame change.
-pub(crate) const PROTO: u32 = 2;
+pub(crate) const PROTO: u32 = 3;
 /// How long a call waits for a leader hand-over before going local.
 pub(crate) const QUEUE_BUDGET: Duration = Duration::from_secs(3);
 /// At startup, a held lock with no reachable socket (an older or opted-out
@@ -162,7 +162,6 @@ pub(crate) struct WireContext {
     pub structured_tool_output: Option<bool>,
     pub excluded_tools: Vec<String>,
     pub notes: String,
-    pub deny_text_search: bool,
 }
 
 impl From<&ClientContext> for WireContext {
@@ -173,7 +172,6 @@ impl From<&ClientContext> for WireContext {
             structured_tool_output: c.structured_tool_output,
             excluded_tools: c.excluded_tools.clone(),
             notes: c.notes.clone(),
-            deny_text_search: c.deny_text_search,
         }
     }
 }
@@ -186,7 +184,6 @@ impl From<WireContext> for ClientContext {
             structured_tool_output: w.structured_tool_output,
             excluded_tools: w.excluded_tools,
             notes: w.notes,
-            deny_text_search: w.deny_text_search,
         }
     }
 }

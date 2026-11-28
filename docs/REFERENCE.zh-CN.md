@@ -1,6 +1,6 @@
 # Astrolabe AI 参考手册（中文）
 
-本页收纳原 README 中的详细内容：工具速查、进阶配置、环境变量、语言矩阵、质量契约、开发命令。英文概览见 [README.md](../README.md)，安装见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)，Hook 见 [HOOKS.md](HOOKS.md)，性能口径见 [PERFORMANCE.md](PERFORMANCE.md)。
+本页收纳原 README 中的详细内容：工具速查、进阶配置、环境变量、语言矩阵、质量契约、开发命令。英文概览见 [README.md](../README.md)，安装见 [INSTALL_GUIDE.md](INSTALL_GUIDE.md)，旧版 Hook 迁移见 [HOOKS.md](HOOKS.md)，性能口径见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ## 一、工具速查（7 个）
 
@@ -17,7 +17,7 @@ Astrolabe 向 AI 固定暴露 7 个工具（v0.12.0 起；此前的调用图、�
 | `get_languages` | — | **代码库盘点**：统计语言种类、文件数与代码行数，并标注 LSP 状态；报告索引覆盖：未进索引的文件按原因计数，有语法错误的文件仍在索引里，按两类计数：其他语法错误（索引可能不完整，符号可能缺失），以及 C/C++/Objective-C 里预处理/宏导致的语法错误（启发式判断，符号基本完整）；≤10 个时逐个列出类别和首个错误的行号与该行片段，>10 个时给出 Markdown 报告 `<仓库>/.astrolabe/coverage-report.md` 的绝对路径（含类别列，其他语法错误在前），不支持语言的文件只按扩展名汇总。 |
 
 
-默认 `tools/list` 只声明各工具的常用参数：`query`、`path_filter`、`include_body`、`case_sensitive`、`skip_comments`、`aggregate`、`symbol`、`path`、`line`、`task_description`（多仓工作区另加 `root`）。表中其余参数（如 `offset`、`group`、`exclude`、`count_only`、`dry_run_rename`）以及 `regex`、`kind`、`depth`、`substring`、`context_lines`、`dedup`、`character`、`severity`、`page`、`budget_tokens` 不在声明里，但照常接受；设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。`find_references` 的 `path` 可省略，由索引按符号定义推断。
+默认 `tools/list` 只声明各工具的常用参数：`query`、`path_filter`、`include_body`、`case_sensitive`、`skip_comments`、`aggregate`、`regex`、`exclude`、`offset`、`page`、`symbol`、`path`、`line`、`dry_run_rename`、`kind`、`substring`、`dedup`、`lsp`、`task_description`、`index_root`（多仓工作区另加 `root`）。表中其余参数（`count_only`、`group`）以及 `budget_tokens`、`depth`、`agent_id`、`context_lines`、`character`、`severity`（以及单仓模式下的 `root`）不在声明里，但照常接受；设 `ASTROLABE_FULL_SCHEMA=1` 可全部声明。`find_references` 的 `path` 可省略，由索引按符号定义推断。
 
 ## 二、进阶配置与运行细节
 
@@ -64,7 +64,7 @@ Astrolabe **只索引 git 仓库和用 `.astrolabe/project.yml` 声明的项目*
 
 ### 4. 环境变量速查表
 
-按主题聚拢排列：仓库定位与多项目 → 客户端与输出 → 索引更新与缓存 → 语言服务器与拦截 → 日志。
+按主题聚拢排列：仓库定位与多项目 → 客户端与输出 → 索引更新与缓存 → 语言服务器与防循环 → 日志。
 
 | 环境变量 | 作用说明 | 默认值 |
 |---|---|---|
@@ -93,13 +93,9 @@ Astrolabe **只索引 git 仓库和用 `.astrolabe/project.yml` 声明的项目*
 | `ASTROLABE_SEARCH_REPEAT_WINDOW_SECS` | 上述重复查询的滑动窗口秒数；`0` 关闭重复拦截 | `600` |
 | `ASTROLABE_SEARCH_RATE_MAX` | 防循环：窗口内搜索工具（`search_code` + `find_symbol`）总调用次数超过该值后，在结果末尾追加循环警告（仍正常返回结果；`0` 关闭） | `300` |
 | `ASTROLABE_SEARCH_RATE_WINDOW_SECS` | 上述总频率的滑动窗口秒数；`0` 关闭频率告警 | `600` |
-| `ASTROLABE_SLICE_READ_MAX` | 切片精读最大行数：带 `limit ≤ N` 的 Read 调用视为切片读 | `200` |
-| `ASTROLABE_SLICE_READ_THRESHOLD` | 连续切片读提醒阈值：连续 N 次切片读且期间无任何 Astrolabe 工具调用时触发 deny | `10` |
-| `ASTROLABE_READ_THRESHOLD` | 连续全文件 Read 调用 deny 阈值（达到该次数触发拦截） | `3` |
-| `ASTROLABE_GREP_THRESHOLD` | 连续 Grep/shell 文本搜索 deny 阈值（soft 模式；`1` ≈ 首次即拦） | `3` |
-| `ASTROLABE_DENY_TEXT_SEARCH` | 硬禁用宿主 Grep / Glob / shell 文本搜索（`true`/`1`/`yes`/`on`）；开启后首次即 deny，覆盖 soft 阈值。多进程/多客户端可在各自 mcp.json `env` 中分别配置 | 关闭 |
-| `ASTROLABE_DENY_SILENCE_SECS` | deny 后静默窗口秒数（窗口内 hook 放行，不累计计数） | `15` |
 | `RUST_LOG` | 日志级别（`error` / `warn` / `info` / `debug`） | `info` |
+
+> **旧版 Hook 升级清理**：防漂移 PreToolUse Hook 及已废弃的 `ASTROLABE_SLICE_READ_*` / `ASTROLABE_READ_THRESHOLD` / `ASTROLABE_GREP_THRESHOLD` / `ASTROLABE_DENY_*` / `ASTROLABE_HOOK_*` 环境变量已移除。从旧版升级后运行 `astrolabe setup`（或 `astrolabe setup --remove-hooks`）可自动清理各客户端遗留的 Astrolabe hooks 并保留其它第三方 hooks，详见 [HOOKS.md](HOOKS.md)。
 
 ### 5. 索引缓存与增量更新
 - **哈希增量缓存**：解析结果按内容哈希持久化于被索引仓库下的 `.astrolabe/` 目录（自动写入 `.gitignore`，不污染版本控制）。未变更的文件二次索引时跳过语法解析，冷启动 1.0 秒、热启动 0.1 秒。
@@ -208,7 +204,7 @@ cargo run --release --example index_bench -- <repo>  # 测试任意指定仓库�
 
 ## 五、致谢与技术渊源
 
-Astrolabe 的设计受 **[Serena](https://github.com/oraios/serena)** 与 **[OpenVisio](https://github.com/syntaxPriest/openvisio-oss)** 启发（三级提示词范式、多客户端兼容性对齐、PreToolUse 拦截思路；目录级聚合、多跳邻域、中心性热点这几类算法思想，实现保留在 core 中、不再作为 MCP 工具暴露）。具体借鉴点见 [NOTICE](../NOTICE)。
+Astrolabe 的设计受 **[Serena](https://github.com/oraios/serena)** 与 **[OpenVisio](https://github.com/syntaxPriest/openvisio-oss)** 启发（三级提示词范式、多客户端兼容性对齐，以及早期版本的 PreToolUse 拦截思路〔现已移除〕；目录级聚合、多跳邻域、中心性热点这几类算法思想，实现保留在 core 中、不再作为 MCP 工具暴露）。具体借鉴点见 [NOTICE](../NOTICE)。
 
 本项目是独立的 Rust 实现；与上述项目的性能对比只在 [PERFORMANCE.md](PERFORMANCE.md) 的「历史对照」里保留，并注明口径限制。
 
